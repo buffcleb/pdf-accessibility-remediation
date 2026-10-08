@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class RemediationFlags(BaseModel):
+    debug: bool = False
+    report_only: bool = False
+    return_base64: bool = False
+    language: str | None = Field(default=None, description="BCP-47 document language, e.g. en-US")
+    title: str | None = Field(default=None, description="Override the document title")
+    full_review: bool = Field(default=False, description="AI-review every figure and page, not just flagged ones + a sample")
+    verify_ai: bool = Field(default=True, description="Run the AI review layer of tag verification")
+    notation_ai: bool = Field(default=True, description="Let the AI read specialist notation the layout rules can't")
+    ocr_ai: bool = Field(default=True, description="Let the AI correct OCR words Tesseract was unsure of")
+    report_branding: dict[str, str] | None = Field(
+        default=None, description="For the PDF report: service_name, organization, accent_color (#rrggbb), ai_label")
+
+
+class SubmitResponse(BaseModel):
+    job_id: str
+    status: Literal["processing"] = "processing"
+
+
+class TokenUsage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class Metrics(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    pages_processed: int = 0
+    ai_tokens_used: TokenUsage = TokenUsage()
+    processing_time_seconds: float = 0.0
+    ai_calls: int = 0
+
+
+class Files(BaseModel):
+    remediated_primary: str | None = None
+    remediated_visual_fallback: str | None = None
+    enhanced: str | None = None  # Adobe route with AI: Adobe's file plus AI alt text (a separate copy)
+
+
+class Reports(BaseModel):
+    verapdf_compliance_report: str | None = None
+    verapdf_before: str | None = None
+    verapdf_after: dict[str, str | None] | None = None
+    comparison: dict[str, Any] | None = None
+    remediation_summary: str = ""
+    ai_findings: list[str] | None = None
+    full_report: str | None = None  # JSON with per-element tagging details
+    markdown_report: str | None = None  # same report rendered as Markdown
+    report_pdf: str | None = None  # same report as an accessible PDF/UA-1 PDF, for people
+    tag_verification: dict[str, Any] | None = None
+    tag_maps: dict[str, str | None] | None = None  # original / primary / visual_fallback, for the tag viewer
+    edits_applied: list[str] | None = None  # edit jobs: one line per tag edit
+    adobe_reports: list[str] | None = None  # Adobe's own accessibility report(s) (xlsx), Adobe route only
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: Literal["processing", "completed", "failed"]
+    progress: dict[str, Any] | None = None
+    files: Files | None = None
+    metrics: Metrics | None = None
+    reports: Reports | None = None
+    warnings: list[str] | None = None
+    error: dict[str, Any] | None = None

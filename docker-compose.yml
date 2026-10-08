@@ -1,0 +1,106 @@
+# Local test stack only. In other environments run the same image with your own Redis
+# and a shared volume (or object storage) mounted at DATA_DIR for both api and worker.
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - jobdata:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: celery -A app.worker.celery_app worker --loglevel=INFO --concurrency=${WORKER_CONCURRENCY:-2}
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - jobdata:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Adobe Autotag jobs: their own queue, so Adobe's pace never holds up the standard route
+  adobe-worker:
+    build: .
+    command: celery -A app.worker.celery_app worker -Q adobe -n adobe@%h --loglevel=INFO --concurrency=${ADOBE_WORKER_CONCURRENCY:-2}
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - jobdata:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # A stand-in for Adobe, for testing without an Adobe account (app/adobe/fake.py). Not started by default:
+  #   docker compose --profile fake-adobe up -d fake-adobe   and   ADOBE_BASE_URL=http://fake-adobe:8090
+  fake-adobe:
+    build: .
+    profiles: ["fake-adobe"]
+    command: python -m app.adobe.fake --host 0.0.0.0 --port 8090
+    ports:
+      - "127.0.0.1:${FAKE_ADOBE_PORT:-8090}:8090"
+
+  beat:
+    build: .
+    command: celery -A app.worker.celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - jobdata:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # AI gateway: every model the service uses goes through here (config/litellm.yaml)
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    env_file: .env
+    environment:
+      LITELLM_DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD:-litellm-dev-only}@litellm-db:5432/litellm
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    # Admin UI at http://localhost:4000/ui (models, spend per job/tag, virtual keys, budgets, logs).
+    # Bound to this machine only; elsewhere put it behind your VPN or SSO, never on the public internet.
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  litellm-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${LITELLM_DB_PASSWORD:-litellm-dev-only}
+      POSTGRES_DB: litellm
+    volumes:
+      - litellmdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "litellm"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  jobdata:
+  litellmdb:

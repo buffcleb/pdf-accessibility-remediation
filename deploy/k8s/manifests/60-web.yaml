@@ -1,0 +1,72 @@
+# The web app (static files) and the one public entry: https://${APP_HOST} -> web, which proxies /api/ to the
+# portal API. Traffic arrives through the Cloudflare tunnel to ingress-nginx; TLS ends at Cloudflare.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: web }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 101, runAsGroup: 101, runAsNonRoot: true }
+      containers:
+        - name: web
+          image: ${REGISTRY}/pdfrem-web:${WEB_TAG}
+          env:
+            - { name: PORTAL_API_UPSTREAM, value: "http://portal-api:8080" }
+            - { name: MAX_UPLOAD_SIZE, value: "${MAX_UPLOAD_SIZE}" }
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: cache, mountPath: /var/cache/nginx }
+            - { name: confd, mountPath: /etc/nginx/conf.d }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: cache, emptyDir: {} }
+        - { name: confd, emptyDir: {} }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: ${NAMESPACE}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "${MAX_UPLOAD_SIZE}"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${APP_HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: web, port: { number: 8080 } }

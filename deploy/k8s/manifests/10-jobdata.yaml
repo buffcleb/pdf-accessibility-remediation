@@ -1,0 +1,13 @@
+# The engine's job folder (uploads, work files, results), shared by its API and workers: ReadWriteMany on the NAS
+# (a folder per claim in the NFS share; the share maps all users to admin, so the engine's uid 10001 can write).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jobdata
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ${SHARED_STORAGE_CLASS}
+  resources:
+    requests:
+      storage: ${JOBDATA_SIZE}

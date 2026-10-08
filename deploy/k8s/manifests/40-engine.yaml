@@ -1,0 +1,185 @@
+# The remediation engine: its API (inside the cluster only; the portal calls it), the standard-route workers,
+# the Adobe-route workers (0 unless Adobe is set up) and the scheduler that clears old jobs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: engine
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: engine-api }
+  ports: [{ name: http, port: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine-api
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: engine-api }
+  template:
+    metadata:
+      labels: { app: engine-api }
+      annotations:
+        checksum/settings: "${ENGINE_ENV_SHA}"
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      initContainers:
+        - name: check-jobdata
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
+          volumeMounts: [{ name: jobdata, mountPath: /data }]
+      containers:
+        - name: engine-api
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
+          env:
+            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: DATA_DIR, value: /data }
+            - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            httpGet: { path: /api/v1/health, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          volumeMounts:
+            - { name: jobdata, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: jobdata
+          persistentVolumeClaim: { claimName: jobdata }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine-worker
+  namespace: ${NAMESPACE}
+spec:
+  replicas: ${ENGINE_WORKERS}
+  selector:
+    matchLabels: { app: engine-worker }
+  template:
+    metadata:
+      labels: { app: engine-worker }
+      annotations:
+        checksum/settings: "${ENGINE_ENV_SHA}"
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      initContainers:
+        - name: check-jobdata
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
+          volumeMounts: [{ name: jobdata, mountPath: /data }]
+      containers:
+        - name: engine-worker
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=${WORKER_CONCURRENCY}"]
+          envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
+          env:
+            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: DATA_DIR, value: /data }
+            - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "3", memory: ${WORKER_MEMORY_LIMIT} }
+          volumeMounts:
+            - { name: jobdata, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: jobdata
+          persistentVolumeClaim: { claimName: jobdata }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine-adobe-worker
+  namespace: ${NAMESPACE}
+spec:
+  replicas: ${ADOBE_WORKERS}
+  selector:
+    matchLabels: { app: engine-adobe-worker }
+  template:
+    metadata:
+      labels: { app: engine-adobe-worker }
+      annotations:
+        checksum/settings: "${ENGINE_ENV_SHA}"
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      initContainers:
+        - name: check-jobdata
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
+          volumeMounts: [{ name: jobdata, mountPath: /data }]
+      containers:
+        - name: engine-adobe-worker
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "adobe", "-n", "adobe@%h", "--loglevel=INFO", "--concurrency=2"]
+          envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
+          env:
+            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: DATA_DIR, value: /data }
+            - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: jobdata, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: jobdata
+          persistentVolumeClaim: { claimName: jobdata }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine-beat
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: engine-beat }
+  template:
+    metadata:
+      labels: { app: engine-beat }
+      annotations:
+        checksum/settings: "${ENGINE_ENV_SHA}"
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      initContainers:
+        - name: check-jobdata
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
+          volumeMounts: [{ name: jobdata, mountPath: /data }]
+      containers:
+        - name: engine-beat
+          image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
+          command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+          envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
+          env:
+            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: DATA_DIR, value: /data }
+            - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+          resources:
+            requests: { cpu: 20m, memory: 128Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+          volumeMounts:
+            - { name: jobdata, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: jobdata
+          persistentVolumeClaim: { claimName: jobdata }
+        - name: tmp
+          emptyDir: {}

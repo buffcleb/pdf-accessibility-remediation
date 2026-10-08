@@ -1,0 +1,12 @@
+// Cloudflare Workers static assets. Deploy with: npm run build && npx wrangler deploy
+// The API then lives on its own host (e.g. api.pdf.example.edu): set "apiBase" in public/config.json,
+// add that origin to connect-src in public/_headers, and set PORTAL_CORS_ORIGINS on the API.
+// Keep both on the same registrable domain so the sign-in cookie stays first-party.
+{
+  "name": "pdf-remediation-web",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  }
+}

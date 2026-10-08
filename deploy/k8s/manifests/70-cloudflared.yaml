@@ -1,0 +1,37 @@
+# Only when deploy/k8s/tunnel.env exists: this service's own Cloudflare tunnel (dashboard-managed, by token). Its
+# public hostname is set in Cloudflare: ${APP_HOST} -> http://web.${NAMESPACE}.svc.cluster.local:8080 (or, with the
+# Worker front end, the API origin -> http://portal-api.${NAMESPACE}.svc.cluster.local:8080).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: cloudflared }
+  template:
+    metadata:
+      labels: { app: cloudflared }
+      annotations:
+        checksum/settings: "${TUNNEL_ENV_SHA}"
+    spec:
+      securityContext: { runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true }
+      containers:
+        - name: cloudflared
+          image: ${CLOUDFLARED_IMAGE}
+          args: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom: { secretKeyRef: { name: pdfrem-tunnel, key: TUNNEL_TOKEN } }
+          livenessProbe:
+            httpGet: { path: /ready, port: 2000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }

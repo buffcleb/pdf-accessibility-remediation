@@ -1,0 +1,71 @@
+# One Postgres server with two databases: the portal's and the AI gateway's (LiteLLM).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: ${NAMESPACE}
+data:
+  10-databases.sh: |
+    #!/bin/sh
+    set -e
+    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" <<SQL
+    CREATE ROLE portal LOGIN PASSWORD '$PORTAL_DB_PASSWORD';
+    CREATE DATABASE portal OWNER portal;
+    CREATE ROLE litellm LOGIN PASSWORD '$LITELLM_DB_PASSWORD';
+    CREATE DATABASE litellm OWNER litellm;
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: postgres }
+  ports: [{ name: pg, port: 5432 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ${NAMESPACE}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      securityContext: { fsGroup: 70 }
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: POSTGRES_ADMIN_PASSWORD } }
+            - name: PORTAL_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
+            - name: LITELLM_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: LITELLM_DB_PASSWORD } }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres"] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+      volumes:
+        - name: init
+          configMap: { name: postgres-init }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ${STORAGE_CLASS}
+        resources: { requests: { storage: ${DB_SIZE} } }

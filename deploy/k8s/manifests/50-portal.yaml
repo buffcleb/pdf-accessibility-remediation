@@ -1,0 +1,110 @@
+# The portal API and its worker (queues, engine polling, email, reports).
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal-api
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: portal-api }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal-api
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: portal-api }
+  template:
+    metadata:
+      labels: { app: portal-api }
+      annotations:
+        checksum/settings: "${PORTAL_ENV_SHA}"
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      containers:
+        - name: portal-api
+          image: ${REGISTRY}/pdfrem-portal:${PORTAL_TAG}
+          # Migrations are a separate step (scripts/deploy.sh runs them after a backup), not on start
+          command: ["sh", "-c", "exec uvicorn portal.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*'"]
+          envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
+          env:
+            - name: PORTAL_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
+            - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal:$(PORTAL_DB_PASSWORD)@postgres:5432/portal" }
+            - { name: PORTAL_REDIS_URL, value: "redis://redis:6379/1" }
+            - { name: PORTAL_APP_URL, value: "https://${APP_HOST}" }
+            - { name: PORTAL_CORS_ORIGINS, value: "https://${APP_HOST}" }
+            - { name: PORTAL_COOKIE_SECURE, value: "true" }
+            - { name: PORTAL_TRUST_PROXY_HEADERS, value: "true" }
+            - { name: PORTAL_CLIENT_IP_HEADER, value: "${CLIENT_IP_HEADER}" }
+            - { name: PORTAL_S3_ENDPOINT_URL, value: "http://seaweedfs:8333" }
+            - { name: PORTAL_S3_BUCKET, value: pdf-remediation }
+            - { name: PORTAL_S3_CREATE_BUCKET, value: "true" }
+            - { name: PORTAL_ENGINE_URL, value: "http://engine:8000" }
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /api/v1/health, port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal-worker
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: portal-worker }
+  template:
+    metadata:
+      labels: { app: portal-worker }
+      annotations:
+        checksum/settings: "${PORTAL_ENV_SHA}"
+    spec:
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      containers:
+        - name: portal-worker
+          image: ${REGISTRY}/pdfrem-portal:${PORTAL_TAG}
+          command: ["python", "-m", "portal.worker"]
+          envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
+          env:
+            - name: PORTAL_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
+            - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal:$(PORTAL_DB_PASSWORD)@postgres:5432/portal" }
+            - { name: PORTAL_REDIS_URL, value: "redis://redis:6379/1" }
+            - { name: PORTAL_APP_URL, value: "https://${APP_HOST}" }
+            - { name: PORTAL_CORS_ORIGINS, value: "https://${APP_HOST}" }
+            - { name: PORTAL_COOKIE_SECURE, value: "true" }
+            - { name: PORTAL_TRUST_PROXY_HEADERS, value: "true" }
+            - { name: PORTAL_CLIENT_IP_HEADER, value: "${CLIENT_IP_HEADER}" }
+            - { name: PORTAL_S3_ENDPOINT_URL, value: "http://seaweedfs:8333" }
+            - { name: PORTAL_S3_BUCKET, value: pdf-remediation }
+            - { name: PORTAL_S3_CREATE_BUCKET, value: "true" }
+            - { name: PORTAL_ENGINE_URL, value: "http://engine:8000" }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes:
+        - name: tmp
+          emptyDir: {}

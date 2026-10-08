@@ -1,0 +1,49 @@
+# AI gateway. Its config is the ConfigMap litellm-config (made from config/litellm.yaml by scripts/deploy.sh).
+# Its admin UI stays inside the cluster: kubectl -n ${NAMESPACE} port-forward svc/litellm 4000 (then /ui).
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: litellm }
+  ports: [{ name: http, port: 4000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: litellm }
+  template:
+    metadata:
+      labels: { app: litellm }
+      annotations:
+        checksum/config: "${LITELLM_CONFIG_SHA}"
+        checksum/settings: "${ENGINE_ENV_SHA}"
+    spec:
+      containers:
+        - name: litellm
+          image: ${LITELLM_IMAGE}
+          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
+          env:
+            - name: LITELLM_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: LITELLM_DB_PASSWORD } }
+            - { name: LITELLM_DATABASE_URL, value: "postgresql://litellm:$(LITELLM_DB_PASSWORD)@postgres:5432/litellm" }
+          ports: [{ containerPort: 4000 }]
+          readinessProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "1", memory: 1536Mi }
+          volumeMounts:
+            - { name: config, mountPath: /app/config.yaml, subPath: litellm.yaml, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: litellm-config }

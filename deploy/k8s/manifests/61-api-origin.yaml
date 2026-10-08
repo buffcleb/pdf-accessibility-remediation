@@ -1,0 +1,22 @@
+# Only with FRONTEND=worker: the portal API on its own host (https://${API_ORIGIN_HOST}), which the Cloudflare
+# Worker forwards /api/ to. Protect that host with Cloudflare Access (a service token the Worker sends).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-origin
+  namespace: ${NAMESPACE}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "${MAX_UPLOAD_SIZE}"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${API_ORIGIN_HOST}
+      http:
+        paths:
+          - path: /api/
+            pathType: Prefix
+            backend:
+              service: { name: portal-api, port: { number: 8080 } }

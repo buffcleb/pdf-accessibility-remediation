@@ -1,0 +1,14 @@
+# Web app: build the static files, then serve them with an unprivileged nginx that also proxies
+# /api/ to the portal API (same origin, so no CORS and the refresh cookie stays first-party).
+FROM node:20-alpine AS build
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+FROM nginxinc/nginx-unprivileged:1.29-alpine
+COPY docker/web/default.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=build /web/dist /usr/share/nginx/html
+ENV PORTAL_API_UPSTREAM=http://portal-api:8080 MAX_UPLOAD_SIZE=512m
+EXPOSE 8080

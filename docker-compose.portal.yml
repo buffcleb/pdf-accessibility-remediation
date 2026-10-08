@@ -1,0 +1,139 @@
+# Portal demo stack: web app, portal API and worker, Postgres, Redis, SeaweedFS (S3) and Mailpit.
+# It is independent of the engine stack and reaches the engine over HTTP (PORTAL_ENGINE_URL).
+#
+#   docker compose -p portal -f docker-compose.portal.yml --env-file .env.portal up -d --build
+#
+#   Web app:   http://localhost:8088
+#   Mail:      http://localhost:8025  (sign-in codes and job emails land here)
+#
+# Local test only. Production uses managed Postgres/Redis/S3/SMTP with the same images.
+x-portal-env: &portal-env
+  PORTAL_DATABASE_URL: postgresql+psycopg://portal:${PORTAL_DB_PASSWORD:-portal-dev-only}@portal-db:5432/portal
+  PORTAL_REDIS_URL: redis://portal-redis:6379/0
+  # Mail goes to Mailpit unless .env.portal says otherwise (e.g. PORTAL_MAIL_BACKEND=cloudflare)
+  PORTAL_MAIL_BACKEND: ${PORTAL_MAIL_BACKEND:-smtp}
+  PORTAL_SMTP_HOST: ${PORTAL_SMTP_HOST:-mailpit}
+  PORTAL_SMTP_PORT: ${PORTAL_SMTP_PORT:-1025}
+  PORTAL_APP_URL: ${PORTAL_APP_URL:-http://localhost:8088}
+  PORTAL_CORS_ORIGINS: ${PORTAL_APP_URL:-http://localhost:8088}
+  PORTAL_COOKIE_SECURE: ${PORTAL_COOKIE_SECURE:-false}
+  PORTAL_TRUST_PROXY_HEADERS: "true"
+  PORTAL_S3_ENDPOINT_URL: http://seaweedfs:8333
+  PORTAL_S3_ACCESS_KEY: ${PORTAL_S3_ACCESS_KEY:-portal-dev-access}
+  PORTAL_S3_SECRET_KEY: ${PORTAL_S3_SECRET_KEY:-portal-dev-secret-change-me}
+  PORTAL_S3_BUCKET: pdf-remediation
+  PORTAL_S3_CREATE_BUCKET: "true"
+  PORTAL_ENGINE_URL: ${PORTAL_ENGINE_URL:-http://host.docker.internal:8000}
+  PORTAL_GATEWAY_ADMIN_URL: ${PORTAL_GATEWAY_ADMIN_URL:-http://localhost:4000/ui}
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+
+services:
+  portal-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: ${PORTAL_DB_PASSWORD:-portal-dev-only}
+      POSTGRES_DB: portal
+    volumes:
+      - portaldb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal"]
+      interval: 5s
+      retries: 10
+
+  portal-redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  seaweedfs:
+    # S3-compatible object store. Credentials come from the environment; the config file is written at start.
+    image: chrislusf/seaweedfs:4.48
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mkdir -p /etc/sw &&
+        printf '{"identities":[{"name":"portal","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}'
+        "$$S3_ACCESS" "$$S3_SECRET" > /etc/sw/s3.json &&
+        mkdir -p /etc/seaweedfs && printf '[s3.sse]\nkek = "%s"\n' "$$S3_SSE_KEK" > /etc/seaweedfs/security.toml &&
+        exec weed server -ip.bind=0.0.0.0 -dir=/data -s3 -s3.port=8333 -s3.config=/etc/sw/s3.json -volume.max=0 -master.volumeSizeLimitMB=1024
+    environment:
+      S3_ACCESS: ${PORTAL_S3_ACCESS_KEY:-portal-dev-access}
+      S3_SECRET: ${PORTAL_S3_SECRET_KEY:-portal-dev-secret-change-me}
+      # Key-encryption key for server-side encryption at rest (32 random bytes, hex)
+      S3_SSE_KEK: ${PORTAL_S3_SSE_KEK:?set PORTAL_S3_SSE_KEK in .env.portal}
+    volumes:
+      - seaweed:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/cluster/status || exit 1"]
+      interval: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "8025:8025"
+
+  portal-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.portal
+    image: pdf-remediation-portal:dev
+    env_file: .env.portal
+    environment:
+      <<: *portal-env
+    <<: *hardening
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      portal-db:
+        condition: service_healthy
+      portal-redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+
+  portal-worker:
+    image: pdf-remediation-portal:dev
+    command: ["python", "-m", "portal.worker"]
+    env_file: .env.portal
+    environment:
+      <<: *portal-env
+    <<: *hardening
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      portal-api:
+        condition: service_started
+
+  portal-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    environment:
+      PORTAL_API_UPSTREAM: http://portal-api:8080
+    ports:
+      - "${PORTAL_WEB_PORT:-8088}:8080"
+    read_only: true
+    tmpfs:  # nginx runs as uid 101 in the unprivileged image
+      - /tmp:uid=101,gid=101
+      - /var/cache/nginx:uid=101,gid=101
+      - /etc/nginx/conf.d:uid=101,gid=101
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    depends_on:
+      - portal-api
+
+volumes:
+  portaldb:
+  seaweed:

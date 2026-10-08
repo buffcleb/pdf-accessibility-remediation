@@ -1,0 +1,593 @@
+"""Submitting PDFs, following jobs, and downloading results."""
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy import Integer, cast, func, or_, select
+from sqlalchemy.orm import Session, object_session
+
+from portal import approval, audit, quota, services, settings_store
+from portal.db import get_db
+from portal.deps import Principal, current_principal
+from portal.errors import ApiError, not_found
+from portal.models import HelpRequest, Job, JobFile, User
+from portal.pdfcheck import receive_pdf
+from portal.storage import get_storage, job_prefix, safe_name
+
+router = APIRouter(tags=["jobs"])
+
+FILE_LABELS = {
+    "input": "Original",
+    "primary": "Remediated PDF",
+    "visual_fallback": "Visually exact PDF",
+    "report_pdf": "Report (PDF)",
+    "report_md": "Report (Markdown)",
+    "report_json": "Report (JSON)",
+    "verapdf_before": "veraPDF report: before",
+    "verapdf_after": "veraPDF report: after",
+    "verapdf_after_visual": "veraPDF report: visually exact file",
+    "adobe_report": "Adobe accessibility report (Excel)",
+    "enhanced": "Improved copy of Adobe's file (PDF)",
+    "verapdf_after_enhanced": "veraPDF report: improved copy",
+}
+
+
+class JobFileOut(BaseModel):
+    id: uuid.UUID
+    kind: str
+    label: str
+    name: str
+    size_bytes: int
+
+
+class JobOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    user_email: str | None
+    group_id: uuid.UUID | None
+    filename: str
+    pages: int
+    pages_charged: int
+    report_only: bool
+    processing: str
+    ai_tier: str | None
+    ai_kind: str | None  # the kind of document within the AI level; None: General
+    ai_kind_fallback: str | None  # processed with the level's General instead: "unavailable" or "failed"
+    ai_kind_auto: bool  # "Let AI decide": the classifier picks the kind before the document is sent
+    ai_kind_pick: dict | None  # what it picked: {kind, label, confidence, used, reason}
+    ai_label: str | None  # "Premium AI · Math and science": the level and kind by name (never the model)
+    charged_services: list[str]
+    external_services: list[str]
+    needs_confirmation: bool
+    full_review: bool
+    no_ai: bool  # made without AI (an audit, when its AI level is set that way)
+    ai_refunded: bool  # the AI tier's pages were given back: every AI call failed, or (ai_unused) none was needed
+    ai_unused: bool
+    cost: dict | None  # AI spend etc.; admins only
+    status: str
+    progress: dict | None
+    result: dict | None
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    finished_at: datetime | None
+    files_expire_at: datetime | None
+    files_deleted: bool
+    files: list[JobFileOut]
+    help: dict | None = None  # the current help request: {id, status, unread}; on the owner's own list
+
+
+def _file_label(job: Job, kind: str) -> str:
+    summary = job.result_summary or {}
+    if kind == "primary" and (summary.get("metrics") or {}).get("route") == "adobe":
+        return "Adobe tagged PDF"
+    if kind == "enhanced" and summary.get("improved_label"):
+        return f"{summary['improved_label']} (PDF)"
+    return FILE_LABELS.get(kind, kind)
+
+
+def _ai_label(job: Job) -> str | None:
+    db = object_session(job)
+    if job.no_ai:
+        return "No AI"
+    if not job.ai_tier or db is None:
+        return None
+    level = services.get_service(db, job.ai_tier)
+    name = level.label if level else job.ai_tier
+    if job.ai_kind_auto and not job.ai_kind_pick:
+        return f"{name} · Let AI decide"
+    return f"{name} · {services.kind_label(db, job.ai_tier, job.ai_kind)}" if job.ai_kind else name
+
+
+def job_out(job: Job, retention_days: int, with_user: bool = False, show_cost: bool = False) -> JobOut:
+    return JobOut(
+        id=job.id, user_id=job.user_id, user_email=job.user.email if with_user else None, group_id=job.group_id,
+        filename=job.filename, pages=job.pages, pages_charged=job.pages_charged, report_only=job.report_only,
+        processing=job.processing, ai_tier=job.ai_tier, ai_kind=job.ai_kind, ai_kind_fallback=job.ai_kind_fallback,
+        ai_kind_auto=bool(job.ai_kind_auto), ai_kind_pick=job.ai_kind_pick,
+        ai_label=_ai_label(job),
+        charged_services=list(job.charged_services or []),
+        external_services=list(job.external_services or []), needs_confirmation=job.status == "held",
+        full_review=job.full_review, no_ai=bool(job.no_ai),
+        ai_refunded=bool((job.cost or {}).get("ai_refunded")),
+        ai_unused=bool((job.cost or {}).get("ai_unused")),
+        cost=job.cost if show_cost else None,
+        status=job.status, progress=job.progress, result=job.result_summary, error_code=job.error_code,
+        error_message=job.error_message, created_at=job.created_at, finished_at=job.finished_at,
+        files_expire_at=None if job.files_deleted_at else job.created_at + timedelta(days=retention_days),
+        files_deleted=job.files_deleted_at is not None,
+        files=[] if job.files_deleted_at else [
+            JobFileOut(id=f.id, kind=f.kind, label=_file_label(job, f.kind), name=f.name,
+                       size_bytes=f.size_bytes) for f in job.files
+            if not f.kind.startswith(("tagmap_", "reviewed_", "corrected_"))])
+
+
+class UploadResult(BaseModel):
+    filename: str
+    accepted: bool
+    job: JobOut | None = None
+    error: dict | None = None
+
+
+def _visible_job(db: Session, job_id: uuid.UUID, p: Principal) -> Job:
+    """Owner, an admin of the job's group, or a super admin. Others get 404."""
+    job = db.get(Job, job_id)
+    if job is None:
+        raise not_found("Job")
+    if job.user_id == p.user.id or p.is_super_admin or (job.group_id and p.can_admin_group(job.group_id)):
+        return job
+    raise not_found("Job")
+
+
+class KindChoice(BaseModel):
+    key: str
+    label: str
+    description: str | None
+
+
+class ServiceChoice(BaseModel):
+    """A service the signed-in user can pick at upload, with what to tell them about it."""
+    key: str
+    kind: str
+    label: str
+    description: str | None
+    external: bool
+    notice: str | None            # shown when the service is picked (None: no notice for this service)
+    confirm_before_send: bool
+    max_pages_per_job: int | None
+    remaining_pages: int | None   # None = unlimited
+    is_default: bool
+    allow_full_review: bool       # AI tiers: people may ask for every figure to be reviewed
+    ai_use: str | None            # processing services: "full" (AI helps throughout) or "alt_text"
+                                  # (optional AI alt text for figures, in a separate copy)
+    kinds: list[KindChoice] = []  # AI levels: kinds of document, General first (never model names)
+    audit_ai: str | None = None   # AI levels: an audit with this level is free, counts its pages, or uses no AI
+
+
+@router.get("/services", response_model=list[ServiceChoice])
+def my_services(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Services this user may use now (switched on globally and for their group, and granted to them)."""
+    out = []
+    user = p.user
+    classifier = services.classifier_for(db, user.group)
+    for s in services.all_services(db):
+        if not services.access(db, user, s.key).ok:
+            continue
+        gs = user.group.service(s.key)
+        out.append(ServiceChoice(
+            key=s.key, kind=s.kind, label=s.label, description=s.description, external=s.external,
+            notice=(s.notice_text or None) if s.notice_enabled else None, confirm_before_send=s.confirm_before_send,
+            max_pages_per_job=s.max_pages_per_job, remaining_pages=services.remaining(user, s.key, s),
+            is_default=bool(gs and gs.is_default), allow_full_review=s.allow_full_review,
+            ai_use=services.ai_use(s) if s.kind == "processing" else None,
+            kinds=_kind_choices(db, s.key, classifier) if s.kind == "ai_tier" else [],
+            audit_ai=s.audit_ai if s.kind == "ai_tier" else None))
+    return out
+
+
+def _kind_choices(db: Session, level: str, classifier) -> list[KindChoice]:
+    """General first, then "Let AI decide" (when the group can use the classifier), then the level's kinds."""
+    ks = services.kinds(db, level)
+    out = [KindChoice(key=services.GENERAL, label="General", description=None)]
+    if ks and classifier:
+        where = " with an outside service" if classifier[0] == "jev" else ""
+        out.append(KindChoice(key=services.AUTO, label="Let AI decide",
+                              description=f"The first pages' text is read{where} to pick the kind; General is used "
+                                          "when it isn't sure."))
+    return out + [KindChoice(key=k.key, label=k.label, description=k.description) for k in ks]
+
+
+class UploadOptions(BaseModel):
+    """What the upload form offers, as the person's group sets it."""
+    ai_mode: str              # "choose": people pick the AI level and kind; "fixed": the group's are used
+    ai_level: str | None      # fixed: the level
+    ai_kind: str | None       # fixed: the kind (None: General)
+    show_external: bool       # mark the options that send documents to an outside provider
+
+
+@router.get("/upload-options", response_model=UploadOptions)
+def upload_options(p: Principal = Depends(current_principal)):
+    g = p.user.group
+    if g is None:
+        return UploadOptions(ai_mode="choose", ai_level=None, ai_kind=None, show_external=False)
+    fixed = g.ai_mode == "fixed" and bool(g.ai_level)
+    return UploadOptions(ai_mode="fixed" if fixed else "choose", ai_level=g.ai_level if fixed else None,
+                         ai_kind=g.ai_kind if fixed else None, show_external=g.show_external)
+
+
+def _pick_tier(db: Session, user, requested: str | None) -> str | None:
+    """The AI tier for an upload: the one asked for, else the group's default tier if the user can use it,
+    else none (the engine's default AI)."""
+    if requested:
+        s = services.get_service(db, requested)
+        if s is None or s.kind != "ai_tier":
+            raise ApiError(422, "unknown_service", "That AI level doesn't exist.")
+        a = services.access(db, user, requested)
+        if not a.ok:
+            raise ApiError(403, a.code, a.message)
+        return requested
+    for gs in user.group.services if user.group else []:
+        if gs.is_default and gs.service.kind == "ai_tier" and services.access(db, user, gs.service_key).ok:
+            return gs.service_key
+    return None
+
+
+def _pick_kind(db: Session, tier: str | None, requested: str | None, group=None) -> str | None:
+    """The kind of document within the AI level: one the level offers, "auto" (the classifier picks it before the
+    document is sent), else General (None)."""
+    if not tier or not requested or requested == services.GENERAL:
+        return None
+    if requested == services.AUTO:
+        if not services.kinds(db, tier) or services.classifier_for(db, group) is None:
+            raise ApiError(422, "classifier_unavailable", "Letting AI decide the kind isn't available here.")
+        return services.AUTO
+    if requested not in {k.key for k in services.kinds(db, tier)}:
+        raise ApiError(422, "unknown_kind", "That kind of document isn't offered with this AI level.")
+    return requested
+
+
+@dataclass
+class _Plan:
+    """How one file is processed and paid for."""
+    tier: str | None
+    kind: str | None
+    full_review: bool
+    keys: list[str]          # every service the document uses
+    charge_keys: list[str]   # the services its pages are counted against (none: free)
+    hold: bool
+    external: list[str]
+    no_ai: bool
+    auto: bool = False       # the classifier picks the kind before the document is sent
+
+
+def _per_file(raw: str | None, count: int) -> dict[int, dict]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        out = {}
+        for k, v in data.items():
+            i = int(k)
+            if not 0 <= i < count or not isinstance(v, dict) or set(v) - {"ai_tier", "ai_kind"} or not all(
+                    x is None or (isinstance(x, str) and len(x) <= 64) for x in v.values()):
+                raise ValueError
+            out[i] = v
+        return out
+    except (ValueError, TypeError, AttributeError):
+        raise ApiError(422, "bad_per_file", "The choices for single files couldn't be read.")
+
+
+def _plan(db: Session, user, chosen, processing: str, report_only: bool, ai_alt_text: bool, full_review: bool,
+          confirm: bool, ai_tier: str | None, ai_kind: str | None) -> _Plan:
+    """The AI level and kind (the group's, when it sets one for everything), what the pages are counted against
+    and whether the file waits for confirmation. An audit follows its AI level's setting: free, counted against
+    the level, or made without AI."""
+    group = user.group
+    if group is not None and group.ai_mode == "fixed" and group.ai_level:
+        ai_tier, ai_kind = group.ai_level, group.ai_kind
+    wants_ai = services.ai_use(chosen) == "full" or ai_alt_text
+    tier = _pick_tier(db, user, ai_tier) if wants_ai else None
+    kind = _pick_kind(db, tier, ai_kind, group)
+    no_ai = False
+    charge_keys = [processing] + ([tier] if tier else [])
+    if report_only:
+        audit_ai = services.get_service(db, tier).audit_ai if tier else "free"
+        if audit_ai == "off":
+            tier, kind, no_ai = None, None, True
+        charge_keys = [tier] if audit_ai == "charge" else []
+    full_review = full_review and wants_ai and not no_ai
+    if full_review and not services.full_review_allowed(db, tier):
+        raise ApiError(422, "full_review_not_allowed", "Reviewing every figure isn't available with this AI level.")
+    keys = [processing] + ([tier] if tier else [])
+    hold = any(services.get_service(db, k).confirm_before_send for k in keys) and not confirm and not report_only
+    external = [k for k in keys if services.get_service(db, k).external]
+    auto = kind == services.AUTO
+    return _Plan(tier, None if auto else kind, full_review, keys, charge_keys, hold, external, no_ai, auto)
+
+
+@router.post("/jobs", response_model=list[UploadResult])
+def upload(request: Request, files: list[UploadFile] = File(...), report_only: bool = Form(False),
+           processing: str = Form(services.STANDARD, max_length=64), ai_tier: str | None = Form(None, max_length=64),
+           ai_kind: str | None = Form(None, max_length=40),
+           confirm: bool = Form(False), full_review: bool = Form(False), ai_alt_text: bool = Form(True),
+           per_file: str | None = Form(None, max_length=20_000),
+           p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Submit one or more PDFs. Each file is accepted or refused on its own.
+
+    processing picks the service. ai_alt_text: for a service whose AI only writes alt text (Adobe),
+    whether to use it (default yes). When it asks for confirmation before documents are sent, files are
+    accepted as held (nothing reserved) until confirmed with POST /jobs/{id}/confirm, unless confirm
+    is already true.
+
+    per_file: JSON {"<index of the file>": {"ai_tier": ..., "ai_kind": ...}} to give some files their own AI level
+    and kind. When the group sets one AI level for everything, what's asked for is ignored."""
+    runtime = settings_store.load(db)
+    if p.user.group_id is None:
+        raise ApiError(422, "no_group", "Your account isn't in a group, so it has no pages to use.")
+    approval.require_approved(p.user)
+    chosen = services.get_service(db, processing)
+    if chosen is None or chosen.kind != "processing":
+        raise ApiError(422, "unknown_service", "That processing option doesn't exist.")
+    a = services.access(db, p.user, processing)
+    if not a.ok:
+        raise ApiError(403, a.code, a.message)
+    if report_only and chosen.engine_route != services.STANDARD:
+        # A report needs nothing from another provider: it's always made here, and costs no pages.
+        processing, chosen = services.STANDARD, services.get_service(db, services.STANDARD)
+    overrides = _per_file(per_file, len(files))
+    plans: dict[tuple, _Plan] = {}
+
+    def plan_for(i: int) -> _Plan:
+        o = overrides.get(i, {})
+        req = (o.get("ai_tier", ai_tier), o.get("ai_kind", ai_kind))
+        if req not in plans:
+            plans[req] = _plan(db, p.user, chosen, processing, report_only, ai_alt_text, full_review, confirm, *req)
+        return plans[req]
+
+    for i in [-1, *overrides]:  # refuse a bad choice before any file is taken
+        plan_for(i)
+    if len(files) > runtime.max_files_per_upload:
+        raise ApiError(413, "too_many_files", f"Upload at most {runtime.max_files_per_upload} files at a time.")
+    storage = get_storage()
+    results: list[UploadResult] = []
+    for index, upload_file in enumerate(files):
+        name = (upload_file.filename or "document.pdf")[:255]
+        try:
+            checked = receive_pdf(upload_file, runtime.max_file_mb * 1024 * 1024,
+                                        runtime.max_pages_per_document)
+        except ApiError as e:
+            results.append(UploadResult(filename=name, accepted=False, error=e.detail))
+            continue
+        try:
+            job_id = uuid.uuid4()
+            # Lock the user row so the waiting-documents limit holds under parallel uploads.
+            # (How many run at once is the worker's job: see max_concurrent_jobs_per_user.)
+            db.scalar(select(User).where(User.id == p.user.id).with_for_update())
+            if quota.active_jobs(db, p.user.id) >= runtime.max_queued_jobs_per_user:
+                raise ApiError(429, "too_many_jobs",
+                               f"You already have {runtime.max_queued_jobs_per_user} documents waiting or in progress. "
+                               "Submit more when some have finished.")
+            pl = plan_for(index)
+            charged = checked.pages if pl.charge_keys else 0
+            if pl.hold:
+                quota.check_access(db, p.user, pl.keys, checked.pages)  # refuse now what can't be confirmed later
+                charged = 0
+            elif charged:
+                quota.reserve(db, p.user, charged, job_id, pl.charge_keys)
+            job = Job(id=job_id, user_id=p.user.id, group_id=p.user.group_id, filename=name, pages=checked.pages,
+                      pages_charged=charged, size_bytes=checked.size, sha256=checked.sha256, report_only=report_only,
+                      processing=processing, ai_tier=pl.tier, ai_kind=pl.kind,
+                      charged_services=pl.charge_keys if charged else [], external_services=pl.external,
+                      status="held" if pl.hold else "queued", full_review=pl.full_review, no_ai=pl.no_ai,
+                      ai_kind_auto=pl.auto)
+            db.add(job)
+            db.flush()
+            key = job_prefix(job.group_id, job.user_id, job.id) + "input/" + safe_name(name)
+            storage.put_file(key, checked.file, "application/pdf")
+            db.add(JobFile(job_id=job.id, kind="input", name=name, s3_key=key, size_bytes=checked.size,
+                           content_type="application/pdf"))
+            audit.record(db, request, "job.submitted", actor=p.user, target_type="job", target_id=job.id,
+                         group_id=job.group_id, details={"filename": name, "pages": checked.pages,
+                                                         "charged": charged, "report_only": report_only,
+                                                         "processing": processing, "ai_tier": pl.tier,
+                                                         "ai_kind": services.AUTO if pl.auto else pl.kind,
+                                                         "no_ai": pl.no_ai,
+                                                         "external": pl.external, "held": pl.hold})
+            db.commit()
+            db.refresh(job)
+            results.append(UploadResult(filename=name, accepted=True, job=job_out(job, runtime.file_retention_days)))
+        except ApiError as e:
+            db.rollback()
+            results.append(UploadResult(filename=name, accepted=False, error=e.detail))
+        finally:
+            checked.file.close()
+    return results
+
+
+@router.get("/jobs", response_model=list[JobOut])
+def my_jobs(limit: int = Query(50, ge=1, le=500), before: datetime | None = None,
+            p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    stmt = select(Job).where(Job.user_id == p.user.id)
+    if before:
+        stmt = stmt.where(Job.created_at < before)
+    jobs = db.scalars(stmt.order_by(Job.created_at.desc()).limit(limit)).all()
+    return _with_help(db, jobs, settings_store.load(db).file_retention_days)
+
+
+class DocumentsPage(BaseModel):
+    items: list[JobOut]
+    total: int
+    page: int
+    page_size: int
+    active: int  # documents of theirs still waiting or in progress (any filter), so the app knows to refresh
+
+
+STATUS_GROUPS = {
+    "waiting": ("queued",), "in_progress": ("submitted", "processing"), "done": ("completed",),
+    "failed": ("failed",), "canceled": ("canceled",), "held": ("held",),
+}
+SORTS = {"created_at": Job.created_at, "filename": func.lower(Job.filename), "pages": Job.pages,
+         "result": Job.result_summary["compliant_after"].as_boolean()}
+PAGE_SIZES = (25, 50, 100, 200)
+
+
+@router.get("/documents", response_model=DocumentsPage)
+def my_documents(q: str = Query("", max_length=200), status: str | None = Query(None, max_length=20),
+                 result: str | None = Query(None, max_length=20), service: str | None = Query(None, max_length=64),
+                 audit: bool | None = None, since: datetime | None = None, until: datetime | None = None,
+                 sort: str = Query("-created_at", max_length=20), page: int = Query(1, ge=1, le=100_000),
+                 page_size: int = Query(25, ge=1, le=200),
+                 p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The signed-in person's documents, a page at a time: search by file name, filter by status, result,
+    processing service or AI level, audit only and date; sort by date, name, pages or result."""
+    where = [Job.user_id == p.user.id]
+    if q.strip():
+        like = "%" + q.strip().lower().replace("%", r"\%").replace("_", r"\_") + "%"
+        where.append(func.lower(Job.filename).like(like, escape="\\"))
+    if status:
+        if status not in STATUS_GROUPS:
+            raise ApiError(422, "bad_filter", "Unknown status.")
+        where.append(Job.status.in_(STATUS_GROUPS[status]))
+    passes = Job.result_summary["compliant_after"].as_boolean()
+    findings = cast(Job.result_summary["review"]["findings_total"].as_string(), Integer)
+    if result == "passes":
+        where += [Job.status == "completed", Job.report_only.is_(False), passes.is_(True)]
+    elif result == "needs_work":
+        where += [Job.status == "completed", Job.report_only.is_(False), passes.is_not(True)]
+    elif result == "review":
+        where += [Job.status == "completed", findings > 0]
+    elif result == "help":
+        where.append(Job.id.in_(select(HelpRequest.job_id).where(HelpRequest.status.in_(("open", "in_progress", "waiting")))))
+    elif result:
+        raise ApiError(422, "bad_filter", "Unknown result.")
+    if service:
+        where.append(or_(Job.processing == service, Job.ai_tier == service))
+    if audit is not None:
+        where.append(Job.report_only.is_(audit))
+    if since:
+        where.append(Job.created_at >= since)
+    if until:
+        where.append(Job.created_at < until)
+    key, desc = sort.lstrip("-"), sort.startswith("-")
+    if key not in SORTS:
+        raise ApiError(422, "bad_sort", "Unknown sort.")
+    order = SORTS[key].desc().nulls_last() if desc else SORTS[key].asc().nulls_last()
+    total = db.scalar(select(func.count()).select_from(Job).where(*where)) or 0
+    size = min(page_size, max(PAGE_SIZES))
+    jobs = db.scalars(select(Job).where(*where).order_by(order, Job.created_at.desc())
+                      .limit(size).offset((page - 1) * size)).all()
+    active = db.scalar(select(func.count()).select_from(Job).where(
+        Job.user_id == p.user.id, Job.status.in_(("queued", "submitted", "processing")))) or 0
+    return DocumentsPage(items=_with_help(db, jobs, settings_store.load(db).file_retention_days), total=total,
+                         page=page, page_size=size, active=active)
+
+
+def _with_help(db: Session, jobs: list[Job], days: int) -> list[JobOut]:
+    """The documents, each with its current help request (the active one, else the latest)."""
+    helps: dict = {}
+    for r in db.scalars(select(HelpRequest).where(HelpRequest.job_id.in_([j.id for j in jobs]))
+                        .order_by(HelpRequest.created_at)):
+        if r.job_id not in helps or r.active:
+            helps[r.job_id] = {"id": str(r.id), "status": r.status, "unread": r.unread_for_person}
+    out = []
+    for j in jobs:
+        o = job_out(j, days)
+        o.help = helps.get(j.id)
+        out.append(o)
+    return out
+
+
+@router.get("/jobs/{job_id}", response_model=JobOut)
+def job_detail(job_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    job = _visible_job(db, job_id, p)
+    # Cost is for super admins only: what groups are charged isn't the per-page cost
+    return job_out(job, settings_store.load(db).file_retention_days, with_user=job.user_id != p.user.id,
+                   show_cost=p.is_super_admin)
+
+
+@router.post("/jobs/{job_id}/confirm", response_model=JobOut)
+def confirm_job(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_principal),
+                db: Session = Depends(get_db)):
+    """Send a held document: its pages are reserved now and it joins the queue."""
+    approval.require_approved(p.user)
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
+    if job is None or job.user_id != p.user.id:
+        raise not_found("Job")
+    if job.status != "held":
+        raise ApiError(409, "not_held", "This document isn't waiting for confirmation.")
+    keys = [job.processing] + ([job.ai_tier] if job.ai_tier else [])
+    quota.reserve(db, p.user, job.pages, job.id, keys)
+    job.pages_charged = job.pages
+    job.charged_services = keys
+    job.status = "queued"
+    audit.record(db, request, "job.confirmed", actor=p.user, target_type="job", target_id=job.id,
+                 group_id=job.group_id, details={"pages": job.pages, "services": keys})
+    db.commit()
+    return job_out(job, settings_store.load(db).file_retention_days)
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=JobOut)
+def cancel(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_principal),
+           db: Session = Depends(get_db)):
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
+    if job is None or job.user_id != p.user.id:
+        raise not_found("Job")
+    if job.status not in ("queued", "held"):
+        raise ApiError(409, "not_cancelable", "Only documents still waiting in the queue can be canceled.")
+    quota.release(db, job, "canceled")
+    job.status = "canceled"
+    job.finished_at = datetime.now(job.created_at.tzinfo)
+    audit.record(db, request, "job.canceled", actor=p.user, target_type="job", target_id=job.id,
+                 group_id=job.group_id)
+    db.commit()
+    return job_out(job, settings_store.load(db).file_retention_days)
+
+
+def _file(db: Session, job: Job, file_id: uuid.UUID) -> JobFile:
+    if job.files_deleted_at is not None:
+        raise ApiError(410, "files_deleted", "This document's files have been deleted under the retention policy.")
+    f = next((f for f in job.files if f.id == file_id), None)
+    if f is None:
+        raise not_found("File")
+    return f
+
+
+def _record_access(db: Session, request: Request, p: Principal, job: Job, f: JobFile, reason: str | None) -> None:
+    """Downloads by anyone but the owner are recorded."""
+    if job.user_id != p.user.id:
+        audit.record(db, request, "file.accessed", actor=p.user, target_type="job", target_id=job.id,
+                     group_id=job.group_id, details={"file": f.name, "kind": f.kind, "owner": job.user.email,
+                                                     "reason": reason})
+        db.commit()
+
+
+@router.get("/jobs/{job_id}/files/{file_id}")
+def download(job_id: uuid.UUID, file_id: uuid.UUID, request: Request, reason: str | None = Query(None, max_length=500),
+             p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    job = _visible_job(db, job_id, p)
+    f = _file(db, job, file_id)
+    _record_access(db, request, p, job, f, reason)
+    disposition = f"attachment; filename=\"{safe_name(f.name)}\""
+    return StreamingResponse(get_storage().get_stream(f.s3_key), media_type=f.content_type,
+                             headers={"Content-Disposition": disposition, "Content-Length": str(f.size_bytes),
+                                      "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/jobs/{job_id}/report")
+def report_markdown(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_principal),
+                    db: Session = Depends(get_db)):
+    """The Markdown report as text, for display in the web app."""
+    job = _visible_job(db, job_id, p)
+    f = next((f for f in job.files if f.kind == "report_md"), None)
+    if f is None:
+        raise not_found("Report")
+    f = _file(db, job, f.id)
+    _record_access(db, request, p, job, f, None)
+    text = b"".join(get_storage().get_stream(f.s3_key)).decode("utf-8", "replace")
+    return {"markdown": text}

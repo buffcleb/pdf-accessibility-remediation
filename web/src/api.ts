@@ -1,0 +1,753 @@
+// API client. The access token lives only in memory; the refresh token is an HttpOnly cookie the
+// page never sees. A 401 triggers one refresh attempt, then the user is sent to sign in.
+
+export type Role = { role: "super_admin" | "group_admin"; group_id: string | null };
+
+export type User = {
+  id: string;
+  email: string;
+  name: string | null;
+  group_id: string | null;
+  group_name: string | null;
+  status: "active" | "disabled";
+  /** Waiting for a group admin's approval, approved, or declined; separate from the account status. */
+  approval: "pending" | "approved" | "declined";
+  approval_at: string | null;
+  approval_by: string | null;
+  decline_reason: string | null;
+  auth_method: string;
+  roles: Role[];
+  cap_pages: number | null;
+  effective_cap: number | null;
+  used_pages: number;
+  reserved_pages: number;
+  remaining_pages: number | null;
+  services: UserService[];
+  created_at: string;
+  last_login_at: string | null;
+};
+
+/** A user's access to one service. */
+export type UserService = {
+  key: string;
+  label: string;
+  kind: "processing" | "ai_tier";
+  granted: boolean;
+  granted_individually: boolean;
+  available: boolean;
+  cap_pages: number | null;
+  effective_cap: number | null;
+  used_pages: number;
+  reserved_pages: number;
+  remaining_pages: number | null;
+};
+
+/** A group's terms for one service. */
+export type GroupService = {
+  key: string;
+  label: string;
+  kind: "processing" | "ai_tier";
+  globally_enabled: boolean;
+  external: boolean;
+  metered: boolean;
+  enabled: boolean;
+  available: boolean;
+  all_users: boolean;
+  is_default: boolean;
+  default_user_cap: number | null;
+  balance: Balance;
+  /** Active members who can use it (everyone, or those given it). */
+  people_with_access: number;
+  /** Active members with a limit of their own. */
+  own_limits: number;
+  /** AI levels: kinds of document beyond General (never models). */
+  kinds: { key: string; label: string }[];
+};
+
+/** A service as super admins see and configure it. */
+export type Service = {
+  key: string;
+  kind: "processing" | "ai_tier";
+  label: string;
+  description: string | null;
+  enabled: boolean;
+  external: boolean;
+  notice_enabled: boolean;
+  notice_text: string | null;
+  metered: boolean;
+  global_limited: boolean;
+  pool_pages: number | null;
+  used_pages: number;
+  reserved_pages: number;
+  remaining_pages: number | null;
+  daily_cap_pages: number | null;
+  pages_sent_today: number;
+  max_pages_per_job: number | null;
+  confirm_before_send: boolean;
+  gateway_model: string | null;
+  gateway_judge_model: string | null;
+  allow_full_review: boolean;
+  allow_notation: boolean;
+  allow_ocr_ai: boolean;
+  /** AI levels: an audit (Check only) with this level is free, counts against its pages, or is made without AI. */
+  audit_ai: "free" | "charge" | "off";
+  engine_route: "standard" | "adobe";
+  sort: number;
+  groups_enabled: number;
+  /** AI levels: kinds of document beyond General, with their models (super admins only). */
+  kinds: AiKind[];
+};
+
+export type AiKind = {
+  key: string; label: string; description: string | null; gateway_model: string; gateway_judge_model: string | null;
+  enabled: boolean; sort: number;
+};
+
+/** A service the signed-in user can pick at upload. */
+export type ServiceChoice = {
+  key: string;
+  kind: "processing" | "ai_tier";
+  label: string;
+  description: string | null;
+  external: boolean;
+  notice: string | null;
+  confirm_before_send: boolean;
+  max_pages_per_job: number | null;
+  remaining_pages: number | null;
+  is_default: boolean;
+  allow_full_review: boolean;
+  /** Processing services: "full" (AI helps throughout) or "alt_text" (Adobe: optional AI alt text, in a separate copy). */
+  ai_use: "full" | "alt_text" | null;
+  /** AI levels: kinds of document, General first. Never model names. */
+  kinds: { key: string; label: string; description: string | null }[];
+  /** AI levels: an audit with this level is free, counts against its pages, or is made without AI. */
+  audit_ai: "free" | "charge" | "off" | null;
+};
+
+/** What the upload form offers, as the person's group sets it. */
+export type UploadOptions = {
+  /** "choose": people pick the AI level and kind; "fixed": the group's are always used. */
+  ai_mode: "choose" | "fixed";
+  ai_level: string | null;
+  ai_kind: string | null;
+  /** Mark the options that send documents to an outside provider. */
+  show_external: boolean;
+};
+
+/** A file's own AI level and kind, instead of the batch's. */
+export type FileChoice = { ai_tier: string | null; ai_kind: string | null };
+
+export type Me = User & {
+  is_super_admin: boolean;
+  admin_of: string[];
+  /** Approved, or an admin. */
+  can_submit: boolean;
+  /** People waiting for approval in the groups this person administers. */
+  pending_approvals: number;
+  /** Their own help requests with something new. */
+  help_unread: number;
+  /** Super admins: help requests waiting on a super admin. */
+  help_needs_us: number;
+};
+
+export type HelpKind = "alt_text" | "reading_order" | "tables" | "headings" | "math" | "visual" | "other";
+export type HelpStatus = "open" | "in_progress" | "waiting" | "resolved" | "closed";
+export type HelpAttachment = { id: string; name: string; content_type: string; size_bytes: number };
+export type HelpMessage = {
+  id: string;
+  /** "note": super admins only; "event": a status change or hand-over. */
+  kind: "message" | "note" | "event";
+  author_email: string;
+  author_role: "person" | "group_admin" | "super_admin" | "system";
+  body: string;
+  created_at: string;
+  attachments: HelpAttachment[];
+};
+export type HelpSummary = {
+  id: string;
+  job_id: string | null;
+  filename: string;
+  user_email: string;
+  group_id: string | null;
+  group_name: string | null;
+  kind: HelpKind;
+  status: HelpStatus;
+  version_number: number | null;
+  version_label: string | null;
+  page: number | null;
+  processing: string | null;
+  ai_tier: string | null;
+  assignee_email: string | null;
+  saved: boolean;
+  needs_staff: boolean;
+  unread: boolean;
+  created_at: string;
+  updated_at: string;
+  waiting_since: string;
+};
+export type HelpRequest = HelpSummary & {
+  tag: { i: number; role: string; text: string } | null;
+  role: "person" | "group_admin" | "super_admin";
+  messages: HelpMessage[];
+  /** What was done, as the person was told. */
+  resolution: string | null;
+  resolved_version_number: number | null;
+  resolved_version_label: string | null;
+  resolved_version_status: string | null;
+  pages_refunded: number | null;
+  finished_at: string | null;
+  /** The person can reopen it themselves until then. */
+  reopen_until: string | null;
+  can_reopen: boolean;
+  /** What the document cost (super admins), as a hint for giving pages back. */
+  pages_charged: number | null;
+};
+
+export type Balance = { pool_pages: number; used_pages: number; reserved_pages: number; remaining_pages: number };
+
+export type Group = {
+  id: string;
+  name: string;
+  status: "active" | "disabled";
+  domains: string[];
+  local_only: boolean;
+  require_approval: boolean;
+  /** "choose": people pick the AI level and kind; "fixed": the group's level and kind are always used. */
+  ai_mode: "choose" | "fixed";
+  ai_level: string | null;
+  ai_kind: string | null;
+  /** Mark the upload options that send documents to an outside provider. */
+  show_external: boolean;
+  pending_members: number;
+  help_active: number;
+  default_user_cap: number | null;
+  over_quota_message: string | null;
+  balance: Balance;
+  services: GroupService[];
+  created_at: string;
+};
+
+export type Finding = {
+  layer?: string;
+  severity: "high" | "review" | "suggest" | string;
+  issue: string;
+  page?: number;
+  role?: string;
+  text?: string;
+  detail?: string;
+  action?: string;
+  confidence?: number;
+  suggested_alt?: string;
+};
+
+export type JobResult = {
+  compliant_before: boolean | null;
+  compliant_after: boolean | null;
+  failed_checks_before: number | null;
+  failed_checks_after: number | null;
+  visual_file_compliant: boolean | null;
+  two_files: boolean;
+  destructive_pages: number[];
+  fonts_embedded: string[];
+  remaining_failures: { clause: string; description: string; failed_checks: number; pages: number[] }[];
+  before_after: Record<string, [unknown, unknown]>;
+  review: {
+    integrity_passed: boolean | null;
+    summary: Record<string, number>;
+    ai: Record<string, unknown>;
+    findings: Finding[];
+    findings_total: number;
+  };
+  summary: string;
+  warnings: string[];
+  metrics: Record<string, unknown>;
+  /** Adobe route only: the improved copy's name and what was done to it. */
+  improved_label?: string | null;
+  improvements?: { alt_text?: number; decorative?: number; glyph_lists?: string[]; unicode_maps?: string[]; glyph_widths?: number } | null;
+  adobe?: { parts: number | null; pages_sent: number | null; seconds: number | null } | null;
+};
+
+export type JobFile = { id: string; kind: string; label: string; name: string; size_bytes: number };
+
+export type Job = {
+  id: string;
+  user_id: string;
+  user_email: string | null;
+  group_id: string | null;
+  filename: string;
+  pages: number;
+  pages_charged: number;
+  report_only: boolean;
+  processing: string;
+  ai_tier: string | null;
+  /** The kind of document within the AI level; null: General. */
+  ai_kind: string | null;
+  /** Processed with the level's General models instead: the kind's model wasn't available, or failed. */
+  ai_kind_fallback: "unavailable" | "failed" | null;
+  /** "Let AI decide": the classifier picks the kind before the document is sent. */
+  ai_kind_auto: boolean;
+  /** What it picked. used: the kind was applied (else General, for `reason`). */
+  ai_kind_pick: {
+    kind: string | null; label: string; confidence: number | null; used: boolean; by?: "jev" | "gateway";
+    reason?: "unsure" | "no_text" | "failed" | "unavailable" | "not_offered" | "no_answer";
+  } | null;
+  /** The level and kind by name, e.g. "Premium AI · Math and science". */
+  ai_label: string | null;
+  charged_services: string[];
+  external_services: string[];
+  needs_confirmation: boolean;
+  full_review: boolean;
+  /** Made without AI (an audit, when its AI level is set that way). */
+  no_ai: boolean;
+  ai_refunded: boolean;
+  ai_unused: boolean;
+  cost: {
+    ai_usd?: number; ai_calls?: number; ai_tier?: string | null;
+    adobe?: { pages_sent?: number; parts?: number; requests?: number; retries?: number; seconds?: number };
+  } | null;
+  status: "held" | "queued" | "submitted" | "processing" | "completed" | "failed" | "canceled";
+  progress: Record<string, unknown> | null;
+  result: JobResult | null;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  finished_at: string | null;
+  files_expire_at: string | null;
+  files_deleted: boolean;
+  files: JobFile[];
+  /** The current help request, on the owner's own list. */
+  help?: { id: string; status: HelpStatus; unread: boolean } | null;
+};
+
+export type UploadResult = {
+  filename: string;
+  accepted: boolean;
+  job: Job | null;
+  error: ApiErrorBody | null;
+};
+
+export type LedgerEntry = {
+  id: number;
+  created_at: string;
+  group_id: string | null;
+  service_key: string;
+  scope: "global" | "group";
+  kind: "topup" | "adjust" | "reserve" | "commit" | "release" | "correct";
+  pages: number;
+  user_id: string | null;
+  job_id: string | null;
+  ticket_ref: string | null;
+  ticket_url: string | null;
+  override: boolean;
+  comment: string | null;
+  actor_email: string | null;
+  pool_after: number;
+  used_after: number;
+  reserved_after: number;
+};
+
+export type AuditEvent = {
+  id: number;
+  created_at: string;
+  actor_email: string | null;
+  action: string;
+  outcome: string;
+  target_type: string | null;
+  target_id: string | null;
+  group_id: string | null;
+  ip: string | null;
+  details: Record<string, unknown>;
+};
+
+export type RuntimeSettings = {
+  service_name: string;
+  organization_name: string;
+  logo_alt: string;
+  logo_content_type: string | null;
+  logo_version: number;
+  contact_email: string | null;
+  accent_color: string | null;
+  mail_from_name: string | null;
+  not_provisioned_message: string;
+  account_disabled_message: string;
+  over_quota_message: string;
+  support_url: string | null;
+  file_retention_days: number;
+  record_retention_days: number;
+  max_file_mb: number;
+  max_pages_per_document: number;
+  max_files_per_upload: number;
+  max_concurrent_jobs_per_user: number;
+  max_queued_jobs_per_user: number;
+  large_doc_pages: number;
+  large_doc_every: number;
+  large_doc_at_once: number;
+  session_idle_hours: number;
+  session_max_days: number;
+  new_groups_require_approval: boolean;
+  help_max_file_mb: number;
+  help_max_request_mb: number;
+  help_reopen_days: number;
+  notify_default_documents: NotifyChoice;
+  notify_default_help: NotifyChoice;
+  notify_default_admin: NotifyChoice;
+  email_reports_enabled: boolean;
+  report_time_zone: string;
+  report_send_hour: number;
+  /** "Let AI decide" the kind of document: Jev (external) for groups that aren't local-only. */
+  classifier_jev: boolean;
+  /** A gateway model for local-only groups (and everyone when Jev is off); "" for none. */
+  classifier_local_model: string;
+  /** Below this confidence (0 to 1), General is used. */
+  classifier_threshold: number;
+  /** Pages read: the first ones and some spread through the document. */
+  classifier_pages: number;
+};
+
+export type EmailReportChoice = { kind: string; label: string; description: string; frequency: "monthly" | "weekly" | "daily" | "off" };
+export type NotifyChoice = "each" | "daily" | "off";
+export type NotificationChoice = {
+  category: string; label: string; description: string; choice: NotifyChoice;
+  /** Email even about what they saw in the portal; null where it doesn't apply. */
+  even_if_seen: boolean | null;
+};
+export type Notifications = { choices: NotificationChoice[] };
+export type ReportView = {
+  id: string; name: string; report: string; report_label: string; params: Record<string, string>; group_id: string | null;
+  frequency: "monthly" | "weekly" | "daily"; attach_csv: boolean; owner: string; mine: boolean;
+  recipients: { id: string; email: string }[]; link: string;
+};
+export type EmailReports = { enabled: boolean; time_zone: string; send_hour: number; reports: EmailReportChoice[] };
+
+export type ApiErrorBody = {
+  error: string;
+  message: string;
+  fields?: { field: string; message: string }[];
+  support_url?: string | null;
+  scope?: string;
+  remaining_pages?: number;
+  service?: string;
+};
+
+export class ApiError extends Error {
+  status: number;
+  body: ApiErrorBody;
+  constructor(status: number, body: ApiErrorBody) {
+    super(body.message);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+type TokenResponse = { access_token: string; expires_in: number; user: Me };
+
+let apiBase = "";
+let accessToken: string | null = null;
+let refreshTimer: number | undefined;
+let refreshing: Promise<Me | null> | null = null;
+let onSignedOut: () => void = () => {};
+
+export function configureApi(base: string, signedOut: () => void) {
+  apiBase = base.replace(/\/$/, "");
+  onSignedOut = signedOut;
+}
+
+function url(path: string) {
+  return `${apiBase}/api/v1${path}`;
+}
+
+async function parseError(r: Response): Promise<ApiError> {
+  let body: ApiErrorBody = { error: "http_" + r.status, message: "Something went wrong. Try again." };
+  try {
+    const j = await r.json();
+    if (j && typeof j.detail === "object" && j.detail) body = j.detail;
+    else if (j && typeof j.detail === "string") body = { error: "error", message: j.detail };
+  } catch {
+    /* not JSON */
+  }
+  return new ApiError(r.status, body);
+}
+
+function acceptTokens(t: TokenResponse): Me {
+  accessToken = t.access_token;
+  window.clearTimeout(refreshTimer);
+  // Refresh a minute before the access token expires
+  refreshTimer = window.setTimeout(() => void refreshSession(), Math.max(10, t.expires_in - 60) * 1000);
+  return t.user;
+}
+
+export function clearSession() {
+  accessToken = null;
+  window.clearTimeout(refreshTimer);
+}
+
+/** Use the refresh cookie to get a new access token. Returns null when not signed in. */
+export function refreshSession(): Promise<Me | null> {
+  if (!refreshing) {
+    refreshing = (async () => {
+      try {
+        const r = await fetch(url("/auth/refresh"), { method: "POST", credentials: "include" });
+        if (!r.ok) {
+          clearSession();
+          return null;
+        }
+        return acceptTokens(await r.json());
+      } catch {
+        return null;
+      } finally {
+        refreshing = null;
+      }
+    })();
+  }
+  return refreshing;
+}
+
+export async function requestCode(email: string) {
+  const r = await fetch(url("/auth/code"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  if (!r.ok) throw await parseError(r);
+  return (await r.json()) as { status: string; expires_in: number };
+}
+
+export async function verifyCode(email: string, code: string): Promise<Me> {
+  const r = await fetch(url("/auth/code/verify"), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, code }),
+  });
+  if (!r.ok) throw await parseError(r);
+  return acceptTokens(await r.json());
+}
+
+export async function signOut(everywhere = false) {
+  try {
+    if (everywhere && accessToken) {
+      await fetch(url("/auth/logout-all"), {
+        method: "POST",
+        credentials: "include",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+    } else {
+      await fetch(url("/auth/logout"), { method: "POST", credentials: "include" });
+    }
+  } finally {
+    clearSession();
+  }
+}
+
+async function send(path: string, init: RequestInit = {}, retry = true): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  const r = await fetch(url(path), { ...init, headers });
+  if (r.status === 401 && retry) {
+    const me = await refreshSession();
+    if (me) return send(path, init, false);
+    onSignedOut();
+  }
+  if (!r.ok) throw await parseError(r);
+  return r;
+}
+
+export async function get<T>(path: string): Promise<T> {
+  return (await send(path)).json();
+}
+
+export async function post<T>(path: string, body?: unknown): Promise<T> {
+  const r = await send(path, {
+    method: "POST",
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return r.status === 204 ? (undefined as T) : r.json();
+}
+
+export async function patch<T>(path: string, body: unknown): Promise<T> {
+  const r = await send(path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+export async function put<T>(path: string, body: unknown): Promise<T> {
+  const r = await send(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+export async function del<T>(path: string): Promise<T | undefined> {
+  const r = await send(path, { method: "DELETE" });
+  return r.status === 204 ? undefined : r.json();
+}
+
+export async function uploadFiles(files: File[], reportOnly: boolean, processing = "standard",
+  confirm = false, aiTier: string | null = null, fullReview = false, aiAltText = true,
+  aiKind: string | null = null, perFile: Record<number, FileChoice> = {}): Promise<UploadResult[]> {
+  const form = new FormData();
+  files.forEach((f) => form.append("files", f, f.name));
+  form.append("report_only", String(reportOnly));
+  form.append("processing", processing);
+  form.append("ai_alt_text", String(aiAltText));
+  form.append("confirm", String(confirm));
+  if (aiTier) form.append("ai_tier", aiTier);
+  if (aiTier && aiKind && aiKind !== "general") form.append("ai_kind", aiKind);
+  if (fullReview) form.append("full_review", "true");
+  if (Object.keys(perFile).length) form.append("per_file", JSON.stringify(perFile));
+  const r = await send("/jobs", { method: "POST", body: form });
+  return r.json();
+}
+
+/** POST a multipart form (fields and files). */
+export async function postForm<T>(path: string, form: FormData): Promise<T> {
+  const r = await send(path, { method: "POST", body: form });
+  return r.json();
+}
+
+/** Fetch a file with the access token and hand it to the browser as a download. */
+export async function download(path: string, fallbackName: string) {
+  const r = await send(path);
+  const disposition = r.headers.get("Content-Disposition") ?? "";
+  const match = /filename="([^"]+)"/.exec(disposition);
+  const blob = await r.blob();
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = match?.[1] ?? fallbackName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(href), 10_000);
+}
+
+export async function getText(path: string): Promise<string> {
+  return (await send(path)).text();
+}
+
+export async function getBytes(path: string): Promise<ArrayBuffer> {
+  return (await send(path)).arrayBuffer();
+}
+
+// --- tag viewer -------------------------------------------------------------------------------
+
+export type TagBox = { page: number; bbox: [number, number, number, number] };
+
+export type TagElement = {
+  i: number;
+  parent: number | null;
+  kids: number[];
+  role: string;
+  raw_role?: string;
+  page?: number;
+  boxes: TagBox[];
+  own: boolean;
+  alt?: string;
+  actual_text?: string;
+  lang?: string;
+  scope?: string;
+  text?: string;
+  order: number | null;
+  parts?: TagPart[];
+};
+
+/** One item of a tag's content, in order: a piece of content, a child tag, or a link. */
+export type TagPart = { k: number; kind: "content" | "tag" | "link"; page?: number; bbox?: [number, number, number, number]; text?: string; el?: number };
+
+export type TagMap = { schema: number; pages: { w: number; h: number }[]; elements: TagElement[] };
+
+export type VersionSummary = {
+  compliant: boolean | null;
+  failed_checks: number | null;
+  failed_rules: number | null;
+  findings: (Finding & { element?: number; extra?: { suggested_alt?: string } })[];
+  findings_total: number;
+  edits_applied?: string[];
+  visual_identical?: boolean;
+  warnings?: string[];
+};
+
+export type DocVersion = {
+  id: string;
+  number: number;
+  kind: "original" | "primary" | "visual_fallback" | "enhanced" | "reviewed" | "corrected";
+  label: string;
+  status: "queued" | "submitted" | "processing" | "ready" | "failed";
+  based_on: number | null;
+  created_by_email: string | null;
+  note: string | null;
+  edits_count: number;
+  summary: VersionSummary | null;
+  error_message: string | null;
+  has_tagmap: boolean;
+  pdf_file_id: string | null;
+  pdf_name: string | null;
+  pdf_size: number | null;
+  verapdf_file_id: string | null;
+  created_at: string;
+  finished_at: string | null;
+  review: "sampled" | "full" | null;
+  review_status: "queued" | "running" | "done" | "failed" | null;
+  reviewed_at: string | null;
+  review_error: string | null;
+};
+
+export type Versions = { can_edit: boolean; versions: DocVersion[] };
+
+export type TagEdit =
+  | { op: "set_role"; element: number; expect_role: string; role: string }
+  | { op: "set_alt"; element: number; expect_role: string; alt: string }
+  | { op: "set_actual_text"; element: number; expect_role: string; text: string }
+  | { op: "set_decorative"; element: number; expect_role: string }
+  | { op: "set_lang"; element: number; expect_role: string; lang: string }
+  | { op: "set_cell"; element: number; expect_role: string; role: "TH" | "TD"; scope?: string }
+  | { op: "move"; element: number; expect_role: string; target: number; expect_target_role: string; position: "before" | "after" }
+  | { op: "merge"; element: number; expect_role: string; absorb: number[] }
+  | { op: "split"; element: number; expect_role: string; at: number; char?: number };
+
+export type MailStatus = { backend: string; from_name: string; from_address: string; reply_to: string | null };
+export type MailTestResult = { sent: boolean; to: string; backend: string; error: string | null };
+
+export async function uploadLogo(file: File): Promise<void> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  await send("/admin/branding/logo", { method: "PUT", body: form });
+}
+
+/** WCAG contrast ratio between two #rrggbb colors (the server checks the accent the same way). */
+export function contrastRatio(a: string, b: string): number {
+  const lum = (hex: string) => {
+    const ch = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+      .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+  };
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+export type AttentionItem = {
+  severity: "bad" | "warn" | "info";
+  kind: string;
+  title: string;
+  detail: string;
+  group_id?: string;
+  group_name?: string;
+  service_key?: string;
+  count?: number;
+  fix?: string;
+};
+
+export type AccessCheck = {
+  user_email: string;
+  service_key: string;
+  service_label: string;
+  can_use: boolean;
+  remaining_pages: number | null;
+  steps: { key: string; label: string; ok: boolean; detail: string; fix: string | null; blocking: boolean }[];
+};

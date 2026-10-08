@@ -1,0 +1,70 @@
+# AI gateway (LiteLLM) models. Each model_name is what the service's AI levels point at; super admins
+# publish a model as an AI level in Administration > Services. Hosts and keys come from the environment
+# (.env), never from this file.
+#
+# Add cloud or commercial models by uncommenting an entry and setting its key in .env. They do nothing
+# until a super admin creates an AI level for them and groups enable it.
+
+model_list:
+  # --- local models (your own servers) -------------------------------------------------------------------------
+  - model_name: local-vision           # alt text, tables, reading order
+    litellm_params:
+      model: os.environ/LOCAL_VISION_MODEL   # e.g. openai/qwen3-vl-8b-instruct
+      api_base: os.environ/LOCAL_AI_BASE_URL
+      api_key: os.environ/LOCAL_AI_API_KEY
+    model_info:
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  - model_name: local-judge            # the review model: a different family from the vision model
+    litellm_params:
+      model: os.environ/LOCAL_JUDGE_MODEL    # e.g. openai/gemma-4-26b-a4b-it-qat-q4_0
+      api_base: os.environ/LOCAL_AI_BASE_URL
+      api_key: os.environ/LOCAL_AI_API_KEY
+    model_info:
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  # --- the same family hosted in the cloud, larger models, commercial models --------------------------
+  # Each AI level (and kind of document) has a writer model and a review (judge) model. Pair every writer with a judge from a
+  # DIFFERENT model family (a model tends to approve its own mistakes), e.g. Qwen writes, Gemma reviews.
+  #
+  # Writers:
+  - model_name: cloud-vision
+    litellm_params:
+      model: openrouter/qwen/qwen3-vl-8b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: large-vision
+    litellm_params:
+      model: openrouter/qwen/qwen3-vl-235b-a22b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: commercial
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+  #
+  # Judges:
+  - model_name: cloud-judge           # Gemma, hosted: reviews cloud-vision and large-vision (Qwen)
+    litellm_params:
+      model: openrouter/google/gemma-4-31b-it
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: commercial-judge      # Gemini: reviews the commercial (Claude) writer
+    litellm_params:
+      model: openrouter/google/gemini-3.8-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  #
+  # Then in the portal (Administration > Services > Add an AI level), choose each level's writer and review
+  # model, e.g. "Cloud AI" = cloud-vision + cloud-judge, "Commercial AI" = commercial + commercial-judge.
+
+litellm_settings:
+  drop_params: true                    # backends that don't take an option (JSON mode, reasoning) ignore it
+  request_timeout: 180
+  num_retries: 2
+  # Backstop for spend across all models, on top of the portal's page quotas: USD per budget period.
+  # Set it for your deployment; local models cost nothing, so it only bites on cloud/commercial use.
+  max_budget: 50
+  budget_duration: 30d
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL

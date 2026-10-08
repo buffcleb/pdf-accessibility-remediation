@@ -1,0 +1,166 @@
+# AI models
+
+[Operations](README.md) › AI models
+
+## Contents
+
+- [Roles](#roles)
+- [The gateway](#the-gateway)
+- [The local model server](#the-local-model-server)
+- [Cloud models through OpenRouter](#cloud-models-through-openrouter)
+- [Without the gateway (development only)](#without-the-gateway-development-only)
+- [Specialist notation](#specialist-notation)
+- [OCR correction](#ocr-correction)
+- [The kind-of-document classifier](#the-kind-of-document-classifier)
+- [Verification settings](#verification-settings)
+
+## Roles
+
+All AI goes through the **AI gateway** (LiteLLM). The engine asks the gateway for a model name; the gateway decides
+where that model runs.
+
+| Role | Where it's set | Tested with |
+|---|---|---|
+| **Writer** (alt text, tables, reading order, notation, OCR corrections) | The job's AI level (and kind of document) → its gateway model; `GATEWAY_DEFAULT_MODEL` when a job has no level | `local-vision` = Qwen3-VL 8B on LocalAI |
+| **Reviewer** (the AI review) | The job's AI level → its review model; `VERIFY_JUDGE_PROVIDER` / `VERIFY_JUDGE_MODEL` when the level has none | `local-judge` = Gemma 4 26B on LocalAI |
+
+Keep the writer and the reviewer in **different model families**: a model tends to approve its own mistakes.
+
+## The gateway
+
+Models are defined in `config/litellm.yaml`, with hosts and keys from the engine's settings:
+
+```
+LITELLM_MASTER_KEY=sk-…                 # the gateway's own admin key
+LITELLM_DB_PASSWORD=…
+UI_USERNAME=admin                        # admin UI sign-in
+UI_PASSWORD=…
+LOCAL_AI_BASE_URL=https://your-localai-host/v1
+LOCAL_AI_API_KEY=…
+LOCAL_VISION_MODEL=openai/qwen3-vl-8b-instruct
+LOCAL_JUDGE_MODEL=openai/gemma-4-26b-a4b-it-qat-q4_0
+GATEWAY_BASE_URL=http://litellm:4000/v1  # how the engine reaches it
+GATEWAY_API_KEY=sk-…                     # a virtual key (below); the master key only for local testing
+GATEWAY_DEFAULT_MODEL=local-vision
+VERIFY_JUDGE_PROVIDER=gateway
+VERIFY_JUDGE_MODEL=local-judge
+```
+
+- **Adding models:** add entries to `config/litellm.yaml`, for the same family in the cloud, larger models or
+  commercial models. Each writer needs a reviewer from a different family; the file has examples (`cloud-judge` for
+  Qwen writers, `commercial-judge` for Claude). Set their keys, then restart the gateway. A super admin then publishes
+  each writer as an AI level and picks its review model.
+- **Reviews follow the level:** a document's AI review, and later re-reviews of its saved versions, use the review
+  model of the level (or kind) it was processed with, so a cloud level's documents aren't reviewed by a local model,
+  or the other way round. The review's cost is part of the job's AI cost.
+- **Admin UI** at the gateway's `/ui` (locally `http://localhost:4000/ui`), linked for super admins in the portal
+  (`PORTAL_GATEWAY_ADMIN_URL`):
+  - models, with a playground;
+  - spend per model, key and tag (every call is tagged `job:<id>` and `tier:<key>`);
+  - request logs and errors;
+  - **virtual keys:** give the engine its own key with a budget and rate limit, instead of the master key.
+- **Spend backstop:** `max_budget` and `budget_duration` in `config/litellm.yaml` (default $50 per 30 days) cap total
+  spend, on top of the portal's page quotas. Local models are listed at zero cost.
+- **Cost per job:** the gateway reports each call's cost; the engine adds it up (`metrics.ai_cost_usd`,
+  `verification_ai_cost_usd`), and super admins see it on the job page and in the Cost report.
+
+## The local model server
+
+Any OpenAI-compatible server works behind the gateway (LocalAI, vLLM, Ollama). Use models with image support (a
+projector, `mmproj`, in the model config). Tested GPU layout: Gemma 4 26B (about 16 GB) on an RTX 3090, Qwen3-VL 8B
+(about 7 GB) on an RTX 4060 Ti 16 GB. To pin a model to a card in LocalAI, set in its YAML:
+
+- `gpu_layers: 99`
+- `main_gpu: "N"`
+- `tensor_split` (for example `"1,0"`)
+- `context_size: 8192`
+
+Then restart LocalAI and check with `nvidia-smi`. Thinking models (Gemma 4, Qwen3) need `reasoning_effort: none`,
+which the engine sends (`GATEWAY_REASONING_EFFORT=none`); without it they can return empty answers.
+
+## Cloud models through OpenRouter
+
+Add OpenRouter models to `config/litellm.yaml` (with `OPENROUTER_API_KEY`) and publish them as AI levels. Prices are
+OpenRouter list prices per million tokens (input / output), checked October 2026:
+
+| Profile | Writer | Reviewer | Notes |
+|---|---|---|---|
+| Same as local, hosted | `qwen/qwen3-vl-32b-instruct` ($0.10 / $0.42) | `google/gemma-4-31b-it` ($0.09 / $0.34) | The local model families, larger; the cheapest path to the cloud |
+| Quality | `anthropic/claude-sonnet-5.5` ($2 / $10) | `google/gemini-3.8-flash` ($0.75 / $3.75) | Best for math-heavy documents ([test report](../evaluation/test-reports/2026-10-07-notation-ai-tiers.md)) |
+| Budget | `google/gemini-3.1-flash-lite` ($0.25 / $1.50) | `openai/gpt-5.4-nano` ($0.20 / $1.25) | Lowest cost from commercial vendors |
+| Handwriting-heavy | `openai/gpt-5.4-mini` ($0.75 / $4.50) | `anthropic/claude-sonnet-5.5` | The GPT-5 family reports the best handwriting accuracy |
+
+With any cloud model, page images leave your infrastructure: check the provider's data-retention terms before sending
+documents with personal, student, patient or personnel information, mark the level **external**, and avoid `:free`
+model variants (free endpoints may log prompts).
+
+## Without the gateway (development only)
+
+The engine can call LocalAI, Ollama or OpenRouter directly (`ai_provider=localai|ollama|openrouter`, with the
+`LOCALAI_*`, `OLLAMA_*`, `OPENROUTER_*` settings). Portal jobs without an AI level use `PORTAL_ENGINE_AI_PROVIDER`.
+Prefer the gateway everywhere else: direct calls have no spend tracking, budget or per-job attribution.
+
+## Specialist notation
+
+Notation the layout rules can't read (math symbols with no Unicode meaning, sums and integrals, chemistry, dosages,
+engineering units) is read by the job's AI model ([how](../architecture/engine-pipeline.md#math-and-specialist-notation)).
+
+- `AI_NOTATION_ENABLED` (default true) switches it off for the engine, and `AI_NOTATION_MAX` (default 100) caps the
+  regions per document, taking the first in page order (the report says how many were left out; raise it for
+  math-heavy collections).
+- Each AI level has **Read specialist notation with AI**, on by default.
+- Every reading is flagged and reviewed; readings that don't match the page aren't used
+  (`metrics.notation_read_by_ai`, `metrics.notation_ai_rejected`).
+- **Quality follows the model.** On a research paper, the local 8B model was rarely wrong but often imprecise; a
+  commercial model read about two thirds of formulas exactly. Use a stronger level, or a *Math and science* kind, for
+  math-heavy documents where accuracy matters ([test report](../evaluation/test-reports/2026-10-07-notation-ai-tiers.md)).
+- **Known gaps:** chemistry, medical and engineering notation are covered by synthetic tests only; the Adobe route
+  doesn't use it yet.
+
+When a document has two output files, a figure or formula that appears in both is reviewed once.
+`VERIFY_MAX_OUTPUT_TOKENS` (default 1500) gives the reviewer room for its explanation.
+
+## OCR correction
+
+On scanned pages the text comes from the Tesseract command line (in the engine image), which reports a confidence for
+each word. Words below `OCR_AI_MIN_CONF` (80) are corrected by the job's AI model from the line image; lines with a
+mean confidence below `OCR_AI_TRANSCRIBE_BELOW` (45) are transcribed afresh. Corrections must pass checks: confident
+words stay, changes look like the word they replace, no added words, no other writing systems, transcriptions fit the
+line.
+
+- `OCR_AI_MAX_LINES` (300) caps the lines per document, most uncertain first. Each AI level has **Correct OCR with
+  AI**, on by default.
+- `OCR_ENGINE=pymupdf` switches back to PyMuPDF's built-in OCR (no confidences, so no AI correction). In testing it
+  read barely legible scans better and everything else worse.
+- Results: `metrics.ocr_ai_words_corrected`, `ocr_ai_lines_transcribed`, `ocr_ai_rejected`, and `reports.ai_ocr`.
+- **Not tested yet:** scanned handwriting. Treat AI transcriptions of handwritten pages as drafts.
+- Measured accuracy: [test report](../evaluation/test-reports/2026-10-07-ocr-ai-correction.md).
+
+Figures printed on scanned pages are found and tagged automatically; see
+[Scanned pages](../architecture/engine-pipeline.md#scanned-pages).
+
+## The kind-of-document classifier
+
+**Let AI decide** (Settings → Uploads and limits) asks the engine's `POST /api/v1/classify` which of an AI level's
+kinds a document is, before the portal sends it. The engine reads the first pages' text (no images) and asks either:
+
+- **Jev** (`typesafe/jev-1.13` through OpenRouter's System One API, using `OPENROUTER_API_KEY`; the model is
+  `CLASSIFIER_JEV_MODEL`). Text only, about $0.042 per million input tokens (about $0.0001 per document), and not
+  trained on requests. Local-only groups never use it.
+- or **a gateway model** you choose (local, for local-only groups).
+
+If the classifier can't be reached, the document goes on with General, so it never holds up the queue. On 30 sample
+documents (math theses, formula sheets, forms, sheet music, policies, catalogs), Jev picked the expected kind for all
+of them (median 0.6 s), and the local 8B model for 29.
+
+## Verification settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `VERIFY_ENABLED` | `true` | Run tag verification on every output |
+| `VERIFY_AI_ENABLED` | `true` | Run the AI review layer |
+| `VERIFY_SAMPLE_RATE` | `0.10` | Share of unflagged figures also reviewed |
+| `VERIFY_AI_MAX_ITEMS` | `150` | Cap on AI reviews per output |
+| `VERIFY_AI_READING_ORDER` | `false` | The AI reading-order check (unreliable with the tested local models) |
+| `VERIFY_ROUTES` | empty | JSON: a different reviewer per content type, e.g. charts |
+| `VERIFY_MAX_OUTPUT_TOKENS` | `1500` | Room for the reviewer's answer |

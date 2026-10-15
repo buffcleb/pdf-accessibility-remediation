@@ -4,7 +4,8 @@
   ses         Amazon SES, through its API (credentials from the environment or the machine's role)
   plunk       Plunk, through its HTTP API
   cloudflare  Cloudflare Email Service, through its REST API (sender address only: Cloudflare's REST docs
-              show no display name; use its SMTP submission with the smtp backend to send one)
+              show no display name; use its SMTP submission with the smtp backend to send one). Attachments
+              are sent; a message can be 5 MiB in all
   console     logged, not sent (local demos)
   memory      kept in memory (tests)
 
@@ -13,6 +14,7 @@ a mail failure never blocks job processing, and sign-in reports it plainly.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import smtplib
 import ssl
@@ -37,12 +39,26 @@ class Mail:
     subject: str
     text: str
     html: str | None = None  # an HTML version (scheduled reports); the text is always sent too
-    # (filename, content type, bytes): only the smtp and ses backends send them (see ATTACHMENTS)
+    # (filename, content type, bytes): sent by the backends in ATTACHMENTS
     attachments: list[tuple[str, str, bytes]] = field(default_factory=list)
+    message_id: str | None = None  # set on sending: our Message-ID, or the provider's own ID for the message
 
 
 # Backends that can send attachments; with the others, emails say where to download the file instead
-ATTACHMENTS = {"smtp", "ses", "console", "memory"}
+ATTACHMENTS = {"smtp", "ses", "cloudflare", "console", "memory"}
+# Cloudflare's REST API takes a message of 5 MiB in all, attachments included, and they travel as base64 (a third
+# larger). This is what attachments may add up to before encoding, leaving room for the text and HTML.
+CLOUDFLARE_MESSAGE_BYTES = 5 * 1024 * 1024
+CLOUDFLARE_ATTACHMENT_BYTES = 3_400_000
+
+
+def attachment_limit(backend: str | None = None) -> int | None:
+    """The most bytes of attachments one message can carry with this backend (None: no limit of the backend's;
+    0: it can't send attachments). Callers leave out what doesn't fit and say where to download it."""
+    backend = backend or get_portal_settings().mail_backend
+    if backend not in ATTACHMENTS:
+        return 0
+    return CLOUDFLARE_ATTACHMENT_BYTES if backend == "cloudflare" else None
 
 
 def _mime(mail: Mail, name: str, address: str) -> EmailMessage:
@@ -55,7 +71,8 @@ def _mime(mail: Mail, name: str, address: str) -> EmailMessage:
     # Always set: senders such as Cloudflare sign "date" even when it's missing, so a receiving server that adds
     # one (Microsoft does) breaks the DKIM signature
     msg["Date"] = formatdate(usegmt=True)
-    msg["Message-ID"] = make_msgid(domain=address.rpartition("@")[2] or None)
+    mail.message_id = mail.message_id or make_msgid(domain=address.rpartition("@")[2] or None)
+    msg["Message-ID"] = mail.message_id
     if s.mail_reply_to:
         msg["Reply-To"] = s.mail_reply_to
     msg.set_content(mail.text)
@@ -129,7 +146,8 @@ def _ses(mail: Mail, name: str, address: str) -> None:
     if s.ses_configuration_set:
         args["ConfigurationSetName"] = s.ses_configuration_set
     try:
-        client.send_email(**args)
+        resp = client.send_email(**args)
+        mail.message_id = resp.get("MessageId") or mail.message_id  # SES's ID, as its logs show it
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         raise MailError(f"SES refused the message ({code})",
@@ -154,6 +172,11 @@ def _plunk(mail: Mail, name: str, address: str) -> None:
         raise MailError(f"Plunk unreachable: {e}", retryable=True) from e
     if r.status_code >= 300:
         raise _http_error("Plunk", r)
+    try:
+        emails = (r.json() or {}).get("emails") or []
+        mail.message_id = str(emails[0].get("id")) if emails and emails[0].get("id") else mail.message_id
+    except (ValueError, AttributeError):
+        pass
 
 
 def _cloudflare(mail: Mail, name: str, address: str) -> None:
@@ -165,6 +188,14 @@ def _cloudflare(mail: Mail, name: str, address: str) -> None:
         body["html"] = mail.html
     if s.mail_reply_to:
         body["reply_to"] = s.mail_reply_to
+    if mail.attachments:
+        body["attachments"] = [{"content": base64.b64encode(data).decode("ascii"), "filename": filename,
+                                "type": content_type.split(";")[0].strip() or "application/octet-stream",
+                                "disposition": "attachment"}
+                               for filename, content_type, data in mail.attachments]
+        size = sum(len(a["content"]) for a in body["attachments"]) + len(mail.text.encode()) + len((mail.html or "").encode())
+        if size > CLOUDFLARE_MESSAGE_BYTES:
+            raise MailError("the message is larger than Cloudflare's 5 MiB limit with its attachments")
     url = f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}/email/sending/send"
     try:
         r = httpx.post(url, json=body, timeout=20, headers={"Authorization": f"Bearer {s.cloudflare_api_token}"})
@@ -175,6 +206,7 @@ def _cloudflare(mail: Mail, name: str, address: str) -> None:
     result = (r.json() or {}).get("result") or {}
     if mail.to in (result.get("permanent_bounces") or []):
         raise MailError("Cloudflare reports the address bounces permanently")
+    mail.message_id = str(result.get("message_id") or result.get("id") or "") or mail.message_id
 
 
 def _text_as_html(text: str) -> str:
@@ -202,6 +234,8 @@ class Mailer:
     def deliver(self, mail: Mail, from_name: str | None = None, attempts: int | None = None) -> None:
         """Send, retrying temporary failures; raises MailError with the last failure."""
         s = get_portal_settings()
+        if s.mail_backend in ("memory", "console"):  # nothing really sent: still an ID, so the log looks as it will
+            mail.message_id = mail.message_id or make_msgid(domain="localhost")
         if s.mail_backend == "memory":
             self.outbox.append(mail)
             return

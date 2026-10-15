@@ -9,19 +9,22 @@ spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
   template:
+    metadata:
+      # The label the Postgres network policy admits (80-network-policies.yaml) must be on the pod, not only the Job
+      labels: { app: portal-migrate }
     spec:
       restartPolicy: Never
       imagePullSecrets: [{ name: pdfrem-ghcr }]
-      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: migrate
           image: ${REGISTRY}/pdfrem-portal:${PORTAL_TAG}
           command: ["python", "-m", "portal.cli", "migrate"]
-          envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
           env:
             - name: PORTAL_DB_PASSWORD
-              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
+              valueFrom: { secretKeyRef: { name: pdfrem-db-env, key: PORTAL_DB_PASSWORD } }
             - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal:$(PORTAL_DB_PASSWORD)@postgres:5432/portal" }
           resources:
             requests: { cpu: 50m, memory: 128Mi }
-            limits: { cpu: "1", memory: 512Mi }
+            limits: { cpu: "1", memory: 512Mi, ephemeral-storage: 512Mi }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }

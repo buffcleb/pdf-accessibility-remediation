@@ -8,8 +8,17 @@ named after what was done ("Adobe + AI alt text", "Adobe + fixes", or both), whi
 Adobe's file:
 
 - **AI alt text** (on by default; people can untick it at upload): an AI level describes every figure Adobe left
-  without alt text, applied with the same tag edits as the tag editor. If no figure needed describing, the AI level's
-  pages are given back.
+  without alt text, applied with the same tag edits as the tag editor. If the AI wasn't needed, the AI level's pages
+  are given back.
+- **Specialist notation** (with the same AI): the engine's own layout analysis of the original finds what the PDF's
+  text can't voice (math, chemistry, unreadable symbols), and the AI reads it with the same checks as the standard
+  route; doses are put in words by rule. (The original, not Adobe's file: the pages are the same, but text extracted
+  from a tagged file can carry its tags' ActualText instead of what is drawn, and readings are checked against what is
+  drawn.) Each accepted reading goes onto the Adobe tag that holds exactly that text, with overlapping boxes: as
+  ActualText on a text tag, or as the alt text of a Formula (as the standard route writes formulas, and as PDF/UA asks).
+  Only a tag with nothing of its own to say takes one: no Alt or ActualText, no link or field, only plain Spans inside
+  (a list item: its label and body). A reading whose text Adobe divided differently stays out, and the report says how
+  many. The AI's readings are listed for review on the improved copy.
 - **Font fixes that never change rendering:** missing ToUnicode maps, incomplete glyph lists in font descriptors
   (7.21.4.2), and glyph width mismatches (7.21.5, only if the pages stay pixel-identical). These are the same fixes
   the standard route applies to its visually exact file.
@@ -40,7 +49,7 @@ sequenceDiagram
   opt AI alt text (on by default)
     A->>A: describe figures without alt text (AI gateway)
   end
-  A->>A: improved copy: alt text, lossless font fixes, veraPDF, integrity, AI review
+  A->>A: improved copy: alt text, lossless font fixes, bookmarks, veraPDF, integrity, AI review
   W->>E: poll, then fetch files
 ```
 
@@ -63,7 +72,6 @@ sequenceDiagram
   (it can also throttle, run out of transactions or fail on request). The tests use it in-process; `docker compose
   --profile fake-adobe` runs it as a server.
 
-Not yet on this route: AI readings of specialist notation (Adobe's tags don't come from this engine's layout
-analysis), and further fixes on top of Adobe's tags beyond alt text and fonts.
+Not yet on this route: further fixes on top of Adobe's tags beyond alt text, notation and fonts.
 
 Setting it up: [Operations → Adobe Autotag](../operations/adobe-autotag.md).

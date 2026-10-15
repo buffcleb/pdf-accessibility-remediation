@@ -280,3 +280,71 @@ def test_same_figure_in_two_outputs_is_judged_once(good, tmp_path, monkeypatch):
     second = asyncio.run(verify_output(twin, VerifyOptions(ai=True, full_review=True, seed="t", review_cache=cache)))
     assert n >= 1 and len(calls) == n  # nothing judged twice
     assert second.ai["results"] == first.ai["results"] and second.ai.get("reused") == n
+
+
+def test_a_labeled_drawing_may_have_a_long_description(tmp_path):
+    """A reaction scheme of several steps needs more than 300 characters to say what reacts and what forms; every
+    such figure was reported as "alt text is very long". A picture's limit is unchanged."""
+    from app.pipeline.models import ImageRegion, bbox_union
+
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 100), "A diagram with labels on it follows, and then a photograph.", fontsize=11, fontname="helv")
+    shape = page.new_shape()
+    for k in range(6):
+        shape.draw_line((150 + 20 * k, 300), (160 + 20 * k, 320))
+    shape.finish(color=(0, 0, 0), width=1)
+    shape.commit()
+    page.insert_text((180, 296), "Step", fontsize=9, fontname="helv")
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 60, 60), False)
+    pix.set_rect(pix.irect, (40, 90, 160))
+    page.insert_image(fitz.Rect(150, 450, 270, 570), pixmap=pix)
+    doc.save(tmp_path / "d.pdf")
+    analysis = prepare_analysis(tmp_path / "d.pdf")
+    pa = analysis.pages[0]
+    label = next(b for b in pa.blocks if b.text == "Step")
+    pa.blocks = [b for b in pa.blocks if b is not label]
+    drawing = ImageRegion(id="p0d0", page=0, bbox=bbox_union([(148, 285, 262, 322), label.bbox]), xref=0, kind="vector",
+                          holds_pieces=True, labels="Step")
+    pa.images = [i for i in pa.images if i.xref] + [drawing]
+    long_alt = "A sequence of six steps, each drawn as a slanted stroke, the third of them labeled. " * 5
+    assert 300 < len(long_alt) <= 1000
+    for img in pa.images:
+        img.alt, img.decorative = long_alt, False
+    pa.reading_order = [b.id for b in pa.blocks] + [i.id for i in pa.images]
+    dst = tmp_path / "out.pdf"
+    tag_document(tmp_path / "d.pdf", dst, analysis, title="Long", language="en-US")
+    long = [f for f in _semantic(dst) if f.issue == "alt text is very long"]
+    assert len(long) == 1, [f.issue for f in _semantic(dst)]   # the photograph's, not the labeled drawing's
+
+
+def test_a_labeled_figure_on_a_flattened_page_may_have_a_long_description_too(tmp_path):
+    """A flattened page's scheme is a picture with its labels as the text layer over it: with no strokes left, it
+    was held to a photograph's 300 characters and reported on every flattened page."""
+    from app.pipeline.models import ImageRegion
+
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 100), "A picture with labels over it follows, and then a plain one.", fontsize=11, fontname="helv")
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 60, 60), False)
+    for n, top in enumerate((200, 450)):
+        pix.set_rect(pix.irect, (40 + 90 * n, 90, 160))
+        page.insert_image(fitz.Rect(150, top, 330, top + 120), pixmap=pix)
+    page.insert_text((170, 260), "OH", fontsize=9, fontname="helv", render_mode=3)   # invisible, as a text layer is
+    doc.save(tmp_path / "f.pdf")
+    analysis = prepare_analysis(tmp_path / "f.pdf")
+    pa = analysis.pages[0]
+    pa.blocks = [b for b in pa.blocks if b.text.strip() != "OH"]
+    long_alt = "A ketone is reduced to the alcohol, which is then protected, in two steps shown left to right. " * 4
+    assert 300 < len(long_alt) <= 1000
+    pictures = sorted((i for i in pa.images if i.xref), key=lambda i: i.bbox[1])
+    assert len(pictures) == 2
+    labeled = ImageRegion(id="p0s0", page=0, bbox=pictures[0].bbox, xref=pictures[0].xref, holds_pieces=True, labels="OH")
+    pa.images = [labeled, pictures[1]]
+    for img in pa.images:
+        img.alt, img.decorative = long_alt, False
+    pa.reading_order = [b.id for b in pa.blocks] + [i.id for i in pa.images]
+    dst = tmp_path / "out.pdf"
+    tag_document(tmp_path / "f.pdf", dst, analysis, title="Long", language="en-US")
+    found = _semantic(dst)
+    assert len([f for f in found if f.issue == "alt text is very long"]) == 1, [f.issue for f in found]

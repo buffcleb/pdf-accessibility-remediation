@@ -25,12 +25,17 @@ def client_ip(request: Request) -> str | None:
     """The caller's IP address, or None if it isn't a valid address (headers are untrusted input)."""
     s = get_portal_settings()
     if s.trust_proxy_headers:
-        cf = request.headers.get(s.client_ip_header or "cf-connecting-ip")
-        if cf:
-            return _valid_ip(cf)
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return _valid_ip(fwd.split(",")[0])
+        name = (s.client_ip_header or "cf-connecting-ip").lower()
+        if name != "x-forwarded-for":
+            own = request.headers.get(name)
+            if own:
+                return _valid_ip(own)
+        # X-Forwarded-For grows from the left: a caller can put anything at the front, and each proxy adds the
+        # address it saw at the end. So count back from the end, one place per trusted proxy; never the first.
+        hops = [h.strip() for h in (request.headers.get("x-forwarded-for") or "").split(",") if h.strip()]
+        if hops:
+            back = max(1, getattr(s, "trusted_proxy_hops", 1))
+            return _valid_ip(hops[-back] if len(hops) >= back else hops[0])
     return _valid_ip(request.client.host if request.client else None)
 
 

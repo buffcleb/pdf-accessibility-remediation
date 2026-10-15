@@ -49,10 +49,14 @@ class Group(Base):
     ai_kind: Mapped[str | None] = mapped_column(String(40), nullable=True)  # None: General
     # Show people which options send documents to an external provider (off: the badge is hidden)
     show_external: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    # "Describe with AI" for the group's people: True/False, or None to follow the service default
+    ai_describe: Mapped[bool | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = _created()
 
     domains: Mapped[list[GroupDomain]] = relationship(back_populates="group", cascade="all, delete-orphan",
                                                       order_by="GroupDomain.domain")
+    emails: Mapped[list[GroupEmail]] = relationship(back_populates="group", cascade="all, delete-orphan",
+                                                    order_by="GroupEmail.email")
     services: Mapped[list[GroupService]] = relationship(back_populates="group", cascade="all, delete-orphan",
                                                         lazy="selectin")
 
@@ -62,6 +66,22 @@ class Group(Base):
 
     def service(self, key: str) -> GroupService | None:
         return next((s for s in self.services if s.service_key == key), None)
+
+
+class GroupEmail(Base):
+    """One person allowed into a group by their address, without their whole domain (a gmail.com user, say).
+    Unique across all groups; takes precedence over a domain match."""
+    __tablename__ = "group_emails"
+
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    group_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("groups.id", ondelete="CASCADE"), nullable=False, index=True)
+    note: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    added_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[datetime] = _created()
+
+    group: Mapped[Group] = relationship(back_populates="emails")
+
+    __table_args__ = (CheckConstraint("email = lower(email)", name="group_email_lower"),)
 
 
 class GroupDomain(Base):
@@ -98,6 +118,8 @@ class User(Base):
     # How often they want each kind of notification email: {"documents"|"help"|"admin": "each"|"daily"|"off"}.
     # Missing: the service default (Settings → Email).
     notify_prefs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    # "Describe with AI" for this person: True/False, or None to follow their group (and it the service default)
+    ai_describe: Mapped[bool | None] = mapped_column(nullable=True)
 
     group: Mapped[Group | None] = relationship()
     roles: Mapped[list[RoleAssignment]] = relationship(back_populates="user", cascade="all, delete-orphan",
@@ -151,6 +173,9 @@ class Service(Base):
     reserved_pages: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     daily_cap_pages: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # pages sent per UTC day
     max_pages_per_job: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Documents processed at once with this service; None = no limit of its own. For what can't grow with the
+    # engine: a local AI's GPUs, an outside provider's rate limit. The rest wait in the queue.
+    max_at_once: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confirm_before_send: Mapped[bool] = mapped_column(nullable=False, default=False)
     gateway_model: Mapped[str | None] = mapped_column(String(200), nullable=True)  # AI tiers: LiteLLM model
     # AI tiers: the review (judge) model, from a different family than gateway_model; None = the engine default
@@ -378,6 +403,12 @@ class Job(Base):
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     files_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # "I'm done with it": the files go once the hold (early_removal_hold_hours) ends, not at the end of retention
+    removal_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    removal_requested_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    # Deleted by a super admin: gone from every document list, still counted in reports
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
     user: Mapped[User] = relationship()
     files: Mapped[list[JobFile]] = relationship(back_populates="job", cascade="all, delete-orphan",
@@ -391,6 +422,8 @@ class Job(Base):
         Index("jobs_group_created_idx", "group_id", "created_at"),
         Index("jobs_created_idx", "created_at"),
         Index("jobs_user_created_idx", "user_id", "created_at"),
+        Index("jobs_removal_requested_idx", "removal_requested_at",
+              postgresql_where=text("removal_requested_at IS NOT NULL AND files_deleted_at IS NULL")),
     )
 
 
@@ -461,7 +494,7 @@ VERSION_STATUSES = ("queued", "submitted", "processing", "ready", "failed")
 
 class DocumentVersion(Base):
     """One viewable version of a job's document: the original, each engine output, and every
-    human-reviewed version saved from the tag viewer. Engine outputs are never modified; edits
+    human-reviewed version saved from the tag manager. Engine outputs are never modified; edits
     always produce a new reviewed version."""
     __tablename__ = "document_versions"
 
@@ -490,6 +523,11 @@ class DocumentVersion(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created()
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Saved "into the same reviewed version": this one takes the place (and label) of the one it replaces once
+    # it's ready. The replaced one is then kept for a day, out of sight, so the save can be undone
+    replaces_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("document_versions.id", ondelete="SET NULL"),
+                                                          nullable=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # AI tag review: requested when saving ("sampled"), or later for a saved version. It re-checks the
     # same file and replaces the version's review findings; the file itself never changes.
@@ -516,7 +554,22 @@ class DocumentVersion(Base):
 
 # --- help requests -------------------------------------------------------------------------------
 
-HELP_KINDS = ("alt_text", "reading_order", "tables", "headings", "math", "visual", "other")
+class TagDraft(Base):
+    """Someone's unsaved tag edits on a document, kept between sessions: reviewing a long document takes days, and
+    edits held only in a browser tab are lost when it closes. One per person per document; it goes when they save
+    a version from it or discard it."""
+    __tablename__ = "tag_drafts"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    user_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    based_on: Mapped[int] = mapped_column(Integer, nullable=False)  # the version number the edits apply to
+    edits: Mapped[list] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _created()
+
+
+HELP_KINDS = ("alt_text", "reading_order", "tables", "headings", "math", "visual", "other", "failed")
 HELP_STATUSES = ("open", "in_progress", "waiting", "resolved", "closed")
 
 
@@ -536,7 +589,7 @@ class HelpRequest(Base):
     version_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     version_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
     page: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    tag: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # {"i", "role", "text"} from the tag viewer
+    tag: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # {"i", "role", "text"} from the tag manager
     assignee_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     assignee_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     saved: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
@@ -633,6 +686,17 @@ class HelpAttachment(Base):
     message: Mapped[HelpMessage] = relationship(back_populates="attachments")
 
 
+class QueueRemoval(Base):
+    """A failed item a super admin removed from a queue's list (kind: documents, edits, reviews or mail). The item
+    itself is untouched: the document, its history and its audit trail stay; it just stops being listed as failed."""
+    __tablename__ = "queue_removals"
+
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    removed_by: Mapped[str] = mapped_column(String(320), nullable=False)
+    removed_at: Mapped[datetime] = _created()
+
+
 class QueuePause(Base):
     """A paused queue: one row while it's paused. Keys: "service:<key>" (documents for that processing service or
     AI level), "edits" (saved edits), "reviews" (AI reviews of saved versions), "mail" (outgoing email other than
@@ -650,8 +714,8 @@ MAIL_STATUSES = ("queued", "sent", "failed", "canceled", "held", "combined", "se
 
 
 class MailOutbox(Base):
-    """Outgoing email, sent by the worker so it can be seen, paused and retried. Sign-in codes and test emails
-    don't come here: they're sent at once."""
+    """Outgoing email, sent by the worker so it can be seen, paused and retried, and the log of every email sent.
+    Sign-in codes and test emails are sent at once, then recorded here as sent or failed, without their body."""
     __tablename__ = "mail_outbox"
 
     id: Mapped[uuid.UUID] = _id()
@@ -671,12 +735,16 @@ class MailOutbox(Base):
     next_try_at: Mapped[datetime] = _created()
     created_at: Mapped[datetime] = _created()
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    backend: Mapped[str | None] = mapped_column(String(16), nullable=True)  # smtp, ses, cloudflare… (when tried)
+    # Our Message-ID header, or the provider's ID for the message: to find it in the provider's or recipient's logs
+    message_id: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status in ('queued','sent','failed','canceled','held','combined','seen')",
                         name="mail_outbox_status"),
         Index("mail_outbox_status_next_idx", "status", "next_try_at"),
         Index("mail_outbox_created_idx", "created_at"),
+        Index("mail_outbox_to_idx", "to_addr"),
     )
 
 

@@ -148,6 +148,11 @@ def test_tag_maps_and_edit_job(client, samples):
     findings = body["reports"]["tag_verification"]["primary"]["findings"]
     assert all(f["element"] < len(tagmap["elements"]) for f in findings if "element" in f)
 
+    # Bookmarks from the headings, one per heading the tag map has
+    heads = [e for e in tagmap["elements"] if e["role"] in ("H1", "H2", "H3", "H4", "H5", "H6") and e.get("text")]
+    assert body["reports"]["comparison"]["bookmarks"] == {"bookmarks": len(heads), "outline": "none"}
+    assert "Bookmarks: " in body["reports"]["remediation_summary"]
+
     pdf = client.get(body["files"]["remediated_primary"]).content
     p = next(e for e in tagmap["elements"] if e["role"] == "P" and e["own"])
     edits = [{"op": "set_role", "element": p["i"], "expect_role": "P", "role": "H2"}]
@@ -160,6 +165,8 @@ def test_tag_maps_and_edit_job(client, samples):
     assert edited["reports"]["edits_applied"] == [f"element {p['i']}: P -> H2"]
     new_map = client.get(edited["reports"]["tag_maps"]["primary"]).json()
     assert new_map["elements"][p["i"]]["role"] == "H2"
+    # The paragraph made a heading has its bookmark: the outline made at remediation follows the headings
+    assert edited["reports"]["comparison"]["bookmarks"] == {"bookmarks": len(heads) + 1, "outline": "ours"}
     assert client.get(edited["files"]["remediated_primary"]).content.startswith(b"%PDF")
 
     # A stale edit is refused with a readable reason
@@ -197,3 +204,89 @@ def test_corrected_file_is_checked_against_the_version_it_replaces(client, sampl
     assert done["reports"]["comparison"]["visual_fidelity"]["identical"] is False
     assert any("from the version it replaces" in w for w in done["warnings"])
 
+
+
+def _pending_job(monkeypatch, samples, client):
+    """A job that has been accepted but whose task never runs here (as if a worker had picked it up)."""
+    from app.worker import tasks
+
+    monkeypatch.setattr(tasks.remediate, "apply_async", lambda args, task_id=None, **kw: None)
+    with (samples / "simple_report.pdf").open("rb") as fh:
+        r = client.post("/api/v1/remediate", files={"file": ("doc.pdf", fh, "application/pdf")}, data={"ai_provider": "none"})
+    assert r.status_code == 202, r.text
+    return r.json()["job_id"]
+
+
+class _Ended:
+    def __init__(self, state, info):
+        self.state, self.info = state, info
+
+
+def test_a_job_whose_worker_was_killed_is_reported_as_failed(client, samples, monkeypatch):
+    """The hard time limit kills the worker before it can write the failure down. The job must not stay
+    "processing" for ever: the portal would wait for ever, holding a place and the person's pages."""
+    from billiard.exceptions import TimeLimitExceeded, WorkerLostError
+
+    from app.worker.celery_app import celery_app
+
+    job_id = _pending_job(monkeypatch, samples, client)
+    assert client.get(f"/api/v1/jobs/{job_id}").json()["status"] == "processing"
+    monkeypatch.setattr(celery_app, "AsyncResult", lambda _id: _Ended("FAILURE", TimeLimitExceeded(3600)))
+    body = client.get(f"/api/v1/jobs/{job_id}").json()
+    assert body["status"] == "failed" and body["error"]["error"] == "time_limit_exceeded"
+    # ...and it stays failed once the queue has forgotten the task
+    monkeypatch.setattr(celery_app, "AsyncResult", lambda _id: _Ended("PENDING", None))
+    assert client.get(f"/api/v1/jobs/{job_id}").json()["error"]["error"] == "time_limit_exceeded"
+
+    other = _pending_job(monkeypatch, samples, client)
+    monkeypatch.setattr(celery_app, "AsyncResult", lambda _id: _Ended("FAILURE", WorkerLostError("signal 9 (SIGKILL)")))
+    assert client.get(f"/api/v1/jobs/{other}").json()["error"]["error"] == "worker_lost"
+
+
+def test_a_job_can_be_stopped(client, samples, monkeypatch):
+    from app.worker.celery_app import celery_app
+
+    revoked = []
+    monkeypatch.setattr(celery_app.control, "revoke", lambda task_id, **kw: revoked.append((task_id, kw)))
+    job_id = _pending_job(monkeypatch, samples, client)
+    r = client.post(f"/api/v1/jobs/{job_id}/stop")
+    assert r.status_code == 200 and r.json()["stopped"] is True
+    assert revoked == [(job_id, {"terminate": True, "signal": "SIGTERM"})]
+    body = client.get(f"/api/v1/jobs/{job_id}").json()
+    assert body["status"] == "failed" and body["error"]["error"] == "stopped"
+    # Stopping again, or stopping a job that isn't there, changes nothing
+    assert client.post(f"/api/v1/jobs/{job_id}/stop").json()["stopped"] is False and len(revoked) == 1
+    assert client.post("/api/v1/jobs/00000000-0000-0000-0000-000000000000/stop").status_code == 404
+
+
+def _figure_page(tmp_path):
+    import pymupdf as fitz
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.draw_rect(fitz.Rect(100, 100, 200, 180), color=(0, 0, 0), fill=(0.8, 0.2, 0.2))
+    page.insert_text((110, 200), "Step A", fontsize=10, fontname="helv")
+    path = tmp_path / "figure.pdf"
+    doc.save(path)
+    return path
+
+
+def test_an_area_of_a_page_is_described_by_the_ai_at_once(client, tmp_path):
+    path = _figure_page(tmp_path)
+    with path.open("rb") as f:
+        r = client.post("/api/v1/describe", files={"file": ("figure.pdf", f, "application/pdf")},
+                        data={"page": "1", "bbox": json.dumps([90, 90, 210, 210]), "ai_provider": "mock", "long": "true"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["alt"] and set(body) >= {"alt", "kind", "decorative", "model", "cost_usd", "prompt_tokens"}
+
+
+def test_describing_an_area_refuses_bad_requests(client, tmp_path):
+    path = _figure_page(tmp_path)
+    for data, code in [({"page": "1", "bbox": "[1, 2, 3]"}, 422), ({"page": "1", "bbox": json.dumps([10, 10, 10, 50])}, 422),
+                       ({"page": "3", "bbox": json.dumps([90, 90, 210, 210])}, 422),
+                       ({"page": "1", "bbox": json.dumps([900, 900, 950, 950])}, 422),
+                       ({"page": "1", "bbox": json.dumps([90, 90, 210, 210]), "ai_provider": "none"}, 422)]:
+        with path.open("rb") as f:
+            r = client.post("/api/v1/describe", files={"file": ("figure.pdf", f, "application/pdf")},
+                            data={"ai_provider": "mock", **data})
+        assert r.status_code == code, (data, r.text)

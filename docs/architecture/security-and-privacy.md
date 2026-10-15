@@ -14,6 +14,13 @@
 - **Roles are checked on every endpoint**, and a resource's group is always taken from the database, never from the
   request.
 - A break-glass command issues a sign-in code when email fails; each use is audited, never the code.
+- **Asking for a code says whether the address can sign in.** An address outside every group's domains gets the
+  configured "not provisioned" message, a disabled account its own; both are a choice, so that people with the
+  wrong address learn why nothing arrives. The cost is that, within the rate limits (30 requests per 15 minutes
+  per IP address), someone can learn which addresses are provisioned. Answering 202 to every address would close
+  that and lose the explanation; this service keeps the explanation.
+- The refresh and sign-out endpoints have no rate limit of their own: each costs a hash and one select, so a
+  flood of them is amplification only, bounded by the sessions the caller holds.
 
 ## Network
 
@@ -28,6 +35,8 @@
 - Files live in object storage, **encrypted at rest**, under keys made of IDs (no names or emails in object names).
 - They're served only through the API after a permission check. **An admin opening someone else's file is audited.**
 - Retention is set by super admins: files are deleted after a set number of days, records after a longer one.
+  People can have a document's files removed sooner (after a short hold, so it can be undone), and super admins can
+  remove files or delete documents at once; all of it is audited.
 - Uploads are checked (PDF signature, size, page count, no encryption) before anything else touches them.
 
 ## Audit

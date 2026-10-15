@@ -1,13 +1,28 @@
-"""veraPDF CLI wrapper (subprocess). Produces the official XML report plus a parsed summary."""
+"""veraPDF: the official XML report plus a parsed summary.
+
+Two ways to run it, with the same report:
+- the **service** (veraPDF's REST server, `VERAPDF_URL`): one Java process kept running, so a check doesn't pay
+  for starting Java (about a second each). Its config must show up to 200 failed checks per rule with their error
+  messages (deploy/verapdf/config/validator.xml), as the engine reads pages, fonts and glyph widths from them.
+- the **command line** in the engine image (`VERAPDF_PATH`), one Java process per check.
+
+A job can choose (the portal's super-admin setting, sent with the job); without a choice the service is used when
+it's configured. If the service doesn't answer, that check falls back to the command line.
+"""
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
+
+import httpx
 
 from lxml import etree
 
@@ -45,11 +60,13 @@ class VeraResult:
     failures: list[RuleFailure] = field(default_factory=list)
     xml_path: str | None = None
     error: str | None = None
+    via: str | None = None  # "service" or "command line"
     # 7.21.5: (font, code) -> (program width, Widths entry), from failed-check details
     width_mismatches: dict = field(default_factory=dict)
 
     def summary(self) -> dict:
         d = asdict(self)
+        d.pop("via", None)
         d.pop("xml_path", None)
         d.pop("width_mismatches", None)
         d["failures"] = d["failures"][:60]
@@ -73,6 +90,41 @@ class VeraResult:
         return any(f.clause.startswith(clause_prefixes) and not f.pages for f in self.failures)
 
 
+@dataclass(frozen=True)
+class ValidatorOptions:
+    service: bool | None = None  # None: the service when it's configured
+    ua2: bool = True  # also run the informational flavours (PDF/UA-2), not only the verdict's
+
+
+_options: contextvars.ContextVar[ValidatorOptions] = contextvars.ContextVar("verapdf_options",
+                                                                            default=ValidatorOptions())
+
+
+@contextlib.contextmanager
+def job_validator(flags: dict | None):
+    """Run a job's checks the way its flags say: {"validator": "service" | "command_line", "verapdf_ua2": bool}."""
+    flags = flags or {}
+    mode = flags.get("validator")
+    token = _options.set(ValidatorOptions(service=None if mode not in ("service", "command_line") else mode == "service",
+                                          ua2=flags.get("verapdf_ua2", True) is not False))
+    try:
+        yield
+    finally:
+        _options.reset(token)
+
+
+def flavours() -> list[str]:
+    """The flavours to check: the first gives the verdict; the rest are shown for information, unless turned off."""
+    fl = get_settings().flavours
+    return fl if _options.get().ua2 else fl[:1]
+
+
+def _service_url() -> str | None:
+    url = get_settings().verapdf_url.rstrip("/")
+    want = _options.get().service
+    return url if url and want is not False else None
+
+
 def _binary() -> str | None:
     path = get_settings().verapdf_path
     return shutil.which(path) or (path if Path(path).is_file() else None)
@@ -91,7 +143,48 @@ def verapdf_version() -> str | None:
         return None
 
 
+@lru_cache
+def service_version(url: str) -> str | None:
+    try:
+        r = httpx.get(f"{url}/api", timeout=10)
+        r.raise_for_status()
+        return f"veraPDF REST {r.json().get('version', '')}".strip()
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+def _run_service(url: str, pdf_path: Path, flavour: str) -> bytes:
+    """The service's XML report; raises httpx.HTTPError when the service can't give one."""
+    with open(pdf_path, "rb") as fh:
+        r = httpx.post(f"{url}/api/validate/{flavour}", headers={"Accept": "application/xml"},
+                       files={"file": (pdf_path.name, fh, "application/pdf")},
+                       timeout=get_settings().verapdf_timeout_s)
+    r.raise_for_status()
+    if not r.content.strip():
+        raise httpx.HTTPError("empty report")
+    return r.content
+
+
 def run_verapdf(pdf_path: Path, xml_out: Path, flavour: str = "ua1") -> VeraResult:
+    url = _service_url()
+    if url:
+        started = time.monotonic()
+        try:
+            xml = _run_service(url, pdf_path, flavour)
+        except httpx.HTTPError as exc:
+            log.warning("veraPDF service at %s failed (%s); using the command line for %s", url, exc, pdf_path.name)
+        else:
+            res = parse_report(xml, flavour)
+            if res.error is None:
+                xml_out.write_bytes(xml)
+                res.xml_path, res.via = str(xml_out), "service"
+                log.debug("veraPDF service: %s %s in %.2fs", pdf_path.name, flavour, time.monotonic() - started)
+                return res
+            log.warning("veraPDF service report for %s unusable (%s); using the command line", pdf_path.name, res.error)
+    return _run_cli(pdf_path, xml_out, flavour)
+
+
+def _run_cli(pdf_path: Path, xml_out: Path, flavour: str) -> VeraResult:
     exe = _binary()
     if not exe:
         return VeraResult(flavour=flavour, available=False, error="veraPDF CLI not found")
@@ -106,7 +199,7 @@ def run_verapdf(pdf_path: Path, xml_out: Path, flavour: str = "ua1") -> VeraResu
                           error=f"veraPDF produced no output (exit {proc.returncode}): {proc.stderr.decode()[:300]}")
     xml_out.write_bytes(xml)
     res = parse_report(xml, flavour)
-    res.xml_path = str(xml_out)
+    res.xml_path, res.via = str(xml_out), "command line"
     return res
 
 
@@ -157,4 +250,11 @@ def parse_report(xml: bytes, flavour: str) -> VeraResult:
                     fonts=sorted(fonts),
                 )
             )
+    # In clause order (7.1 before 7.2 before 7.21), whichever way veraPDF ran: the service lists rules in another order
+    res.failures.sort(key=_clause_order)
     return res
+
+
+def _clause_order(f: RuleFailure) -> tuple:
+    num = lambda v: int(v) if v.isdigit() else 0  # noqa: E731
+    return tuple(num(p) for p in f.clause.split(".")), num(f.test)

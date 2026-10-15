@@ -16,6 +16,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.reports.markdown import stage_rows
+
 log = logging.getLogger(__name__)
 
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -216,6 +218,10 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
     if metrics.get("images_described"):
         facts.append(("Images described", _val("", metrics["images_described"])))
     s.append("<h2>Details</h2><dl>" + "".join(f"<dt>{_e(k)}</dt><dd>{_e(v)}</dd>" for k, v in facts) + "</dl>")
+    stages = stage_rows(metrics)
+    if stages:
+        s.append(_table("Time by stage, in seconds (writing this report isn't counted)", ["Stage", "Seconds"],
+                        [[_e(label), f"{seconds:,.1f}"] for label, seconds in stages], {1}))
     warnings = result.get("warnings") or []
     if warnings:
         s.append("<h3>Notes</h3><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings[:20]) + "</ul>")

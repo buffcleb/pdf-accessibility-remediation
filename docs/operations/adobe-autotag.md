@@ -32,8 +32,8 @@ Adobe doesn't publish its limits, so take them from your contract.
 4. Submit a short document and check its "Adobe tagged" version, Adobe's report and the review.
 
 **AI alt text.** Adobe writes no alt text, so uploads to Adobe Autotag have "Write alt text for images with AI" ticked
-by default. That needs an AI level the person can use, and it charges that level's pages, given back if no figure needed
-describing.
+by default. That needs an AI level the person can use, and it charges that level's pages, given back if the AI wasn't
+needed. The same AI reads specialist notation (math, chemistry) onto Adobe's tags in the improved copy.
 
 Each job records what it sent (`cost.adobe`: pages sent, parts, requests, retries, seconds at Adobe), shown to super
 admins. If Adobe says the account is out of transactions, jobs fail with "Adobe's usage limit…" and the pages are given

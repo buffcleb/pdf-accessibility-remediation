@@ -14,6 +14,8 @@ from pathlib import Path
 import pikepdf
 from pikepdf import Array, ContentStreamInstruction, Dictionary, Name, Operator
 
+from app.tagging.content_marker import MAX_CID, inherited_resources
+
 log = logging.getLogger(__name__)
 
 # (font base name without subset prefix, character code) -> (program width, dictionary width)
@@ -44,7 +46,7 @@ def _parse_w(w) -> dict[int, object]:
                 out[first + k] = val
             i += 2
         elif i + 2 < len(items):
-            for cid in range(first, int(nxt) + 1):
+            for cid in range(max(0, first), min(int(nxt), MAX_CID) + 1):  # a range past two bytes is the file's error
                 out[cid] = items[i + 2]
             i += 3
         else:
@@ -168,12 +170,7 @@ def fix_width_mismatches(src: Path, dst: Path, mismatches: Mismatches) -> int:
                     owner.Contents = pdf.make_stream(data)
 
         for page in pdf.pages:
-            res = page.obj.get("/Resources")
-            node = page.obj
-            while res is None and node.get("/Parent") is not None:
-                node = node.Parent
-                res = node.get("/Resources")
-            process(page.obj, res or Dictionary())
+            process(page.obj, inherited_resources(page.obj))
 
         # Correct the width tables of the fonts we compensated.
         for obj in pdf.objects:

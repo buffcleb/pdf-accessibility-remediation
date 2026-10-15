@@ -343,6 +343,57 @@ SIGN_INS = Report(
 )
 
 
+# --- email: every email sent, and how it went --------------------------------------------------------
+
+MAIL_KINDS = {"sign_in": "Sign-in code", "job": "Document", "help": "Help request", "digest": "Daily summary",
+              "approval": "Approval request", "account": "Account decision", "report": "Email report",
+              "report_view": "Scheduled report view", "report_preview": "Report preview", "test": "Test email"}
+MAIL_STATUSES = {"sent": "Sent", "failed": "Failed", "queued": "Waiting or retrying", "held": "Held (email paused)",
+                 "seen": "Not sent: already seen in the portal", "combined": "Combined into a daily summary",
+                 "canceled": "Canceled"}
+
+
+def _labels(expr, labels: dict[str, str]) -> ColumnElement:
+    return case(*[(expr == k, v) for k, v in labels.items()], else_=expr)
+
+
+def _mail_headline(db: Session, sub) -> list[dict]:
+    row = db.execute(select(func.count().filter(sub.c.status == "Sent"), func.count().filter(sub.c.status == "Failed"),
+                            func.count().filter(sub.c.status == "Waiting or retrying"))).one()
+    return [{"label": "Sent", "value": row[0]}, {"label": "Failed", "value": row[1]},
+            {"label": "Waiting or retrying", "value": row[2]}]
+
+
+EMAIL = Report(
+    name="email", label="Email",
+    description="Every email the service sent or tried to: sign-in codes, document and help notifications, summaries "
+                "and reports. The message ID matches the email in your mail provider's and recipients' logs.",
+    base=lambda ctx: (select().select_from(MailOutbox).outerjoin(User, User.email == MailOutbox.to_addr)
+                      .outerjoin(Group, Group.id == User.group_id)),
+    cols=[
+        Col("created_at", "When", MailOutbox.created_at, "date"),
+        Col("to", "To", MailOutbox.to_addr, link="person"),
+        Col("group", "Group", Group.name, link="group"),
+        Col("kind", "Kind", _labels(MailOutbox.kind, MAIL_KINDS)),
+        Col("subject", "Subject", MailOutbox.subject),
+        Col("status", "Status", _labels(MailOutbox.status, MAIL_STATUSES)),
+        Col("finished_at", "Sent or given up", MailOutbox.finished_at, "date", default=False),
+        Col("attempts", "Tries", MailOutbox.attempts, "num", default=False),
+        Col("error", "Last error", MailOutbox.last_error),
+        Col("backend", "Sent with", MailOutbox.backend, default=False),
+        Col("message_id", "Message ID", MailOutbox.message_id, default=False),
+    ],
+    group_col=User.group_id, date_col=MailOutbox.created_at,
+    search=[MailOutbox.to_addr, MailOutbox.subject, MailOutbox.message_id],
+    filters=[
+        Filter("kind", "Kind", _eq(MailOutbox.kind), list(MAIL_KINDS.items())),
+        Filter("status", "Status", _eq(MailOutbox.status), list(MAIL_STATUSES.items())),
+    ],
+    sort="-created_at", links={"group_id": User.group_id}, headline=_mail_headline,
+    search_hint="address, subject or message ID",
+)
+
+
 # --- help requests -----------------------------------------------------------------------------------
 
 _help_hours = cast(func.extract("epoch", HelpRequest.finished_at - HelpRequest.created_at), Float) / 3600
@@ -412,7 +463,7 @@ AUDIT = Report(
     group_col=AuditEvent.group_id, date_col=AuditEvent.created_at,
     search=[AuditEvent.actor_email, AuditEvent.action, cast(AuditEvent.details, Text)],
     filters=[
-        Filter("event", "Event", lambda st, v: st.where(AuditEvent.action.like(f"{v.replace('%', '')}%")),
+        Filter("event", "Event", lambda st, v: st.where(AuditEvent.action.startswith(v, autoescape=True)),
                lambda db: [(p, p) for p in sorted({a.split(".")[0] for a in db.scalars(
                    select(AuditEvent.action).distinct().limit(500))})]),
         Filter("outcome", "Outcome", _eq(AuditEvent.outcome), _distinct(AuditEvent.outcome)),
@@ -561,6 +612,117 @@ COST = Report(
 )
 
 
+# --- AI usage: what each AI level does and costs ----------------------------------------------------
+
+def _cost_num(key: str, kind=Float) -> ColumnElement:
+    return cast(Job.cost[key].as_string(), kind)
+
+
+DEFAULT_AI = "Engine default AI (no AI level)"
+
+
+def _level_expr() -> ColumnElement:
+    """The AI level, and the kind of document past General, by name: "Premium AI (Math and science)". Documents sent
+    without an AI level use the engine's own default AI (its AI_PROVIDER), counted under DEFAULT_AI."""
+    label = select(AiKind.label).where(AiKind.service_key == Job.ai_tier, AiKind.key == Job.ai_kind).scalar_subquery()
+    kind = func.coalesce(" (" + func.coalesce(label, Job.ai_kind) + ")", "")
+    return case((Job.ai_tier.is_(None), DEFAULT_AI), else_=func.coalesce(_TierService.c.label, Job.ai_tier) + kind)
+
+
+# AI was used: on an AI level, or the engine's default AI (it made calls, or tried to)
+_used_ai = or_(Job.ai_tier.is_not(None),
+               func.coalesce(cast(Job.cost["ai_calls"].as_string(), Integer),
+                             cast(_summary["metrics"]["ai_calls"].as_string(), Integer), 0) > 0,
+               cast(Job.cost["ai_failures"].as_string(), Integer) > 0)
+
+
+def _ai_usage_cols(ctx: Ctx) -> list[Col]:
+    docs = func.count()
+    pages = func.sum(Job.pages_charged)
+    usd = func.coalesce(func.sum(_ai_usd), 0)
+    tokens = (func.coalesce(_cost_num("prompt_tokens", Integer), 0) + func.coalesce(_cost_num("completion_tokens", Integer), 0)
+              + func.coalesce(_cost_num("review_prompt_tokens", Integer), 0)
+              + func.coalesce(_cost_num("review_completion_tokens", Integer), 0))
+    # Jobs from before tokens were recorded have none: sums leave them out, and "jobs measured" says how many count
+    measured = func.count().filter(Job.cost.has_key("prompt_tokens"))
+    seconds = func.coalesce(_cost_num("seconds"), cast(_summary["metrics"]["processing_time_seconds"].as_string(), Float))
+    return [
+        Col("period", "Period", _period(ctx, Job.finished_at), "period"),
+        Col("level", "AI level", _level_expr()),
+        Col("writer_model", "Model", func.coalesce(Job.cost["writer_model"].astext, _summary["metrics"]["ai_model"].astext,
+                                                   Job.ai_model), super_only=True),
+        Col("review_model", "Review model", Job.cost["review_model"].astext, super_only=True, default=False),
+        Col("documents", "Documents", docs, "num", total=True),
+        Col("pages", "Pages", pages, "num", total=True),
+        Col("calls", "AI calls", func.coalesce(func.sum(_cost_num("ai_calls", Integer)), 0), "num", total=True),
+        Col("failed", "Failed calls", func.coalesce(func.sum(_cost_num("ai_failures", Integer)), 0), "num", total=True),
+        Col("tokens", "Tokens", func.sum(tokens).filter(Job.cost.has_key("prompt_tokens")), "num", total=True),
+        Col("prompt_tokens", "Tokens in (writing)", func.sum(_cost_num("prompt_tokens", Integer)), "num", total=True,
+            default=False),
+        Col("completion_tokens", "Tokens out (writing)", func.sum(_cost_num("completion_tokens", Integer)), "num",
+            total=True, default=False),
+        Col("review_tokens", "Tokens (review)", func.sum(func.coalesce(_cost_num("review_prompt_tokens", Integer), 0)
+                                                         + func.coalesce(_cost_num("review_completion_tokens", Integer), 0))
+            .filter(Job.cost.has_key("prompt_tokens")), "num", total=True, default=False),
+        Col("measured", "Documents with token counts", measured, "num", total=True, default=False),
+        Col("ai_usd", "AI cost ($)", usd, "money", total=True, super_only=True),
+        Col("usd_per_doc", "Cost per document ($)", func.round(cast(usd / func.nullif(docs, 0), Numeric), 4), "money",
+            super_only=True),
+        Col("usd_per_page", "Cost per page ($)", func.round(cast(usd / func.nullif(pages, 0), Numeric), 5), "money",
+            super_only=True, default=False),
+        Col("review_usd", "Review cost ($)", func.coalesce(func.sum(_cost_num("review_usd")), 0), "money", total=True,
+            super_only=True, default=False),
+        Col("classifier_usd", "\"Let AI decide\" cost ($)", func.coalesce(func.sum(_cost_num("classifier_usd")), 0),
+            "money", total=True, super_only=True, default=False),
+        Col("refunded", "AI not charged", func.count().filter(Job.cost["ai_refunded"].as_boolean().is_(True)), "num",
+            total=True),
+        Col("fallbacks", "Used General instead of the kind", func.count().filter(Job.ai_kind_fallback.is_not(None)), "num",
+            total=True, default=False),
+        Col("avg_seconds", "Average time (s)", func.round(cast(func.avg(seconds), Numeric), 0), "num"),
+    ]
+
+
+def _ai_usage_headline(db: Session, sub) -> list[dict]:
+    calls, failed, tokens, docs = db.execute(select(
+        func.coalesce(func.sum(sub.c.calls), 0), func.coalesce(func.sum(sub.c.failed), 0),
+        func.coalesce(func.sum(sub.c.tokens), 0), func.coalesce(func.sum(sub.c.documents), 0))).one()
+    out = [{"label": "Documents with AI", "value": int(docs)},
+           {"label": "AI calls", "value": int(calls), "hint": f"{int(failed)} failed" if failed else None},
+           {"label": "Tokens", "value": int(tokens)}]
+    if "ai_usd" in sub.c:
+        usd = db.scalar(select(func.coalesce(func.sum(sub.c.ai_usd), 0))) or 0
+        out.append({"label": "AI cost", "value": f"${float(usd):,.2f}"})
+    return out
+
+
+def _ai_levels(db: Session) -> list[tuple[str, str]]:
+    return [(s.key, s.label) for s in db.scalars(select(Service).where(Service.kind == "ai_tier")
+                                                  .order_by(Service.sort, Service.label))] + [("default", DEFAULT_AI)]
+
+
+def _filter_level(stmt: Select, v: str) -> Select:
+    return stmt.where(Job.ai_tier.is_(None)) if v == "default" else stmt.where(Job.ai_tier == v)
+
+
+AI_USAGE = Report(
+    name="ai_usage", label="AI usage",
+    description="What each AI level does and costs: documents, calls, failed calls, tokens and time, by level, kind of "
+                "document and model, over time. Documents sent without an AI level, on the engine's own default AI, "
+                "are counted too.",
+    base=lambda ctx: (select().select_from(Job).outerjoin(_TierService, _TierService.c.key == Job.ai_tier)
+                      .where(Job.status == "completed", _used_ai, Job.finished_at.is_not(None))),
+    cols=[], cols_fn=_ai_usage_cols, group_by=["period", "level", "writer_model", "review_model"],
+    group_col=Job.group_id, date_col=Job.finished_at, search=[],
+    filters=[PERIOD_FILTER,
+             Filter("level", "AI level", _filter_level, _ai_levels),
+             Filter("audit", "Audit only", _yes_no(Job.report_only), YES_NO)],
+    sort="-period", headline=_ai_usage_headline,
+    chart=Chart(x="period", kind="bar", series="level", measures=[
+        Measure("ai_usd", "AI cost", "$", num="ai_usd"), Measure("calls", "AI calls", "", num="calls"),
+        Measure("tokens", "Tokens", "", num="tokens"), Measure("documents", "Documents", "", num="documents")]),
+)
+
+
 # --- daily use against each service's daily limit (super admins) -----------------------------------
 
 _charged = func.jsonb_array_elements_text(Job.charged_services).table_valued(column("value", String)).lateral("charged")
@@ -622,8 +784,8 @@ REPORT_EMAILS = Report(
     sort="-created_at", links={"group_id": User.group_id}, super_only=True, search_hint="email address",
 )
 
-REPORTS: dict[str, Report] = {r.name: r for r in (DOCUMENTS, USAGE, LEDGER, SIGN_INS, HELP, AUDIT,
-                                                    QUALITY, FAILURES, COST, DAILY, REPORT_EMAILS)}
+REPORTS: dict[str, Report] = {r.name: r for r in (DOCUMENTS, USAGE, LEDGER, SIGN_INS, EMAIL, HELP, AUDIT,
+                                                    QUALITY, FAILURES, COST, AI_USAGE, DAILY, REPORT_EMAILS)}
 
 
 # --- running a report ------------------------------------------------------------------------------
@@ -691,7 +853,8 @@ def _build(db: Session, report: Report, query: Query, group_ids: list[uuid.UUID]
     if report.group_by:
         # By output column name: the same expression written twice binds its parameters twice, and Postgres
         # then doesn't see the GROUP BY and the SELECT as the same expression
-        stmt = stmt.group_by(*[literal_column(f'"{k}"') for k in report.group_by])
+        present = {c.key for c in cols}  # a super-admin-only column (a model) isn't there for group admins
+        stmt = stmt.group_by(*[literal_column(f'"{k}"') for k in report.group_by if k in present])
     return stmt, cols
 
 
@@ -725,8 +888,13 @@ def _chart(db: Session, report: Report, cols: list[Col], sub) -> dict | None:
     keys = [ch.x] + ([ch.series] if ch.series else [])
     measures = []
     for m in ch.measures:
+        if m.num not in kinds or (m.den and m.den not in kinds):
+            continue  # a super-admin-only measure (cost), for a group admin
+
         total = func.sum(sub.c[m.num])
         measures.append((m, (total * m.scale / func.nullif(func.sum(sub.c[m.den]), 0)) if m.den else total))
+    if not measures:
+        return None
     extra = [func.max(sub.c[ch.ref]).label("_ref")] if ch.ref else []
     stmt = select(*[sub.c[k] for k in keys], *[e.label(m.key) for m, e in measures], *extra).group_by(*[sub.c[k] for k in keys])
     if ch.kind == "hbar":

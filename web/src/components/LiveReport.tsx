@@ -21,10 +21,20 @@ type ReportData = {
 };
 
 /** The reports in three groups: [key, label, super admins only]. */
+/** Dollars: cents for amounts of a dollar or more; below that, up to four decimals, so per-page AI costs
+ * ($0.0019) don't show as $0.00. */
+function fmtMoney(v: unknown): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "–";
+  if (n === 0 || Math.abs(n) >= 1) return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `$${n.toFixed(4).replace(/(\.\d\d\d*?)0+$/, "$1")}`;
+}
+
 const REPORT_GROUPS: { label: string; superLabel?: string; reports: [string, string, boolean][] }[] = [
   { label: "Documents", reports: [["documents", "Documents", false], ["quality", "Quality", false], ["failures", "Remaining failures", false]] },
-  { label: "Usage", superLabel: "Usage and cost", reports: [["usage", "Usage", false], ["ledger", "Page ledger", false], ["cost", "Cost", true], ["daily", "Daily use", true]] },
-  { label: "Activity", reports: [["sign_ins", "Sign-ins", false], ["help", "Help requests", false], ["audit", "Audit log", false],
+  { label: "Usage", superLabel: "Usage and cost", reports: [["usage", "Usage", false], ["ledger", "Page ledger", false], ["ai_usage", "AI usage", false],
+    ["cost", "Cost", true], ["daily", "Daily use", true]] },
+  { label: "Activity", reports: [["sign_ins", "Sign-ins", false], ["email", "Email", false], ["help", "Help requests", false], ["audit", "Audit log", false],
     ["report_emails", "Report emails", true]] },
 ];
 
@@ -103,7 +113,7 @@ function cell(col: Column, row: Record<string, unknown>, labels: Record<string, 
         <span className="muted small nowrap">{d.toLocaleTimeString(undefined, { timeStyle: "short" })}</span></>;
     }
     case "num": text = fmtNum(Number(v)); break;
-    case "money": text = `$${Number(v).toFixed(2)}`; break;
+    case "money": text = fmtMoney(v); break;
     case "hours": text = `${Number(v).toFixed(1)} h`; break;
     case "pct": text = `${Number(v)}%`; break;
     case "period": {
@@ -170,8 +180,15 @@ export function LiveReports({ groupId }: { groupId?: string }) {
   const periodKind = data?.chart?.x === "day" ? "day" : data?.period ?? "day";
   const sortKey = (data?.sort ?? "").replace(/^-/, "");
   const sortDesc = (data?.sort ?? "").startsWith("-");
-  const [moreOpen, setMoreOpen] = useState(false);
-  const [scheduling, setScheduling] = useState(false);
+  // The Filters panel and the schedule form belong to the report they were opened on: choosing another report
+  // closes them (each report has its own filters and schedule)
+  const [moreOpenFor, setMoreOpenFor] = useState<string | null>(null);
+  const [schedulingFor, setSchedulingFor] = useState<string | null>(null);
+  const moreOpen = moreOpenFor === name;
+  const scheduling = schedulingFor === name;
+  const setMoreOpen = (open: boolean) => setMoreOpenFor(open ? name : null);
+  const setScheduling = (open: boolean) => setSchedulingFor(open ? name : null);
+  useEffect(() => { setMoreOpenFor(null); setSchedulingFor(null); setExportError(null); }, [name]);
   // Offer more room when the table is wider than its space
   const { full, setFull } = useFullWidth();
   const tableRef = useRef<HTMLDivElement>(null);
@@ -331,7 +348,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
           {data.chart && <ReportChart chart={data.chart} period={periodKind} title={data.label} busy={report.loading} />}
           <div className="report-toolbar">
             <span role="status" aria-live="polite">{fmtNum(data.total_rows)} {data.total_rows === 1 ? "row" : "rows"}{report.loading ? " (updating…)" : ""}</span>
-            <details className="report-columns">
+            <details className="report-columns" key={name}>{/* a new chooser, closed, for each report */}
               <summary>Columns</summary>
               <fieldset className="choices">
                 <legend className="visually-hidden">Columns to show</legend>
@@ -394,7 +411,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
                     <tr>
                       {shown.map((c, i) => (
                         <td key={c.key} className={c.total ? "num" : undefined}>
-                          {c.total ? (c.kind === "money" ? `$${Number(data.totals[c.key] ?? 0).toFixed(2)}` : fmtNum(data.totals[c.key] ?? 0))
+                          {c.total ? (c.kind === "money" ? fmtMoney(data.totals[c.key] ?? 0) : fmtNum(data.totals[c.key] ?? 0))
                             : i === 0 ? <strong>Total, all {fmtNum(data.total_rows)} rows</strong> : null}
                         </td>
                       ))}

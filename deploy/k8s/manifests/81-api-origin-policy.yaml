@@ -1,0 +1,18 @@
+# With the Cloudflare Worker front end the portal API is published through the ingress controller (61-api-origin.yaml),
+# so it must be let in beside the web pod and cloudflared. RKE2's ingress controller runs in the nodes' own network,
+# where a pod selector doesn't see it: its traffic comes from the node addresses, named here as a range
+# (API_ORIGIN_SOURCE_CIDR in deploy.env). The kube-system selector covers an ingress controller that runs as an
+# ordinary pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: portal-api-origin
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: portal-api } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+        - ipBlock: { cidr: "${API_ORIGIN_SOURCE_CIDR}" }
+      ports: [{ port: 8080 }]

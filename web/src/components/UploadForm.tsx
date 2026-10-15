@@ -202,8 +202,8 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
           <input type="checkbox" checked={altText} onChange={(e) => setAltText(e.target.checked)} />
           <span>
             Write alt text for images with AI. <span className="muted">{chosen?.label} doesn't describe images. You get
-            its file as it is, plus an improved copy with the AI alt text (and any font fixes, which never change how
-            the pages look). Uses pages of the AI level, given back if no image needed describing.</span>
+            its file as it is, plus an improved copy with the AI alt text (and any font fixes and bookmarks, which never
+            change how the pages look). Uses pages of the AI level, given back if no image needed describing.</span>
           </span>
         </label>
       )}

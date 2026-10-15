@@ -1,16 +1,22 @@
 """End-to-end remediation flow for one job.
 
   1. Validate the ORIGINAL (veraPDF + internal audit)        -> "before" report
-  2. Analyze layout (PyMuPDF); OCR scanned pages (invisible text layer)
-  3. AI enrichment: alt text, table structure, reading order
+  2. Fix font Unicode maps and check marks (rendering unchanged); analyze layout (PyMuPDF);
+     OCR scanned pages, the AI correcting unsure words (invisible text layer); figures on scans;
+     music examples as figures, read by the music reading service
+  3. AI enrichment: alt text, table structure, reading order, notation the rules can't read
   4. Non-destructive tagging (existing valid tags retained)  -> visual output
-  5. Validate. If failures remain that only destructive fixes can address, flatten the
-     affected pages and tag again                            -> modified output
-  6. Validate outputs                                        -> "after" report, comparison, summary
+  5. Validate; glyph widths and glyph lists fixed if pixel-identical. If failures remain that only
+     destructive fixes can address: substitute fonts, then flatten the affected pages and tag again
+                                                             -> modified output
+  6. Verify every output (integrity, semantics, AI review), tag maps for the viewer
+                                                             -> "after" report, comparison, summary, reports
+  docs/architecture/engine-pipeline.md says the same, step by step, with the rules each one follows.
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import re
 import json
 import logging
@@ -25,22 +31,25 @@ import pymupdf as fitz
 from app.ai.base import AIError
 from app.ai.registry import get_provider
 from app.config import get_settings
-from app.pipeline.analyzer import analyze_document
-from app.pipeline.enrichment import EnrichmentStats, enrich
+from app.pipeline.analyzer import analyze_document, capped_dpi
+from app.pipeline.enrichment import EnrichmentStats, enrich, render_slots
 from app.pipeline.models import DocumentAnalysis
-from app.pipeline.ocr import ocr_lines, tesseract_available, tesseract_cli, write_ocr_layer
+from app.pipeline.ocr import block_confidence, ocr_lines, tesseract_available, tesseract_cli, write_ocr_layer
 from app.pipeline.ocr_ai import correct_lines
-from app.pipeline import scan_figures
+from app.pipeline import music, scan_figures
 from app.pipeline.structure import assign_roles, detect_columns, heuristic_reading_order
 from app.pipeline.transfer import transfer_enrichment
 from app.storage import JobStore
+from app.tagging.bookmarks import write_bookmarks
 from app.tagging.destructive import DESTRUCTIVE_CLAUSES, flatten_pages
 from app.tagging.font_embed import embed_standard_fonts
 from app.tagging.font_unicode import add_missing_tounicode
+from app.tagging.form_marks import redraw_dingbat_marks
 from app.tagging.font_metrics import fix_width_mismatches
-from app.tagging.tagger import TagResult, tag_document
+from app.tagging.tagger import TagResult, apply_written_alts, tag_document, write_figure_alts
 from app.validation.audit import audit_pdf
 from app.validation.verapdf import VeraResult, run_verapdf
+from app.validation.verapdf import flavours as verapdf_flavours
 from app.verification.model import IntegrityError
 from app.verification.tagmap import build_tagmap
 from app.verification.verify import VerifyOptions, verify_output
@@ -97,6 +106,15 @@ class JobOptions:
 
 
 # --------------------------------------------------------------------------- helpers
+def _covers_page(bbox, width: float, height: float) -> bool:
+    """Whether an image is a scanned page's picture of the page: what's visible of it covers most of the page. A scan
+    can sit inside margins, be drawn in several layers, or be larger than the page and cut off at its edge (a web
+    page "printed" to PDF), so its own width and height don't say."""
+    w = min(bbox[2], width) - max(bbox[0], 0.0)
+    h = min(bbox[3], height) - max(bbox[1], 0.0)
+    return w > 0 and h > 0 and w * h >= 0.6 * width * height
+
+
 def prepare_analysis(path: Path) -> DocumentAnalysis:
     analysis = analyze_document(path)
     assign_roles(analysis)
@@ -106,10 +124,51 @@ def prepare_analysis(path: Path) -> DocumentAnalysis:
     return analysis
 
 
+class StageClock:
+    """Where a document's time goes: seconds per stage (a stage runs from one progress mark to the next; one
+    visited twice adds up), and within them the time spent waiting for the validator."""
+
+    def __init__(self, progress: Progress):
+        self._progress = progress
+        self._stage: str | None = None
+        self._since = time.monotonic()
+        self.stages: dict[str, float] = {}
+        self.parts: dict[str, float] = {}
+
+    def __call__(self, stage: str, pct: int) -> None:
+        self._close()
+        self._stage = stage
+        self._progress(stage, pct)
+
+    def _close(self) -> None:
+        now = time.monotonic()
+        if self._stage is not None:
+            self.stages[self._stage] = self.stages.get(self._stage, 0.0) + now - self._since
+        self._since = now
+
+    def add(self, part: str, seconds: float) -> None:
+        self.parts[part] = self.parts.get(part, 0.0) + seconds
+
+    def seconds(self) -> dict:
+        """So far, in the order the stages were first reached; the stage in progress counts up to now."""
+        self._close()
+        out = {k: round(v, 1) for k, v in self.stages.items() if k != "completed"}
+        if self.parts:
+            out["of_which"] = {k: round(v, 1) for k, v in self.parts.items()}
+        return out
+
+
+# The clock of the document being processed (threads started with asyncio.to_thread see the same one)
+_clock: contextvars.ContextVar[StageClock | None] = contextvars.ContextVar("stage_clock", default=None)
+
+
 def _validate(pdf: Path, out_dir: Path, label: str, stem: str) -> dict[str, VeraResult]:
     results = {}
-    for fl in get_settings().flavours:
+    started = time.monotonic()
+    for fl in verapdf_flavours():
         results[fl] = run_verapdf(pdf, out_dir / f"{stem}_verapdf_{label}_{fl}.xml", fl)
+    if (clock := _clock.get()) is not None:
+        clock.add("validator", time.monotonic() - started)
     return results
 
 
@@ -139,7 +198,8 @@ def _visual_fidelity(a: Path, b: Path, dpi: int = 50) -> dict:
     try:
         differing = []
         for i in range(min(da.page_count, db.page_count)):
-            if da[i].get_pixmap(dpi=dpi, alpha=False).samples != db[i].get_pixmap(dpi=dpi, alpha=False).samples:
+            d = capped_dpi(da[i], dpi)  # the same for both: the pages are the same size
+            if da[i].get_pixmap(dpi=d, alpha=False).samples != db[i].get_pixmap(dpi=d, alpha=False).samples:
                 differing.append(i + 1)
         return {"pages_compared": da.page_count, "pages_identical": da.page_count - len(differing),
                 "differing_pages": differing[:50], "identical": not differing and da.page_count == db.page_count}
@@ -148,16 +208,31 @@ def _visual_fidelity(a: Path, b: Path, dpi: int = 50) -> dict:
         db.close()
 
 
+TITLE_MAX = 1000  # a title from the file's own metadata is its producer's to write; past this it isn't a title
+
+# A language tag as PDF/UA wants it (BCP 47: "en", "en-US", "zh-Hant-TW"); the file's own /Lang is its producer's to
+# write, and one that isn't a tag would be copied into the output as it is
+_LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$")
+
+
 def _pick_title(opts: JobOptions, analysis: DocumentAnalysis) -> str:
     if opts.title:
         return opts.title
     if analysis.title and analysis.title.lower() not in ("untitled", "document", "microsoft word"):
-        return analysis.title
+        return analysis.title[:TITLE_MAX]
     for p in analysis.pages:
         for b in p.blocks:
             if b.role == "H1":
                 return b.text[:200]
     return opts.stem.replace("_", " ")
+
+
+def _pick_language(opts: JobOptions, analysis: DocumentAnalysis, default: str) -> str:
+    """The job's language, else the file's own when it is a well-formed tag, else the default."""
+    for candidate in (opts.language, analysis.language):
+        if candidate and _LANGUAGE_TAG.match(candidate.strip()):
+            return candidate.strip()
+    return default
 
 
 def _primary(v: dict[str, VeraResult]) -> VeraResult | None:
@@ -169,11 +244,17 @@ def _primary(v: dict[str, VeraResult]) -> VeraResult | None:
 async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress = lambda s, p: None) -> dict:
     settings = get_settings()
     started = time.monotonic()
+    progress = clock = StageClock(progress)
+    _clock.set(clock)
     work, out, stem = store.work_dir, store.output_dir, opts.stem
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
     src = store.input_pdf
     warnings: list[str] = []
+    # The viewer's tag map of the original needs nothing the pipeline produces and costs about as much as a
+    # verification pass (it reads every page back through pdfplumber). Built on its own thread from the start, it
+    # runs while the job waits on the validator and on the AI instead of adding its time at the end.
+    original_map = asyncio.create_task(_tagmap_file(out, stem, "original", src))
 
     # 1. before -------------------------------------------------------------------------
     progress("validating_original", 5)
@@ -189,6 +270,10 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     unicode_maps = await asyncio.to_thread(add_missing_tounicode, src, work / "tounicode.pdf")
     if unicode_maps:
         base = work / "tounicode.pdf"
+    # Check marks of unchecked boxes are one ZapfDingbats glyph, a font forms don't embed: drawn as shapes instead
+    form_marks = await asyncio.to_thread(redraw_dingbat_marks, base, work / "form_marks.pdf")
+    if form_marks:
+        base = work / "form_marks.pdf"
     analysis = await asyncio.to_thread(prepare_analysis, base)
     scanned = [p.number for p in analysis.pages if p.is_scanned]
     enrichment = EnrichmentStats()
@@ -204,6 +289,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             ocr_ai = (ai is not None and opts.ocr_ai and settings.ocr_ai_enabled and settings.ocr_engine != "pymupdf"
                       and tesseract_cli() is not None)
             pictures: dict[int, list] = {}  # what OCR read as letters but looks like a picture
+            # Scanned pages with text of their own (values typed onto a form), noted before the OCR layer is added
+            with fitz.open(base) as before_ocr:
+                typed_on = {pno for pno in scanned if before_ocr[pno].get_text("text").strip()}
             ocr_records = await asyncio.to_thread(ocr_lines, str(base), scanned, True, pictures)
             if ocr_ai:
                 progress("ai_ocr", 22)
@@ -222,19 +310,23 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                 text_boxes.setdefault(rec.page, []).append(rec.bbox)
             figures_path = work / "scan_figures.pdf"
             try:
-                scan_regions = await asyncio.to_thread(scan_figures.separate, str(base), str(figures_path), scanned,
-                                                       text_boxes, pictures)
+                # Not on a page with typed text: a figure is drawn again on top of the page, which would cover the typed
+                # values with the paper of the scan (and a filled-in form's rules aren't a figure)
+                scan_regions = await asyncio.to_thread(scan_figures.separate, str(base), str(figures_path),
+                                                       [p for p in scanned if p not in typed_on], text_boxes, pictures)
             except Exception as exc:  # noqa: BLE001 - a problem here only means the figures stay untagged
                 log.warning("figures on scanned pages not separated: %s", exc)
                 scan_regions = {}
             if scan_regions:
                 base = figures_path
             analysis = await asyncio.to_thread(prepare_analysis, base)
+            # How sure the OCR was of each block's words: a scanned formula reads with low confidence (notation)
+            block_confidence([p for p in analysis.pages if p.number in scanned], ocr_records)
             # The OCR text now carries the content; the page scan itself becomes a background artifact.
             for p in analysis.pages:
                 if p.number in scanned:
                     for img in p.images:
-                        if img.bbox[2] - img.bbox[0] >= 0.9 * p.width and img.bbox[3] - img.bbox[1] >= 0.9 * p.height:
+                        if _covers_page(img.bbox, p.width, p.height):
                             img.decorative = True
                     if scan_regions.get(p.number):
                         scan_figure_count += scan_figures.add_to_page(p, scan_regions[p.number])
@@ -243,6 +335,32 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                         (el := p.element(e)) is not None and getattr(el, "decorative", False))]
         else:
             warnings.append(f"{len(scanned)} scanned page(s) without a text layer; OCR is unavailable")
+
+    # Music: each example becomes one figure, read by the music reading service when there is one
+    music_count = 0
+    music_files: list[tuple[str, bytes]] = []  # the notation of each example that was read (MusicXML)
+    music_score: list[tuple[str, bytes]] = []  # sheet music: the whole piece read as one (MusicXML)
+    try:
+        music_started = time.monotonic()
+        music_count = await asyncio.to_thread(music.apply, base, analysis, enrichment.music, music_files, music_score,
+                                              enrichment.findings)
+        if music_count:
+            clock.add("music", time.monotonic() - music_started)
+        for m in enrichment.music:
+            if m["read"]:
+                enrichment.findings.append(f"page {m['page'] + 1}: music read by the music reading service "
+                                           f"({m['notes']} notes); check its alt text against the notes")
+    except Exception as exc:  # noqa: BLE001 - a problem here only means music is handled as before
+        log.warning("music examples not handled: %s", exc)
+    enrichment.music_score = len(music_score)
+    music_archive = music_score_file = None
+    if music_files:
+        music_archive = f"{stem}_music.zip"
+        await asyncio.to_thread(music.write_archive, out / music_archive, music_score + music_files, f"{stem}.pdf")
+    if len(music_score) == 1:
+        # The whole piece as one file is what a musician opens: on its own, beside the zip of every line
+        music_score_file = f"{stem}_music.{music_score[0][0].rsplit('.', 1)[-1]}"
+        (out / music_score_file).write_bytes(music_score[0][1])
 
     # 3. AI ---------------------------------------------------------------------------------
     progress("ai_enrichment", 30)
@@ -275,7 +393,10 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         "ai_provider": opts.provider,
         "ai_model": ai.model if ai else None,
         "images_described": enrichment.images_described,
-        "notation_read_by_ai": len(enrichment.notation),
+        "music_examples": music_count,
+        "music_read": sum(1 for m in enrichment.music if m["read"]),
+        "notation_read_by_ai": sum(1 for n in enrichment.notation if not n.get("by_rule")),
+        "notation_by_rule": sum(1 for n in enrichment.notation if n.get("by_rule")) + enrichment.dose_cells,
         "notation_ai_rejected": enrichment.notation_rejected,
         "tables_analyzed": enrichment.tables_analyzed,
         "reading_order_pages_ai": enrichment.reading_order_pages,
@@ -296,8 +417,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                                                          seed=opts.job_id, kinds=_kinds(analysis),
                                                          judge_model=opts.judge_model))
             verification = {"original": rep.to_dict()}
-        tag_maps = {"original": await _tagmap_file(out, stem, "original", src)}
+        tag_maps = {"original": await original_map}
         metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
+        metrics["stage_seconds"] = clock.seconds()
         result = {
             "files": {"remediated_primary": None, "remediated_visual_fallback": None},
             "metrics": metrics,
@@ -319,7 +441,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     # 4. visual (non-destructive) ----------------------------------------------------------
     progress("tagging", 55)
     title = _pick_title(opts, analysis)
-    language = opts.language or analysis.language or settings.default_language
+    language = _pick_language(opts, analysis, settings.default_language)
     visual = work / "visual.pdf"
     visual_region_alts: list = []
     tag_visual = await asyncio.to_thread(
@@ -335,10 +457,18 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         metrics["ai_cost_usd"] = round(ai.usage.cost_usd, 6)
         metrics["ai_calls"] = ai.calls
         metrics["ai_failures"] = ai.failures
-        if region_alts:
+        if region_alts and any(decorative for _, _, _, decorative in region_alts):
+            # A figure judged decorative loses its tag and its content becomes an artifact: that takes the content
+            # marker, so the document is tagged again with every verdict
             tag_visual = await asyncio.to_thread(
                 tag_document, base, visual, analysis, title=title, language=language,
                 pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables, region_alts=region_alts)
+        elif region_alts:
+            # Descriptions alone go straight onto the tags they describe; nothing else about the file changes
+            written = await asyncio.to_thread(write_figure_alts, visual, tag_visual.figure_handles,
+                                              [(p, b, alt) for p, b, alt, _ in region_alts])
+            apply_written_alts(tag_visual, written)
+        if region_alts:
             visual_region_alts = region_alts
     progress("validating_output", 70)
     vera_visual = await asyncio.to_thread(_validate, visual, work, "after_visual", stem)
@@ -353,7 +483,11 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     shutil.copyfile(visual, pre_fix)
     vera_prefix = vera_visual
     vera_visual, widths_fixed = await asyncio.to_thread(_fix_widths, visual, vera_visual, work, "after_visual", stem)
-    if widths_fixed and not (await asyncio.to_thread(_visual_fidelity, src, visual))["identical"]:
+    fidelity: dict | None = None  # of the visual file as it will be returned; the comparison renders every page
+    if widths_fixed:
+        fidelity = await asyncio.to_thread(_visual_fidelity, src, visual)
+    if fidelity is not None and not fidelity["identical"]:
+        fidelity = None
         wf = work / "visual_widthfixed.pdf"
         shutil.move(visual, wf)
         shutil.copyfile(pre_fix, visual)
@@ -412,6 +546,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                        for p in analysis.pages if p.number in destructive_pages}
             await asyncio.to_thread(flatten_pages, str(stage_src), str(flat), destructive_pages, vectors)
             analysis_mod = await asyncio.to_thread(prepare_analysis, flat)
+            music.carry_over(analysis, analysis_mod)
             layout_mod = transfer_enrichment(analysis, analysis_mod, set(destructive_pages), enrichment.layout_tables,
                                              notation=enrichment.notation)
             tag_modified = await asyncio.to_thread(
@@ -456,13 +591,17 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
 
     verification = None
     # Tag maps for the portal's viewer: the original and every output
-    tag_maps = {"original": await _tagmap_file(out, stem, "original", src)}
+    tag_maps = {"original": await original_map}
+    # Bookmarks from the headings go in once each output's tag map says where the headings are (after veraPDF, which
+    # doesn't check the outline; the tag tree, and so the tag map, don't change)
+    bookmarks: dict[str, dict] = {}
     if settings.verify_enabled:
         progress("verifying_tags", 92)
         verification = {}
         vopts = VerifyOptions(ai=opts.verify_ai, full_review=opts.full_review, seed=opts.job_id,
                               kinds=_kinds(analysis), judge_model=opts.judge_model,
-                              ai_read=[(n["page"], n["bbox"], n["kind"], n["spoken"]) for n in enrichment.notation]
+                              ai_read=[(n["page"], n["bbox"], n["kind"], n["spoken"]) for n in enrichment.notation
+                                       if not n.get("by_rule")]
                               + [(o["page"], o["bbox"], f"ocr-{o['mode']}", o["after"]) for o in enrichment.ocr],
                               review_cache={})  # one verdict per figure across both output files
         outputs = [("primary", out / files["remediated_primary"])]
@@ -473,7 +612,8 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             if not rep.integrity_passed:
                 raise IntegrityError(label, rep.errors)
             verification[label] = rep.to_dict()
-            tag_maps[label] = await _tagmap_file(out, stem, label, path, rep.tagmap)
+            bookmarks[label], data = await _bookmarks(path, rep.tagmap)
+            tag_maps[label] = await _tagmap_file(out, stem, label, path, data)
             if rep.ai.get("error") and rep.ai["error"] not in " ".join(warnings):
                 warnings.append(f"AI review did not run: {rep.ai['error']}")
             if rep.ai.get("ai_tokens_used"):
@@ -485,7 +625,8 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
 
     for label, key in (("primary", "remediated_primary"), ("visual_fallback", "remediated_visual_fallback")):
         if files.get(key) and label not in tag_maps:
-            tag_maps[label] = await _tagmap_file(out, stem, label, out / files[key])
+            bookmarks[label], data = await _bookmarks(out / files[key], None)
+            tag_maps[label] = await _tagmap_file(out, stem, label, out / files[key], data)
 
     after_audit = await asyncio.to_thread(audit_pdf, primary_path)
     after_snapshot = _snapshot(after_audit, primary_vera)
@@ -494,11 +635,13 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         "after": after_snapshot,
         "delta": _delta(before_snapshot, after_snapshot),
         "existing_tags": tag_visual.existing_tags,
-        "visual_fidelity": await asyncio.to_thread(_visual_fidelity, src, visual),
+        "visual_fidelity": fidelity or await asyncio.to_thread(_visual_fidelity, src, visual),
         "glyph_widths_compensated": widths_fixed,
         "glyph_widths_modified_only": widths_subpixel[2] if widths_subpixel else 0,
         "glyph_lists_removed": glyph_lists_fixed,
         "unicode_maps_added": unicode_maps,
+        "form_marks_redrawn": form_marks,
+        "bookmarks": bookmarks.get("primary"),
     }
     if modified is not None:
         comparison["after_visual_fallback"] = _snapshot(await asyncio.to_thread(audit_pdf, visual), vera_visual)
@@ -506,6 +649,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         comparison["fonts_embedded"] = fonts_embedded
 
     metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
+    metrics["stage_seconds"] = clock.seconds()
     summary = _summary(analysis, tag_visual, tag_modified, enrichment, before_snapshot, after_snapshot,
                        comparison, destructive_pages, warnings, title, language)
     result = {
@@ -516,7 +660,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             "verapdf_after": vera_after if any(vera_after.values()) else None,
             "comparison": comparison,
             "remediation_summary": summary,
-            "tagging": {"visual": asdict(tag_visual), "modified": asdict(tag_modified) if tag_modified else None},
+            "tagging": {"visual": _tag_report(tag_visual), "modified": _tag_report(tag_modified) if tag_modified else None},
             "tag_verification": verification,
             "tag_maps": tag_maps,
             "ai_findings": enrichment.findings[:100],
@@ -524,12 +668,30 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             "ai_notation": [{**n, "page": n["page"] + 1} for n in enrichment.notation][:300] or None,
             # OCR lines the AI corrected or transcribed (page 1-based, region, mode, before, after, changed words)
             "ai_ocr": [{**o, "page": o["page"] + 1} for o in enrichment.ocr][:500] or None,
+            # Music examples (page 1-based, region, whether the music reading service read it, its reading or why not)
+            "music": [{**m, "page": m["page"] + 1} for m in enrichment.music][:300] or None,
+            # The notation of the examples that were read, as MusicXML files in one zip
+            "music_files": music_archive,
+            # Sheet music: the whole piece as one MusicXML file (several movements: they're in the zip)
+            "music_score": music_score_file,
         },
         "warnings": warnings,
     }
+    # The whole run up to here; writing the reports comes after and can't be in them
+    metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
+    metrics["stage_seconds"] = clock.seconds()
+    log.info("job %s: %d pages in %.0f s; by stage: %s", opts.job_id, metrics.get("pages_processed") or 0,
+             metrics["processing_time_seconds"], json.dumps(metrics["stage_seconds"]))
     _write_json_report(out, stem, result, store)
     progress("completed", 100)
     return result
+
+
+def _tag_report(result: TagResult) -> dict:
+    """A TagResult for the report: everything but the handles that only serve the job itself."""
+    out = asdict(result)
+    out.pop("figure_handles", None)
+    return out
 
 
 def _kinds(analysis: DocumentAnalysis) -> list:
@@ -544,7 +706,6 @@ def analysis_has_tags(pdf: Path) -> bool:
         return "/StructTreeRoot" in doc.Root
 
 
-MAX_REGION_FIGURES = 150
 
 
 async def _describe_regions(ai, pdf_path: Path, regions: list, enrichment: EnrichmentStats) -> list:
@@ -552,17 +713,21 @@ async def _describe_regions(ai, pdf_path: Path, regions: list, enrichment: Enric
     from app.pipeline.analyzer import render_png
 
     doc = fitz.open(pdf_path)
+    slots = render_slots()
     try:
-        async def one(page: int, bbox) -> tuple | None:
-            if (bbox[2] - bbox[0]) < 6 and (bbox[3] - bbox[1]) < 6:
-                # A few-point dot or mark tagged as a figure carries no information: make it an artifact.
-                enrichment.findings.append(f"page {page + 1}: tiny figure ({bbox[2] - bbox[0]:.0f}×"
-                                           f"{bbox[3] - bbox[1]:.0f} pt) marked as an artifact")
+        async def one(page: int, bbox, *_) -> tuple | None:
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if (w < 6 and h < 6) or min(w, h) < 2:
+                # A few-point dot, or a rule or hairline (Word tags horizontal lines as figures), carries no
+                # information: make it an artifact.
+                enrichment.findings.append(f"page {page + 1}: {'line' if min(w, h) < 2 and max(w, h) >= 6 else 'tiny'} "
+                                           f"figure ({w:.0f}×{h:.1f} pt) marked as an artifact")
                 return (page, tuple(bbox), None, True)
-            png = render_png(doc, page, dpi=150, clip=bbox, max_px=1200)
             try:
-                res = await ai.describe_image(png, page, "")
-            except (AIError, ValueError) as exc:
+                async with slots:
+                    png = render_png(doc, page, dpi=150, clip=bbox, max_px=1200)
+                    res = await ai.describe_image(png, page, "")
+            except Exception as exc:  # noqa: BLE001 - one figure never fails the job: it's left for review
                 enrichment.findings.append(f"page {page + 1}: alt text for existing figure failed ({exc})")
                 return None
             if res["decorative"] and not res["alt"]:
@@ -578,11 +743,14 @@ async def _describe_regions(ai, pdf_path: Path, regions: list, enrichment: Enric
             enrichment.images_described += 1
             return (page, tuple(bbox), res["alt"], False)
 
-        results = await asyncio.gather(*(one(p, b) for p, b in regions[:MAX_REGION_FIGURES]))
+        limit = get_settings().ai_existing_figures_max
+        results = await asyncio.gather(*(one(*region) for region in regions[:limit]))
     finally:
         doc.close()
-    if len(regions) > MAX_REGION_FIGURES:
-        enrichment.findings.append(f"{len(regions) - MAX_REGION_FIGURES} existing figure(s) beyond the limit left without alt")
+    if len(regions) > limit:
+        enrichment.findings.append(f"{len(regions) - limit} figure tag(s) the document arrived with, beyond the limit of "
+                                   f"{limit} (AI_EXISTING_FIGURES_MAX), weren't described and have no alt text "
+                                   f"(from page {regions[limit][0] + 1} on)")
     return [r for r in results if r]
 
 
@@ -714,6 +882,7 @@ def _ai_audit(analysis: DocumentAnalysis, enrichment: EnrichmentStats) -> dict:
                     "summary": t.summary} for p in analysis.pages for t in p.tables][:100],
         "multi_column_pages": [p.number + 1 for p in analysis.pages if p.columns > 1],
         "notation": [{**n, "page": n["page"] + 1} for n in enrichment.notation][:200],
+        "music": [{**m, "page": m["page"] + 1} for m in enrichment.music][:200],
         "findings": enrichment.findings[:100],
     }
 
@@ -737,9 +906,35 @@ def _verdict_line(label: str, snap: dict) -> str:
     return f"{label}: {status} PDF/UA validation ({snap['failed_rules']} failed rules, {snap['failed_checks']} failed checks)."
 
 
+def music_summary(records: list[dict]) -> str:
+    """How much music there is and how it was tagged: lines or examples, and the figures they became (a line that
+    was read is one figure per measure where the page's bar lines agree with the reading; a scanned score is one
+    picture, however many lines it has)."""
+    n = len(records)
+    in_pictures = sum(1 for m in records if m.get("figures") == 0)
+    figures = sum(m.get("figures", 1) for m in records)
+    split = sum(1 for m in records if m.get("figures", 1) > 1)
+    line = f"Music notation: {n} line{'s' if n != 1 else ''} or example{'s' if n != 1 else ''} of music"
+    if split:
+        line += (f", tagged as {figures} figure{'s' if figures != 1 else ''} ({split} of them one figure per measure; "
+                 "the others one figure each)")
+    elif figures:
+        line += ", each tagged as one figure"
+    if in_pictures:
+        line += (f"{'; ' if figures else ', '}{in_pictures} {'are' if in_pictures != 1 else 'is'} part of a picture "
+                 "(a scanned score), which stays one figure")
+    return line
+
+
 def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats, before: dict, after: dict,
              comparison: dict, destructive_pages: list[int], warnings: list[str], title: str, language: str) -> str:
     lines = [_verdict_line("Before", before), _verdict_line("After", after)]
+    bm = comparison.get("bookmarks") or {}
+    if bm.get("bookmarks"):
+        lines.append(f"Bookmarks: {bm['bookmarks']} made from the headings"
+                     + (", replacing bookmarks that went nowhere." if bm.get("outline") == "broken" else "."))
+    elif bm.get("outline") == "kept":
+        lines.append("Bookmarks: the document's own were kept.")
     et = tv.existing_tags
     if et.get("present"):
         if et.get("rebuilt_tree"):
@@ -748,7 +943,14 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
             lines.append(f"Existing tags: {et['retained']} retained, {et['repaired']} repaired, "
                          f"{et['replaced']} replaced, {et.get('removed', 0)} empty removed, "
                          f"{et.get('artifacted', 0)} decorative figure(s) made artifacts; "
-                         f"{tv.orphans_retagged} orphaned content item(s) re-tagged.")
+                         f"{tv.orphans_retagged} orphaned content item(s) re-tagged."
+                         + (f" {tv.empty_spans_removed} empty span(s) folded into the tag they were in."
+                            if tv.empty_spans_removed else ""))
+            if tv.added_placed:
+                lines.append(f"Added to the existing tags: {tv.added_placed} tag(s) (content the old tags left out, "
+                             "untagged form fields and links) placed beside the tags they follow on their page"
+                             + (f"; {tv.added_headings_demoted} of them looked like headings and were made paragraphs, "
+                                "as the document has its own headings." if tv.added_headings_demoted else "."))
         for f in et.get("findings", [])[:5]:
             lines.append(f"  - {f}")
     el = tv.elements
@@ -758,6 +960,14 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
         f"{headings} heading(s), {el.get('P', 0)} paragraph(s), {el.get('L', 0)} list(s), "
         f"{tv.tables} table(s), {tv.figures_with_alt + tv.figures_without_alt} figure(s), {tv.links} link(s)."
     )
+    if tv.footnotes or tv.notes_given_ids:
+        lines.append("Footnotes: " + "; ".join(
+            ([f"{tv.footnotes} tagged as notes, each linked from the text with its mark"] if tv.footnotes else [])
+            + ([f"{tv.notes_given_ids} of the document's own notes given the ID PDF/UA requires"]
+               if tv.notes_given_ids else [])) + ".")
+    if tv.tables_linked:
+        lines.append(f"Complex tables: {tv.tables_linked} with several levels of headers, each cell linked to its "
+                     "headers (Headers and ID).")
     lines.append(f"Alt text: {enr.images_described} generated by AI, {enr.images_decorative} image(s) judged decorative"
                  + (f", {tv.figures_without_alt} figure(s) still without alt text" if tv.figures_without_alt else "") + ".")
     if enr.tables_analyzed:
@@ -770,11 +980,34 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
                      "couldn't read (each is flagged for review)"
                      + (f"; {enr.ocr_rejected} AI correction(s) failed the checks and weren't used" if enr.ocr_rejected else "")
                      + ".")
-    if enr.notation:
-        lines.append(f"Specialist notation: {len(enr.notation)} block(s) the layout rules couldn't read were read by AI "
+    if tv.picture_glyphs_mapped:
+        n = sum(tv.picture_glyphs_mapped.values())
+        lines.append(f"Characters that are pictures: {n} character(s) in {len(tv.picture_glyphs_mapped)} font(s) with no "
+                     "meaning as text (music note heads, pieces of drawn lines), in figures and decoration, were "
+                     "given private-use Unicode values so every font is fully mapped; rendering unchanged."
+                     + (f" On page(s) {', '.join(map(str, tv.picture_glyphs_in_text[:20]))} such a symbol stands in a sentence "
+                        "and has no spoken form: give it replacement text in the tag editor."
+                        if tv.picture_glyphs_in_text else ""))
+    if enr.music:
+        read = sum(1 for m in enr.music if m["read"])
+        line = music_summary(enr.music)
+        if read:
+            line += (f"; {read} read note by note by the music reading service (check them: a reading can have wrong "
+                     "notes)" + (f", {len(enr.music) - read} described as pictures" if len(enr.music) - read else "")
+                     + ". Their notation is in the music files (MusicXML, one per example): someone who reads music "
+                       "can open them in notation software to play them back against the page"
+                     + (". The whole piece was also read as one score" if enr.music_score else ""))
+        lines.append(line + ".")
+    by_ai = sum(1 for n in enr.notation if not n.get("by_rule"))
+    by_rule = len(enr.notation) - by_ai
+    if by_ai or enr.notation_rejected:
+        lines.append(f"Specialist notation: {by_ai} block(s) the layout rules couldn't read were read by AI "
                      "(each is flagged for review)"
                      + (f"; {enr.notation_rejected} AI reading(s) didn't match the page and weren't used" if enr.notation_rejected else "")
                      + ".")
+    if by_rule or enr.dose_cells:
+        lines.append(f"Dosage notation: {by_rule} block(s) and {enr.dose_cells} table cell(s) put in words by rule (units "
+                     "by name, prescription shorthand in full); no AI was used for these.")
     if enr.reading_order_pages:
         lines.append(f"Reading order: determined by AI on {enr.reading_order_pages} page(s).")
     lines.append(f"Document: title \"{title}\", language {language}, PDF/UA identifier set.")
@@ -783,6 +1016,9 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
     if comparison.get("glyph_lists_removed"):
         lines.append(f"Font descriptors: incomplete glyph lists removed from {len(comparison['glyph_lists_removed'])} "
                      "font(s) (they're optional and unused for drawing; rendering unchanged).")
+    if comparison.get("form_marks_redrawn"):
+        lines.append(f"Form fields: the check marks of {comparison['form_marks_redrawn']} unchecked box(es) are now drawn as "
+                     "shapes (they used ZapfDingbats, a font that isn't embedded); the pages look the same.")
     if comparison.get("unicode_maps_added"):
         lines.append(f"Unicode maps completed for {len(comparison['unicode_maps_added'])} font(s) "
                      f"({'; '.join(comparison['unicode_maps_added'][:4])}) so symbols can be read aloud; rendering unchanged.")
@@ -810,6 +1046,18 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
     for w in warnings:
         lines.append(f"Warning: {w}")
     return "\n".join(lines)
+
+
+async def _bookmarks(path: Path, tagmap: dict | None) -> tuple[dict, dict | None]:
+    """Write bookmarks from the headings into an output (see app/tagging/bookmarks.py). Returns what was done and the
+    tag map, built here when the caller had none. Bookmarks are a help, not a requirement: a failure is logged."""
+    try:
+        if tagmap is None:
+            tagmap = await asyncio.to_thread(build_tagmap, path)
+        return await asyncio.to_thread(write_bookmarks, path, tagmap), tagmap
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bookmarks for %s failed: %s", path.name, exc)
+        return {"bookmarks": 0, "outline": "failed"}, tagmap
 
 
 async def _tagmap_file(out: Path, stem: str, label: str, pdf_path: Path, data: dict | None = None) -> str | None:

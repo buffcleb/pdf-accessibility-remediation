@@ -30,6 +30,24 @@ same Compose network) or `http://localhost:8088`.
 (`PORTAL_TRUST_PROXY_HEADERS=true`). Uploads through Cloudflare are capped by its plan (100 MB on Free and Pro), so
 keep `MAX_UPLOAD_SIZE` and the portal's largest file at or below that.
 
+## A bot check on sign-in
+
+Every "Email me a code" sends an email, so a script could use the sign-in page to send mail to any address, at your
+cost and your sender reputation's. Rate limits slow that down; **Turnstile**, Cloudflare's free bot check, stops it.
+Most people never see it: it runs in the background and only shows a challenge when Cloudflare needs one.
+
+1. In the Cloudflare dashboard: **Turnstile → Add widget**. Name it, add your sign-in hostname (`APP_HOST`, e.g.
+   `pdf.example.org`; add `localhost` too if you test locally), and choose **Managed** mode.
+2. Put the two keys in the portal's settings (`deploy/k8s/portal.env`, or `.env.portal`):
+   `PORTAL_TURNSTILE_SITE_KEY=…` and `PORTAL_TURNSTILE_SECRET_KEY=…`. Redeploy.
+3. Check: the sign-in page says "Check complete." under the button, and a code arrives.
+
+The site key is public (the page needs it); the secret key isn't. If Cloudflare's check can't be reached, sign-in is
+allowed by default and the audit log notes it (`login.code_requested` with "bot_check: unavailable (allowed)");
+`PORTAL_TURNSTILE_FAIL_OPEN=false` refuses instead. Refused requests are in the audit log with the outcome
+`bot_check_failed`. The page's content security policy already allows `challenges.cloudflare.com`. Turnstile works
+whether or not the rest of the service runs behind Cloudflare.
+
 ## The web app on a Cloudflare Worker
 
 The web app's static files can be served by a Cloudflare Worker from Cloudflare's edge, with `/api/` forwarded to the

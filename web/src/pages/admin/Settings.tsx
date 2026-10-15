@@ -260,6 +260,20 @@ function LimitSettings() {
           <NumberField id="l-hreopen" label="Reopen within" unit="days" hint="After it's resolved or closed."
             value={s.help_reopen_days} onChange={(n) => set({ help_reopen_days: n })} />
         </div>
+        <label className="check">
+          <input type="checkbox" checked={s.help_on_failure} onChange={(e) => set({ help_on_failure: e.target.checked })} />
+          <span>Open a help request when a document fails <span className="muted small">(so every failure is looked at;
+            a known limitation can be closed with a note. Off: people can still ask for help with a failed document
+            themselves. Documents someone stopped don't get one)</span></span>
+        </label>
+      </Section>
+      <Section title="AI in the tag manager" intro="Each use is one AI call at the document's AI level, recorded on its cost.">
+        <label className="check">
+          <input type="checkbox" checked={s.ai_describe_default} onChange={(e) => set({ ai_describe_default: e.target.checked })} />
+          <span><strong>Describe with AI</strong>, for everyone <span className="muted small">(alt text for an area of a
+            figure, written by the AI. A group, and each person in it, can be set otherwise by their group admins
+            or a super admin)</span></span>
+        </label>
       </Section>
       <Section title="Each person's queue" intro="So one big batch doesn't hold everyone else up.">
         <div className="grid">
@@ -309,6 +323,27 @@ function LimitSettings() {
             value={s.classifier_pages} onChange={(n) => set({ classifier_pages: n })} />
         </div>
       </Section>
+      <Section title="PDF/UA validation (veraPDF)" intro={"veraPDF checks every document before and after remediation, " +
+        "and every saved version. The results are the same either way; only the speed and memory differ."}>
+        <fieldset className="choices">
+          <legend className="small">Run veraPDF</legend>
+          <label className="check">
+            <input type="radio" name="l-vera" checked={s.verapdf_mode === "service"} onChange={() => set({ verapdf_mode: "service" })} />
+            <span>As a service kept running <span className="muted small">(faster: Java isn't started for every check;
+              if the service doesn't answer, the engine uses the command line for that check)</span></span>
+          </label>
+          <label className="check">
+            <input type="radio" name="l-vera" checked={s.verapdf_mode === "command_line"} onChange={() => set({ verapdf_mode: "command_line" })} />
+            <span>From the command line in the engine <span className="muted small">(Java started for each check,
+              about a second more each)</span></span>
+          </label>
+        </fieldset>
+        <label className="check">
+          <input type="checkbox" checked={s.verapdf_ua2} onChange={(e) => set({ verapdf_ua2: e.target.checked })} />
+          <span>Also check PDF/UA-2 <span className="muted small">(shown in reports for information; the verdict is
+            PDF/UA-1. Off halves the number of checks)</span></span>
+        </label>
+      </Section>
       <ErrorNotice error={error} />
       <SaveBar dirty={dirty} saved={saved} />
     </form>
@@ -342,6 +377,9 @@ function SignInSettings() {
             value={s.file_retention_days} onChange={(n) => set({ file_retention_days: n })} />
           <NumberField id="s-records" label="Records" unit="days" hint="Usage, page ledger, sign-in and audit records."
             value={s.record_retention_days} onChange={(n) => set({ record_retention_days: n })} />
+          <NumberField id="s-hold" label="Files marked done" unit="hours"
+            hint="When someone marks a document done, its files are removed after this, so a mistake can be undone. 0: at the next cleanup."
+            value={s.early_removal_hold_hours} min={0} onChange={(n) => set({ early_removal_hold_hours: n })} />
         </div>
       </Section>
       <ErrorNotice error={error} />

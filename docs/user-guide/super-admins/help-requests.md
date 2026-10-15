@@ -16,7 +16,7 @@ Each request shows the conversation next to its details: the document, version, 
    - **In progress**
    - **Waiting on the person:** they get reminders after 3 and 7 days; with no reply by 10 days the request is
      closed (they can still reopen it).
-5. **Open in tag viewer** goes to the version the person named, to fix it there. Saving creates a new version.
+5. **Open in tag manager** goes to the version the person named, to fix it there. Saving creates a new version.
 
 ## Fixing it outside the portal
 
@@ -34,7 +34,7 @@ replaces. Failed checks are shown to you, not blocking.
 
 Or **Close without changes** when nothing needs fixing.
 
-The person sees the outcome on the document's page, with **Compare in the tag viewer**, and can **reopen** the
+The person sees the outcome on the document's page, with **Compare in the tag manager**, and can **reopen** the
 request within 14 days (configurable in Settings → Uploads and limits).
 
 ## Keeping a request

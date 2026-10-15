@@ -4,7 +4,7 @@
 
 | Decision | Why |
 |---|---|
-| Never change drawing operators in the visual output | The visual file is guaranteed identical to the original; every job and every edit checks it pixel by pixel |
+| Never change drawing operators in the visual output | The visual file is guaranteed identical to the original; every job and every edit checks it by rendering both at 50 dpi and comparing the pixels (a shift under about a point can't show at that scale: the glyph-width corrections are judged this way on purpose) |
 | A separate "modified" output, least destructive first | Some documents can't comply without a visible change; people choose, and it's discarded if it would lose structure |
 | Verification reads back with different libraries | A bug in the writer can't hide itself |
 | Structure from layout rules; AI only where rules can't decide | Predictable, cheap and testable. AI writes alt text and interprets tables, hard reading orders and notation |

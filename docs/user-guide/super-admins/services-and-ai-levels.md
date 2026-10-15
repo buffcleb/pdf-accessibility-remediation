@@ -21,7 +21,7 @@ Tabs:
 |---|---|
 | **General** | Name, description (shown at upload), switched on or off |
 | **Data and notice** | Whether it sends documents to an **external provider** (blocked for local-only groups); an optional **notice** shown when people pick it, with your text |
-| **Pages and cost guards** | Whether **page limits apply** (otherwise use is only counted); **most pages per document**; **most pages sent per day** (extra documents wait, they don't fail); **confirm before sending**; an optional **global pool** shared by all groups |
+| **Pages and cost guards** | Whether **page limits apply** (otherwise use is only counted); **most pages per document**; **most pages sent per day** (extra documents wait, they don't fail); **most documents at once** (for what can't grow with the rest, such as a local AI's GPUs: extra documents wait their turn); **confirm before sending**; an optional **global pool** shared by all groups |
 | **Model** (AI levels) | The gateway model, the review model, and switches (below) |
 | **Kinds of document** (AI levels) | Kinds offered at upload (below) |
 | **Groups** | Which groups use it, who has it there, and their pages |
@@ -37,9 +37,11 @@ An AI level is a model behind the AI gateway, published under a name people unde
 **Add an AI level** publishes one of the gateway's models (the list comes from the gateway's configuration). New
 levels start switched off. On its **Model** tab:
 
-- **Gateway model:** the writer (alt text, tables, reading order, notation, OCR corrections).
+- **Gateway model:** the writer (alt text, tables, reading order, notation, OCR corrections), chosen from the
+  models the gateway serves. A level whose model was renamed or removed at the gateway shows it as **not served
+  by the gateway**: choose another and save.
 - **Review model:** the AI that checks the writer's work. Use a model from a **different family**: a model tends to
-  approve its own mistakes. Empty uses the engine's default.
+  approve its own mistakes. **Default review model** uses the engine's default.
 - **Allow "review every figure":** lets people ask for every figure to be reviewed (more AI calls).
 - **Read specialist notation with AI:** math, chemistry, dosage and engineering notation the layout rules can't
   read. Each reading is flagged for review.
@@ -50,6 +52,16 @@ On its **Pages and cost guards** tab, **Audits** sets what **Check only** uses w
 - **Use AI, free** (the default): the AI review runs and no pages are counted.
 - **Use AI and count its pages:** each page counts against this level's pages (not the processing pages).
 - **No AI:** checks are made without AI and use no pages.
+
+### Deleting an AI level
+
+An AI level that is no longer offered can be deleted from its **General** tab. Switch it off and save first; it
+can be deleted once no document is waiting or in progress with it. Its kinds of document go with it, and so do
+every group's and person's settings, pages and page counts for it. Documents already processed keep their record,
+and the page ledger and the activity log keep their rows; reports and the documents themselves then show the
+level by its key (for example `ai:large-ai`) instead of its name. A later AI review of one of those documents
+uses the engine's default review model. Deleting can't be undone: to stop offering a level for a while, switch it
+off instead. Standard and Adobe Autotag can't be deleted.
 
 ### Kinds of document
 

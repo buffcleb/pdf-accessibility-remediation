@@ -12,7 +12,7 @@ from app.verification.ai_review import FigureItem, OrderItem, ReviewPlan, review
 from app.verification.integrity import check_integrity
 from app.verification.model import Finding, VerificationReport
 from app.verification.semantic import SemanticChecker
-from app.verification.tagmap import page_sizes, tagmap_from
+from app.verification.tagmap import annotation_places, artifact_sections, page_sizes, tagmap_from
 
 
 @dataclass
@@ -66,7 +66,7 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
         out.append(Finding(
             layer="ai", severity="review", issue=issue,
             page=page + 1, role=best.role if best else None, element=best.index if best else None,
-            detail=detail, action="Check it matches what's printed; correct it in the tag viewer if not"))
+            detail=detail, action="Check it matches what's printed; correct it in the tag manager if not"))
     return out
 
 
@@ -87,7 +87,8 @@ def _structural(path: Path, opts: VerifyOptions) -> tuple[VerificationReport, Re
         report.skipped += checker.skipped
         report.findings += _ai_read_findings(index, checker, opts.ai_read)
         if opts.tagmap:
-            report.tagmap = tagmap_from(page_sizes(path), index, checker)
+            report.tagmap = tagmap_from(page_sizes(path), index, checker, artifact_sections(path),
+                                        annotation_places(path))
 
         # Build the AI review plan while the PDF is open (alt text lives on the elements).
         flagged_elems = {f.element for f in report.findings if f.element is not None}

@@ -24,6 +24,11 @@ def _sessionmaker() -> sessionmaker[Session]:
     return sessionmaker(bind=get_engine(), expire_on_commit=False)
 
 
+def open_session() -> Session:
+    """A session for code outside a request (the body-size check runs before the request is one)."""
+    return _sessionmaker()()
+
+
 def get_db() -> Iterator[Session]:
     """One session per request; committed by the route, rolled back on error."""
     db = _sessionmaker()()

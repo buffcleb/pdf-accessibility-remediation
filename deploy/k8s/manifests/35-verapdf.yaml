@@ -1,0 +1,123 @@
+# veraPDF kept running (its REST service): the engine sends each PDF/UA check here instead of starting Java every
+# time, and falls back to its own command line when this doesn't answer. Settings come from the verapdf-config
+# ConfigMap (deploy/verapdf/validator.xml, made by deploy.sh). The Java heap is capped, and an hourly rolling
+# restart (the new pod is ready before the old one stops) clears whatever memory it holds on to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: verapdf
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: verapdf }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verapdf
+  namespace: ${NAMESPACE}
+spec:
+  ${VERAPDF_REPLICAS}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app: verapdf }
+  template:
+    metadata:
+      labels: { app: verapdf }
+      annotations:
+        checksum/config: "${VERAPDF_CONFIG_SHA}"
+    spec:
+      securityContext: { runAsUser: 100, runAsGroup: 101, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: verapdf
+          image: ${VERAPDF_IMAGE}
+          env:
+            - { name: JAVA_TOOL_OPTIONS, value: "-Xmx${VERAPDF_HEAP} -XX:+UseSerialGC" }
+            - { name: VERAPDF_MAX_FILE_SIZE, value: "2048" }  # MB
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /api/info, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /api/info, port: 8080 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests: { cpu: 200m, memory: 768Mi }
+            limits: { cpu: "2", memory: ${VERAPDF_MEMORY_LIMIT}, ephemeral-storage: 6Gi }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /opt/verapdf-rest/config/validator.xml, subPath: validator.xml, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: verapdf-config }
+        - name: tmp
+          emptyDir: { sizeLimit: 4Gi }  # uploads up to VERAPDF_MAX_FILE_SIZE land here
+---
+# The hourly restart: a job allowed to restart this one deployment and nothing else
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: verapdf-restarter
+  namespace: ${NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: verapdf-restarter
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["verapdf"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: verapdf-restarter
+  namespace: ${NAMESPACE}
+subjects: [{ kind: ServiceAccount, name: verapdf-restarter, namespace: ${NAMESPACE} }]
+roleRef: { kind: Role, name: verapdf-restarter, apiGroup: rbac.authorization.k8s.io }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: verapdf-restart
+  namespace: ${NAMESPACE}
+spec:
+  schedule: "${VERAPDF_RESTART_SCHEDULE}"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          serviceAccountName: verapdf-restarter
+          restartPolicy: OnFailure
+          securityContext: { runAsUser: 100, runAsGroup: 101, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+          containers:
+            - name: restart
+              image: ${CURL_IMAGE}
+              # What `kubectl rollout restart` does: a new annotation on the pod template starts a rolling update
+              command:
+                - sh
+                - -c
+                - >-
+                  curl -fsS --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                  -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+                  -H "Content-Type: application/strategic-merge-patch+json" -X PATCH
+                  -d "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"kubectl.kubernetes.io/restartedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}}}}"
+                  "https://kubernetes.default.svc/apis/apps/v1/namespaces/${NAMESPACE}/deployments/verapdf" -o /dev/null
+              securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+              resources:
+                requests: { cpu: 10m, memory: 16Mi }
+                limits: { cpu: 100m, memory: 64Mi, ephemeral-storage: 64Mi }

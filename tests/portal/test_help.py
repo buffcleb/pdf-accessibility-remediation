@@ -334,3 +334,56 @@ def test_reminders_at_3_and_7_days_then_closed_at_10(setup):
     events = [m["body"] for m in s["c"]["user"].get(f"{API}/help/{req['id']}").json()["messages"] if m["kind"] == "event"]
     assert any("Closed after 10 days" in e for e in events)
     assert s["c"]["user"].get(f"{API}/help/{req['id']}").json()["can_reopen"] is True
+
+
+# --- documents that fail (#141) -------------------------------------------------------------------
+
+def _failed(s, code="tag_integrity_failed"):
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("doc.pdf", pdf_bytes(2))).json()[0]["job"]["id"]
+    run_worker(s["db"])
+    s["engine"].fail(s["db"].get(Job, uuid.UUID(job_id)).engine_job_id, code)
+    run_worker(s["db"])
+    return job_id
+
+
+def test_a_failed_document_gets_a_help_request_of_its_own(setup):
+    s = setup
+    job_id = _failed(s)
+    req = s["c"]["user"].get(f"{API}/jobs/{job_id}/help").json()
+    assert req["kind"] == "failed" and req["status"] == "open" and req["role"] == "person"
+    first = req["messages"][0]
+    assert first["author_email"] == "The service" and "tag_integrity_failed" in first["body"]
+    # What the engine recorded is for super admins: a note on the request, and in their email
+    assert len(req["messages"]) == 1 and "internal detail" not in first["body"]
+    staff = s["c"]["super"].get(f"{API}/help/{req['id']}").json()
+    assert [m["kind"] for m in staff["messages"]] == ["message", "note"] and "internal detail" in staff["messages"][1]["body"]
+    mail = _mails("root@admin.test")[-1]
+    assert mail.subject == "Failed document: doc.pdf" and "couldn't be processed" in mail.text and "internal detail" in mail.text
+    assert s["c"]["super"].get(f"{API}/me").json()["help_needs_us"] == 1
+    # The person adds to it rather than opening a second one
+    assert _ask(s, job_id).status_code == 409
+    more = s["c"]["user"].post(f"{API}/help/{req['id']}/messages", data={"body": "It's a scan of a signed form."})
+    assert more.status_code == 201 and len(more.json()["messages"]) == 2
+
+
+def test_with_the_setting_off_the_person_can_still_ask(setup):
+    s = setup
+    r = s["c"]["super"].patch(f"{API}/admin/settings", json={"help_on_failure": False})
+    assert r.status_code == 200 and r.json()["help_on_failure"] is False
+    job_id = _failed(s)
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/help").json() is None
+    asked = _ask(s, job_id, kind="tables", version="1", page="2")   # the form's choices don't apply to a failure
+    assert asked.status_code == 201, asked.text
+    assert asked.json()["kind"] == "failed" and asked.json()["version_label"] is None and asked.json()["page"] is None
+
+
+def test_a_document_someone_stopped_gets_no_request(setup):
+    s = setup
+    job_id = _failed(s, code="stopped")
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/help").json() is None
+
+
+def test_the_failed_kind_is_not_one_to_choose(setup):
+    s = setup
+    assert _ask(s, _completed(s), kind="failed").status_code == 422

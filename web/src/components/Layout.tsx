@@ -27,6 +27,19 @@ export function Layout() {
     mainRef.current?.focus({ preventScroll: true });
   }, [location.pathname]);
 
+  // The header stays in view while the page scrolls. Its height changes (it wraps on a narrow window), and what
+  // sticks under it, or is scrolled into view, has to clear it: the height is kept where the styles can read it.
+  const barRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const bar = barRef.current;
+    if (!bar) return;
+    const note = () => document.documentElement.style.setProperty("--topbar-h", `${Math.round(bar.getBoundingClientRect().height)}px`);
+    note();
+    const seen = new ResizeObserver(note);
+    seen.observe(bar);
+    return () => seen.disconnect();
+  }, [me !== null]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!me) return null;
   const isAdmin = me.is_super_admin || me.admin_of.length > 0;
 
@@ -35,7 +48,7 @@ export function Layout() {
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <header className="topbar">
+      <header className="topbar" ref={barRef}>
         <div className="topbar-inner">
           <NavLink to="/" className="brand">
             {config.logoUrl
@@ -68,7 +81,7 @@ export function Layout() {
           </div>
         </div>
       </header>
-      <main id="main" ref={mainRef} tabIndex={-1} className={location.pathname.endsWith("/tags") || full ? "wide" : undefined}>
+      <main id="main" ref={mainRef} tabIndex={-1} className={location.pathname.endsWith("/tags") ? "wide viewer" : full ? "wide" : undefined}>
         <FullWidth.Provider value={fullWidth}>
           <Outlet />
         </FullWidth.Provider>

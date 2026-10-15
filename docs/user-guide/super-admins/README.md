@@ -29,3 +29,5 @@ becomes a super admin the first time it signs in. After that, super admins make 
 As a super admin, the menu on the left has: **Attention**, **Groups**, **Help requests**, **Services and AI levels**,
 **People (all groups)**, **Queues**, **Reports**, **Settings** and **+ Offer a service to a group**. When the AI
 gateway's admin UI is configured, a link to it appears in the menu and on Services and AI levels.
+
+![Administration, Attention for a super admin: Across every group and service showing All clear, and the access check, Why can't this person use a service?](../../images/admin-attention.png)

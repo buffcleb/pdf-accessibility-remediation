@@ -17,7 +17,9 @@ export const HELP_KINDS: [HelpKind, string][] = [
   ["visual", "Looks different from the original"],
   ["other", "Something else"],
 ];
-export const kindLabel = (k: HelpKind) => HELP_KINDS.find(([key]) => key === k)?.[1] ?? k;
+/** Not one to choose: what a request about a document that couldn't be processed is filed under. */
+const FAILED_LABEL = "The document couldn't be processed";
+export const kindLabel = (k: HelpKind) => k === "failed" ? FAILED_LABEL : HELP_KINDS.find(([key]) => key === k)?.[1] ?? k;
 
 const STAFF_STATUS: Record<HelpStatus, string> = {
   open: "Open", in_progress: "In progress", waiting: "Waiting on the person", resolved: "Resolved", closed: "Closed",
@@ -167,7 +169,7 @@ export function HelpOutcome({ req }: { req: HelpRequest }) {
         <p>
           {forPerson ? "The fixed version: " : "Version: "}<strong>{req.resolved_version_label}</strong>
           {req.resolved_version_status !== "ready" && req.resolved_version_status !== null && " (still being checked)"}
-          {compare && <> · <Link to={compare}>Compare in the tag viewer</Link></>}
+          {compare && <> · <Link to={compare}>Compare in the tag manager</Link></>}
         </p>
       )}
       {!!req.pages_refunded && <p>{forPerson ? `${req.pages_refunded} pages were given back to you.` : `${req.pages_refunded} pages given back.`}</p>}
@@ -181,6 +183,7 @@ type Prefill = { version?: number; page?: number; tag?: { i: number; role: strin
 function AskForm({ job, prefill, onCreated, onCancel }: { job: Job; prefill: Prefill; onCreated: (r: HelpRequest) => void; onCancel: () => void }) {
   const versions = useLoad(() => get<Versions>(`/jobs/${job.id}/versions`), [job.id]);
   const usable = (versions.data?.versions ?? []).filter((v) => v.status === "ready" && v.kind !== "original");
+  const failed = job.status === "failed";
   const [body, setBody] = useState("");
   const [kind, setKind] = useState<HelpKind>("other");
   const [version, setVersion] = useState<string>(prefill.version !== undefined ? String(prefill.version) : "");
@@ -198,10 +201,12 @@ function AskForm({ job, prefill, onCreated, onCancel }: { job: Job; prefill: Pre
     try {
       const form = new FormData();
       form.append("body", body);
-      form.append("kind", kind);
-      if (chosen) form.append("version", chosen);
-      if (page) form.append("page", page);
-      if (prefill.tag) form.append("tag", JSON.stringify(prefill.tag));
+      if (!failed) {  // a failed document has no result to point into
+        form.append("kind", kind);
+        if (chosen) form.append("version", chosen);
+        if (page) form.append("page", page);
+        if (prefill.tag) form.append("tag", JSON.stringify(prefill.tag));
+      }
       files.forEach((f) => form.append("files", f, f.name));
       const r = await postForm<HelpRequest>(`/jobs/${job.id}/help`, form);
       setBody("");
@@ -217,13 +222,13 @@ function AskForm({ job, prefill, onCreated, onCancel }: { job: Job; prefill: Pre
   return (
     <form className="panel edit-panel" onSubmit={submit} aria-labelledby="ask-h">
       <h2 id="ask-h">Ask for help with this document</h2>
-      <p className="muted small">A person who runs this service will look at it. You can add files and talk it through on the request.</p>
+      <p className="muted small">{failed ? "This document couldn't be processed. " : ""}A person who runs this service will look at it. You can add files and talk it through on the request.</p>
       {prefill.tag && <p className="small">About the tag you selected: <span className="mono">{prefill.tag.role}</span>{prefill.tag.text ? ` "${prefill.tag.text}"` : ""}{prefill.page ? `, page ${prefill.page}` : ""}.</p>}
       <div className="field">
-        <label htmlFor="ask-body">What's wrong? <span className="hint">(required)</span></label>
+        <label htmlFor="ask-body">{failed ? "Anything we should know about this document?" : "What's wrong?"} <span className="hint">(required)</span></label>
         <textarea id="ask-body" required value={body} maxLength={5000} onChange={(e) => setBody(e.target.value)} autoFocus />
       </div>
-      <div className="form-row">
+      {!failed && <div className="form-row">
         <div className="field"><label htmlFor="ask-kind">Kind of problem</label>
           <select id="ask-kind" value={kind} onChange={(e) => setKind(e.target.value as HelpKind)}>
             {HELP_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
@@ -234,7 +239,7 @@ function AskForm({ job, prefill, onCreated, onCancel }: { job: Job; prefill: Pre
           </select></div>
         <div className="field" style={{ maxWidth: 140 }}><label htmlFor="ask-page">Page <span className="hint">(optional)</span></label>
           <input id="ask-page" type="number" min={1} max={job.pages} value={page} onChange={(e) => setPage(e.target.value)} /></div>
-      </div>
+      </div>}
       <FilePicker id="ask-files" files={files} setFiles={setFiles} />
       <ErrorNotice error={error} />
       <div className="actions">
@@ -257,7 +262,8 @@ export function HelpPanel({ job }: { job: Job }) {
   const [actionError, setActionError] = useState<unknown>(null);
   const ref = useRef<HTMLDivElement>(null);
   const own = job.user_id === me?.id;
-  const canAsk = own && job.status === "completed" && !job.files_deleted && !!me?.can_submit;
+  const failed = job.status === "failed";
+  const canAsk = own && (failed || (job.status === "completed" && !job.files_deleted)) && !!me?.can_submit;
   const prefill: Prefill = {};
   if (params.get("version")) prefill.version = Number(params.get("version"));
   if (params.get("page")) prefill.page = Number(params.get("page"));
@@ -308,7 +314,8 @@ export function HelpPanel({ job }: { job: Job }) {
           <div className="page-head" style={{ alignItems: "center" }}>
             <div>
               <h2 id="help-h">Need help with this document?</h2>
-              <p className="muted small">If something in the result isn't right, tell us and a person will look at it.</p>
+              <p className="muted small">{failed ? "It couldn't be processed. Tell us and a person will look into why."
+                : "If something in the result isn't right, tell us and a person will look at it."}</p>
             </div>
             <button className="btn secondary" onClick={() => setAsking(true)}>Ask for help</button>
           </div>

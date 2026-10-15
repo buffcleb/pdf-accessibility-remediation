@@ -12,7 +12,7 @@ from collections.abc import Callable
 
 import pikepdf
 
-from app.pipeline.orchestrator import _move_xml, _snapshot, _tagmap_file, _validate, _visual_fidelity
+from app.pipeline.orchestrator import _bookmarks, _move_xml, _snapshot, _tagmap_file, _validate, _visual_fidelity
 from app.storage import JobStore
 from app.tagging.editor import apply_edits
 from app.validation.audit import audit_pdf
@@ -57,6 +57,9 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
     rep = await verify_output(dst, opts)
     if not rep.integrity_passed:
         raise IntegrityError("reviewed", rep.errors)
+    # Edits can change the headings: bookmarks the engine made follow them, and a file with none gets them. A
+    # document's own working bookmarks are never touched, and a file checked without edits stays as it is
+    bookmarks = (await _bookmarks(dst, rep.tagmap))[0] if ops else None
 
     progress("validating", 70)
     vera = await asyncio.to_thread(_validate, dst, work, "after", stem)
@@ -73,7 +76,7 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
         "reports": {
             "verapdf_before": None,
             "verapdf_after": {"primary": _move_xml(vera, out, f"{stem}_verapdf_after")},
-            "comparison": {"before": None, "after": snapshot, "visual_fidelity": fidelity},
+            "comparison": {"before": None, "after": snapshot, "visual_fidelity": fidelity, "bookmarks": bookmarks},
             "remediation_summary": (f"Applied {len(log)} tag edit(s)." if ops else
                                     "Checked a corrected file." if reference else "Re-reviewed without changes.")
             + (" AI review: flagged items and a sample." if review == "sampled" else

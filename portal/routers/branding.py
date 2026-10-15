@@ -9,7 +9,8 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from portal import audit, settings_store
+from portal import audit, outbox, settings_store
+from portal.security import botcheck
 from portal.config import get_portal_settings
 from portal.db import get_db
 from portal.deps import Principal, require_super_admin
@@ -33,6 +34,7 @@ class BrandingOut(BaseModel):
     accent_color: str | None
     support_url: str | None
     contact_email: str | None
+    bot_check_site_key: str | None = None  # Cloudflare Turnstile's site key, when the sign-in bot check is on
 
 
 def branding_out(rs: settings_store.RuntimeSettings) -> BrandingOut:
@@ -40,7 +42,8 @@ def branding_out(rs: settings_store.RuntimeSettings) -> BrandingOut:
         service_name=rs.service_name, organization_name=rs.organization_name,
         logo_url=f"/api/v1/branding/logo?v={rs.logo_version}" if rs.logo_content_type else None,
         logo_alt=rs.logo_alt, accent_color=rs.accent_color, support_url=rs.support_url,
-        contact_email=rs.contact_email)
+        contact_email=rs.contact_email,
+        bot_check_site_key=get_portal_settings().turnstile_site_key or None if botcheck.enabled() else None)
 
 
 @router.get("/branding", response_model=BrandingOut)
@@ -139,10 +142,12 @@ def mail_test(body: MailTestIn, request: Request, p: Principal = Depends(require
     rs = settings_store.load(db)
     backend = get_portal_settings().mail_backend
     error = None
+    mail = test_mail(to, rs.service_name)
     try:
-        get_mailer().deliver(test_mail(to, rs.service_name), from_name=rs.mail_from_name, attempts=1)
+        get_mailer().deliver(mail, from_name=rs.mail_from_name, attempts=1)
     except MailError as e:
         error = str(e)
+    outbox.record(db, mail, "test", error=error)
     audit.record(db, request, "mail.test_sent", actor=p.user, target_type="settings",
                  outcome="success" if error is None else "failure",
                  details={"to": to, "backend": backend, **({"error": error[:300]} if error else {})})

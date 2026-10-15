@@ -163,6 +163,33 @@ def test_daily_cap_holds_jobs_back_without_failing_them(setup):
     assert second.status == "submitted"
 
 
+def test_at_once_limit_holds_documents_until_a_place_is_free(setup):
+    s = setup
+    _add_service(s["db"], max_at_once=1)
+    _enable_everywhere(s, pages=100)
+    topup(s, s["a"].id, 100)
+    user = s["c"]["user"]
+    ids = [x["job"]["id"] for x in _upload_to(user, EXTRA, ("a.pdf", pdf_bytes(1)), ("b.pdf", pdf_bytes(1))).json()]
+    other = upload(user, ("c.pdf", pdf_bytes(1))).json()[0]["job"]["id"]  # the standard service has no such limit
+    worker.submit_queued(s["db"])
+    jobs = {j.id: j for j in s["db"].scalars(select(Job))}
+    first, second = jobs[uuid.UUID(ids[0])], jobs[uuid.UUID(ids[1])]
+    assert first.status == "submitted" and jobs[uuid.UUID(other)].status == "submitted"
+    assert second.status == "queued" and second.progress == {"stage": "waiting_at_once", "services": [EXTRA]}
+    # Still held on the next pass, while the first is at the engine
+    worker.submit_queued(s["db"])
+    s["db"].refresh(second)
+    assert second.status == "queued"
+    # Raising the limit lets it go; clearing it removes the limit
+    r = s["c"]["super"].patch(f"{API}/admin/services/{EXTRA}", json={"max_at_once": 2})
+    assert r.status_code == 200 and r.json()["max_at_once"] == 2
+    worker.submit_queued(s["db"])
+    s["db"].refresh(second)
+    assert second.status == "submitted"
+    assert s["c"]["super"].patch(f"{API}/admin/services/{EXTRA}", json={"max_at_once": None}).json()["max_at_once"] is None
+    assert s["c"]["super"].patch(f"{API}/admin/services/{EXTRA}", json={"max_at_once": 0}).status_code == 422
+
+
 def test_global_pool_limits_every_group(setup):
     s = setup
     _add_service(s["db"])
@@ -273,3 +300,27 @@ def test_super_admin_sets_limits_for_group_members_and_it_is_audited(setup):
     s["c"]["admin_a"].put(f"{API}/groups/{a}/users/{uid}/services/standard", json={"cap_pages": 15})
     ev = sup.get(f"{API}/admin/audit", params={"action": "quota.cap_set"}).json()
     assert ev[0]["details"]["cap_pages"] == [12, 15] and not ev[0]["details"]["by_super_admin"]
+
+
+def test_the_scaling_query_counts_documents_workers_could_process(setup):
+    """The query KEDA runs (deploy/k8s/manifests/45-autoscale.yaml) against the portal's database."""
+    import re
+    from pathlib import Path
+
+    from sqlalchemy import text
+
+    manifest = (Path(__file__).parents[2] / "deploy/k8s/manifests/45-autoscale.yaml").read_text()
+    query = " ".join(re.search(r"query: >-\n((?:\s{10}.*\n?)+)", manifest).group(1).split())
+    s = setup
+    count = lambda: s["db"].execute(text(query)).scalar()  # noqa: E731
+    assert count() == 0
+    _add_service(s["db"], max_at_once=1)
+    _enable_everywhere(s, pages=100)
+    topup(s, s["a"].id, 100)
+    user = s["c"]["user"]
+    _upload_to(user, EXTRA, ("a.pdf", pdf_bytes(1)), ("b.pdf", pdf_bytes(1)))
+    upload(user, ("c.pdf", pdf_bytes(1)))
+    assert count() == 3  # all waiting
+    worker.submit_queued(s["db"])
+    s["db"].commit()
+    assert count() == 2  # two at the engine; the one held by its service's limit doesn't call for another worker

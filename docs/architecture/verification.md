@@ -7,7 +7,7 @@ Every output is checked after remediation, and after every edit, in three layers
 
 | Layer | Reads the PDF with | Checks | Effect |
 |---|---|---|---|
-| 1. Integrity | pikepdf + its own content-stream scan (no shared code with the writer) | Every tagged sequence belongs to exactly one tag; ParentTree and annotation links are consistent; no nested or unbalanced marked content; roles are standard; nesting | **Fails the job (or the save)** |
+| 1. Integrity | pikepdf + its own content-stream scan (no shared code with the writer; the tag map's list of artifact sections, in the same package, does reuse the writer's content walk, as it must number them the way the editor does) | Every tagged sequence belongs to exactly one tag; ParentTree and annotation links are consistent; no nested or unbalanced marked content; roles are standard; nesting | **Fails the job (or the save)** |
 | 2. Semantics | pdfplumber (independent of PyMuPDF) | Headings that look like body text, figures over nothing, file-name alt text, hidden text, table text, list numbering, link text, reading order against an independent ordering, language | Review list |
 | 3. AI review | Rendered images + a review model from a different family | Alt text accurate, partly wrong or wrong (with a suggested rewrite); checklists for charts, formulas, handwriting, sheet music | Review list |
 

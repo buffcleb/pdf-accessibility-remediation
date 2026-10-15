@@ -7,6 +7,7 @@ SELECT ... FOR UPDATE SKIP LOCKED.
 from __future__ import annotations
 
 import logging
+import re
 import signal
 import tempfile
 import time
@@ -16,7 +17,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from portal import (
-    audit, email_reports, helpdesk, notifications, outbox, queues, quota, report_views, services, settings_store,
+    audit, email_reports, helpdesk, notifications, outbox, queues, quota, removal, report_views, services,
+    settings_store,
 )
 from portal.config import get_portal_settings
 from portal.db import _sessionmaker
@@ -31,7 +33,6 @@ from portal.storage import get_storage, job_prefix, safe_name
 log = logging.getLogger("portal.worker")
 
 JOB_TIMEOUT = timedelta(hours=12)
-MAX_FINDINGS = 300
 
 FRIENDLY_ERRORS = {
     "ai_provider_unavailable": "The AI service wasn't available, so the document couldn't be processed. "
@@ -39,6 +40,9 @@ FRIENDLY_ERRORS = {
     "tag_integrity_failed": "The remediation engine couldn't produce a valid file for this document. "
                             "The problem has been logged for the support team.",
     "time_limit_exceeded": "This document took too long to process.",
+    "worker_lost": "The remediation engine stopped unexpectedly while processing this document (it may be too large "
+                   "for the engine's memory). Your pages have been given back.",
+    "stopped": "Processing of this document was stopped.",
     "engine_rejected": "The remediation engine refused this document.",
     "engine_lost": "The remediation engine lost track of this document. Try submitting it again.",
     "adobe_quota": "Adobe's usage limit for this service has been reached, so the document wasn't tagged. "
@@ -49,7 +53,8 @@ FRIENDLY_ERRORS = {
 }
 
 CONTENT_TYPES = {".pdf": "application/pdf", ".xml": "application/xml", ".md": "text/markdown; charset=utf-8",
-                 ".json": "application/json"}
+                 ".json": "application/json", ".zip": "application/zip",
+                 ".mxl": "application/vnd.recordare.musicxml", ".musicxml": "application/vnd.recordare.musicxml+xml"}
 
 
 def _now() -> datetime:
@@ -62,7 +67,7 @@ def improved_label(resp: dict) -> str:
     """Name of the Adobe route's improved copy, from what was done to it."""
     imp = (resp.get("reports") or {}).get("improvements") or {}
     alt = bool(imp.get("alt_text") or imp.get("decorative"))
-    fixes = bool(imp.get("glyph_lists") or imp.get("unicode_maps") or imp.get("glyph_widths"))
+    fixes = bool(imp.get("glyph_lists") or imp.get("unicode_maps") or imp.get("glyph_widths") or imp.get("bookmarks"))
     if alt and fixes:
         return "Adobe + AI alt text and fixes"
     return "Adobe + fixes" if fixes else "Adobe + AI alt text"
@@ -82,6 +87,9 @@ def summarize(resp: dict) -> dict:
     visual = comp.get("visual_fidelity") or {}
     return {
         "compliant_before": before.get("compliant"),
+        # The document came tagged and its tags were kept (the tag manager then shows which tags were its own)
+        "tags_kept": bool((comp.get("existing_tags") or {}).get("present")
+                          and not (comp.get("existing_tags") or {}).get("rebuilt_tree")),
         "compliant_after": after.get("compliant"),
         "failed_checks_before": before.get("failed_checks"),
         "failed_checks_after": after.get("failed_checks"),
@@ -101,13 +109,14 @@ def summarize(resp: dict) -> dict:
             "integrity_passed": (tv.get("integrity") or {}).get("passed"),
             "summary": tv.get("summary") or {},
             "ai": {k: (tv.get("ai") or {}).get(k) for k in ("mode", "reviewed", "results", "judges")},
-            "findings": findings[:MAX_FINDINGS],
+            "findings": findings[:get_portal_settings().review_findings_max],
             "findings_total": len(findings),
         },
         "summary": reports.get("remediation_summary") or "",
         "warnings": resp.get("warnings") or [],
         "metrics": {k: metrics.get(k) for k in ("pages_processed", "processing_time_seconds", "ai_calls",
-                                                 "ai_provider", "ai_model", "images_described", "ocr_pages", "route")},
+                                                 "ai_provider", "ai_model", "images_described", "ocr_pages", "route",
+                                                 "stage_seconds")},
         "adobe": {k: (metrics.get("adobe") or {}).get(k) for k in ("parts", "pages_sent", "seconds")}
         if metrics.get("adobe") else None,
         "improved_label": improved_label(resp) if files.get("enhanced") else None,
@@ -134,6 +143,8 @@ def _engine_files(resp: dict) -> list[tuple[str, str]]:
     pairs += [(f"tagmap_{label}", maps.get(label)) for label in ("original", "primary", "visual_fallback", "enhanced")]
     pairs += [("adobe_report", p) for p in reports.get("adobe_reports") or []]
     pairs.append(("report_pdf", reports.get("report_pdf")))
+    pairs.append(("music_files", reports.get("music_files")))
+    pairs.append(("music_score", reports.get("music_score")))
     return [(k, p) for k, p in pairs if isinstance(p, str) and p.startswith("/api/v1/jobs/")]
 
 
@@ -168,8 +179,15 @@ def _fail(db: Session, job: Job, code: str, detail: str | None) -> None:
     job.error_message = FRIENDLY_ERRORS.get(code, "Remediation failed for this document.")
     job.progress = None
     job.finished_at = _now()
+    # The engine's detail (paths, internal messages) goes to the super-admin note of the help request below and
+    # the log, not to the audit row, which group admins read
     audit.record(db, None, "job.failed", actor_email="system", target_type="job", target_id=job.id,
-                 group_id=job.group_id, outcome="failure", details={"code": code, "detail": (detail or "")[:1000]})
+                 group_id=job.group_id, outcome="failure", details={"code": code})
+    try:
+        with db.begin_nested():  # a problem opening the request must not undo the failure itself
+            helpdesk.open_for_failure(db, job, code, detail)
+    except Exception:  # noqa: BLE001
+        log.exception("job %s: no help request could be opened for the failure", job.id)
 
 
 def is_large(job: Job, threshold: int) -> bool:
@@ -190,6 +208,7 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
     - nobody gets more than `max_concurrent_jobs_per_user` at the engine at once, so one batch doesn't hold up
       everyone else;
     - paused services and daily page caps hold their documents back;
+    - a service's "at once" limit (a local AI's GPUs can only serve so many) holds the rest back;
     - large documents (more than `large_doc_pages`) are mixed in: one after every `large_doc_every` smaller ones,
       no more than `large_doc_at_once` running, and one after another when nothing smaller is waiting. A super
       admin's "process now" skips the large-document rules."""
@@ -202,6 +221,15 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
     caps = {s.key: s.daily_cap_pages for s in db.scalars(select(Service).where(Service.daily_cap_pages.is_not(None)))}
     pauses = queues.paused(db)
     sent_today = {k: quota.pages_sent_today(db, k) for k in caps}
+    # Services with a limit on documents at once, and how many each has at the engine now
+    at_once = {s.key: s.max_at_once for s in db.scalars(select(Service).where(Service.max_at_once.is_not(None)))}
+    using: dict[str, int] = {k: 0 for k in at_once}
+    if at_once:
+        for j in db.scalars(select(Job).where(active)):
+            for k in queues.job_services(j):
+                if k in using:
+                    using[k] += 1
+    full = lambda job: [k for k in queues.job_services(job) if k in at_once and using[k] >= at_once[k]]  # noqa: E731
 
     def note(job: Job, value: dict | None) -> None:
         if job.progress != value:
@@ -231,7 +259,7 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
             return False
         if any(k in sent_today and sent_today[k] + job.pages_charged > caps[k] for k in job.charged_services or []):
             return False
-        return True
+        return not full(job)
 
     picked: list[Job] = []
     small = [j for j in ready if not is_large(j, threshold) or j.expedited_at]
@@ -258,6 +286,9 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
         for k in job.charged_services or []:
             if k in sent_today:
                 sent_today[k] += job.pages_charged
+        for k in queues.job_services(job):
+            if k in using:
+                using[k] += 1
         running[job.user_id] = running.get(job.user_id, 0) + 1
         picked.append(job)
     # Say why what's left is waiting: large documents wait their turn; anything else just waits for a free slot
@@ -266,19 +297,36 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
         over = [k for k in job.charged_services or [] if k in caps and sent_today[k] + job.pages_charged > caps[k]]
         if over:
             note(job, {"stage": "waiting_daily_cap", "services": over})
+        elif full(job):
+            note(job, {"stage": "waiting_at_once", "services": full(job)})
         elif job in large:
             note(job, {"stage": "waiting_large", "every": rs.large_doc_every})
-        elif (job.progress or {}).get("stage") in ("paused", "waiting_daily_cap", "waiting_large"):
+        elif (job.progress or {}).get("stage") in ("paused", "waiting_daily_cap", "waiting_large", "waiting_at_once"):
             note(job, None)
     return picked
 
 
-def submit_queued(db: Session) -> int:
+_capacity: tuple[float, int | None] = (0.0, None)
+
+
+def in_flight_limit() -> int:
+    """How many jobs to keep at the engine: the configured number, or the engine's running capacity when that's
+    more (asked every half minute, as workers come and go with the queue)."""
+    global _capacity
     s = get_portal_settings()
-    slots = s.engine_max_in_flight - _engine_in_flight(db)
+    now = time.monotonic()
+    if now - _capacity[0] >= s.engine_capacity_cache_seconds:
+        ask = getattr(get_engine_client(), "capacity", None)
+        _capacity = (now, ask() if ask else None)
+    return min(s.engine_in_flight_ceiling, max(s.engine_max_in_flight, _capacity[1] or 0))
+
+
+def submit_queued(db: Session) -> int:
+    slots = in_flight_limit() - _engine_in_flight(db)
     if slots <= 0:
         return 0
-    jobs = _pick_queued(db, slots, settings_store.load(db))
+    rs = settings_store.load(db)
+    jobs = _pick_queued(db, slots, rs)
     engine, storage, sent = get_engine_client(), get_storage(), 0
     for job in jobs:
         src = next((f for f in job.files if f.kind == "input"), None)
@@ -295,7 +343,8 @@ def submit_queued(db: Session) -> int:
                 tmp.seek(0)
                 job.engine_job_id = engine.submit(safe_name(job.filename), tmp, job.report_only, _ai_choice(db, job),
                                                   full_review=job.full_review, route=_route(db, job),
-                                                  branding=_branding(db, job), no_ai=job.no_ai)
+                                                  branding=_branding(db, job), no_ai=job.no_ai,
+                                                  validator=validator_flags(rs))
         except EngineUnavailable as e:
             job.submit_attempts += 1
             log.warning("engine unavailable, job %s stays queued: %s", job.id, e)
@@ -455,6 +504,11 @@ def _ai_choice(db: Session, job: Job) -> AIChoice | None:
     return AIChoice(job.ai_tier, model, judge, notation=s.allow_notation, ocr=s.allow_ocr_ai)
 
 
+def validator_flags(rs) -> dict:
+    """How the engine runs veraPDF for a job (the super admins' choice)."""
+    return {"validator": rs.verapdf_mode, "verapdf_ua2": rs.verapdf_ua2}
+
+
 def _branding(db: Session, job: Job) -> dict:
     """What the engine's PDF report shows: the service, the organization, the accent color and the AI level by
     name (never a model)."""
@@ -475,6 +529,29 @@ def _judge_for(db: Session, job: Job) -> str | None:
         or s.gateway_judge_model
 
 
+def _ai_use(db: Session, job: Job, m: dict) -> dict:
+    """What the AI did for a document, from the engine's metrics, for the AI usage report: tokens and cost for the
+    writing model and the review, failed calls, the models that served them, and how long the job took."""
+    if not job.ai_tier and not int(m.get("ai_calls") or 0) and not int(m.get("ai_failures") or 0):
+        # No AI was used (no AI level, and the engine's own default AI wasn't either)
+        return {"seconds": m.get("processing_time_seconds")} if m.get("processing_time_seconds") is not None else {}
+    tok = m.get("ai_tokens_used") or {}
+    rtok = m.get("verification_ai_tokens") or {}
+    reviewed = bool(rtok.get("prompt_tokens") or rtok.get("completion_tokens") or m.get("verification_ai_cost_usd"))
+    return {
+        "writer_usd": round(float(m.get("ai_cost_usd") or 0), 6),
+        "review_usd": round(float(m.get("verification_ai_cost_usd") or 0), 6),
+        "prompt_tokens": int(tok.get("prompt_tokens") or 0),
+        "completion_tokens": int(tok.get("completion_tokens") or 0),
+        "review_prompt_tokens": int(rtok.get("prompt_tokens") or 0),
+        "review_completion_tokens": int(rtok.get("completion_tokens") or 0),
+        "ai_failures": int(m.get("ai_failures") or 0),
+        "writer_model": m.get("ai_model") or job.ai_model,
+        "review_model": (_judge_for(db, job) if job.ai_tier else None) if reviewed else None,
+        "seconds": m.get("processing_time_seconds"),
+    }
+
+
 def _collect(db: Session, job: Job, resp: dict) -> None:
     engine, storage = get_engine_client(), get_storage()
     prefix = job_prefix(job.group_id, job.user_id, job.id)
@@ -487,7 +564,8 @@ def _collect(db: Session, job: Job, resp: dict) -> None:
     job.result_summary = summarize(resp)
     m = resp.get("metrics") or {}
     job.cost = {"ai_usd": round(float(m.get("ai_cost_usd") or 0) + float(m.get("verification_ai_cost_usd") or 0), 6),
-                "ai_calls": m.get("ai_calls") or 0, "ai_tier": job.ai_tier}
+                "ai_calls": m.get("ai_calls") or 0, "ai_tier": job.ai_tier, **_ai_use(db, job, m),
+                **({"classifier_usd": job.cost["classifier_usd"]} if (job.cost or {}).get("classifier_usd") else {})}
     if m.get("adobe"):
         a = m["adobe"]
         job.cost["adobe"] = {k: a.get(k) for k in ("pages_sent", "parts", "requests", "retries", "seconds")}
@@ -538,7 +616,7 @@ def version_summary(resp: dict, label: str) -> dict:
         "compliant": snap.get("compliant"),
         "failed_checks": snap.get("failed_checks"),
         "failed_rules": snap.get("failed_rules"),
-        "findings": findings[:MAX_FINDINGS],
+        "findings": findings[:get_portal_settings().review_findings_max],
         "findings_total": len(findings),
         "review": {"integrity_passed": (tv.get("integrity") or {}).get("passed"), "summary": tv.get("summary") or {}},
     }
@@ -587,9 +665,43 @@ def _engine_in_flight(db: Session) -> int:
     return (jobs or 0) + (versions or 0) + (reviews or 0)
 
 
+UNDO_HOURS = 24  # how long the file before a save into a reviewed version is kept (portal/routers/versions.py)
+
+
+def _take_place(db: Session, v: DocumentVersion) -> None:
+    """A version saved into another: once ready it takes that one's place, and the one before goes out of sight,
+    kept a day so the save can be undone. If it failed, the one before simply stays, and this one says so."""
+    if v.replaces_id is None:
+        return
+    before = db.get(DocumentVersion, v.replaces_id)
+    if v.status == "ready":
+        if before is not None and before.superseded_at is None:
+            before.superseded_at = _now()
+    elif not (v.label or "").endswith("(not saved)"):
+        v.label = f"{v.label} (not saved)"[:100]
+
+
+def purge_superseded(db: Session) -> int:
+    """Remove versions a save replaced more than a day ago, with their files. Returns how many."""
+    old = db.scalars(select(DocumentVersion).where(DocumentVersion.superseded_at.is_not(None),
+                                                   DocumentVersion.superseded_at < _now() - timedelta(hours=UNDO_HOURS))
+                     .with_for_update(skip_locked=True).limit(500)).all()
+    for v in old:
+        job = v.job
+        get_storage().delete_prefix(job_prefix(job.group_id, job.user_id, job.id) + f"versions/{v.number}/")
+        for fid in (v.pdf_file_id, v.tagmap_file_id, v.verapdf_file_id):
+            f = db.get(JobFile, fid) if fid else None
+            if f is not None:
+                db.delete(f)
+        db.delete(v)
+    db.commit()
+    return len(old)
+
+
 def _fail_version(db: Session, v: DocumentVersion, code: str, detail: str | None) -> None:
     log.warning("version %s of job %s failed: %s %s", v.number, v.job_id, code, detail)
     v.status = "failed"
+    _take_place(db, v)
     v.error_code = code
     # The editor's own refusals are written for people; anything else gets a generic message.
     v.error_message = detail if code == "edit_rejected" and detail else VERSION_ERRORS.get(
@@ -598,12 +710,11 @@ def _fail_version(db: Session, v: DocumentVersion, code: str, detail: str | None
     if v.review_status in ("queued", "running"):
         v.review_status, v.review_error = "failed", "The version wasn't saved, so it wasn't reviewed."
     audit.record(db, None, "version.failed", actor_email="system", target_type="job", target_id=v.job_id,
-                 group_id=v.job.group_id, outcome="failure", details={"version": v.number, "code": code,
-                                                                       "detail": (detail or "")[:1000]})
+                 group_id=v.job.group_id, outcome="failure", details={"version": v.number, "code": code})
 
 
 def submit_versions(db: Session) -> int:
-    slots = get_portal_settings().engine_max_in_flight - _engine_in_flight(db)
+    slots = in_flight_limit() - _engine_in_flight(db)
     if slots <= 0 or queues.is_paused(db, queues.EDITS):
         return 0
     versions = db.scalars(select(DocumentVersion).where(DocumentVersion.status == "queued")
@@ -628,7 +739,8 @@ def submit_versions(db: Session) -> int:
                 v.engine_job_id = get_engine_client().submit_edit(safe_name(src.name), tmp, v.edits or [],
                                                                   review=v.review or "none",
                                                                   judge=_judge_for(db, v.job),
-                                                                  reference=ref if v.source_file_id else None)
+                                                                  reference=ref if v.source_file_id else None,
+                                                                  validator=validator_flags(settings_store.load(db)))
         except EngineUnavailable as e:
             log.warning("engine unavailable, version %s stays queued: %s", v.id, e)
             db.commit()
@@ -690,6 +802,11 @@ def _collect_version(db: Session, v: DocumentVersion, resp: dict) -> None:
     stem = job.filename.rsplit(".", 1)[0]
     reports = resp.get("reports") or {}
     pdf_name = f"{stem}_corrected_{v.number}.pdf" if v.kind == "corrected" else f"{stem}_human_reviewed_{v.number}.pdf"
+    # A version saved into another keeps that one's name, so its file keeps its file name too
+    before = db.get(DocumentVersion, v.replaces_id) if v.replaces_id else None
+    before_pdf = db.get(JobFile, before.pdf_file_id) if before is not None and before.pdf_file_id else None
+    if before_pdf is not None:
+        pdf_name = before_pdf.name
     wanted = [
         ("reviewed_pdf", (resp.get("files") or {}).get("remediated_primary"), pdf_name),
         ("reviewed_tagmap", (reports.get("tag_maps") or {}).get("primary"), f"{stem}_tagmap_v{v.number}.json"),
@@ -707,6 +824,7 @@ def _collect_version(db: Session, v: DocumentVersion, resp: dict) -> None:
     v.summary = version_summary(resp, "reviewed")
     v.status = "ready" if v.pdf_file_id else "failed"
     v.finished_at = _now()
+    _take_place(db, v)
     if v.review_status == "running" and v.review_engine_job_id == v.engine_job_id:
         v.review_status = "done" if v.status == "ready" else "failed"
         v.reviewed_at = _now()
@@ -722,7 +840,7 @@ REVIEW_FAILED = "The AI review couldn't be completed. The version and its earlie
 
 def submit_reviews(db: Session) -> int:
     """Send queued reviews of saved versions to the engine: no edits, sampled AI review."""
-    slots = get_portal_settings().engine_max_in_flight - _engine_in_flight(db)
+    slots = in_flight_limit() - _engine_in_flight(db)
     if slots <= 0 or queues.is_paused(db, queues.REVIEWS):
         return 0
     pauses = queues.paused(db)
@@ -747,7 +865,9 @@ def submit_reviews(db: Session) -> int:
                 tmp.seek(0)
                 v.review_engine_job_id = get_engine_client().submit_edit(safe_name(src.name), tmp, [],
                                                                          review=v.review or "sampled",
-                                                                         judge=_judge_for(db, v.job))
+                                                                         judge=_judge_for(db, v.job),
+                                                                         validator=validator_flags(
+                                                                             settings_store.load(db)))
         except EngineUnavailable as e:
             log.warning("engine unavailable, review of version %s stays queued: %s", v.id, e)
             db.commit()
@@ -818,25 +938,27 @@ def _notify(db: Session, job: Job) -> None:
 
 
 def sweep(db: Session) -> dict:
-    """Delete files past the retention period, and records past the records purge cycle."""
+    """Delete files past the retention period or marked done (once the hold is over), and records past the records
+    purge cycle."""
     runtime = settings_store.load(db)
     now = _now()
-    storage = get_storage()
     file_cutoff = now - timedelta(days=runtime.file_retention_days)
     expired = db.scalars(select(Job).where(Job.files_deleted_at.is_(None), Job.created_at < file_cutoff,
                                            Job.status.not_in(ACTIVE_JOB_STATUSES))
                          .with_for_update(skip_locked=True).limit(500)).all()
-    objects = 0
-    for job in expired:
-        objects += storage.delete_prefix(job_prefix(job.group_id, job.user_id, job.id))
-        job.files_deleted_at = now
-    help_requests, help_objects = helpdesk.expire_with_documents(db, [j.id for j in expired])
-    objects += help_objects
+    # Documents people marked done, once the hold is over
+    early = [j for j in removal.due(db, runtime.early_removal_hold_hours, now) if j not in expired]
+    objects, help_requests = removal.remove_files(db, list(expired) + early, now)
+    for job in early:
+        audit.record(db, None, "job.files_removed", actor_email="system", target_type="job", target_id=job.id,
+                     group_id=job.group_id, details={"filename": job.filename, "reason": "marked done",
+                                                     "requested_by": job.removal_requested_by})
     db.commit()
 
     record_cutoff = now - timedelta(days=runtime.record_retention_days)
     counts = {
         "files_jobs": len(expired),
+        "files_jobs_marked_done": len(early),
         "files_objects": objects,
         "help_requests": help_requests,
         "audit_events": db.execute(delete(AuditEvent).where(AuditEvent.created_at < record_cutoff)).rowcount,
@@ -894,6 +1016,7 @@ def run_forever() -> None:
                 if time.monotonic() - last_sweep > s.worker_sweep_minutes * 60:
                     counts = sweep(db)
                     counts.update(helpdesk.remind_and_close(db))
+                    counts["versions_replaced"] = purge_superseded(db)
                     last_sweep = time.monotonic()
                     if any(counts.values()):
                         log.info("purge: %s", counts)

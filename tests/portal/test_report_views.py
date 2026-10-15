@@ -90,6 +90,33 @@ def test_a_view_is_emailed_each_period_with_its_filters_and_a_csv(data):
     assert email_reports.send_due(db, s["due"]) >= 1
 
 
+def test_the_csv_follows_what_the_mail_service_can_carry(data, monkeypatch):
+    """Cloudflare's API takes attachments up to its message size; a service without attachments gets a note."""
+    from portal import mail as mailmod
+    from portal.config import get_portal_settings
+
+    s, db, ids = data, data["db"], data["ids"]
+    ps = get_portal_settings()
+
+    def send(backend, name):
+        r = s["c"]["super"].post(V, json={"name": name, "report": "documents", "group_id": str(s["a"].id),
+                                          "recipients": [ids["root@admin.test"]], "attach_csv": True})
+        assert r.status_code == 201, r.text
+        _backdate(db)
+        monkeypatch.setattr(ps, "mail_backend", backend)  # decides what the email is built with
+        report_views.send_due(db, s["due"])
+        monkeypatch.setattr(ps, "mail_backend", "memory")  # ...and nothing is really sent
+        return next(m for m in _sent(db) if m.subject.startswith(name))
+
+    m = send("cloudflare", "Fits")
+    assert len(m.attachments) == 1 and "too big" not in m.text and "can't send" not in m.text
+    monkeypatch.setattr(mailmod, "CLOUDFLARE_ATTACHMENT_BYTES", 10)
+    m = send("cloudflare", "Too big")
+    assert m.attachments == [] and "too big to attach" in m.text
+    m = send("plunk", "No attachments")
+    assert m.attachments == [] and "can't send attachments" in m.text
+
+
 def test_access_is_checked_when_it_is_sent(data):
     s, db, ids = data, data["db"], data["ids"]
     s["c"]["super"].post(V, json={"name": "A docs", "report": "documents", "group_id": str(s["a"].id),

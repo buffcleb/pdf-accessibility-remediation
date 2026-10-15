@@ -118,3 +118,20 @@ def test_adobe_improved_copy_fixes_fonts_without_ai(tmp_path, verapdf_available,
     assert _has_cidset(store.output_dir / "cid_adobe_tagged.pdf")
     assert "enhanced" not in (reps["tag_verification"] or {}) or \
         reps["tag_verification"]["enhanced"]["ai"].get("mode") in (None, "off")
+
+
+@needs_font
+def test_inserted_font_descriptor_is_named_like_the_font(tmp_path):
+    """FontDescriptor /FontName must equal the CIDFont's /BaseFont (PDF spec; the Arlington checker tests it)."""
+    src = _cid_doc(tmp_path / "cid.pdf")
+    # What PyMuPDF writes with DejaVu Sans (the engine image's font): the descriptor named by the full name
+    with pikepdf.open(src, allow_overwriting_input=True) as pdf:
+        for o in pdf.objects:
+            if isinstance(o, pikepdf.Dictionary) and o.get("/Subtype") == pikepdf.Name.CIDFontType2:
+                o.FontDescriptor.FontName = pikepdf.Name("/Full Font Name Book")
+        pdf.save(src)
+    assert fix_inserted_cid_fonts(str(src), fitz.Font(fontfile=FONT).name) >= 1
+    with pikepdf.open(src) as pdf:
+        fonts = [o for o in pdf.objects if isinstance(o, pikepdf.Dictionary)
+                 and o.get("/Subtype") == pikepdf.Name.CIDFontType2]
+        assert fonts and all(o.FontDescriptor.FontName == o.BaseFont for o in fonts)

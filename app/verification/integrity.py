@@ -70,6 +70,12 @@ def _is_elem(o) -> bool:
     return isinstance(o, Dictionary) and "/S" in o and o.get("/Type") not in (Name.MCR, Name.OBJR)
 
 
+def _mcid(item) -> int | None:
+    """The marked-content id a BDC's properties or a tree's reference names; None when it isn't an integer."""
+    value = item.get("/MCID") if isinstance(item, Dictionary) else item
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class IntegrityChecker:
     def __init__(self, pdf: pikepdf.Pdf):
         self.pdf = pdf
@@ -103,9 +109,16 @@ class IntegrityChecker:
     # ------------------------------------------------------------------ content streams
     @staticmethod
     def _resources(node):
-        while node is not None:
+        # Each node once: a /Parent chain that loops would be walked for ever (this layer shares no code with
+        # the tagger, so the same guard is written here)
+        seen = set()
+        while isinstance(node, Dictionary):
             if "/Resources" in node:
                 return node.Resources
+            if node.is_indirect:
+                if node.objgen in seen:
+                    break
+                seen.add(node.objgen)
             node = node.get("/Parent")
         return Dictionary()
 
@@ -132,7 +145,11 @@ class IntegrityChecker:
                 mcid = None
                 args = list(ins.operands)
                 if op == "BDC" and len(args) == 2 and isinstance(args[1], Dictionary) and "/MCID" in args[1]:
-                    mcid = int(args[1].MCID)
+                    mcid = _mcid(args[1])
+                    if mcid is None:
+                        self.err("marked-content id is not an integer", page=page_no + 1, detail=str(args[1].MCID))
+                        stack.append(None)
+                        continue
                     if any(m is not None for m in stack):
                         self.err("marked-content sequence with an MCID nested inside another MCID sequence",
                                  page=page_no + 1, detail=f"MCID {mcid}")
@@ -213,10 +230,14 @@ class IntegrityChecker:
                     e.content_refs += 1
                 elif isinstance(item, Dictionary) and "/MCID" in item:
                     owner = _og(item.get("/Stm")) or _og(item.get("/Pg")) or pg_og
+                    mcid = _mcid(item)
                     if owner is None:
                         self.err("marked-content reference without a page or stream", role=raw, element=e.index)
                         continue
-                    self.index.refs.setdefault((owner, int(item.MCID)), []).append(e.index)
+                    if mcid is None:
+                        self.err("marked-content reference whose id is not an integer", role=raw, element=e.index)
+                        continue
+                    self.index.refs.setdefault((owner, mcid), []).append(e.index)
                     e.content_refs += 1
                 elif isinstance(item, Dictionary) and "/Obj" in item:
                     a = _og(item.Obj)

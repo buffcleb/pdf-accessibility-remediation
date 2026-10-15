@@ -42,6 +42,11 @@ _TEX = {
     "hatwide": "ˆ", "hatwider": "ˆ", "hatwidest": "ˆ", "tildewide": "˜", "tildewider": "˜", "tildewidest": "˜",
     "slash": "/", "backslash": "\\", "dotlessi": "ı", "dotlessj": "ȷ", "ff": "ﬀ", "fi": "ﬁ", "fl": "ﬂ",
     "ffi": "ﬃ", "ffl": "ﬄ", "visiblespace": "␣", "emptyset": "∅", "prime": "′", "infinity": "∞",
+    # More of TeX's symbol fonts (cmsy, msam, msbm, cmex, wasy)
+    "circlecopyrt": "◯", "mapsto": "↦", "square": "□", "squaresolid": "■", "planckover2pi": "ℏ", "planckover2pi1": "ℏ",
+    "rightanglenw": "⌜", "rightanglene": "⌝", "rightanglesw": "⌞", "rightanglese": "⌟",
+    "archleftdown": "↶", "archrightdown": "↷", "downslope": "⟍", "upslope": "⟋", "varhexagon": "⬡",
+    "bracehtipdownleft": "╮", "bracehtipdownright": "╭", "bracehtipupleft": "╯", "bracehtipupright": "╰",
 }
 
 
@@ -183,3 +188,71 @@ def add_missing_tounicode(src: Path, dst: Path) -> list[str]:
             pdf.save(dst)
     log.info("added ToUnicode maps to %d font(s)", len(fixed))
     return fixed
+
+
+# --------------------------------------------------------------------------- characters that are pictures
+_PRIVATE_USE = 0xE000
+
+
+def map_picture_glyphs(pdf: pikepdf.Pdf, used: dict[tuple[int, int], set[int]],
+                       body: dict[tuple[int, int], set[int]] | None = None,
+                       counts: dict[tuple[int, int], list[int]] | None = None
+                       ) -> tuple[dict[str, int], set[tuple[int, int]]]:
+    """Give private-use Unicode values to characters that have no meaning as text and are part of a figure or
+    decoration: the note heads of a music font, the line and arc pieces of a drawing font. `used`: font (object
+    number, generation) -> the character codes shown in figures and artifacts (from the content marker).
+
+    A font needs a Unicode value for every character it shows (PDF/UA 7.21.7). For these there is none to find, and
+    nothing is lost by saying so: the figure's alt text carries what they mean, and decoration isn't read. Only a code
+    whose glyph name is known and means nothing is mapped; codes the font's existing map or a glyph name account
+    for, and codes with no name to go by, are left alone.
+
+    `body` and `counts` (font -> codes shown in ordinary text; font -> [characters in pictures, in text]): a font
+    that shows at least nine characters in pictures for every one in text is a font of pictures, and the few it
+    shows in text (a double-sharp sign in a sentence about it) are mapped too. No reader loses by it: making the
+    page a picture with a text layer, the alternative, can't say what the symbol is either. Any other font's
+    unreadable characters in text are left unmapped, so the text is found and read another way.
+
+    Returns ({font name: codes mapped}, the fonts some of whose mapped codes are shown in text)."""
+    body, counts = body or {}, counts or {}
+    stray: set[tuple[int, int]] = set()
+    done: dict[str, int] = {}
+    for objgen, codes in used.items():
+        in_pictures, in_text = counts.get(objgen, [1, 0])
+        in_body = body.get(objgen, set()) if in_pictures >= 9 * in_text else set()
+        codes = codes | in_body
+        try:
+            font = pdf.get_object(objgen)
+        except (ValueError, pikepdf.PdfError):
+            continue
+        if not isinstance(font, Dictionary) or font.get("/Subtype") not in (Name.Type1, Name.MMType1, Name.Type3,
+                                                                              Name.TrueType):
+            continue
+        existing: dict[int, str] = {}
+        if "/ToUnicode" in font:
+            try:
+                existing = parse_tounicode(font.ToUnicode.read_bytes())
+            except (pikepdf.PdfError, AttributeError):
+                continue
+        names = _code_names(font)
+        need = set()
+        for code in codes:
+            if code in existing and existing[code].strip("\x00"):
+                continue
+            # Only a character known by a name that means nothing ("a113", "B4"): one with no name here is read
+            # through the font's own encoding, which this can't see, and may well be an ordinary letter
+            name = names.get(code)
+            if name is None or name == ".notdef" or glyph_to_unicode(name):
+                continue
+            need.add(code)
+        if not need:
+            continue
+        added = {code: chr(_PRIVATE_USE + code) for code in need}
+        # With a map of its own the font is read through that map alone: keep what glyph names give the others
+        named = {code: u for code, n in names.items() if code not in existing and (u := glyph_to_unicode(n))}
+        font.ToUnicode = pdf.make_stream(_cmap({**named, **existing, **added}))
+        name = str(font.get("/BaseFont", font.get("/Name", f"/unnamed font {objgen[0]}")))[1:]
+        done[name] = done.get(name, 0) + len(added)
+        if need & in_body:
+            stray.add(objgen)
+    return done, stray

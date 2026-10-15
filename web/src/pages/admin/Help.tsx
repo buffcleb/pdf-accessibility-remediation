@@ -159,7 +159,7 @@ export function HelpDetail() {
             <dt>Handled by</dt><dd>{r.assignee_email ?? "nobody yet"}</dd>
           </dl>
           <div className="actions">
-            {viewer && <Link className="btn secondary small" to={viewer}>Open in tag viewer</Link>}
+            {viewer && <Link className="btn secondary small" to={viewer}>Open in tag manager</Link>}
             {r.job_id && <Link className="btn secondary small" to={`/jobs/${r.job_id}`}
               state={{ back: location.pathname, backLabel: "the help request" }}>Open the document</Link>}
           </div>

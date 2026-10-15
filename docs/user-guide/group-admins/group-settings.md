@@ -37,6 +37,14 @@ Marks the processing options and AI levels that send documents to an outside pro
 upload form. It's off by default. Turn it on if people in your group should see where their documents go.
 Independently, super admins can show a notice when a particular option is picked.
 
+## Describe with AI
+
+In the tag manager's **Split the figure** window, **Describe with AI** writes the alt text for the part someone picked
+or boxed: one AI call at the document's AI level each time, recorded on the document's cost. Choose whether your
+group's people have it: **Follow the service default** (whatever the super admins set), **On for the group** or
+**Off for the group**. For one person, open their row under **People** and set **Describe with AI** to **Follow
+the group**, **On** or **Off**. The person's setting wins over the group's, and the group's over the service default.
+
 ## Managed by super admins
 
 The group's name, email domains, group admins and corrections to its pool are edited by super admins (on the same

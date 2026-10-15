@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import asynccontextmanager
+import re
+from contextlib import asynccontextmanager, closing
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import text
 
 from portal.config import get_portal_settings
@@ -19,6 +21,27 @@ from portal.security.tokens import check_config
 log = logging.getLogger(__name__)
 
 API_PREFIX = "/api/v1"
+
+# The routes that take files, and the setting that bounds what one request to each may carry (in MB)
+_UPLOAD_LIMITS = (
+    (re.compile(r"/jobs$"), lambda rs: rs.max_files_per_upload * rs.max_file_mb),
+    (re.compile(r"/jobs/[^/]+/help$"), lambda rs: rs.help_max_request_mb),
+    (re.compile(r"/help/[^/]+/messages$"), lambda rs: rs.help_max_request_mb),
+    (re.compile(r"/help/[^/]+/corrected$"), lambda rs: rs.max_file_mb),
+)
+_BODY_SLACK = 1024 * 1024  # the multipart framing and the form fields around the files
+
+
+def upload_limit_bytes(path: str, rs) -> int | None:
+    """What a request to this path may carry, or None for a path that takes no files."""
+    if not path.startswith(API_PREFIX):
+        return None
+    rest = path[len(API_PREFIX):]
+    for pattern, limit_mb in _UPLOAD_LIMITS:
+        if pattern.search(rest):
+            return limit_mb(rs) * 1024 * 1024 + _BODY_SLACK
+    return None
+
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -61,6 +84,25 @@ def create_app() -> FastAPI:
             allow_headers=["Authorization", "Content-Type"],
             max_age=600,
         )
+
+    @app.middleware("http")
+    async def body_size(request: Request, call_next):
+        """A request whose declared size is past what its route's files may add up to is refused before any of
+        it is read: the routes' own file-size and file-count checks run only after Starlette has spooled every
+        part to disk, so an account could fill the pod's temporary space with bodies far larger than the limits."""
+        length = request.headers.get("content-length")
+        if request.method == "POST" and length and length.isdigit():
+            def limit():
+                from portal import settings_store
+                from portal.db import open_session
+                with closing(open_session()) as db:
+                    return upload_limit_bytes(request.url.path, settings_store.load(db))
+            cap = await run_in_threadpool(limit)
+            if cap is not None and int(length) > cap:
+                return JSONResponse(status_code=413, content={"detail": {
+                    "error": "request_too_large",
+                    "message": f"This request is larger than the files it may carry add up to ({cap // (1024 * 1024)} MB)."}})
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):

@@ -52,17 +52,27 @@ class UserServiceOut(BaseModel):
     remaining_pages: int | None  # None = unlimited
 
 
+class GroupEmailOut(BaseModel):
+    email: str
+    note: str | None
+    added_by: str | None
+    created_at: datetime
+    has_account: bool  # they've signed in (removing the address then doesn't remove the account)
+
+
 class GroupOut(BaseModel):
     id: uuid.UUID
     name: str
     status: str
     domains: list[str]
+    emails: list[GroupEmailOut] = []  # people allowed in by their address (super admins change them)
     local_only: bool
     require_approval: bool
     ai_mode: str  # choose | fixed
     ai_level: str | None  # fixed: the AI level everyone's documents use
     ai_kind: str | None  # fixed: its kind of document (None: General)
     show_external: bool  # show people which options send documents to an external provider
+    ai_describe: bool | None = None  # "Describe with AI" for its people; None follows the service default
     pending_members: int  # people waiting for approval
     help_active: int  # help requests from the group still being worked on
     # The standard service's terms (kept for screens that show one pool)
@@ -95,6 +105,7 @@ class UserOut(BaseModel):
     services: list[UserServiceOut]
     created_at: datetime
     last_login_at: datetime | None
+    ai_describe: bool | None = None  # "Describe with AI" set for this person; None follows their group
 
 
 class MeOut(UserOut):
@@ -104,6 +115,7 @@ class MeOut(UserOut):
     pending_approvals: int  # people waiting in the groups this person administers
     help_unread: int  # their own help requests with something new
     help_needs_us: int  # super admins: help requests waiting on a super admin
+    can_describe: bool = False  # "Describe with AI" in the tag manager, as the three levels work out
 
 
 def balance_of(gs: GroupService | None) -> GroupBalance:
@@ -167,11 +179,22 @@ def group_out(g: Group, services: list[Service] | None = None) -> GroupOut:
     std = g.service(svc.STANDARD)
     services = services if services is not None else _services_of(g)
     return GroupOut(id=g.id, name=g.name, status=g.status, domains=[d.domain for d in g.domains],
+                    emails=_emails_of(g),
                     local_only=g.local_only, require_approval=g.require_approval, ai_mode=g.ai_mode, ai_level=g.ai_level,
-                    ai_kind=g.ai_kind, show_external=g.show_external,
+                    ai_kind=g.ai_kind, show_external=g.show_external, ai_describe=g.ai_describe,
                     pending_members=_pending_in(g), help_active=_help_active_in(g), default_user_cap=std.default_user_cap if std else None,
                     over_quota_message=g.over_quota_message, balance=balance_of(std),
                     services=group_services_out(g, services), created_at=g.created_at)
+
+
+def _emails_of(g: Group) -> list[GroupEmailOut]:
+    if not g.emails:
+        return []
+    from sqlalchemy import select
+    db = object_session(g)
+    known = set(db.scalars(select(User.email).where(User.email.in_([e.email for e in g.emails])))) if db else set()
+    return [GroupEmailOut(email=e.email, note=e.note, added_by=e.added_by, created_at=e.created_at,
+                          has_account=e.email in known) for e in g.emails]
 
 
 def _pending_in(g: Group) -> int:
@@ -239,10 +262,11 @@ def user_out(u: User, services: list[Service] | None = None) -> UserOut:
         used_pages=std.used_pages if std else 0, reserved_pages=std.reserved_pages if std else 0,
         remaining_pages=svc.remaining(u, svc.STANDARD, std_service) if (u.group and std_service) else None,
         services=user_services_out(u, services),
-        created_at=u.created_at, last_login_at=u.last_login_at)
+        created_at=u.created_at, last_login_at=u.last_login_at, ai_describe=u.ai_describe)
 
 
 def me_out(db: Session, u: User) -> MeOut:
+    from portal import ai_describe
     base = user_out(u, svc.all_services(db)).model_dump()
     from portal.approval import pending_count
     groups = None if u.is_super_admin else list(u.admin_group_ids())
@@ -256,4 +280,5 @@ def me_out(db: Session, u: User) -> MeOut:
             HelpRequest.status.in_(("open", "in_progress")), HelpRequest.saved.is_(False))) if r.needs_staff)
     return MeOut(**base, is_super_admin=u.is_super_admin, admin_of=sorted(u.admin_group_ids(), key=str),
                  can_submit=u.approved, pending_approvals=pending_count(db, groups) if (u.is_super_admin or groups) else 0,
-                 help_unread=sum(1 for r in mine if r.unread_for_person), help_needs_us=needs_us)
+                 help_unread=sum(1 for r in mine if r.unread_for_person), help_needs_us=needs_us,
+                 can_describe=ai_describe.allowed(db, u))

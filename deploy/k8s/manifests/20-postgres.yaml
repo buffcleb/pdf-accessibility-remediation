@@ -8,10 +8,11 @@ data:
   10-databases.sh: |
     #!/bin/sh
     set -e
-    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" <<SQL
-    CREATE ROLE portal LOGIN PASSWORD '$PORTAL_DB_PASSWORD';
+    # The passwords go in as psql variables (:'name' quotes them), so a quote in one can't break or alter the SQL
+    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -v portal_pw="$PORTAL_DB_PASSWORD" -v litellm_pw="$LITELLM_DB_PASSWORD" <<'SQL'
+    CREATE ROLE portal LOGIN PASSWORD :'portal_pw';
     CREATE DATABASE portal OWNER portal;
-    CREATE ROLE litellm LOGIN PASSWORD '$LITELLM_DB_PASSWORD';
+    CREATE ROLE litellm LOGIN PASSWORD :'litellm_pw';
     CREATE DATABASE litellm OWNER litellm;
     SQL
 ---
@@ -38,25 +39,30 @@ spec:
     metadata:
       labels: { app: postgres }
     spec:
-      securityContext: { fsGroup: 70 }
+      # The image starts as root to make the data directory postgres's own (uid 70, mode 0700; the volume root is
+      # that directory) and then drops to postgres. Running it as 70 from the start would leave the mode fsGroup
+      # gives the volume, which postgres refuses, so root keeps the five capabilities that step needs and no other
+      securityContext: { fsGroup: 70, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          # Pinned to the digest of its 2026-10-13 build; moving is a deliberate change of this line (#220 did the rest)
+          image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
           env:
             - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
             - name: POSTGRES_PASSWORD
-              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: POSTGRES_ADMIN_PASSWORD } }
+              valueFrom: { secretKeyRef: { name: pdfrem-db-env, key: POSTGRES_ADMIN_PASSWORD } }
             - name: PORTAL_DB_PASSWORD
-              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
+              valueFrom: { secretKeyRef: { name: pdfrem-db-env, key: PORTAL_DB_PASSWORD } }
             - name: LITELLM_DB_PASSWORD
-              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: LITELLM_DB_PASSWORD } }
+              valueFrom: { secretKeyRef: { name: pdfrem-db-env, key: LITELLM_DB_PASSWORD } }
           ports: [{ containerPort: 5432 }]
           readinessProbe:
             exec: { command: ["pg_isready", "-U", "postgres"] }
             periodSeconds: 5
           resources:
             requests: { cpu: 100m, memory: 256Mi }
-            limits: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 1Gi }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL], add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID] } }
           volumeMounts:
             - { name: data, mountPath: /var/lib/postgresql/data }
             - { name: init, mountPath: /docker-entrypoint-initdb.d }

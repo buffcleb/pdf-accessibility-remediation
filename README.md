@@ -8,7 +8,7 @@ look, and shows people exactly what still needs a human eye.**
 [![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Target: PDF/UA-1](https://img.shields.io/badge/target-PDF%2FUA--1-2E7D32.svg)](https://www.iso.org/standard/64599.html)
 
-<!-- SCREENSHOT: docs/images/my-documents.png — My documents: the upload form, page allowances and documents list -->
+![My documents: pages left for each service, the Submit PDFs box with the AI level, and a list of five documents with their status and result](docs/images/my-documents.png)
 
 A self-hosted service with a web portal. People upload PDFs; the engine adds the structure assistive technology needs
 (headings, lists, tables, figures with alt text, reading order, language), checks the result with veraPDF and its own
@@ -38,13 +38,16 @@ models, and everything it writes is checked or flagged for review.
   document (*Math and science*, *Forms*…), an optional classifier that picks the kind, and **local-only** groups that
   never send anything outside.
 - **A complete portal:** emailed-code sign-in, groups and approval, page quotas per service with a ledger, a
-  side-by-side **tag viewer and editor** with versions, help requests, live reports with charts, scheduled email
+  side-by-side **tag manager and editor** with versions, help requests, live reports with charts, scheduled email
   summaries, queues, and an audit log. It aims at WCAG 2.2 AA itself.
 - **Optional Adobe route:** send documents to Adobe PDF Services instead, and get Adobe's file checked the same way,
   plus a copy with AI alt text.
 
-<!-- SCREENSHOT: docs/images/document-page.png — a document's page: the verdict, three tiles and the review list -->
-<!-- SCREENSHOT: docs/images/tag-viewer.png — the tag viewer: original and remediated side by side, with the editing panel -->
+![A document's page: Passes PDF/UA-1 with failed checks 111 to 0, the Fixed, To review and Still failing tiles, the Needs review list, and the downloads](docs/images/document-page.png)
+
+![The tag manager: the original and the remediated document side by side, the remediated one with its tags outlined and labeled on the page, and the editing panel for the selected heading](docs/images/tag-manager/overview.png)
+
+More in the [tag manager guide](docs/user-guide/people/tag-manager/README.md).
 
 ## How it works
 
@@ -119,7 +122,7 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```
 
 The portal's tests need a throwaway PostgreSQL; see [tests/README.md](tests/README.md). GitHub Actions runs both
-suites, plus the web app's type-check and build, on every pull request. Batch testing against folders of PDFs:
+suites, plus the web app's type-check, build and unit tests (`npm test` in `web/`), on every pull request. Batch testing against folders of PDFs:
 [harness/README.md](harness/README.md).
 
 ## License
@@ -129,3 +132,5 @@ its source to the people using it.
 
 It builds on, among others, PyMuPDF (AGPL-3.0), veraPDF (GPL-3.0+ or MPL-2.0), Tesseract (Apache-2.0), pikepdf
 (MPL-2.0), pdfplumber (MIT), WeasyPrint (BSD), LiteLLM (MIT) and pdf.js (Apache-2.0).
+The optional music reading service is [Audiveris](https://github.com/Audiveris/audiveris) (AGPL-3.0), run as a
+separate program.

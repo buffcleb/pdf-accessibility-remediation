@@ -3,7 +3,8 @@
 Start one with:
     docker run -d --rm --name portal-test-db -e POSTGRES_USER=portal -e POSTGRES_PASSWORD=test \
         -e POSTGRES_DB=portal -p 55432:5432 postgres:16-alpine
-or point PORTAL_TEST_DATABASE_URL at another empty database. Tests are skipped if none is reachable.
+or point PORTAL_TEST_DATABASE_URL at another empty database. Tests are skipped if none is reachable, unless
+PORTAL_TEST_DATABASE_REQUIRED is set (as in CI), when they fail.
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ from portal.security.ratelimit import RateLimiter, get_rate_limiter  # noqa: E40
 
 email_validator.TEST_ENVIRONMENT = True  # allow the reserved .test domain
 
-TABLES = "user_presence, report_sends, saved_reports, report_subscriptions, mail_outbox, queue_pauses, document_versions, quota_ledger, job_files, jobs, audit_events, sessions, otp_challenges, role_assignments, users, group_domains, groups, settings"
+TABLES = "user_presence, report_sends, saved_reports, report_subscriptions, mail_outbox, queue_pauses, document_versions, quota_ledger, job_files, jobs, audit_events, sessions, otp_challenges, role_assignments, users, group_emails, group_domains, groups, settings"
 
 
 @pytest.fixture(scope="session")
@@ -53,7 +54,10 @@ def engine():
     try:
         with eng.connect() as c:
             c.execute(text("select 1"))
-    except Exception:
+    except Exception as exc:
+        # Skipping suits a laptop with no database running. In CI it would turn "nothing was tested" into a pass
+        if os.environ.get("PORTAL_TEST_DATABASE_REQUIRED"):
+            pytest.fail(f"no test database at {TEST_DB}: {exc}", pytrace=False)
         pytest.skip(f"no test database at {TEST_DB}")
     with eng.begin() as c:
         c.execute(text("drop schema public cascade; create schema public"))

@@ -1,0 +1,134 @@
+# Who may talk to what, inside the cluster. Without these, every pod in every namespace could reach the queues, the
+# database, the file store, the validator, the AI gateway and the engine's API (none of which asks who is calling,
+# apart from Postgres and the gateway). Each policy below selects one service and lists the pods allowed in; a pod
+# selected by a policy with no matching rule is closed to everything else. Pods not named here (the web pod,
+# cloudflared) keep the cluster's default: open.
+#
+# Probes from the kubelet and traffic between the pods named here are the only flows these services need. The
+# ingress controller reaches only the web pod (60-web.yaml), or the portal API in the Worker front end
+# (81-api-origin-policy.yaml). Egress is not restricted.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: postgres } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+        - podSelector: { matchLabels: { app: litellm } }
+        - podSelector: { matchLabels: { app: portal-migrate } }
+        # KEDA reads the queue's length from the portal's database (45-autoscale.yaml)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: keda } }
+      ports: [{ port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: redis } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: engine-api } }
+        - podSelector: { matchLabels: { app: engine-worker } }
+        - podSelector: { matchLabels: { app: engine-adobe-worker } }
+        - podSelector: { matchLabels: { app: engine-beat } }
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+        - podSelector: { matchLabels: { app: music-reader } }
+        # KEDA reads the music queue's length (46-music-autoscale.yaml)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: keda } }
+      ports: [{ port: 6379 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seaweedfs
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: seaweedfs } }
+  policyTypes: [Ingress]
+  ingress:
+    # Only the S3 port, which checks a key; the master, filer and volume ports it also listens on check nothing
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+      ports: [{ port: 8333 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: verapdf
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: verapdf } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: engine-api } }
+        - podSelector: { matchLabels: { app: engine-worker } }
+        - podSelector: { matchLabels: { app: engine-adobe-worker } }
+      ports: [{ port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: litellm
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: litellm } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: engine-api } }
+        - podSelector: { matchLabels: { app: engine-worker } }
+        - podSelector: { matchLabels: { app: engine-adobe-worker } }
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+      ports: [{ port: 4000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: engine
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: engine-api } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+      ports: [{ port: 8000 }]
+---
+# The workers and the scheduler take their work from Redis and answer no one
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: engine-workers
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [engine-worker, engine-adobe-worker, engine-beat, portal-worker, music-reader] }
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: portal-api
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: portal-api } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: web } }
+        - podSelector: { matchLabels: { app: cloudflared } }
+      ports: [{ port: 8080 }]

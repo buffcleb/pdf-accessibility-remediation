@@ -1,17 +1,18 @@
 import { Fragment, useState, type FormEvent } from "react";
 import { Link, Navigate, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
-  get, patch, post, put, type AccessCheck, type Group, type GroupService, type Job, type LedgerEntry, type User,
+  get, patch, post, put, type AccessCheck, type Group, type GroupService, type LedgerEntry, type User,
 } from "../../api";
 import { useAuth } from "../../auth";
 import { AccessCheckForm, AccessCheckView, AttentionList, serviceOptions } from "../../components/attention";
+import { DocumentsList } from "../../components/DocumentsList";
 import { LiveReports } from "../../components/LiveReport";
+import { AdminRemoveBar, canAdminRemove } from "../../components/removal";
 import { LedgerTable } from "../../components/tables";
 import { ErrorNotice, Loading, Meter, Notice, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { SAVED, useConfirmLeave, useUnsavedChanges } from "../../components/unsaved";
-import { JobsTable } from "../Home";
 import { GroupHelp } from "./Help";
-import { Adjust, Domains, GroupAdmins, GroupSettings, LimitInput, Topup } from "./shared";
+import { Adjust, Domains, GroupAdmins, GroupEmails, GroupSettings, LimitInput, Topup } from "./shared";
 
 /** Super admins: every group, with what needs attention. Group admins: their groups (straight in if one). */
 export function GroupsList() {
@@ -339,6 +340,18 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
     }
   }
 
+  async function describe(u: User, value: string) {
+    setError(null);
+    const on = value === "on" ? true : value === "off" ? false : null;
+    try {
+      const updated = await patch<User>(`/groups/${group.id}/users/${u.id}`, { ai_describe: on });
+      users.setData((users.data ?? []).map((x) => (x.id === u.id ? updated : x)));
+      setSaved(`Describe with AI ${on === null ? "follows the group" : on ? "is on" : "is off"} for ${u.email}.`);
+    } catch (e) {
+      setError(e);
+    }
+  }
+
   async function status(u: User) {
     setError(null);
     try {
@@ -464,6 +477,18 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
                           )}
                           <h3>Can {u.email} use {svc.label}?</h3>
                           {why ? <AccessCheckView result={why} /> : whyError ? <ErrorNotice error={whyError} /> : <Loading />}
+                          <div className="person-section">
+                            <h3>Describe with AI</h3>
+                            <div className="field">
+                              <label htmlFor={`d-${u.id}`} className="small">In the tag manager, for {u.email}</label>
+                              <select id={`d-${u.id}`} value={u.ai_describe === true ? "on" : u.ai_describe === false ? "off" : "inherit"}
+                                onChange={(e) => void describe(u, e.target.value)}>
+                                <option value="inherit">Follow the group</option>
+                                <option value="on">On</option>
+                                <option value="off">Off</option>
+                              </select>
+                            </div>
+                          </div>
                           {u.id !== me?.id && (
                             <div className="person-section">
                               <h3>Account</h3>
@@ -529,13 +554,20 @@ function WaitingList({ people, onDecide }: { people: User[]; onDecide: (u: User,
 }
 
 function Documents({ group }: { group: Group }) {
-  const jobs = useLoad(() => get<Job[]>(`/groups/${group.id}/jobs?limit=200`), [group.id]);
+  const { me } = useAuth();
+  const isSuper = !!me?.is_super_admin;
   return (
     <section className="panel" aria-labelledby="gjobs-h">
       <h2 id="gjobs-h">Documents</h2>
-      <p className="muted small">Opening someone else's files is recorded in the audit log (Reports).</p>
-      {jobs.loading ? <Loading /> : <ErrorNotice error={jobs.error} />}
-      {jobs.data && <JobsTable jobs={jobs.data} showUser />}
+      <p className="muted small">Opening someone else's files is recorded in the audit log (Reports).
+        {isSuper && " Select documents to remove their files now or delete them."}</p>
+      <DocumentsList key={group.id} scope={{
+        endpoint: `/groups/${group.id}/documents`,
+        services: group.services.filter((s) => s.enabled || s.balance.used_pages > 0).map((s) => ({ key: s.key, label: s.label })),
+        backLabel: `${group.name}: documents`,
+        ...(isSuper ? { can: canAdminRemove,
+          bar: (selected: Set<string>, onDone: (message: string) => void) => <AdminRemoveBar selected={selected} onDone={onDone} /> } : {}),
+      }} />
     </section>
   );
 }
@@ -557,6 +589,16 @@ function GroupSettingsTab({ group, isSuper, onChange, reload }: { group: Group; 
     try {
       onChange(await patch<Group>(`/groups/${group.id}`, { show_external: on }));
       setMsg(on ? "External options are now marked on the upload form." : "External options are no longer marked.");
+    } catch (e) {
+      setError(e);
+    }
+  }
+  async function describe(value: string) {
+    setError(null);
+    const on = value === "on" ? true : value === "off" ? false : null;
+    try {
+      onChange(await patch<Group>(`/groups/${group.id}`, { ai_describe: on }));
+      setMsg(on === null ? "Describe with AI now follows the service default." : on ? "Describe with AI is on for the group." : "Describe with AI is off for the group.");
     } catch (e) {
       setError(e);
     }
@@ -597,6 +639,17 @@ function GroupSettingsTab({ group, isSuper, onChange, reload }: { group: Group; 
           <span><strong>Show which options are external.</strong> Mark the processing options and AI levels that send
             documents to an outside provider on the upload form.</span>
         </label>
+        <div className="field">
+          <label htmlFor="g-describe"><strong>Describe with AI</strong> in the tag manager</label>
+          <select id="g-describe" value={group.ai_describe === true ? "on" : group.ai_describe === false ? "off" : "inherit"}
+            onChange={(e) => void describe(e.target.value)}>
+            <option value="inherit">Follow the service default</option>
+            <option value="on">On for the group</option>
+            <option value="off">Off for the group</option>
+          </select>
+          <span className="hint">Alt text for an area of a figure, written by the AI: one AI call at the document's AI level each
+            time. Each person can also be set otherwise (People, then their row).</span>
+        </div>
         <ErrorNotice error={error} />
         <div role="status" className="small muted">{msg}</div>
       </section>
@@ -604,6 +657,7 @@ function GroupSettingsTab({ group, isSuper, onChange, reload }: { group: Group; 
         <>
           <GroupSettings group={group} onSaved={onChange} />
           <Domains group={group} onChange={onChange} />
+          <GroupEmails group={group} onChange={onChange} />
           <GroupAdmins group={group} />
           <Adjust base={`/admin/groups/${group.id}`} onDone={reload} services={group.services.map((x) => ({ key: x.key, label: x.label }))} />
         </>

@@ -2,6 +2,8 @@
 that may send text outside and a local model for local-only ones; General when it isn't sure or can't be used."""
 from __future__ import annotations
 
+import uuid
+
 from portal.engine import AIChoice, EngineUnavailable
 from tests.portal.test_ai_levels import _kind
 from tests.portal.test_ai_tiers import _tier
@@ -65,6 +67,13 @@ def test_the_classifier_picks_the_kind(setup):
     assert j["ai_kind_pick"] == {"kind": "math-and-science", "label": "Math and science", "confidence": 0.93,
                                  "used": True, "by": "jev"}
     assert "classifier" in j["external_services"]
+    # Its cost is still on the job once the results are in
+    from portal.models import Job
+    jid = uuid.UUID(job["id"])
+    s["engine"].complete(db.get(Job, jid).engine_job_id)
+    run_worker(db)
+    db.expire_all()
+    assert db.get(Job, jid).status == "completed" and db.get(Job, jid).cost["classifier_usd"] == 0.0001
 
 
 def test_general_when_unsure_or_unavailable(setup):

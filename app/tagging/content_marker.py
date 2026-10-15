@@ -15,6 +15,8 @@ how valid existing tags are retained.
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -31,6 +33,7 @@ Resolver = Callable[[str, BBox, int], tuple[str, str]]
 
 _PATH_CONSTRUCT = {"m", "l", "c", "v", "y", "h", "re"}
 _PATH_PAINT = {"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"}
+_PATH_FILL = {"f", "F", "f*", "B", "B*", "b", "b*"}
 _CLIP = {"W", "W*"}
 _TEXT_SHOW = {"Tj", "TJ", "'", '"'}
 _BARRIERS = {"q", "Q", "BT", "ET", "BDC", "BMC", "EMC", "BX", "EX"}
@@ -75,6 +78,14 @@ class StreamMarks:
     is_form: bool
     mcids: list[tuple[int, str]] = field(default_factory=list)  # (mcid, target_key) created by us
     existing: dict[int, BBox] = field(default_factory=dict)  # pre-existing MCID -> bbox of its content
+    existing_kinds: dict[int, set] = field(default_factory=dict)  # pre-existing MCID -> what it draws (text, image…)
+    # Pre-existing /Artifact sequences, numbered in stream order: their /Type and /Subtype, and how much of their text
+    # the layout calls body text (points of width), for releasing body text a producer hid as an artifact
+    artifacts: dict[int, dict] = field(default_factory=dict)
+    # Drawing order, for text hidden under shapes drawn over it: (z, pre-existing MCID or None, bbox, visible) for
+    # each piece of text, and (z, bbox) for each opaque fill (a filled shape, an image without transparency)
+    text_units: list[tuple] = field(default_factory=list)
+    fills: list[tuple] = field(default_factory=list)
 
 
 @dataclass
@@ -85,24 +96,42 @@ class MarkResult:
     existing_units: int = 0
     stripped_marks: int = 0
     forms_wrapped: int = 0
+    released_artifacts: int = 0  # existing artifact sequences unwrapped so their body text gets tagged
+    # Characters shown inside a figure or as decoration: font (object number, generation) -> character codes.
+    # The ones with no Unicode meaning (note heads, pieces of a drawn line) get private-use values afterwards
+    picture_glyphs: dict[tuple[int, int], set[int]] = field(default_factory=dict)
+    # The same for characters shown in ordinary text, and how many characters each font showed in either place: a
+    # font nearly all of whose characters are in figures is a font of pictures wherever else it turns up
+    body_glyphs: dict[tuple[int, int], set[int]] = field(default_factory=dict)
+    glyph_counts: dict[tuple[int, int], list[int]] = field(default_factory=dict)  # font -> [in pictures, in text]
+
+
+def mcid_of(item) -> int | None:
+    """The marked-content id an item names, or None. The item is a bare id, or a dictionary with /MCID (a BDC's
+    properties, a marked-content reference in a tree); an id that isn't an integer is the file's error and names
+    nothing. (The verification layer has its own copy: it shares no code with the writer.)"""
+    value = item.get("/MCID") if isinstance(item, Dictionary) else item
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def existing_mcids(instructions) -> set[int]:
     found = set()
     for ins in instructions:
         if isinstance(ins, ContentStreamInstruction) and str(ins.operator) == "BDC" and len(ins.operands) == 2:
-            props = ins.operands[1]
-            if isinstance(props, Dictionary) and "/MCID" in props:
-                found.add(int(props.MCID))
+            mcid = mcid_of(ins.operands[1])
+            if mcid is not None:
+                found.add(mcid)
     return found
 
 
 class _GState:
-    __slots__ = ("ctm", "clip")
+    __slots__ = ("ctm", "clip", "render", "opaque")
 
-    def __init__(self, ctm: Matrix, clip: BBox | None = None):
+    def __init__(self, ctm: Matrix, clip: BBox | None = None, render: int = 0, opaque: bool = True):
         self.ctm = ctm
         self.clip = clip  # page-space bounds of the clipping path, if one is set
+        self.render = render  # text render mode (3: invisible, as in an OCR text layer)
+        self.opaque = opaque  # fills cover what's under them (no transparency or soft mask in the ExtGState)
 
 
 def _clip_to(bbox: BBox | None, clip: BBox | None) -> BBox | None:
@@ -124,6 +153,7 @@ class ContentMarker:
         *,
         strip_existing: bool = False,
         recursable_forms: set[tuple[int, int]] | None = None,
+        release_artifacts: dict[tuple[int, int], set[int]] | None = None,
     ):
         self.pdf = pdf
         self.page = page
@@ -131,8 +161,14 @@ class ContentMarker:
         self.resolve = resolver
         self.strip_existing = strip_existing
         self.recursable_forms = recursable_forms or set()
+        # Existing /Artifact sequences to unwrap (owner objgen -> sequence numbers): their content is tagged afresh
+        self.release_artifacts = release_artifacts or {}
         self.result = MarkResult()
         self._width_cache: dict = {}
+        self._z = 0  # drawing order across the page and the forms drawn on it
+        # The forms being tagged from the inside right now: one that draws itself (or two that draw each other)
+        # would otherwise be entered again and again until Python's recursion limit
+        self._open_forms: set[tuple[int, int]] = set()
 
     # ------------------------------------------------------------------ public
     def run(self) -> MarkResult:
@@ -145,12 +181,7 @@ class ContentMarker:
 
     # ------------------------------------------------------------------ internals
     def _inherited_resources(self) -> pikepdf.Object:
-        node = self.page.obj
-        while node is not None:
-            if "/Resources" in node:
-                return node.Resources
-            node = node.get("/Parent")
-        return Dictionary()
+        return inherited_resources(self.page.obj)
 
     def _to_page_bbox(self, ctm: Matrix, pts: list[tuple[float, float]]) -> BBox | None:
         m = mat_mul(ctm, self.user_to_page)
@@ -173,22 +204,32 @@ class ContentMarker:
         word_space = 0.0
         two_byte = False
         widths: _Widths | None = None
+        fdict = None
         fonts = resources.get("/Font") or Dictionary()
         xobjects = resources.get("/XObject") or Dictionary()
 
-        # marked-content nesting of the ORIGINAL stream: entries are (is_tagging_mark, stripped, mcid)
-        mc_stack: list[tuple[bool, bool, int | None]] = []
+        # marked-content nesting of the ORIGINAL stream: entries are (is_tagging_mark, stripped, mcid, artifact seq)
+        mc_stack: list[tuple[bool, bool, int | None, int | None]] = []
+        art_seq = 0
+        release = self.release_artifacts.get(owner.objgen, set()) if owner.is_indirect else set()
         open_key: str | None = None
         path_buf: list = []
         path_pts: list[tuple[float, float]] = []
 
         def inside_existing() -> bool:
-            return any(is_tag and not stripped for is_tag, stripped, _ in mc_stack)
+            return any(is_tag and not stripped for is_tag, stripped, _, _ in mc_stack)
 
         def current_existing_mcid() -> int | None:
-            for is_tag, stripped, mcid in reversed(mc_stack):
+            for is_tag, stripped, mcid, _ in reversed(mc_stack):
                 if mcid is not None and not stripped:
                     return mcid
+            return None
+
+        def current_artifact() -> int | None:
+            """The existing artifact sequence this content is directly in (not inside a tagged MCID)."""
+            for is_tag, stripped, mcid, seq in reversed(mc_stack):
+                if is_tag and not stripped:
+                    return seq
             return None
 
         def close() -> None:
@@ -215,10 +256,34 @@ class ContentMarker:
                 self.result.tagged_units += 1
             open_key = key
 
-        def emit_unit(kind: str, bbox: BBox | None, ops: list, xref: int = 0) -> None:
+        def emit_unit(kind: str, bbox: BBox | None, ops: list, xref: int = 0, covers: bool = True,
+                      glyphs: bool = False) -> None:
+            if bbox is not None:
+                self._z += 1
+                if kind == "text":
+                    marks.text_units.append((self._z, current_existing_mcid() if inside_existing() else None, bbox,
+                                             gs.render not in (3, 7)))
+                elif gs.opaque and covers and (kind == "image" or (kind == "path" and str(ops[-1].operator) in _PATH_FILL)):
+                    shown = _clip_to(bbox, gs.clip)
+                    if shown is not None:
+                        marks.fills.append((self._z, shown))
             if inside_existing():
                 self.result.existing_units += 1
                 mcid = current_existing_mcid()
+                if mcid is not None:
+                    marks.existing_kinds.setdefault(mcid, set()).add(kind)
+                seq = current_artifact()
+                if seq is not None and bbox is not None:
+                    info = marks.artifacts[seq]
+                    prev = info["bbox"]
+                    info["bbox"] = bbox if prev is None else (min(prev[0], bbox[0]), min(prev[1], bbox[1]),
+                                                              max(prev[2], bbox[2]), max(prev[3], bbox[3]))
+                    info["kinds"].add(kind)
+                # Visible text only: an invisible text layer (render mode 3 or 7) rightly stays an artifact
+                if seq is not None and kind == "text" and bbox is not None and gs.render not in (3, 7):
+                    key, _ = self.resolve("text", bbox, 0)
+                    if not key.startswith("artifact:"):
+                        marks.artifacts[seq]["body"] += bbox[2] - bbox[0]
                 if mcid is not None and bbox is not None:
                     prev = marks.existing.get(mcid)
                     marks.existing[mcid] = bbox if prev is None else (
@@ -229,30 +294,30 @@ class ContentMarker:
                 key, tag = "artifact:Layout", "Artifact"
             else:
                 key, tag = self.resolve(kind, bbox, xref)
+            if glyphs and fdict is not None and fdict.is_indirect and not two_byte:
+                picture = tag == "Figure" or key.startswith("artifact:")
+                codes = (self.result.picture_glyphs if picture else self.result.body_glyphs).setdefault(fdict.objgen, set())
+                counts = self.result.glyph_counts.setdefault(fdict.objgen, [0, 0])
+                operand = ops[-1].operands[-1] if ops[-1].operands else None
+                for it in (operand if isinstance(operand, pikepdf.Array) else [operand]):
+                    if isinstance(it, pikepdf.String):
+                        codes.update(bytes(it))
+                        counts[0 if picture else 1] += len(bytes(it))
             open_for(key, tag)
             out.extend(ops)
 
-        def text_advance(operand) -> float:
-            """Advance (text space) of a show operand, from the font's glyph widths where it has them."""
-            total = 0.0
-            items = operand if isinstance(operand, pikepdf.Array) else [operand]
-            for it in items:
-                if isinstance(it, pikepdf.String):
-                    raw = bytes(it)
-                    codes = [int.from_bytes(raw[i:i + 2], "big") for i in range(0, len(raw) - 1, 2)] if two_byte \
-                        else list(raw)
-                    for c in codes:
-                        w = widths.get(c) if widths is not None else None
-                        total += (w / 1000.0 * font_size if w is not None else 0.5 * font_size) + char_space
-                        if not two_byte and c == 32:
-                            total += word_space
-                else:
-                    total -= _num(it) / 1000.0 * font_size
-            return total * h_scale
+        def glyph_advance(c: int) -> float:
+            """One glyph's advance before horizontal scaling: the font's width where it has one (half an em
+            otherwise), the character spacing, and the word spacing after a single-byte space."""
+            w = widths.get(c) if widths is not None else None
+            adv = (w / 1000.0 * font_size if w is not None else 0.5 * font_size) + char_space
+            if not two_byte and c == 32:
+                adv += word_space
+            return adv
 
         def glyph_runs(operand) -> list[tuple[int, int, float, float, bool]]:
             """Each glyph of a show operand: (item index, byte offset, start x, end x, is a space), in text
-            space from the current pen position."""
+            space from the current pen position; a position adjustment moves the pen between glyphs."""
             out_g = []
             x = 0.0
             items = operand if isinstance(operand, pikepdf.Array) else [operand]
@@ -262,14 +327,26 @@ class ContentMarker:
                     raw = bytes(it)
                     for i in range(0, len(raw) - step + 1, step):
                         c = int.from_bytes(raw[i:i + step], "big")
-                        w = widths.get(c) if widths is not None else None
-                        adv = ((w / 1000.0 * font_size if w is not None else 0.5 * font_size) + char_space
-                               + (word_space if not two_byte and c == 32 else 0.0)) * h_scale
+                        adv = glyph_advance(c) * h_scale
                         out_g.append((n, i, x, x + adv, not two_byte and c == 32))
                         x += adv
                 else:
                     x -= _num(it) / 1000.0 * font_size * h_scale
             return out_g
+
+        def text_advance(operand) -> float:
+            """Advance (text space) of a whole show operand: where the pen ends up."""
+            total = 0.0
+            items = operand if isinstance(operand, pikepdf.Array) else [operand]
+            step = 2 if two_byte else 1
+            for it in items:
+                if isinstance(it, pikepdf.String):
+                    raw = bytes(it)
+                    for i in range(0, len(raw) - step + 1, step):
+                        total += glyph_advance(int.from_bytes(raw[i:i + step], "big"))
+                else:
+                    total -= _num(it) / 1000.0 * font_size
+            return total * h_scale
 
         def target_at(x0: float, x1: float) -> str:
             fs = font_size or 1.0
@@ -354,7 +431,9 @@ class ContentMarker:
             corners = [(lead, -0.2 * fs), (adv, -0.2 * fs), (lead, 0.8 * fs), (adv, 0.8 * fs)]
             m = mat_mul(trm, self.user_to_page)
             bbox = bbox_of_points(apply(m, x, y) for x, y in corners)
-            emit_unit("text", bbox, [ins])
+            # A drawing font's characters are strokes (LaTeX's picture lines and circles): placed as drawings are,
+            # in the figure they lie in or as decoration, never as a paragraph
+            emit_unit("path" if _is_drawing_font(fdict) else "text", bbox, [ins], glyphs=True)
             tm = mat_mul((1, 0, 0, 1, adv, 0), tm)
 
         for ins in instructions:
@@ -400,14 +479,32 @@ class ContentMarker:
                 if op in ("BDC", "BMC"):
                     is_tag = False
                     mcid = None
+                    seq = None
                     if op == "BDC" and len(args) == 2 and isinstance(args[1], Dictionary) and "/MCID" in args[1]:
-                        is_tag = True
-                        mcid = int(args[1].MCID)
+                        mcid = mcid_of(args[1])
+                        if mcid is None:
+                            # An id that isn't an integer names nothing: the key goes, and what the section holds
+                            # is tagged afresh like any untagged content
+                            args[1] = Dictionary({k: v for k, v in args[1].items() if k != "/MCID"})
+                            ins = ContentStreamInstruction(args, ins.operator)
+                        else:
+                            is_tag = True
                     if args and isinstance(args[0], Name) and str(args[0]) == "/Artifact":
                         is_tag = True
-                    strip = is_tag and self.strip_existing
+                        if mcid is None and not self.strip_existing:
+                            seq = art_seq
+                            art_seq += 1
+                            props = args[1] if len(args) == 2 and isinstance(args[1], Dictionary) else Dictionary()
+                            marks.artifacts[seq] = {"type": str(props.get("/Type", ""))[1:],
+                                                    "subtype": str(props.get("/Subtype", ""))[1:], "body": 0.0,
+                                                    "bbox": None, "kinds": set(),
+                                                    "nested": inside_existing()}
+                    released = seq is not None and seq in release
+                    strip = is_tag and (self.strip_existing or released)
+                    if released:
+                        self.result.released_artifacts += 1
                     close()
-                    mc_stack.append((is_tag, strip, mcid))
+                    mc_stack.append((is_tag, strip, mcid, seq))
                     if strip:
                         self.result.stripped_marks += 1
                         continue
@@ -415,14 +512,14 @@ class ContentMarker:
                     continue
                 if op == "EMC":
                     close()
-                    _, strip, _ = mc_stack.pop() if mc_stack else (False, False, None)
+                    _, strip, _, _ = mc_stack.pop() if mc_stack else (False, False, None, None)
                     if strip:
                         continue
                     out.append(ins)
                     continue
                 close()
                 if op == "q":
-                    gs_stack.append(_GState(gs.ctm, gs.clip))
+                    gs_stack.append(_GState(gs.ctm, gs.clip, gs.render, gs.opaque))
                 elif op == "Q":
                     if gs_stack:
                         gs = gs_stack.pop()
@@ -445,6 +542,14 @@ class ContentMarker:
                 tm = tlm = mat_mul((1, 0, 0, 1, 0, -leading), tlm)
             elif op == "TL" and args:
                 leading = _num(args[0])
+            elif op == "Tr" and args:
+                gs.render = int(_num(args[0]))
+            elif op == "gs" and args and isinstance(args[0], Name):
+                ext = (resources.get("/ExtGState") or Dictionary()).get(args[0])
+                if isinstance(ext, Dictionary):
+                    smask = ext.get("/SMask")
+                    if "/ca" in ext or smask is not None:
+                        gs.opaque = _num(ext.get("/ca", 1)) >= 0.999 and (smask is None or smask == Name("/None"))
             elif op == "Tz" and args:
                 h_scale = _num(args[0]) / 100.0
             elif op == "Tc" and args:
@@ -480,12 +585,14 @@ class ContentMarker:
                 subtype = xobj.get("/Subtype") if xobj is not None else None
                 if subtype == Name.Image:
                     bbox = _clip_to(self._to_page_bbox(gs.ctm, [(0, 0), (1, 0), (0, 1), (1, 1)]), gs.clip)
-                    emit_unit("image", bbox, [ins], xobj.objgen[0])
+                    # An image with its own transparency doesn't cover what's under it
+                    emit_unit("image", bbox, [ins], xobj.objgen[0], covers="/SMask" not in xobj and "/Mask" not in xobj)
                     continue
                 if subtype == Name.Form:
                     fm = tuple(_num(v) for v in xobj.get("/Matrix", [1, 0, 0, 1, 0, 0]))
                     form_ctm = mat_mul(fm, gs.ctm)  # type: ignore[arg-type]
                     if (not inside_existing() and xobj.objgen in self.recursable_forms
+                            and xobj.objgen not in self._open_forms
                             and "/StructParents" not in xobj and "/StructParent" not in xobj):
                         close()
                         self._tag_form(xobj, form_ctm, resources)
@@ -494,6 +601,14 @@ class ContentMarker:
                     fb = [_num(v) for v in xobj.get("/BBox", [0, 0, 0, 0])]
                     bbox = self._to_page_bbox(form_ctm, [(fb[0], fb[1]), (fb[2], fb[3]), (fb[0], fb[3]), (fb[2], fb[1])])
                     self.result.forms_wrapped += 1
+                    # A form that only draws lines and fills (crop marks, a box behind a stamp), with any text in
+                    # it already marked as an artifact, is furniture: it's placed by what it draws, as paths are (a
+                    # figure it lies in, else a Layout artifact). Its /BBox is often the whole page, which would hand
+                    # it to whatever text it overlaps most, and tagging it would put its artifact inside a tag.
+                    drawn = None if inside_existing() else _furniture_extent(xobj)
+                    if drawn is not None:
+                        emit_unit("path", self._to_page_bbox(form_ctm, drawn) if drawn else bbox, [ins])
+                        continue
                     emit_unit("form", bbox, [ins])
                     continue
                 emit_unit("form", None, [ins])
@@ -513,14 +628,91 @@ class ContentMarker:
     def _tag_form(self, form: pikepdf.Object, ctm: Matrix, parent_resources) -> None:
         instructions = list(pikepdf.parse_content_stream(form))
         resources = form.get("/Resources") or parent_resources
-        new_ops, marks = self._process(instructions, ctm, resources, owner=form, is_form=True)
+        self._open_forms.add(form.objgen)
+        try:
+            new_ops, marks = self._process(instructions, ctm, resources, owner=form, is_form=True)
+        finally:
+            self._open_forms.discard(form.objgen)
         form.write(pikepdf.unparse_content_stream(new_ops))
         if marks.mcids:
             self.result.streams.append(marks)
 
 
+def inherited_resources(page: pikepdf.Object) -> pikepdf.Object:
+    """A page's /Resources, or the nearest ancestor's. A /Parent chain is the file's to write: one that loops (a
+    page naming itself, two nodes naming each other) would be walked for ever, so each node is visited once."""
+    node, seen = page, set()
+    while isinstance(node, Dictionary):
+        if "/Resources" in node:
+            return node.Resources
+        if node.is_indirect:
+            if node.objgen in seen:
+                break
+            seen.add(node.objgen)
+        node = node.get("/Parent")
+    return Dictionary()
+
+
+def _furniture_extent(form: pikepdf.Object) -> list[tuple[float, float]] | None:
+    """For a form XObject that draws only paths (and text or pictures already inside its own /Artifact sections):
+    the points of what it paints, in its own space ([] if it paints nothing). None for any other form: one with
+    text or pictures of its own, tagged content, another form inside it, or a stream that can't be read."""
+    try:
+        instructions = list(pikepdf.parse_content_stream(form))
+    except pikepdf.PdfError:
+        return None
+    ctm: Matrix = (1, 0, 0, 1, 0, 0)
+    stack: list[Matrix] = []
+    marked: list[bool] = []  # open marked-content sections: whether each is an /Artifact
+    path: list[tuple[float, float]] = []
+    painted: list[tuple[float, float]] = []
+    for ins in instructions:
+        if not isinstance(ins, ContentStreamInstruction):
+            return None  # an inline image
+        op, args = str(ins.operator), ins.operands
+        if op == "q":
+            stack.append(ctm)
+        elif op == "Q":
+            ctm = stack.pop() if stack else ctm
+        elif op == "cm" and len(args) == 6:
+            ctm = mat_mul(tuple(_num(v) for v in args), ctm)  # type: ignore[arg-type]
+        elif op in ("BDC", "BMC"):
+            if op == "BDC" and len(args) == 2 and isinstance(args[1], Dictionary) and "/MCID" in args[1]:
+                return None  # tagged content of its own
+            marked.append(bool(args) and str(args[0]) == "/Artifact")
+        elif op == "EMC":
+            if marked:
+                marked.pop()
+        elif op in ("Tj", "TJ", "'", '"', "Do", "sh", "BI"):
+            if not any(marked):
+                return None  # text, a picture or a shading that isn't an artifact
+        elif op == "re" and len(args) == 4:
+            x, y, w, h = (_num(v) for v in args)
+            path += [apply(ctm, x, y), apply(ctm, x + w, y), apply(ctm, x, y + h), apply(ctm, x + w, y + h)]
+        elif op in ("m", "l") and len(args) == 2:
+            path.append(apply(ctm, _num(args[0]), _num(args[1])))
+        elif op in ("c", "v", "y") and len(args) in (4, 6):
+            nums = [_num(v) for v in args]
+            path += [apply(ctm, nums[k], nums[k + 1]) for k in range(0, len(nums), 2)]
+        elif op in _PATH_PAINT:
+            painted += path
+            path = []
+        elif op == "n":
+            path = []
+    return painted
+
+
 _Widths = dict  # character code -> glyph width in thousandths of an em
+MAX_CID = 65535  # a CID is two bytes; a /W range past this is a malformed (or hostile) file
 SPLIT_GAP = -1000  # a TJ adjustment moving the pen right by at least one em separates two pieces
+
+
+_DRAWING_FONTS = re.compile(r"^(?:[A-Z]{6}\+)?(?:LINEW?|LCIRCLEW?)\d+$", re.IGNORECASE)
+
+
+def _is_drawing_font(font) -> bool:
+    """LaTeX's picture-mode fonts: every character is a piece of a slanted line, an arrow head or an arc."""
+    return font is not None and bool(_DRAWING_FONTS.match(str(font.get("/BaseFont", ""))[1:]))
 
 
 def _font_widths(font, cache: dict) -> _Widths | None:
@@ -545,7 +737,8 @@ def _font_widths(font, cache: dict) -> _Widths | None:
                         out[first + k] = _num(v)
                     i += 2
                 elif i + 2 < len(items):
-                    for c in range(first, int(nxt) + 1):
+                    # A CID is two bytes: a range that claims more is the file's error, not a reason to build it
+                    for c in range(max(0, first), min(int(nxt), MAX_CID) + 1):
                         out[c] = _num(items[i + 2])
                     i += 3
                 else:

@@ -6,6 +6,7 @@ import pymupdf as fitz
 import pytest
 
 from app.config import get_settings
+from app.pipeline.analyzer import render_png
 from app.pipeline.ocr import OcrLine, OcrWord, tesseract_cli
 from app.pipeline.ocr_ai import _keep_punctuation, check_correction, check_transcription, marked_text, mode
 
@@ -198,3 +199,129 @@ def test_pictures_read_as_letters_are_left_out(monkeypatch):
     # A tall word read confidently is kept (a big headline or a drop cap)
     rows[2]["conf"] = 92.0
     assert any(ln.text == "alll" for ln in ocr._tsv_lines(page, "eng"))
+
+
+def _rotated_scan(path, lines, dpi=150):
+    """A scan stored sideways in a landscape page, shown upright through /Rotate 90 (as scanners often save it)."""
+    src = fitz.open()
+    p = src.new_page(width=595, height=842)
+    for i, t in enumerate(lines):
+        p.insert_text((72, 100 + 22 * i), t, fontsize=13, fontname="tiro")
+    pix = p.get_pixmap(dpi=dpi)
+    doc = fitz.open()
+    page = doc.new_page(width=842, height=595)
+    page.insert_image(page.rect, stream=pix.tobytes("png"), rotate=90)
+    page.set_rotation(90)
+    doc.save(path)
+    return path
+
+
+def test_render_refuses_an_empty_clip():
+    doc = fitz.open()
+    doc.new_page(width=200, height=200)
+    with pytest.raises(ValueError, match="nothing to render"):
+        render_png(doc, 0, clip=(300, 300, 400, 320))
+
+
+def test_a_line_that_cant_be_rendered_keeps_tesseract(tmp_path):
+    from app.ai.mock import MockProvider
+    from app.pipeline.enrichment import EnrichmentStats
+    from app.pipeline.ocr_ai import correct_lines
+
+    pdf = tmp_path / "blank.pdf"
+    doc = fitz.open()
+    doc.new_page(width=200, height=200)
+    doc.save(pdf)
+    line = _line(("Hello", 40), ("world", 95))
+    line.bbox = (900, 900, 1000, 910)  # off the page
+    stats = EnrichmentStats()
+
+    async def go():
+        async with MockProvider() as ai:
+            await correct_lines(ai, str(pdf), [line], stats)
+
+    asyncio.run(go())
+    assert line.text == "Hello world" and any("Tesseract's text kept" in f for f in stats.findings)
+
+
+@needs_cli
+def test_rotated_scan_crops_the_line_upright(tmp_path, monkeypatch):
+    from app.ai.mock import MockProvider
+    from app.pipeline.enrichment import EnrichmentStats
+    from app.pipeline.ocr import ocr_lines
+    from app.pipeline.ocr_ai import correct_lines
+
+    pdf = _rotated_scan(tmp_path / "rot.pdf", ["Remediation report for the quarter", "Every figure has alt text now"])
+    monkeypatch.setattr(get_settings(), "ocr_ai_min_conf", 101.0)
+    crops = []
+
+    async def fix(self, png, page, text, how):
+        crops.append(fitz.Pixmap(png))
+        return {"text": text.replace("[[", "").replace("]]", "").replace("quarter", "quartet"), "confidence": 0.9}
+
+    monkeypatch.setattr(MockProvider, "correct_ocr_line", fix)
+    lines = ocr_lines(str(pdf), [0])
+    stats = EnrichmentStats()
+
+    async def go():
+        async with MockProvider() as ai:
+            await correct_lines(ai, str(pdf), lines, stats)
+
+    asyncio.run(go())
+    assert crops and not any("failed" in f for f in stats.findings), stats.findings
+    assert any(("quarter", "quartet") in o["changes"] for o in stats.ocr)
+    for pix in crops:  # each crop is a line lying flat, with ink in it
+        assert pix.width > 3 * pix.height
+        gray = fitz.Pixmap(fitz.csGRAY, pix)
+        assert min(gray.samples) < 100
+
+
+@needs_cli
+def test_pipeline_completes_on_a_rotated_scan_with_ai_ocr(tmp_path, monkeypatch):
+    import uuid
+
+    from app.ai.mock import MockProvider
+    from app.pipeline.orchestrator import JobOptions, run_remediation
+    from app.storage import JobStore
+
+    monkeypatch.setattr(get_settings(), "ocr_ai_min_conf", 101.0)
+
+    async def fix(self, png, page, text, how):
+        return {"text": text.replace("[[", "").replace("]]", "").replace("quarter", "quartet"), "confidence": 0.9}
+
+    monkeypatch.setattr(MockProvider, "correct_ocr_line", fix)
+    jid = str(uuid.uuid4())
+    store = JobStore(jid, root=tmp_path / "jobs")
+    store.create()
+    _rotated_scan(store.input_pdf, ["Remediation report for the quarter", "Every figure has alt text now"])
+    res = asyncio.run(run_remediation(store, JobOptions(stem="r", job_id=jid, provider="mock")))
+    assert res["metrics"]["ocr_pages"] == 1 and res["metrics"]["ocr_ai_words_corrected"] >= 1
+
+
+def test_render_pads_a_sliver():
+    doc = fitz.open()
+    doc.new_page(width=612, height=792)
+    assert fitz.Pixmap(render_png(doc, 0, dpi=150, clip=(72.0, 290.3, 540.0, 290.5))).height >= 1  # a 0.2 pt rule
+
+
+def test_existing_figures_that_are_rules_or_fail_never_fail_the_job(tmp_path):
+    """Word tags horizontal rules as figures: one 0.2 pt tall used to fail the whole job."""
+    from app.pipeline.enrichment import EnrichmentStats
+    from app.pipeline.orchestrator import _describe_regions
+
+    pdf = tmp_path / "p.pdf"
+    doc = fitz.open()
+    doc.new_page(width=612, height=792)
+    doc.save(pdf)
+
+    class AI:
+        calls = 0
+
+        async def describe_image(self, png, page, context):
+            AI.calls += 1
+            raise RuntimeError("the model fell over")
+
+    stats = EnrichmentStats()
+    out = asyncio.run(_describe_regions(AI(), pdf, [(0, (72.0, 290.3, 540.0, 290.5)), (0, (100, 100, 300, 250))], stats))
+    assert out == [(0, (72.0, 290.3, 540.0, 290.5), None, True)]  # the rule: an artifact, without asking the AI
+    assert AI.calls == 1 and any("failed" in f for f in stats.findings)  # the real figure: left for review

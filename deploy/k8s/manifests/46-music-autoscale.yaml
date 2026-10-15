@@ -1,0 +1,31 @@
+# The music reading service runs only while there are pictures to read (applied when MUSIC_READER=on and scaling
+# is on): KEDA starts a pod when something is put on the Redis list, one more per ${MUSIC_PER_POD} waiting up to
+# ${MUSIC_MAX}, and removes them ${SCALE_DOWN_SECONDS} seconds after the list was last in use.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: redis-queue
+  namespace: ${NAMESPACE}
+spec:
+  secretTargetRef:
+    - { parameter: password, name: pdfrem-engine-env, key: REDIS_PASSWORD }
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: music-reader
+  namespace: ${NAMESPACE}
+spec:
+  scaleTargetRef: { name: music-reader }
+  minReplicaCount: 0
+  maxReplicaCount: ${MUSIC_MAX}
+  pollingInterval: 5
+  cooldownPeriod: ${SCALE_DOWN_SECONDS}
+  triggers:
+    - type: redis
+      authenticationRef: { name: redis-queue }
+      metadata:
+        address: redis.${NAMESPACE}.svc.cluster.local:6379
+        databaseIndex: "0"
+        listName: "omr:requests"
+        listLength: "${MUSIC_PER_POD}"

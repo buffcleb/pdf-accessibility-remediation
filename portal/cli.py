@@ -47,7 +47,8 @@ def _sign_in_code(args) -> int:
     with _sessionmaker()() as db:
         elig = eligibility(db, email)
         if not elig.allowed:
-            print(f"{email} can't sign in here: no account, and its domain isn't in a group.", file=sys.stderr)
+            print(f"{email} can't sign in here: no account, and neither the address nor its domain is on a group.",
+                  file=sys.stderr)
             return 2
         if elig.user is not None and _blocked_message(db, elig.user):
             print(f"{email}'s account is disabled (or its group is).", file=sys.stderr)

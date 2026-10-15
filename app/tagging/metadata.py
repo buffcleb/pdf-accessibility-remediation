@@ -1,5 +1,8 @@
-"""Document-level PDF/UA requirements: MarkInfo, Lang, title, XMP identifier, tab order, OC configs."""
+"""Document-level PDF/UA requirements: MarkInfo, Lang, title, XMP identifier, tab order, OC configs, and the
+names of embedded files."""
 from __future__ import annotations
+
+import re
 
 import pikepdf
 from pikepdf import Dictionary, Name, String
@@ -30,12 +33,21 @@ def apply_document_metadata(pdf: pikepdf.Pdf, *, title: str, language: str, pdfu
         changes.append("DisplayDocTitle enabled")
 
     pdf.docinfo[Name.Title] = String(title)
+    rewritten = _drop_old_style_metadata(pdf)
     with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
+        if rewritten:
+            # Author, dates and the rest come back from the document information
+            try:
+                meta.load_from_docinfo(pdf.docinfo)
+            except Exception:  # noqa: BLE001 - an odd date or encoding there mustn't cost the title and identifier
+                pass
         meta["dc:title"] = title
         meta["pdfuaid:part"] = str(pdfua_part)
         if language:
             meta["dc:language"] = [language]
-    changes.append(f"title and PDF/UA-{pdfua_part} identifier written to XMP")
+    changes.append(f"title and PDF/UA-{pdfua_part} identifier written to XMP"
+                   + (" (the file's metadata was in an early form of XMP that checkers don't read: written afresh "
+                      "from the document information)" if rewritten else ""))
 
     tabs = 0
     for page in pdf.pages:
@@ -55,5 +67,48 @@ def apply_document_metadata(pdf: pikepdf.Pdf, *, title: str, language: str, pdfu
             if "/AS" in cfg:
                 del cfg["/AS"]
                 changes.append("optional content /AS removed")
+    named = name_embedded_files(pdf)
+    if named:
+        changes.append(f"{named} embedded file(s) given the name entries they lacked")
     return changes
 
+
+def name_embedded_files(pdf: pikepdf.Pdf) -> int:
+    """An embedded file's specification needs its name twice, as /F and as /UF (PDF/UA 7.11). Producers often
+    write one (Distiller attaches its settings as "folder.joboptions" with /F alone): the other is copied from it.
+    With neither, the file gets a plain name. Returns how many specifications were completed."""
+    done = 0
+    for obj in pdf.objects:
+        if not isinstance(obj, Dictionary) or not isinstance(obj.get("/EF"), Dictionary):
+            continue
+        f, uf = obj.get("/F"), obj.get("/UF")
+        have_f, have_uf = f is not None and str(f).strip() != "", uf is not None and str(uf).strip() != ""
+        if have_f and have_uf:
+            continue
+        name = str(uf if have_uf else f) if (have_f or have_uf) else "attachment"
+        obj.F = String(name)
+        obj.UF = String(name)
+        done += 1
+    return done
+
+
+
+_OLD_ABOUT = re.compile(rb"<rdf:Description[^>]*\sabout\s*=")
+
+
+def _drop_old_style_metadata(pdf: pikepdf.Pdf) -> bool:
+    """Remove a metadata stream written in the form XMP had before it was a standard (Acrobat 5 and earlier): no
+    x:xmpmeta wrapper, "about" without its rdf: prefix, the title as plain text. A title and a PDF/UA identifier
+    added to such a packet aren't found by validators, so the file failed for having neither. Also one that
+    can't be parsed at all. True when it was removed (a new one is then written)."""
+    stream = pdf.Root.get("/Metadata")
+    if stream is None:
+        return False
+    try:
+        raw = stream.read_bytes()
+    except Exception:  # noqa: BLE001
+        raw = b""
+    old = not raw.strip() or b"<x:xmpmeta" not in raw or bool(_OLD_ABOUT.search(raw))
+    if old:
+        del pdf.Root["/Metadata"]
+    return old

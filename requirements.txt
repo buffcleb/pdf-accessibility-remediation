@@ -15,4 +15,4 @@ lxml==6.1.3
 pdfplumber==0.11.10  # independent reader for tag verification
 py3langid==0.4.0
 fonttools==4.66.1  # Adobe Glyph List (glyph name -> Unicode)
-weasyprint==66.0  # the PDF report (PDF/UA-1); needs Pango from the OS
+weasyprint==70.0  # the PDF report (PDF/UA-1); needs Pango from the OS

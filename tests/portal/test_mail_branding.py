@@ -60,6 +60,34 @@ def test_cloudflare_sends_and_reports_permanent_bounces(backend):
             get_mailer().deliver(Mail("a@b.test", "Hi", "Hello"))
 
 
+def test_cloudflare_sends_attachments_up_to_its_message_limit(backend):
+    import base64
+
+    from portal import mail as mailmod
+
+    backend("cloudflare", cloudflare_account_id="acc1", cloudflare_api_token="tok", mail_from="no-reply@example.org")
+    url = "https://api.cloudflare.com/client/v4/accounts/acc1/email/sending/send"
+    csv = "name,pages\r\nRené,3\r\n".encode("utf-8-sig")
+    with respx.mock() as rx:
+        route = rx.post(url).mock(return_value=httpx.Response(200, json={
+            "success": True, "result": {"delivered": ["a@b.test"], "permanent_bounces": [], "queued": []}}))
+        get_mailer().deliver(Mail("a@b.test", "Report", "See attached", attachments=[
+            ("use-2026-10-01.csv", "text/csv; charset=utf-8", csv)]))
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["attachments"] == [{"content": base64.b64encode(csv).decode(), "filename": "use-2026-10-01.csv",
+                                        "type": "text/csv", "disposition": "attachment"}]
+        # Too big for one message: refused here, not sent to be rejected (and not retried)
+        calls = route.call_count
+        big = Mail("a@b.test", "Report", "x", attachments=[("big.csv", "text/csv", b"x" * (4 * 1024 * 1024))])
+        with pytest.raises(MailError, match="5 MiB"):
+            get_mailer().deliver(big)
+        assert route.call_count == calls
+    assert mailmod.attachment_limit("cloudflare") == mailmod.CLOUDFLARE_ATTACHMENT_BYTES
+    assert mailmod.attachment_limit("smtp") is None and mailmod.attachment_limit("plunk") == 0
+    # What callers may attach always fits once encoded
+    assert mailmod.CLOUDFLARE_ATTACHMENT_BYTES * 4 / 3 < mailmod.CLOUDFLARE_MESSAGE_BYTES
+
+
 def test_client_errors_are_not_retried(backend):
     backend("plunk", plunk_api_key="sk_test")
     with respx.mock() as rx:

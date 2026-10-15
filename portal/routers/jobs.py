@@ -8,13 +8,13 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.orm import Session, object_session
 
-from portal import approval, audit, quota, services, settings_store
+from portal import approval, audit, quota, removal, services, settings_store
 from portal.db import get_db
-from portal.deps import Principal, current_principal
+from portal.deps import Principal, current_principal, require_super_admin
 from portal.errors import ApiError, not_found
 from portal.models import HelpRequest, Job, JobFile, User
 from portal.pdfcheck import receive_pdf
@@ -35,6 +35,8 @@ FILE_LABELS = {
     "adobe_report": "Adobe accessibility report (Excel)",
     "enhanced": "Improved copy of Adobe's file (PDF)",
     "verapdf_after_enhanced": "veraPDF report: improved copy",
+    "music_score": "Music: the whole piece (MusicXML)",
+    "music_files": "Music: every line, and the whole piece (MusicXML files, zip)",
 }
 
 
@@ -77,8 +79,15 @@ class JobOut(BaseModel):
     error_message: str | None
     created_at: datetime
     finished_at: datetime | None
-    files_expire_at: datetime | None
+    files_expire_at: datetime | None  # the earlier of the end of retention and the end of the hold, if marked done
     files_deleted: bool
+    # Marked done by its owner: the files go at removal_at (the hold gives time to undo it)
+    removal_requested: bool = False
+    removal_at: datetime | None = None
+    removal_hold_hours: int = 24
+    deleted: bool = False  # deleted by a super admin (only super admins still see it)
+    deleted_at: datetime | None = None
+    deleted_by: str | None = None
     files: list[JobFileOut]
     help: dict | None = None  # the current help request: {id, status, unread}; on the owner's own list
 
@@ -105,7 +114,11 @@ def _ai_label(job: Job) -> str | None:
     return f"{name} · {services.kind_label(db, job.ai_tier, job.ai_kind)}" if job.ai_kind else name
 
 
-def job_out(job: Job, retention_days: int, with_user: bool = False, show_cost: bool = False) -> JobOut:
+def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool = False,
+            show_cost: bool = False) -> JobOut:
+    hold = runtime.early_removal_hold_hours
+    removal_at = removal.remove_at(job, hold)
+    expires = None if job.files_deleted_at else job.created_at + timedelta(days=runtime.file_retention_days)
     return JobOut(
         id=job.id, user_id=job.user_id, user_email=job.user.email if with_user else None, group_id=job.group_id,
         filename=job.filename, pages=job.pages, pages_charged=job.pages_charged, report_only=job.report_only,
@@ -120,8 +133,10 @@ def job_out(job: Job, retention_days: int, with_user: bool = False, show_cost: b
         cost=job.cost if show_cost else None,
         status=job.status, progress=job.progress, result=job.result_summary, error_code=job.error_code,
         error_message=job.error_message, created_at=job.created_at, finished_at=job.finished_at,
-        files_expire_at=None if job.files_deleted_at else job.created_at + timedelta(days=retention_days),
+        files_expire_at=min(expires, removal_at) if expires and removal_at else expires,
         files_deleted=job.files_deleted_at is not None,
+        removal_requested=job.removal_requested_at is not None, removal_at=removal_at, removal_hold_hours=hold,
+        deleted=job.deleted_at is not None, deleted_at=job.deleted_at, deleted_by=job.deleted_by,
         files=[] if job.files_deleted_at else [
             JobFileOut(id=f.id, kind=f.kind, label=_file_label(job, f.kind), name=f.name,
                        size_bytes=f.size_bytes) for f in job.files
@@ -140,7 +155,10 @@ def _visible_job(db: Session, job_id: uuid.UUID, p: Principal) -> Job:
     job = db.get(Job, job_id)
     if job is None:
         raise not_found("Job")
-    if job.user_id == p.user.id or p.is_super_admin or (job.group_id and p.can_admin_group(job.group_id)):
+    if p.is_super_admin:
+        return job
+    # A deleted document is gone for everyone but super admins (its record stays for reports)
+    if job.deleted_at is None and (job.user_id == p.user.id or (job.group_id and p.can_admin_group(job.group_id))):
         return job
     raise not_found("Job")
 
@@ -401,7 +419,7 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                                                          "external": pl.external, "held": pl.hold})
             db.commit()
             db.refresh(job)
-            results.append(UploadResult(filename=name, accepted=True, job=job_out(job, runtime.file_retention_days)))
+            results.append(UploadResult(filename=name, accepted=True, job=job_out(job, runtime)))
         except ApiError as e:
             db.rollback()
             results.append(UploadResult(filename=name, accepted=False, error=e.detail))
@@ -413,11 +431,11 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
 @router.get("/jobs", response_model=list[JobOut])
 def my_jobs(limit: int = Query(50, ge=1, le=500), before: datetime | None = None,
             p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
-    stmt = select(Job).where(Job.user_id == p.user.id)
+    stmt = select(Job).where(Job.user_id == p.user.id, Job.deleted_at.is_(None))
     if before:
         stmt = stmt.where(Job.created_at < before)
     jobs = db.scalars(stmt.order_by(Job.created_at.desc()).limit(limit)).all()
-    return _with_help(db, jobs, settings_store.load(db).file_retention_days)
+    return _with_help(db, jobs, settings_store.load(db))
 
 
 class DocumentsPage(BaseModel):
@@ -446,10 +464,22 @@ def my_documents(q: str = Query("", max_length=200), status: str | None = Query(
                  p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """The signed-in person's documents, a page at a time: search by file name, filter by status, result,
     processing service or AI level, audit only and date; sort by date, name, pages or result."""
-    where = [Job.user_id == p.user.id]
+    return documents_page(db, [Job.user_id == p.user.id], q=q, status=status, result=result, service=service,
+                          audit=audit, since=since, until=until, sort=sort, page=page, page_size=page_size)
+
+
+def documents_page(db: Session, scope: list, *, q: str, status: str | None, result: str | None, service: str | None,
+                   audit: bool | None, since: datetime | None, until: datetime | None, sort: str, page: int,
+                   page_size: int, people: bool = False, show_cost: bool = False) -> DocumentsPage:
+    """One page of the documents in `scope` (a person's, a group's), searched, filtered and sorted the same way
+    wherever they are listed. With `people`, the list is an admin's view of other people's documents: each says
+    whose it is, the search also matches the person's email, and the list can be sorted by person."""
+    where = [*scope, Job.deleted_at.is_(None)]
     if q.strip():
         like = "%" + q.strip().lower().replace("%", r"\%").replace("_", r"\_") + "%"
-        where.append(func.lower(Job.filename).like(like, escape="\\"))
+        by_name = func.lower(Job.filename).like(like, escape="\\")
+        where.append(or_(by_name, Job.user_id.in_(select(User.id).where(func.lower(User.email).like(like, escape="\\"))))
+                     if people else by_name)
     if status:
         if status not in STATUS_GROUPS:
             raise ApiError(422, "bad_filter", "Unknown status.")
@@ -475,29 +505,33 @@ def my_documents(q: str = Query("", max_length=200), status: str | None = Query(
     if until:
         where.append(Job.created_at < until)
     key, desc = sort.lstrip("-"), sort.startswith("-")
-    if key not in SORTS:
+    sorts = {**SORTS, "user": select(func.lower(User.email)).where(User.id == Job.user_id).scalar_subquery()} if people \
+        else SORTS
+    if key not in sorts:
         raise ApiError(422, "bad_sort", "Unknown sort.")
-    order = SORTS[key].desc().nulls_last() if desc else SORTS[key].asc().nulls_last()
+    order = sorts[key].desc().nulls_last() if desc else sorts[key].asc().nulls_last()
     total = db.scalar(select(func.count()).select_from(Job).where(*where)) or 0
     size = min(page_size, max(PAGE_SIZES))
     jobs = db.scalars(select(Job).where(*where).order_by(order, Job.created_at.desc())
                       .limit(size).offset((page - 1) * size)).all()
     active = db.scalar(select(func.count()).select_from(Job).where(
-        Job.user_id == p.user.id, Job.status.in_(("queued", "submitted", "processing")))) or 0
-    return DocumentsPage(items=_with_help(db, jobs, settings_store.load(db).file_retention_days), total=total,
-                         page=page, page_size=size, active=active)
+        *scope, Job.status.in_(("queued", "submitted", "processing")))) or 0
+    return DocumentsPage(items=_with_help(db, jobs, settings_store.load(db), with_user=people, show_cost=show_cost),
+                         total=total, page=page, page_size=size, active=active)
 
 
-def _with_help(db: Session, jobs: list[Job], days: int) -> list[JobOut]:
-    """The documents, each with its current help request (the active one, else the latest)."""
+def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSettings, with_user: bool = False,
+               show_cost: bool = False) -> list[JobOut]:
+    """The documents, each with its current help request (the active one, else the latest). "Unread" is the
+    owner's own: an admin looking at someone else's documents hasn't a reply waiting for them there."""
     helps: dict = {}
     for r in db.scalars(select(HelpRequest).where(HelpRequest.job_id.in_([j.id for j in jobs]))
                         .order_by(HelpRequest.created_at)):
         if r.job_id not in helps or r.active:
-            helps[r.job_id] = {"id": str(r.id), "status": r.status, "unread": r.unread_for_person}
+            helps[r.job_id] = {"id": str(r.id), "status": r.status, "unread": r.unread_for_person and not with_user}
     out = []
     for j in jobs:
-        o = job_out(j, days)
+        o = job_out(j, runtime, with_user=with_user, show_cost=show_cost)
         o.help = helps.get(j.id)
         out.append(o)
     return out
@@ -507,7 +541,7 @@ def _with_help(db: Session, jobs: list[Job], days: int) -> list[JobOut]:
 def job_detail(job_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
     # Cost is for super admins only: what groups are charged isn't the per-page cost
-    return job_out(job, settings_store.load(db).file_retention_days, with_user=job.user_id != p.user.id,
+    return job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id,
                    show_cost=p.is_super_admin)
 
 
@@ -529,7 +563,7 @@ def confirm_job(job_id: uuid.UUID, request: Request, p: Principal = Depends(curr
     audit.record(db, request, "job.confirmed", actor=p.user, target_type="job", target_id=job.id,
                  group_id=job.group_id, details={"pages": job.pages, "services": keys})
     db.commit()
-    return job_out(job, settings_store.load(db).file_retention_days)
+    return job_out(job, settings_store.load(db))
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=JobOut)
@@ -546,12 +580,94 @@ def cancel(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_p
     audit.record(db, request, "job.canceled", actor=p.user, target_type="job", target_id=job.id,
                  group_id=job.group_id)
     db.commit()
-    return job_out(job, settings_store.load(db).file_retention_days)
+    return job_out(job, settings_store.load(db))
+
+
+# --- removing files early ----------------------------------------------------------------------------
+
+class JobIds(BaseModel):
+    ids: list[str] = Field(..., min_length=1, max_length=500)
+
+
+class AdminRemoval(JobIds):
+    delete: bool = False  # True: delete the documents (files now; gone from document lists, kept for reports)
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class RemovalResult(BaseModel):
+    done: list[str]
+    skipped: list[dict]  # {id, reason, message}
+
+
+def _own_job_for_update(db: Session, job_id: uuid.UUID, p: Principal) -> Job:
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
+    if job is None or job.user_id != p.user.id or job.deleted_at is not None:
+        raise not_found("Job")
+    return job
+
+
+@router.post("/jobs/{job_id}/remove-early", response_model=JobOut)
+def remove_early(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_principal),
+                 db: Session = Depends(get_db)):
+    """The owner is done with a finished document: its files go when the hold ends."""
+    job = _own_job_for_update(db, job_id, p)
+    removal.request_removal(db, request, job, p.user)
+    db.commit()
+    return job_out(job, settings_store.load(db))
+
+
+@router.post("/jobs/remove-early", response_model=RemovalResult)
+def remove_early_many(body: JobIds, request: Request, p: Principal = Depends(current_principal),
+                      db: Session = Depends(get_db)):
+    """Several of the owner's documents at once; those that can't be marked are listed with the reason."""
+    ids = removal.parse_ids(body.ids)
+    jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_(ids), Job.user_id == p.user.id,
+                                                          Job.deleted_at.is_(None)).with_for_update())}
+    done, skipped = [], []
+    for i in ids:
+        job = jobs.get(i)
+        if job is None:
+            skipped.append({"id": str(i), "reason": "not_found", "message": "Document not found."})
+            continue
+        try:
+            removal.request_removal(db, request, job, p.user)
+            done.append(str(i))
+        except ApiError as e:
+            skipped.append({"id": str(i), **{"reason": e.detail["error"], "message": e.detail["message"]}})
+    db.commit()
+    return RemovalResult(done=done, skipped=skipped)
+
+
+@router.post("/jobs/{job_id}/keep", response_model=JobOut)
+def keep(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_principal),
+         db: Session = Depends(get_db)):
+    """Undo "I'm done with it" while the hold lasts: the files are kept for the normal period."""
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
+    if job is None or job.deleted_at is not None or not (job.user_id == p.user.id or p.is_super_admin):
+        raise not_found("Job")
+    removal.cancel_removal(db, request, job, p.user)
+    db.commit()
+    return job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id)
+
+
+@router.post("/admin/jobs/remove", response_model=RemovalResult)
+def admin_remove(body: AdminRemoval, request: Request, p: Principal = Depends(require_super_admin),
+                 db: Session = Depends(get_db)):
+    """Super admins: remove documents' files now, or delete the documents. Documents still waiting or in progress
+    are skipped."""
+    ids = removal.parse_ids(body.ids)
+    jobs = list(db.scalars(select(Job).where(Job.id.in_(ids)).with_for_update()))
+    found = {j.id for j in jobs}
+    result = removal.admin_remove(db, request, jobs, p.user, delete=body.delete, reason=body.reason.strip())
+    result["skipped"] += [{"id": str(i), "reason": "not_found", "message": "Document not found."}
+                          for i in ids if i not in found]
+    db.commit()
+    return RemovalResult(**result)
 
 
 def _file(db: Session, job: Job, file_id: uuid.UUID) -> JobFile:
     if job.files_deleted_at is not None:
-        raise ApiError(410, "files_deleted", "This document's files have been deleted under the retention policy.")
+        raise ApiError(410, "files_deleted", "This document's files have been removed.")
     f = next((f for f in job.files if f.id == file_id), None)
     if f is None:
         raise not_found("File")

@@ -9,14 +9,14 @@ How the service is built: its parts, how a document moves through them, and why 
 2. [The engine pipeline](engine-pipeline.md): how a PDF is analyzed, tagged and checked, step by step
 3. [Verification](verification.md): the three layers that check every output
 4. [The Adobe route](adobe-route.md): sending documents to Adobe PDF Services, and what's done with the result
-5. [The tag viewer and editor](tag-editor.md): human review in the browser
+5. [The tag manager and editor](tag-editor.md): human review in the browser
 6. [Security and privacy](security-and-privacy.md), and the [design decisions](design-decisions.md) behind it all
 7. [Source map](source-map.md): where everything is in the code
 
 ## The parts
 
 - **The web portal:** sign-in, groups, services and page quotas, uploads, results, reports, help requests and the
-  tag viewer and editor. It's the only part people use directly.
+  tag manager and editor. It's the only part people use directly.
 - **The remediation engine:** a headless service that tags a PDF for accessibility (PDF/UA-1), validates it,
   checks its own work and returns the files with reports. Only the portal can reach it.
 - **The AI gateway (LiteLLM):** one endpoint in front of every AI model the engine may use, local or cloud, with
@@ -45,7 +45,7 @@ flowchart LR
     EAPI["Engine API<br/>FastAPI"] --> ER[("Redis<br/>queue")]
     ER --> EW["Workers<br/>Celery"]
     ER -- "queue: adobe" --> AW["Adobe worker"]
-    EW --> VP["veraPDF"]
+    EW --> VP["veraPDF service<br/>(kept running; command line<br/>in the worker as a fallback)"]
     EW --> TS["Tesseract OCR"]
     EAPI --- JS[("Shared job<br/>folder")]
     EW --- JS
@@ -60,14 +60,15 @@ flowchart LR
 
 | Component | Technology | Role |
 |---|---|---|
-| Web app | React + Vite, served by nginx | All screens, including the tag viewer and editor (pdf.js). nginx also proxies `/api` to the portal API |
+| Web app | React + Vite, served by nginx | All screens, including the tag manager and editor (pdf.js). nginx also proxies `/api` to the portal API |
 | Portal API | FastAPI, SQLAlchemy 2, Alembic | Accounts, groups, services, quotas, uploads, versions, help requests, reports, audit |
 | Portal worker | Python loop | Sends queued jobs, edits and reviews to the engine, polls them, copies results into storage, settles quotas, sends email, applies retention |
 | Database | PostgreSQL 16 | Everything the portal knows. The quota ledger is append-only (a trigger refuses updates) |
 | Object store | S3 API (SeaweedFS locally; AWS S3, Cloudflare R2 and so on elsewhere) | Input and output files under `groups/{group}/users/{user}/jobs/{job}/…`, encrypted at rest |
 | Engine API and workers | FastAPI, Celery, Redis | The remediation pipeline, tag edits, re-reviews and the kind-of-document classifier. Never exposed to the internet |
 | AI gateway | LiteLLM + its own PostgreSQL | Routes each call to the model behind an AI level; reports cost per call; budget backstop; admin UI |
-| Validator | veraPDF 1.30 | PDF/UA-1 (and informational PDF/UA-2) before and after |
+| Validator | veraPDF 1.30, as a service kept running (its REST server) | PDF/UA-1 (and informational PDF/UA-2) before and after. A check that the service doesn't answer runs from the command line in the worker ([details](../operations/configuration.md#verapdf-service)) |
+| Scaling (Kubernetes) | KEDA, the Horizontal Pod Autoscaler | Workers follow the portal's queue; veraPDF and the AI gateway follow their CPU use. Services and AI levels can limit their documents at once ([details](../../deploy/k8s/README.md#scaling-with-the-queue)) |
 | OCR | Tesseract 5 | Text of scanned pages, with a confidence per word |
 | Report PDF | WeasyPrint | The accessible PDF report (PDF/UA-1) |
 | Adobe worker | Celery on the `adobe` queue | Adobe Autotag jobs: split, send, poll, merge, then the same checks as every output |

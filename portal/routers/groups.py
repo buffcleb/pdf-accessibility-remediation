@@ -25,6 +25,8 @@ class MemberUpdate(BaseModel):
     status: str | None = Field(None, pattern="^(active|disabled)$")
     # Explicit page cap for the standard service; null resets the user to the group default
     cap_pages: int | None = Field(None, ge=0, le=10_000_000)
+    # "Describe with AI" for this person; null follows the group
+    ai_describe: bool | None = None
 
 
 @router.get("", response_model=list[GroupOut])
@@ -83,6 +85,9 @@ def update_member(group_id: uuid.UUID, user_id: uuid.UUID, body: MemberUpdate, r
         if us.cap_pages != sent["cap_pages"]:
             changes["cap_pages"] = [us.cap_pages, sent["cap_pages"]]
             us.cap_pages = sent["cap_pages"]
+    if "ai_describe" in sent and user.ai_describe != sent["ai_describe"]:
+        changes["ai_describe"] = [user.ai_describe, sent["ai_describe"]]
+        user.ai_describe = sent["ai_describe"]
     if "status" in sent and user.status != sent["status"]:
         changes["status"] = [user.status, sent["status"]]
         user.status = sent["status"]
@@ -105,6 +110,7 @@ class GroupSettings(BaseModel):
     ai_level: str | None = Field(None, max_length=64)  # fixed: the level ("" clears)
     ai_kind: str | None = Field(None, max_length=40)  # fixed: the kind ("" or "general": General)
     show_external: bool | None = None  # show people which options send documents to an external provider
+    ai_describe: bool | None = None  # "Describe with AI" for its people; null follows the service default
 
 
 @router.patch("/{group_id}", response_model=GroupOut)

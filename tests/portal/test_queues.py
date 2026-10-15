@@ -1,4 +1,5 @@
-"""Queues: see them, pause and resume them, retry and cancel single items. Sign-in codes are never queued."""
+"""Queues: see them, pause and resume them; retry, cancel, stop and remove single items. Sign-in codes are never
+queued."""
 from __future__ import annotations
 
 import uuid
@@ -144,7 +145,7 @@ def test_email_retries_temporary_failures_then_waits_for_support(setup, monkeypa
         outbox.send_queued(db)
         db.execute(MailOutbox.__table__.update().values(next_try_at=MailOutbox.created_at))  # skip the wait
         db.commit()
-    m = db.scalars(select(MailOutbox)).one()
+    m = db.scalars(select(MailOutbox).where(MailOutbox.kind != "sign_in")).one()
     db.refresh(m)
     assert m.status == "failed" and m.attempts == 3 and "503" in m.last_error
     att = s["c"]["super"].get(f"{API}/admin/attention").json()
@@ -173,3 +174,85 @@ def test_paused_saved_edits_wait(setup):
     s["c"]["super"].post(f"{Q}/edits/pause")
     assert worker.submit_versions(db) == 0
     assert _queue(s, "edits")["paused"]["by"] == "root@admin.test"
+
+
+def test_support_can_stop_a_document_in_progress(setup):
+    """A document stuck at the engine: stopped there, ended here, pages given back, the person told."""
+    s, db = setup, setup["db"]
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("book.pdf", pdf_bytes(5))).json()[0]["job"]["id"]
+    run_worker(db)
+    eng_id = db.get(Job, uuid.UUID(job_id)).engine_job_id
+    assert _queue(s, STD)["active"] == 1 and s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == 5
+    item = s["c"]["super"].get(f"{Q}/{STD}/items?state=active").json()["items"][0]
+    assert item["can_stop"] and not item["can_cancel"] and not item["can_remove"]
+    # A waiting or finished item can't be "stopped", and only super admins can stop
+    assert s["c"]["admin_a"].post(f"{Q}/{STD}/items/{job_id}/stop").status_code == 403
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/stop").status_code == 204
+    assert s["engine"].stopped == [eng_id]
+    job = s["c"]["user"].get(f"{API}/jobs/{job_id}").json()
+    assert job["status"] == "canceled"
+    assert s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == 0
+    assert _queue(s, STD)["active"] == 0
+    run_worker(db)  # the engine's "failed: stopped" answer changes nothing; the email goes out
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}").json()["status"] == "canceled"
+    assert get_mailer().outbox[-1].subject == "Stopped: book.pdf"
+    assert db.scalar(select(AuditEvent).where(AuditEvent.action == "job.stopped")).actor_email == "root@admin.test"
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/stop").status_code == 409
+
+
+def test_a_document_is_stopped_here_even_when_the_engine_cant_be_reached(setup):
+    s, db = setup, setup["db"]
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("gone.pdf", pdf_bytes(2))).json()[0]["job"]["id"]
+    run_worker(db)
+    s["engine"].stop_unreachable = True
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/stop").status_code == 204
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}").json()["status"] == "canceled"
+    ev = db.scalar(select(AuditEvent).where(AuditEvent.action == "job.stopped"))
+    assert "connection refused" in ev.details["engine_not_reached"]
+
+
+def test_a_failed_item_can_be_removed_from_the_list_and_comes_back_if_it_fails_again(setup):
+    s, db = setup, setup["db"]
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("bad.pdf", pdf_bytes(3))).json()[0]["job"]["id"]
+    # Not failed yet: nothing to remove
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/remove").status_code == 409
+    run_worker(db)
+    s["engine"].fail(db.get(Job, uuid.UUID(job_id)).engine_job_id, "engine_lost")
+    run_worker(db)
+    item = s["c"]["super"].get(f"{Q}/{STD}/items?state=failed").json()["items"][0]
+    assert item["can_remove"] and _queue(s, STD)["failed"] == 1
+    assert s["c"]["admin_a"].post(f"{Q}/{STD}/items/{job_id}/remove").status_code == 403
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/remove").status_code == 204
+    assert s["c"]["super"].get(f"{Q}/{STD}/items?state=failed").json()["items"] == []
+    assert _queue(s, STD)["failed"] == 0
+    # The document itself is untouched: still the person's, still failed
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}").json()["status"] == "failed"
+    assert db.scalar(select(AuditEvent).where(AuditEvent.action == "queue.item_removed")).details["file"] == "bad.pdf"
+    # Removing twice is harmless
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/remove").status_code == 204
+    # Tried again and failed again: it's a new failure, so it's listed again
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/retry").status_code == 204
+    run_worker(db)
+    s["engine"].fail(db.get(Job, uuid.UUID(job_id)).engine_job_id, "engine_lost")
+    run_worker(db)
+    assert [i["id"] for i in s["c"]["super"].get(f"{Q}/{STD}/items?state=failed").json()["items"]] == [job_id]
+
+
+def test_a_failed_email_can_be_removed_from_the_list(setup, monkeypatch):
+    s, db = setup, setup["db"]
+
+    def refuse(mail, *a, **k):
+        raise MailError("mailbox unavailable")
+    outbox.queue(db, [outbox.Mail(to="x@a.test", subject="Hello", text="hi")], None, "test")
+    db.commit()
+    monkeypatch.setattr(get_mailer(), "deliver", refuse)
+    outbox.send_queued(db)
+    failed = s["c"]["super"].get(f"{Q}/mail/items?state=failed").json()["items"]
+    assert len(failed) == 1 and failed[0]["can_remove"]
+    assert s["c"]["super"].post(f"{Q}/mail/items/{failed[0]['id']}/remove").status_code == 204
+    assert s["c"]["super"].get(f"{Q}/mail/items?state=failed").json()["items"] == [] and _queue(s, "mail")["failed"] == 0
+    # Nothing is "in progress" for email
+    assert s["c"]["super"].post(f"{Q}/mail/items/{failed[0]['id']}/stop").status_code == 409

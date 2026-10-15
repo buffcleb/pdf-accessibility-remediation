@@ -24,7 +24,8 @@ Follow steps 1 and 3 of the [local setup](local-docker.md#steps) to create `.env
 PORTAL_APP_URL=https://pdf.example.org
 PORTAL_COOKIE_SECURE=true
 PORTAL_TRUST_PROXY_HEADERS=true
-PORTAL_GATEWAY_ADMIN_URL=          # empty: don't link the gateway's UI unless it's reachable privately
+PORTAL_CLIENT_IP_HEADER=x-forwarded-for   # not behind Cloudflare: the address comes from the reverse proxy
+PORTAL_GATEWAY_ADMIN_URL=          # empty: super admins see how to reach the gateway's UI, not a link
 # real email (see docs/operations/email-and-branding.md), e.g.
 PORTAL_MAIL_BACKEND=smtp
 PORTAL_SMTP_HOST=smtp.example.org
@@ -65,6 +66,19 @@ pdf.example.org {
 With nginx, proxy to `http://127.0.0.1:8088`, set `client_max_body_size` to your largest upload, turn off request
 buffering for uploads (`proxy_request_buffering off`), and allow 300 s timeouts. Pass `X-Forwarded-For` and
 `X-Forwarded-Proto`.
+
+**So the audit log records people's addresses, not the proxy's:** tell the web app which proxy to believe, in
+`.env.portal` next to the compose file:
+
+```
+WEB_TRUSTED_PROXIES=<range>   # the reverse proxy as the web container sees it: Docker's network range
+```
+
+Docker gives its networks addresses from the private 172.16 to 172.31 block unless you set your own;
+`docker network inspect <network>` shows the subnet to use (a CIDR range such as `192.0.2.0/24`).
+
+Without it, the web app reports its own peer (the reverse proxy) as the caller, so nobody can make up an address
+by sending the header themselves.
 
 Alternatively, a [Cloudflare Tunnel](cloudflare.md#a-tunnel-in-front-tested) needs no open ports at all.
 

@@ -3,8 +3,9 @@ import { marked } from "marked";
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useSeen } from "../components/seen";
-import { download, get, getText, post, type Finding, type Job, type JobFile, type Versions } from "../api";
+import { download, get, getText, post, type DocVersion, type Finding, type Job, type JobFile, type RemovalResult, type Versions } from "../api";
 import { parseVeraPdf, VeraPdfView, type VeraReport } from "../components/verapdf";
+import { checkKey, checkLink } from "../checks";
 import { useAuth } from "../auth";
 import { HelpPanel } from "../components/help";
 import { ErrorNotice, Loading, Notice, fmtBytes, fmtDate, fmtNum, isActive, useLoad, useTitle } from "../components/ui";
@@ -33,12 +34,13 @@ const STAGES: Record<string, string> = {
   adobe_merging: "Putting Adobe's parts back together",
   waiting_daily_cap: "Waiting: today's page limit for this service has been reached",
   paused: "Waiting: support has paused this processing option for now; it will go ahead when it's resumed",
+  waiting_at_once: "Waiting: this processing option is handling as many documents as it can at once",
   waiting_large: "Large document: it's processed in turn with smaller ones, so it may take longer to start",
 };
 
 // The steps shown while a document is processed, and the engine stages that belong to each
 const STEPS: [string, string[]][] = [
-  ["Waiting", ["", "pending", "started", "waiting_daily_cap", "paused", "waiting_large"]],
+  ["Waiting", ["", "pending", "started", "waiting_daily_cap", "paused", "waiting_large", "waiting_at_once"]],
   ["Checking the original", ["validating", "validating_original", "analyzing", "adobe_sending"]],
   ["Tagging", ["tagging", "adobe_tagging", "adobe_merging"]],
   ["Alt text and tables", ["enriching", "ai_enrichment"]],
@@ -49,7 +51,9 @@ const FILE_HINTS: Record<string, string> = {
   report_pdf: "What was done, the accessibility check, and what to check.",
   primary: "Passes the check where possible. Use this one.",
   visual_fallback: "Looks identical to your original.",
-  enhanced: "Adobe's file with AI alt text and font fixes, looking the same.",
+  enhanced: "Adobe's file with AI alt text, font fixes and bookmarks, looking the same.",
+  music_score: "The whole piece as one score, as read by software. Open it in notation software to play it, check it, or make braille music.",
+  music_files: "The music one file per line or example, for notation software: play it back to check it against the page.",
 };
 
 /** Pages that link here can pass this as the link's state so "Back" returns to the exact view they showed. */
@@ -128,7 +132,9 @@ export function JobDetail() {
   }
 
   // The document's PDFs first, then the report
-  const pdfs = j.files.filter((f) => f.name.toLowerCase().endsWith(".pdf") && f.kind !== "input")
+  // The files people come for: the PDFs, and the music files when the document has music (not folded away with
+  // the technical files: the people who need them are the ones checking or reading the music)
+  const pdfs = j.files.filter((f) => (f.name.toLowerCase().endsWith(".pdf") && f.kind !== "input") || f.kind === "music_files" || f.kind === "music_score")
     .sort((a, b) => Number(a.kind === "report_pdf") - Number(b.kind === "report_pdf"));
   const main = pdfs.find((f) => f.kind === "primary") ?? pdfs.find((f) => f.kind !== "report_pdf");
   const stage = (j.progress?.stage as string | undefined) ?? "";
@@ -157,7 +163,7 @@ export function JobDetail() {
             <button className="btn" onClick={() => void getFile(main.id, main.name)}>Download {main.label}</button>
           )}
           {done && <Link className="btn secondary" to={`/jobs/${j.id}/tags`}
-            state={{ back: location.pathname + location.search, backLabel: "the document" } satisfies BackState}>Open in tag viewer</Link>}
+            state={{ back: location.pathname + location.search, backLabel: "the document" } satisfies BackState}>Open in tag manager</Link>}
           {j.status === "held" && own && <>
             <button className="btn" onClick={() => void act("confirm")}>Send ({fmtNum(j.pages)} pages)</button>
             <button className="btn secondary" onClick={() => void act("cancel")}>Cancel</button>
@@ -167,6 +173,12 @@ export function JobDetail() {
       </section>
 
       <ErrorNotice error={actionError} />
+      {j.deleted && (
+        <div className="notice" role="status">
+          Deleted{j.deleted_by ? ` by ${j.deleted_by}` : ""}{j.deleted_at ? ` on ${fmtDate(j.deleted_at)}` : ""}. Its files are
+          gone and it no longer appears in any document list; only super admins can open it, and reports still count it.
+        </div>
+      )}
       <Notes job={j} />
 
       {done && (
@@ -195,20 +207,23 @@ export function JobDetail() {
               {tab === "review" && <Review jobId={j.id} findings={r!.review?.findings ?? []} total={findingsTotal} />}
               {tab === "report" && <ReportPanel job={j} own={own} onError={setActionError} getFile={getFile}
                 onOpenReview={() => setTab("review", { section: null })} />}
-              {tab === "check" && <CheckPanel job={j} own={own} onError={setActionError} getFile={getFile} />}
-              {tab === "versions" && <VersionsPanel jobId={j.id} own={own} versions={reviewed} onError={setActionError} />}
+              {tab === "check" && <CheckPanel job={j} own={own} onError={setActionError} getFile={getFile} versions={reviewed} />}
+              {tab === "versions" && <VersionsPanel jobId={j.id} own={own} versions={reviewed} onError={setActionError}
+                canEdit={!!versions.data?.can_edit} onChanged={() => void versions.reload()} />}
             </div>
           </section>
         )}
 
-        {sideOpen ? (
-          <aside className="doc-side" aria-label="Downloads and help">
-            <button type="button" className="linkbtn small doc-side-toggle" aria-expanded="true" onClick={() => toggleSide(false)}>
-              Hide downloads and help <span aria-hidden="true">»</span></button>
+        {sideOpen || !done ? (
+          <aside className="doc-side" aria-label={done ? "Downloads and help" : "Help"}>
+            {/* Without results there is nothing beside this panel to make room for, so nothing to hide it for */}
+            {done && <button type="button" className="linkbtn small doc-side-toggle" aria-expanded="true" onClick={() => toggleSide(false)}>
+              Hide downloads and help <span aria-hidden="true">»</span></button>}
             {(done || j.files.some((f) => f.kind === "input")) && (
-              <div id="doc-downloads" tabIndex={-1} aria-label="Downloads"><Downloads job={j} pdfs={pdfs} getFile={getFile} /></div>
+              <div id="doc-downloads" tabIndex={-1} aria-label="Downloads"><Downloads job={j} pdfs={pdfs} getFile={getFile} reviewed={reviewed}
+                own={own} isSuper={!!me?.is_super_admin} onChanged={() => void job.reload()} onError={setActionError} /></div>
             )}
-            <div id="doc-help" tabIndex={-1} aria-label="Help"><HelpPanel job={j} /></div>
+            {(done || j.status === "failed") && <div id="doc-help" tabIndex={-1} aria-label="Help"><HelpPanel job={j} /></div>}
           </aside>
         ) : (
           <nav className="doc-rail" aria-label="Downloads and help">
@@ -331,7 +346,7 @@ function Notes({ job: j }: { job: Job }) {
     notes.push({ key: "adobe", head: "Tagged by Adobe:", line: <>Adobe doesn't write alt text, and its tags aren't guaranteed to pass.</>,
       more: <>"Adobe tagged PDF" is the file exactly as Adobe returned it{r.adobe && (r.adobe.parts ?? 1) > 1
         ? ` (sent in ${r.adobe.parts} parts and put back together)` : ""}.{j.files.some((f) => f.kind === "enhanced")
-        ? ` "${r.improved_label ?? "Improved copy"}" is the same file, looking exactly the same, with the improvements; it's a separate version in the tag viewer.`
+        ? ` "${r.improved_label ?? "Improved copy"}" is the same file, looking exactly the same, with the improvements; it's a separate version in the tag manager.`
         : ""} Needs review lists what to fix, and Adobe's own report is with the technical files.</> });
   }
   if (j.external_services.length > 0 && j.status !== "held") {
@@ -405,13 +420,57 @@ function TabList({ label, items, active, onPick, idPrefix, small = false }: {
 
 // --- downloads ----------------------------------------------------------------------------------------
 
-function Downloads({ job: j, pdfs, getFile }: { job: Job; pdfs: JobFile[]; getFile: (id: string, name: string) => Promise<void> }) {
+/** A version's PDF. Opening someone else's file is recorded, with the reason if they give one. */
+async function fetchVersionPdf(jobId: string, own: boolean, n: number, name: string, onError: (e: unknown) => void) {
+  try {
+    let reason = "";
+    if (!own) reason = window.prompt("You're opening someone else's file. This is recorded. Reason (optional):") ?? "";
+    await download(`/jobs/${jobId}/versions/${n}/pdf${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`, name);
+  } catch (e) {
+    onError(e);
+  }
+}
+
+/** The human-reviewed file, first among the downloads: the newest by default, the others one choice away. */
+function ReviewedDownload({ jobId, own, versions, onError }: {
+  jobId: string; own: boolean; versions: DocVersion[]; onError: (e: unknown) => void;
+}) {
+  const ready = versions.filter((v) => v.status === "ready" && v.pdf_name).sort((a, b) => b.number - a.number);
+  const [pick, setPick] = useState<number | null>(null);
+  if (!ready.length) return null;
+  const chosen = ready.find((v) => v.number === pick) ?? ready[0];
+  return (
+    <div className="doc-reviewed">
+      <label htmlFor="dl-reviewed" className="doc-file-name">Human reviewed</label>
+      {ready.length > 1 ? (
+        <select id="dl-reviewed" value={chosen.number} onChange={(e) => setPick(Number(e.target.value))}>
+          {ready.map((v, n) => (
+            <option key={v.number} value={v.number}>{v.label}{n === 0 ? " (newest)" : ""}, {fmtDate(v.finished_at, false)}</option>
+          ))}
+        </select>
+      ) : <span id="dl-reviewed" className="small">{chosen.label}, {fmtDate(chosen.finished_at, false)}</span>}
+      <button type="button" className="btn" onClick={() => void fetchVersionPdf(jobId, own, chosen.number, chosen.pdf_name!, onError)}>
+        Download{chosen.pdf_size ? ` (${fmtBytes(chosen.pdf_size)})` : ""}
+      </button>
+      <span className="doc-file-hint">{chosen.summary?.compliant ? "Passes PDF/UA-1." : checkLink(jobId, chosen)
+        ? <Link to={checkLink(jobId, chosen)!}>{fmtNum(chosen.summary?.failed_checks)} failed checks.</Link>
+        : `${fmtNum(chosen.summary?.failed_checks)} failed checks.`}{" "}
+        Edited by {chosen.created_by_email ?? "–"}. All versions are under Versions.</span>
+    </div>
+  );
+}
+
+function Downloads({ job: j, pdfs, getFile, own, isSuper, onChanged, onError, reviewed }: {
+  job: Job; pdfs: JobFile[]; getFile: (id: string, name: string) => Promise<void>; own: boolean; isSuper: boolean;
+  onChanged: () => void; onError: (e: unknown) => void; reviewed: DocVersion[];
+}) {
   const original = j.files.find((f) => f.kind === "input");
   const technical = j.files.filter((f) => !pdfs.includes(f) && f.kind !== "input");
   return (
     <section className="doc-card" aria-labelledby="dl-h">
       <h2 id="dl-h">Downloads</h2>
-      {j.files_deleted ? <p className="muted small">The files were deleted under the retention policy.</p> : <>
+      {j.files_deleted ? <p className="muted small">The files have been removed.</p> : <>
+        <ReviewedDownload jobId={j.id} own={own} versions={reviewed} onError={onError} />
         {pdfs.map((f) => (
           <button key={f.id} type="button" className="doc-file" onClick={() => void getFile(f.id, f.name)}>
             <span className="doc-file-name">{f.label}</span>
@@ -433,9 +492,78 @@ function Downloads({ job: j, pdfs, getFile }: { job: Job; pdfs: JobFile[]; getFi
             </ul>
           </details>
         )}
-        {j.files_expire_at && <p className="muted small">Files are kept until {fmtDate(j.files_expire_at, false)}.</p>}
+        {j.removal_at ? null : j.files_expire_at && <p className="muted small">Files are kept until {fmtDate(j.files_expire_at, false)}.</p>}
       </>}
+      <Removal job={j} own={own} isSuper={isSuper} onChanged={onChanged} onError={onError} />
     </section>
+  );
+}
+
+const FINISHED = ["completed", "failed", "canceled"];
+
+/** Removing the files early: the owner marks the document done (undoable until the hold ends); super admins remove
+ * files now or delete the document. */
+function Removal({ job: j, own, isSuper, onChanged, onError }: {
+  job: Job; own: boolean; isSuper: boolean; onChanged: () => void; onError: (e: unknown) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  if (j.deleted || !FINISHED.includes(j.status)) return null;
+  const hold = j.removal_hold_hours;
+  const when = hold === 0 ? "at the next cleanup (within the hour)" : `in ${hold} ${hold === 1 ? "hour" : "hours"}`;
+
+  async function run(fn: () => Promise<unknown>) {
+    setBusy(true);
+    onError(null);
+    try {
+      await fn();
+      onChanged();
+    } catch (e) {
+      onError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function markDone() {
+    if (!window.confirm(`Remove the files of “${j.filename}” ${when}?\n\nDownload anything you need first. You can undo this `
+      + "until then. The document stays in your list, without its files.")) return;
+    void run(() => post(`/jobs/${j.id}/remove-early`));
+  }
+
+  function adminRemove(del: boolean) {
+    const what = del
+      ? `Delete “${j.filename}”?\n\nIts files are removed now and it leaves every document list, including its owner's. `
+        + "Reports and page usage still count it. This can't be undone."
+      : `Remove the files of “${j.filename}” now?\n\nThe document stays in its owner's list, without its files. This can't be undone.`;
+    if (!window.confirm(what)) return;
+    const reason = window.prompt("Reason (recorded in the audit log):")?.trim();
+    if (!reason || reason.length < 3) return;
+    void run(() => post<RemovalResult>("/admin/jobs/remove", { ids: [j.id], delete: del, reason }).then((r) => {
+      if (r.skipped.length) throw new Error(r.skipped[0].message);
+    }));
+  }
+
+  return (
+    <div className="doc-removal">
+      {j.removal_at && !j.files_deleted && <>
+        <p className="small"><strong>Marked done.</strong> The files will be removed on {fmtDate(j.removal_at)}.</p>
+        {(own || isSuper) && <button type="button" className="btn secondary small" disabled={busy}
+          onClick={() => void run(() => post(`/jobs/${j.id}/keep`))}>Keep the files</button>}
+      </>}
+      {own && !j.removal_requested && !j.files_deleted && (
+        <button type="button" className="linkbtn small" disabled={busy} onClick={markDone}>
+          I'm done with it: remove the files</button>
+      )}
+      {isSuper && (
+        <details className="doc-admin-removal">
+          <summary className="small">Super admin: remove</summary>
+          {!j.files_deleted && <button type="button" className="btn secondary small" disabled={busy}
+            onClick={() => adminRemove(false)}>Remove files now</button>}
+          <button type="button" className="btn secondary small danger-text" disabled={busy}
+            onClick={() => adminRemove(true)}>Delete the document</button>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -477,7 +605,7 @@ function Review({ jobId, findings, total }: { jobId: string; findings: (Finding 
     return () => window.clearTimeout(t);
   }, [search]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Back from the tag viewer: bring the finding that was opened into view, and give it focus
+  // Back from the tag manager: bring the finding that was opened into view, and give it focus
   useEffect(() => {
     const m = /^#finding-(\d+)$/.exec(location.hash);
     if (!m) return;
@@ -641,7 +769,7 @@ function ReportPanel({ job, own, onError, getFile, onOpenReview }: {
   // Owners' reports load as they open the tab. Anyone else's open on request, because it's recorded.
   useEffect(() => { if (own && !sections && !loading && !job.files_deleted) void load(); }, [own, sections, loading, load, job.files_deleted]);
 
-  if (job.files_deleted) return <p className="muted">The report was deleted with the files under the retention policy.</p>;
+  if (job.files_deleted) return <p className="muted">The report was removed with the files.</p>;
   if (!sections) {
     return loading ? <p className="muted" role="status">Loading…</p> : !own ? (
       <div className="actions">
@@ -666,7 +794,7 @@ function ReportPanel({ job, own, onError, getFile, onOpenReview }: {
       <div role="tabpanel" id={`rep-panel-${current.key}`} aria-labelledby={`rep-tab-${current.key}`} tabIndex={0}>
         {current.key === "review" && (
           <p className="report-pointer">Every item is in <strong>Needs review</strong>, where you can filter, search and open
-            each one in the tag viewer. <button type="button" className="linkbtn" onClick={onOpenReview}>Open Needs review</button></p>
+            each one in the tag manager. <button type="button" className="linkbtn" onClick={onOpenReview}>Open Needs review</button></p>
         )}
         <div className="report" dangerouslySetInnerHTML={{ __html: current.html }} />
       </div>
@@ -681,15 +809,21 @@ const CHECKS: [string, string][] = [
   ["verapdf_after_enhanced", "Improved copy"],
 ];
 
-function CheckPanel({ job, own, onError, getFile }: {
+function CheckPanel({ job, own, onError, getFile, versions = [] }: {
   job: Job; own: boolean; onError: (e: unknown) => void; getFile: (id: string, name: string) => Promise<void>;
+  versions?: DocVersion[]; // saved versions: each keeps its own check, shown in a tab of its own
 }) {
   const location = useLocation();
   const [params, setParams] = useSearchParams();
-  const files = CHECKS.flatMap(([kind, label]) => {
-    const f = job.files.find((x) => x.kind === kind);
-    return f ? [{ key: kind, label, file: f }] : [];
-  });
+  const files: { key: string; label: string; file: { id: string; name: string } }[] = [
+    ...CHECKS.flatMap(([kind, label]) => {
+      const f = job.files.find((x) => x.kind === kind);
+      return f ? [{ key: kind, label, file: f }] : [];
+    }),
+    ...versions.filter((v) => v.status === "ready" && v.verapdf_file_id).map((v) => ({
+      key: checkKey(v)!, label: v.label, file: { id: v.verapdf_file_id!, name: `${v.label} accessibility check.xml` },
+    })),
+  ];
   const current = files.find((x) => x.key === params.get("check")) ?? files.find((x) => x.key === "verapdf_after") ?? files[0];
   // The check results are a section of the PDF report; the XML stays with the technical files
   const reportPdf = job.files.find((f) => f.kind === "report_pdf");
@@ -710,12 +844,13 @@ function CheckPanel({ job, own, onError, getFile }: {
     if (own && current && !(current.key in reports) && loading === null && !job.files_deleted) void load(current.key, current.file.id);
   }, [own, current, reports, loading, load, job.files_deleted]);
 
-  if (job.files_deleted) return <p className="muted">The check results were deleted with the files under the retention policy.</p>;
+  if (job.files_deleted) return <p className="muted">The check results were removed with the files.</p>;
   if (!current) return null;
   const report = reports[current.key];
+  const isVersion = versions.some((v) => checkKey(v) === current.key);
   return (
     <div className="report-panel">
-      <p className="muted small" style={{ margin: 0 }}>The PDF/UA-1 check (veraPDF) on your original and on the result.</p>
+      <p className="muted small" style={{ margin: 0 }}>The PDF/UA-1 check (veraPDF) on your original, on the result, and on each version saved from the tag manager.</p>
       {files.length > 1 && (
         <TabList label="Which file" small idPrefix="chk" active={current.key} items={files.map((x) => ({ key: x.key, label: x.label }))}
           onPick={(k) => { const n = new URLSearchParams(params); n.set("check", k); setParams(n, { replace: true, state: location.state }); }} />
@@ -729,9 +864,10 @@ function CheckPanel({ job, own, onError, getFile }: {
           </div>
         )}
         {current.key in reports && (report ? (
+          // The PDF report covers the engine's run; a saved version's check is its own XML
           <VeraPdfView report={report}
-            downloadLabel={reportPdf ? "Download the report (PDF)" : "Download XML"}
-            onDownload={() => void (reportPdf ? getFile(reportPdf.id, reportPdf.name) : getFile(current.file.id, current.file.name))} />
+            downloadLabel={reportPdf && !isVersion ? "Download the report (PDF)" : "Download XML"}
+            onDownload={() => void (reportPdf && !isVersion ? getFile(reportPdf.id, reportPdf.name) : getFile(current.file.id, current.file.name))} />
         ) : (
           <Notice kind="warn">These results couldn't be read. <button className="linkbtn" onClick={() => void getFile(current.file.id, current.file.name)}>Download the XML</button></Notice>
         ))}
@@ -742,16 +878,21 @@ function CheckPanel({ job, own, onError, getFile }: {
 
 // --- saved versions -------------------------------------------------------------------------------------
 
-function VersionsPanel({ jobId, own, versions, onError }: {
+function VersionsPanel({ jobId, own, versions, onError, canEdit, onChanged }: {
   jobId: string; own: boolean; versions: Versions["versions"]; onError: (e: unknown) => void;
+  canEdit: boolean; onChanged: () => void;
 }) {
-  async function fetchPdf(n: number, name: string) {
+  const [busy, setBusy] = useState<number | null>(null);
+  async function undo(v: DocVersion) {
+    if (!window.confirm(`Undo the last save into ${v.label}? It goes back to the file it had before, and the newer file is removed.`)) return;
+    setBusy(v.number);
     try {
-      let reason = "";
-      if (!own) reason = window.prompt("You're opening someone else's file. This is recorded. Reason (optional):") ?? "";
-      await download(`/jobs/${jobId}/versions/${n}/pdf${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`, name);
+      await post(`/jobs/${jobId}/versions/${v.number}/undo-save`);
+      onChanged();
     } catch (e) {
       onError(e);
+    } finally {
+      setBusy(null);
     }
   }
   return (
@@ -759,13 +900,21 @@ function VersionsPanel({ jobId, own, versions, onError }: {
       {versions.map((v) => (
         <li key={v.number}>
           <span className="versions-name">{v.status === "ready" && v.pdf_name
-            ? <button className="linkbtn" onClick={() => void fetchPdf(v.number, v.pdf_name!)}>{v.label}</button> : <strong>{v.label}</strong>}</span>
+            ? <button className="linkbtn" onClick={() => void fetchVersionPdf(jobId, own, v.number, v.pdf_name!, onError)}>{v.label}</button> : <strong>{v.label}</strong>}</span>
           <span className="muted small">
             {v.status === "ready"
-              ? `${v.summary?.compliant ? "passes PDF/UA-1" : `${fmtNum(v.summary?.failed_checks)} failed checks`} · ${v.edits_count} edit(s) by ${v.created_by_email ?? "–"}, ${fmtDate(v.finished_at)}`
-              : v.status === "failed" ? `not saved: ${v.error_message ?? ""}` : "being checked…"}
+              ? <>{v.summary?.compliant ? "passes PDF/UA-1" : checkLink(jobId, v)
+                ? <Link to={checkLink(jobId, v)!}>{fmtNum(v.summary?.failed_checks)} failed checks</Link>
+                : `${fmtNum(v.summary?.failed_checks)} failed checks`} · {v.edits_count} edit(s) by {v.created_by_email ?? "–"}, {fmtDate(v.finished_at)}</>
+              : v.status === "failed" ? `not saved: ${v.error_message ?? ""}`
+              : v.replacing != null ? "being checked; it replaces the one above when it passes…" : "being checked…"}
           </span>
           {v.note && <span className="muted small">“{v.note}”</span>}
+          {v.undo_until && (
+            <span className="muted small">Saved into this version. The file it had before is kept until {fmtDate(v.undo_until)}.{" "}
+              {canEdit && <button className="linkbtn" disabled={busy === v.number} onClick={() => void undo(v)}>
+                {busy === v.number ? "Undoing…" : "Undo this save"}</button>}</span>
+          )}
         </li>
       ))}
     </ol>

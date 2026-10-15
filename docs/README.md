@@ -3,7 +3,7 @@
 ## Using the service
 
 - **[User guide](user-guide/README.md)**, by role:
-  - [People submitting documents](user-guide/people/README.md): signing in, uploading, results, the tag viewer,
+  - [People submitting documents](user-guide/people/README.md): signing in, uploading, results, the tag manager,
     getting help, email
   - [Group admins](user-guide/group-admins/README.md): approval, pages and limits, group settings, reports
   - [Super admins](user-guide/super-admins/README.md): first-time setup, services and AI levels, settings, help
@@ -19,7 +19,7 @@
 - **[Operations](operations/README.md):** [configuration](operations/configuration.md),
   [AI models](operations/ai-models.md), [email and branding](operations/email-and-branding.md),
   [Adobe Autotag](operations/adobe-autotag.md), [backups and migrations](operations/backups-and-migrations.md),
-  [monitoring and troubleshooting](operations/monitoring.md)
+  [monitoring and troubleshooting](operations/monitoring.md), [limits](operations/limits.md)
 
 ## How it works
 

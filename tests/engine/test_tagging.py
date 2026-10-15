@@ -157,6 +157,9 @@ def test_headings_group_following_content_into_sections(samples, tmp_path):
         assert str(h1_sect.K[0].S) == "/H1"
         subs = [k for k in h1_sect.K if str(k.S) == "/Sect"]
         assert len(subs) == 2 and all(str(s.K[0].S) == "/H2" for s in subs)
-        # page 2's H2 section holds its own list and figure, i.e. content follows its heading
-        assert {"/L", "/Figure"} <= {str(k.S) for k in subs[1].K}
+        # page 2's H2 section holds its own list and figure (grouped with its caption), i.e. content follows
+        # its heading
+        kids = list(subs[1].K)
+        assert "/L" in {str(k.S) for k in kids}
+        assert any(str(k.S) == "/Sect" and [str(x.S) for x in k.K] == ["/Figure", "/Caption"] for k in kids)
     _parent_tree_consistent(out)

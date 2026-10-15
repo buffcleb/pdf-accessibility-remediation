@@ -86,6 +86,11 @@ async def submit_remediation(
         if size == 0:
             raise HTTPException(status_code=422, detail="empty file")
         page_count = await run_in_threadpool(_check_pdf, store.input_pdf)
+        # The portal keeps to its own page cap, but this API trusts whoever holds its key: a document of
+        # tens of thousands of pages would hold a worker until the time limit, so the engine has a cap of its own
+        if settings.max_pages and page_count > settings.max_pages:
+            raise HTTPException(status_code=422, detail=f"the document has {page_count} pages; at most "
+                                                        f"{settings.max_pages} are accepted (MAX_PAGES)")
     except HTTPException:
         shutil.rmtree(store.dir, ignore_errors=True)
         raise
@@ -125,12 +130,34 @@ async def ai_models():
         raise HTTPException(status_code=503, detail=str(exc))
 
 
+def worker_capacity(timeout: float = 1.0) -> dict:
+    """The workers answering now and how many documents they process at once between them (None when none answer,
+    or the queue can't be reached)."""
+    from app.worker.celery_app import celery_app
+
+    try:
+        stats = celery_app.control.inspect(timeout=timeout).stats() or {}
+    except Exception:  # noqa: BLE001 - the queue being down mustn't break the caller
+        return {"workers": None, "documents_at_once": None}
+    at_once = sum(int((s.get("pool") or {}).get("max-concurrency") or 0) for s in stats.values())
+    return {"workers": len(stats), "documents_at_once": at_once or None}
+
+
+@router.get("/capacity", dependencies=[Depends(require_api_key)])
+async def capacity():
+    """How much the engine can process at once, so the portal hands over as many documents as there are places
+    (the number of workers changes when they're scaled with the queue)."""
+    return await run_in_threadpool(worker_capacity)
+
+
 @router.post("/edit", response_model=SubmitResponse, status_code=202, dependencies=[Depends(require_api_key)])
 async def submit_edit(file: UploadFile = File(...), edits: str = Form(...), verify_ai: bool = Form(True),
                       review: str = Form("none", pattern="^(none|sampled|full)$"),
                       judge_model: str | None = Form(None, max_length=200),
-                      reference: UploadFile | None = File(None)):
-    """Apply tag edits to a remediated PDF and validate the result (the portal's tag viewer).
+                      reference: UploadFile | None = File(None),
+                      validator: str | None = Form(None, pattern="^(service|command_line)$"),
+                      verapdf_ua2: bool = Form(True)):
+    """Apply tag edits to a remediated PDF and validate the result (the portal's tag manager).
     review=sampled also runs the AI tag review (flagged items plus a sample) over the whole result, and
     review=full reviews every figure;
     with no edits that re-reviews the file as it is.
@@ -154,7 +181,8 @@ async def submit_edit(file: UploadFile = File(...), edits: str = Form(...), veri
     store.write_meta({"job_id": job_id, "kind": "edit", "filename": file.filename,
                       "stem": safe_stem(file.filename or "document.pdf"), "size_bytes": size,
                       "edits": ops, "verify_ai": verify_ai, "review": review, "judge_model": judge_model,
-                      "reference": reference is not None, "flags": {}, "submitted_at": time.time()})
+                      "reference": reference is not None, "submitted_at": time.time(),
+                      "flags": {**({"validator": validator} if validator else {}), "verapdf_ua2": verapdf_ua2}})
     from app.worker.tasks import edit_tags
 
     edit_tags.apply_async(args=[job_id], task_id=job_id)
@@ -214,6 +242,12 @@ async def get_job(job_id: str, format: str = Query("json", pattern="^(json|markd
 
     result = store.read_result()
     if result is None:
+        # A task that ended without a result or an error on file was killed before it could write one (the hard
+        # time limit, the worker running out of memory, a stop request): say so, or the caller waits for ever
+        ended = await run_in_threadpool(_ended_without_result, job_id)
+        if ended is not None:
+            store.write_error(ended)
+            return JobResponse(job_id=job_id, status="failed", error=ended)
         return JobResponse(job_id=job_id, status="processing", progress=_progress(job_id))
 
     b64 = bool(meta.get("flags", {}).get("return_base64"))
@@ -241,6 +275,8 @@ async def get_job(job_id: str, format: str = Query("json", pattern="^(json|markd
             report_pdf=ref(result.get("report_pdf")),
             tag_verification=reports.get("tag_verification"),
             tag_maps={k: ref(v) for k, v in (reports.get("tag_maps") or {}).items()} or None,
+            music_files=ref(reports.get("music_files")),
+            music_score=ref(reports.get("music_score")),
             edits_applied=reports.get("edits_applied"),
             adobe_reports=[ref(n) for n in reports.get("adobe_reports") or []] or None,
         ),
@@ -259,6 +295,52 @@ def _markdown(store: JobStore, meta: dict) -> PlainTextResponse:
         ref=lambda name: store.render_file_ref(name, as_base64=False),  # links, never inline base64
     )
     return PlainTextResponse(md, media_type="text/markdown; charset=utf-8")
+
+
+def _ended_without_result(job_id: str) -> dict | None:
+    """The error to record for a task the queue says is over (failed or stopped), else None."""
+    try:
+        from app.worker.celery_app import celery_app
+
+        res = celery_app.AsyncResult(job_id)
+        state, info = res.state, res.info
+    except Exception:  # noqa: BLE001 - the queue being unreachable isn't the job failing
+        return None
+    if state == "REVOKED":
+        return {"error": "stopped", "detail": "The job was stopped before it finished."}
+    if state != "FAILURE":
+        return None
+    name = type(info).__name__
+    if "TimeLimit" in name:
+        return {"error": "time_limit_exceeded", "detail": "Job exceeded the processing time limit."}
+    if "WorkerLost" in name:
+        return {"error": "worker_lost", "detail": "The worker processing this job stopped unexpectedly (often out of memory)."}
+    return {"error": name or "failed", "detail": str(info)[:500]}
+
+
+@router.post("/jobs/{job_id}/stop", dependencies=[Depends(require_api_key)])
+async def stop_job(job_id: str):
+    """Stop a job that's waiting or in progress. Its failure is on file at once (error "stopped"), and the worker
+    process running it is ended so it stops using a place. A finished job is left as it is."""
+    try:
+        store = JobStore(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="job not found")
+    if store.read_meta() is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if store.read_result() is not None or store.read_error() is not None:
+        return {"job_id": job_id, "stopped": False}
+    store.write_error({"error": "stopped", "detail": "The job was stopped before it finished."})
+
+    def revoke() -> None:
+        from app.worker.celery_app import celery_app
+
+        celery_app.control.revoke(job_id, terminate=True, signal="SIGTERM")
+    try:
+        await run_in_threadpool(revoke)
+    except Exception as exc:  # noqa: BLE001 - the job is marked stopped either way; say the worker wasn't reached
+        return {"job_id": job_id, "stopped": True, "worker": f"not reached: {exc}"}
+    return {"job_id": job_id, "stopped": True}
 
 
 def _progress(job_id: str) -> dict | None:
@@ -320,9 +402,66 @@ async def classify_document(file: UploadFile = File(...), kinds: str = Form(...,
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@router.post("/describe", dependencies=[Depends(require_api_key)])
+async def describe_area(file: UploadFile = File(...), page: int = Form(..., ge=1), bbox: str = Form(..., max_length=200),
+                        ai_provider: str = Form("gateway", max_length=40), ai_model: str | None = Form(None, max_length=200),
+                        long: bool = Form(False)):
+    """Alt text for an area of a page, from the AI: the area (bbox, JSON [x0, y0, x1, y1] in page units, as the tag
+    map gives them) is drawn and sent with the text inside it. long: the room a scheme's steps need. Answers at once
+    with {alt, kind, decorative, latex, model, cost_usd, prompt_tokens, completion_tokens}; nothing is kept."""
+    import pymupdf as fitz
+
+    from app.ai.base import AIError
+    from app.ai.registry import available_providers, get_provider
+    from app.pipeline.analyzer import render_png
+    try:
+        box = [float(v) for v in json.loads(bbox)]
+        if len(box) != 4 or box[2] - box[0] < 1 or box[3] - box[1] < 1:
+            raise ValueError
+    except (json.JSONDecodeError, ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="bbox must be a JSON list [x0, y0, x1, y1] with some width and height")
+    if ai_provider not in available_providers() or ai_provider == "none":
+        raise HTTPException(status_code=422, detail=f"unknown AI provider: {ai_provider}")
+    tmp = Path(tempfile.mkdtemp(prefix="describe-"))
+    try:
+        path = tmp / "in.pdf"
+        size, limit = 0, get_settings().max_upload_mb * 1024 * 1024
+        with path.open("wb") as out:
+            while chunk := await file.read(_CHUNK):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(status_code=413, detail=f"file exceeds {get_settings().max_upload_mb} MB")
+                out.write(chunk)
+        await run_in_threadpool(_check_pdf, path)
+
+        def crop() -> tuple[bytes, str]:
+            with fitz.open(path) as doc:
+                if page > doc.page_count:
+                    raise HTTPException(status_code=422, detail=f"page {page} doesn't exist")
+                png = render_png(doc, page - 1, clip=tuple(box), max_px=1200)
+                # What's written inside the area (labels, a caption) helps the AI name what's drawn
+                words = doc[page - 1].get_text("text", clip=fitz.Rect(box)).strip()
+            return png, " ".join(words.split())[:2000]
+        try:
+            png, context = await run_in_threadpool(crop)
+        except ValueError as exc:  # the box is off the page
+            raise HTTPException(status_code=422, detail=str(exc))
+        ai = get_provider(ai_provider, ai_model)
+        try:
+            out = await ai.describe_image(png, page - 1, context, long=long)
+        except AIError as exc:
+            raise HTTPException(status_code=502, detail=f"ai_unavailable: {exc}")
+        return {"alt": out.get("alt") or "", "kind": out.get("kind"), "decorative": bool(out.get("decorative")),
+                "latex": out.get("latex"), "model": getattr(ai, "model", ai_model),
+                "cost_usd": round(ai.usage.cost_usd, 6), "prompt_tokens": ai.usage.prompt_tokens,
+                "completion_tokens": ai.usage.completion_tokens}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @router.get("/health")
 async def health():
-    from app.validation.verapdf import verapdf_version
+    from app.validation.verapdf import service_version, verapdf_version
 
     status: dict = {"status": "ok"}
     try:
@@ -335,7 +474,13 @@ async def health():
         status["status"] = "degraded"
     version = await run_in_threadpool(verapdf_version)
     status["verapdf"] = version or "unavailable"
-    if not version:
+    url = get_settings().verapdf_url.rstrip("/")
+    service = None
+    if url:
+        service_version.cache_clear()  # the service restarts (hourly): ask each time
+        service = await run_in_threadpool(service_version, url)
+        status["verapdf_service"] = service or "unavailable (checks use the command line)"
+    if not version and not service:
         status["status"] = "degraded"
     status["ai_providers"] = available_providers()
     s = get_settings()

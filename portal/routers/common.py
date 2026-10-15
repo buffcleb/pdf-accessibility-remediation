@@ -34,7 +34,9 @@ def audit_query(*, action: str | None, actor_id: uuid.UUID | None, since: dateti
     stmt = select(AuditEvent)
     if action:
         # "login" matches login, "group." matches every group action
-        stmt = stmt.where(AuditEvent.action.startswith(action) if action.endswith(".") else AuditEvent.action == action)
+        # autoescape: "%" and "_" in what was asked for are characters, not LIKE wildcards
+        stmt = stmt.where(AuditEvent.action.startswith(action, autoescape=True) if action.endswith(".")
+                          else AuditEvent.action == action)
     if actor_id:
         stmt = stmt.where(AuditEvent.actor_id == actor_id)
     if since:

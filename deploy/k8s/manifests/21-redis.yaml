@@ -1,4 +1,6 @@
-# Queues: the engine's Celery broker (db 0) and the portal's (db 1).
+# Queues: the engine's Celery broker (db 0) and the portal's (db 1). A password (REDIS_PASSWORD in engine.env, the
+# same value as PORTAL_REDIS_PASSWORD in portal.env; deploy.sh keeps them together) and the network policies in
+# 80-network-policies.yaml keep the queues to the pods that use them.
 apiVersion: v1
 kind: Service
 metadata:
@@ -22,18 +24,24 @@ spec:
     metadata:
       labels: { app: redis }
     spec:
-      securityContext: { fsGroup: 999, runAsUser: 999, runAsNonRoot: true }
+      securityContext: { fsGroup: 999, runAsUser: 999, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: redis
-          image: redis:7-alpine
-          args: ["--appendonly", "yes", "--dir", "/data"]
+          image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+          # With no ceiling a flood of requests (a 40 MB score per job, say) grows until the container is killed and the
+          # queues with it; past the ceiling a write is refused instead, which the sender reports
+          args: ["--appendonly", "yes", "--dir", "/data", "--requirepass", "$(REDIS_PASSWORD)", "--maxmemory", "384mb", "--maxmemory-policy", "noeviction"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
           ports: [{ containerPort: 6379 }]
           readinessProbe:
-            exec: { command: ["redis-cli", "ping"] }
+            exec: { command: ["sh", "-c", "redis-cli --no-auth-warning -a \"$REDIS_PASSWORD\" ping | grep -q PONG"] }
             periodSeconds: 5
           resources:
-            requests: { cpu: 50m, memory: 64Mi }
-            limits: { cpu: 500m, memory: 256Mi }
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
           volumeMounts: [{ name: data, mountPath: /data }]
   volumeClaimTemplates:
     - metadata: { name: data }

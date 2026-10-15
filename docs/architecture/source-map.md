@@ -17,12 +17,18 @@ app/                         the remediation engine
                 ocr.py, ocr_ai.py OCR lines with confidence; AI correction under checks
                 scan_figures.py   figures inside scanned pages (clipped redraws of the scan)
                 transfer.py       carrying AI results over to a re-analyzed (flattened) document
+                music.py, omr.py  music examples as figures; the music reading service, asked over Redis
+                plots.py          graphs drawn as hundreds of specks or one long path, as one figure each
+                schemes.py        chemical structures and reaction schemes drawn with lines, as one figure each
                 edit_job.py       saves from the tag editor;  adobe_job.py  the Adobe route
                 fonts.py, models.py
   tagging/      content_marker.py marked-content rewriter (text-run splitting, clips)
                 tagger.py, struct_tree.py, targets.py   the structure tree, and what each piece of content belongs to
                 existing_tags.py  auditing, repairing and rebuilding existing tags
                 editor.py, role_rules.py   tag edits, and which role changes are valid
+                placement.py, reorder.py   where added tags go among kept ones; kept tags put in reading order
+                empty_spans.py, legend.py  Spans around nothing, folded away; marks a page's legend explains
+                form_marks.py, blank_fonts.py   check marks redrawn as shapes; fonts that draw nothing
                 font_*.py, metadata.py, destructive.py (flattening)
   ai/           base.py (provider contract), gateway.py (LiteLLM), openai_compat.py, localai.py, ollama.py,
                 openrouter.py, mock.py, prompts.py, registry.py
@@ -54,10 +60,14 @@ web/src/                     the React app
   pages/admin/  index (menu, Attention), Groups, People, Services, Setup (guided set-up), Help, Queues,
                 Settings, shared
   components/   UploadForm, DocumentsList, Allowances, LiveReport, ReportChart, help, …
-  viewer/       TagViewer, Pane, PageView, TreePane, EditPanel, draft.ts, roles.ts, pdf.ts
+  viewer/       TagViewer, Pane, PageView, TreePane, EditPanel, Reader (read aloud), draft.ts, roles.ts,
+                speech.ts (what read aloud says), pdf.ts
+web/tests/                   unit tests of the viewer's logic (npm test: tsc, then Node's test runner)
 
 config/litellm.yaml          the AI gateway's models
-deploy/k8s/                  Kubernetes manifests and settings templates
+deploy/k8s/                  Kubernetes manifests and settings templates (35-verapdf: the veraPDF service and its
+                             hourly restart; 45-autoscale: scaling with the queue)
+deploy/verapdf/              settings of the veraPDF service (how many failed checks it reports, with messages)
 deploy/cloudflare-worker/    the optional Cloudflare Worker front end
 scripts/                     build.sh, deploy.sh, deploy-worker.sh, backup.sh, restore.sh, sign-in-code.sh
 harness/                     make_samples.py (synthetic PDFs), run_harness.py (batch tester), ocr_eval.py

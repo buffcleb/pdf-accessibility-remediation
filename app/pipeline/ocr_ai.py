@@ -20,7 +20,6 @@ import unicodedata
 
 import pymupdf as fitz
 
-from app.ai.base import AIError
 from app.config import get_settings
 from app.pipeline.analyzer import render_png
 from app.pipeline.ocr import OcrLine
@@ -167,12 +166,15 @@ async def correct_lines(ai, pdf_path: str, lines: list[OcrLine], stats) -> None:
         async def one(line: OcrLine, how: str) -> None:
             x0, y0, x1, y1 = line.bbox
             pad = 0.6 * line.size  # a little of the lines around, for context
-            png = render_png(doc, line.page, dpi=200, clip=(x0 - pad, y0 - pad, x1 + pad, y1 + pad), max_px=1600)
+            # OCR boxes are in unrotated page space; the render clips the page as shown, so a rotated page's
+            # box is turned with it (and the line comes out upright, as the AI should see it)
+            clip = fitz.Rect(x0 - pad, y0 - pad, x1 + pad, y1 + pad) * doc[line.page].rotation_matrix
             where = f"page {line.page + 1}"
             try:
+                png = render_png(doc, line.page, dpi=200, clip=tuple(clip), max_px=1600)
                 res = await ai.correct_ocr_line(png, line.page, marked_text(line) if how == "correct" else line.text,
                                                 how)
-            except (AIError, ValueError) as exc:
+            except Exception as exc:  # one line never fails the job: Tesseract's reading stands
                 stats.findings.append(f"{where}: AI OCR {how} failed ({exc}); Tesseract's text kept")
                 return
             text = " ".join(res["text"].split())

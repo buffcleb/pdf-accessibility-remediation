@@ -11,6 +11,7 @@ const DEFAULTS: AppConfig = { apiBase: "", appName: "PDF Accessibility Remediati
 type Branding = {
   service_name: string; organization_name: string; logo_url: string | null; logo_alt: string;
   accent_color: string | null; support_url: string | null; contact_email: string | null;
+  bot_check_site_key?: string | null;
 };
 
 // The accent color is validated by the server (#rrggbb, 4.5:1 against white). Light theme only: dark mode
@@ -55,6 +56,7 @@ async function start() {
         logoAlt: b.logo_alt,
         supportUrl: b.support_url,
         contactEmail: b.contact_email,
+        botCheckSiteKey: b.bot_check_site_key ?? null,
       };
       if (b.accent_color) applyAccent(b.accent_color);
     }

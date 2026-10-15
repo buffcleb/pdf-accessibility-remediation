@@ -25,6 +25,8 @@ export type User = {
   services: UserService[];
   created_at: string;
   last_login_at: string | null;
+  /** "Describe with AI" set for this person; null follows their group. */
+  ai_describe?: boolean | null;
 };
 
 /** A user's access to one service. */
@@ -81,6 +83,8 @@ export type Service = {
   reserved_pages: number;
   remaining_pages: number | null;
   daily_cap_pages: number | null;
+  /** Documents processed at once with this service; null: no limit of its own. */
+  max_at_once: number | null;
   pages_sent_today: number;
   max_pages_per_job: number | null;
   confirm_before_send: boolean;
@@ -148,9 +152,11 @@ export type Me = User & {
   help_unread: number;
   /** Super admins: help requests waiting on a super admin. */
   help_needs_us: number;
+  /** "Describe with AI" in the tag manager, as the service default, the group and the person work out. */
+  can_describe?: boolean;
 };
 
-export type HelpKind = "alt_text" | "reading_order" | "tables" | "headings" | "math" | "visual" | "other";
+export type HelpKind = "alt_text" | "reading_order" | "tables" | "headings" | "math" | "visual" | "other" | "failed";
 export type HelpStatus = "open" | "in_progress" | "waiting" | "resolved" | "closed";
 export type HelpAttachment = { id: string; name: string; content_type: string; size_bytes: number };
 export type HelpMessage = {
@@ -210,6 +216,8 @@ export type Group = {
   name: string;
   status: "active" | "disabled";
   domains: string[];
+  /** People allowed in by their address, without their domain (super admins change them). */
+  emails: { email: string; note: string | null; added_by: string | null; created_at: string; has_account: boolean }[];
   local_only: boolean;
   require_approval: boolean;
   /** "choose": people pick the AI level and kind; "fixed": the group's level and kind are always used. */
@@ -218,6 +226,8 @@ export type Group = {
   ai_kind: string | null;
   /** Mark the upload options that send documents to an outside provider. */
   show_external: boolean;
+  /** "Describe with AI" for the group's people; null follows the service default. */
+  ai_describe?: boolean | null;
   pending_members: number;
   help_active: number;
   default_user_cap: number | null;
@@ -312,12 +322,24 @@ export type Job = {
   error_message: string | null;
   created_at: string;
   finished_at: string | null;
+  /** The earlier of the end of retention and, if marked done, the end of the hold. */
   files_expire_at: string | null;
   files_deleted: boolean;
+  /** Marked done by its owner: the files go at removal_at; until then it can be undone. */
+  removal_requested: boolean;
+  removal_at: string | null;
+  removal_hold_hours: number;
+  /** Deleted by a super admin: only super admins still see it. */
+  deleted: boolean;
+  deleted_at: string | null;
+  deleted_by: string | null;
   files: JobFile[];
   /** The current help request, on the owner's own list. */
   help?: { id: string; status: HelpStatus; unread: boolean } | null;
 };
+
+/** Removing documents' files early: what was done, and what was skipped and why. */
+export type RemovalResult = { done: string[]; skipped: { id: string; reason: string; message: string }[] };
 
 export type UploadResult = {
   filename: string;
@@ -374,6 +396,7 @@ export type RuntimeSettings = {
   support_url: string | null;
   file_retention_days: number;
   record_retention_days: number;
+  early_removal_hold_hours: number;
   max_file_mb: number;
   max_pages_per_document: number;
   max_files_per_upload: number;
@@ -402,6 +425,14 @@ export type RuntimeSettings = {
   classifier_threshold: number;
   /** Pages read: the first ones and some spread through the document. */
   classifier_pages: number;
+  /** veraPDF: its running service (falls back to the command line), or the command line in the engine. */
+  verapdf_mode: "service" | "command_line";
+  /** Also check PDF/UA-2, shown for information. */
+  verapdf_ua2: boolean;
+  /** A document that fails gets a help request of its own. */
+  help_on_failure: boolean;
+  /** "Describe with AI" in the tag manager, for everyone unless their group or they are set otherwise. */
+  ai_describe_default: boolean;
 };
 
 export type EmailReportChoice = { kind: string; label: string; description: string; frequency: "monthly" | "weekly" | "daily" | "off" };
@@ -502,11 +533,11 @@ export function refreshSession(): Promise<Me | null> {
   return refreshing;
 }
 
-export async function requestCode(email: string) {
+export async function requestCode(email: string, botCheck?: string | null) {
   const r = await fetch(url("/auth/code"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ email, ...(botCheck ? { bot_check: botCheck } : {}) }),
   });
   if (!r.ok) throw await parseError(r);
   return (await r.json()) as { status: string; expires_in: number };
@@ -635,7 +666,7 @@ export async function getBytes(path: string): Promise<ArrayBuffer> {
   return (await send(path)).arrayBuffer();
 }
 
-// --- tag viewer -------------------------------------------------------------------------------
+// --- tag manager -------------------------------------------------------------------------------
 
 export type TagBox = { page: number; bbox: [number, number, number, number] };
 
@@ -652,7 +683,13 @@ export type TagElement = {
   actual_text?: string;
   lang?: string;
   scope?: string;
+  refs?: number[]; // what the tag points at (/Ref): a footnote mark's note
+  headers?: number[]; // a table cell's headers, as it names them (Headers): the header cells it's read with, in order
   text?: string;
+  orig?: boolean; // the tag was in the document as it was uploaded (only set when its tags were kept)
+  annot?: boolean; // it holds a form field, link or other annotation
+  name?: string; // a form field's or link's name (its tooltip or description), when the tag has no text of its own
+  say?: string; // the tag's own text in full, when it differs from text (which is cut short, and includes child tags)
   order: number | null;
   parts?: TagPart[];
 };
@@ -660,7 +697,15 @@ export type TagElement = {
 /** One item of a tag's content, in order: a piece of content, a child tag, or a link. */
 export type TagPart = { k: number; kind: "content" | "tag" | "link"; page?: number; bbox?: [number, number, number, number]; text?: string; el?: number };
 
-export type TagMap = { schema: number; pages: { w: number; h: number }[]; elements: TagElement[] };
+/** A piece of tagged content (one marked section of a page) and the tag holding it. */
+export type TagPiece = { page: number; mcid: number; el: number; bbox: [number, number, number, number]; kind: "text" | "image" | "drawing"; text?: string };
+/** A section of a page marked as an artifact (not read), numbered in the page's drawing order. */
+export type TagArtifact = { page: number; seq: number; bbox: [number, number, number, number]; kinds: string[]; type: string; nested?: boolean; text?: string };
+
+export type TagMap = {
+  schema: number; pages: { w: number; h: number }[]; elements: TagElement[];
+  pieces?: TagPiece[]; artifacts?: TagArtifact[]; // missing from tag maps made before area editing
+};
 
 export type VersionSummary = {
   compliant: boolean | null;
@@ -696,6 +741,10 @@ export type DocVersion = {
   review_status: "queued" | "running" | "done" | "failed" | null;
   reviewed_at: string | null;
   review_error: string | null;
+  /** Being saved into another reviewed version: that version's number. */
+  replacing?: number | null;
+  /** A save into this version can be undone until then (the file before is kept a day). */
+  undo_until?: string | null;
 };
 
 export type Versions = { can_edit: boolean; versions: DocVersion[] };
@@ -709,7 +758,23 @@ export type TagEdit =
   | { op: "set_cell"; element: number; expect_role: string; role: "TH" | "TD"; scope?: string }
   | { op: "move"; element: number; expect_role: string; target: number; expect_target_role: string; position: "before" | "after" }
   | { op: "merge"; element: number; expect_role: string; absorb: number[] }
-  | { op: "split"; element: number; expect_role: string; at: number; char?: number };
+  | { op: "split"; element: number; expect_role: string; at: number; char?: number }
+  | { op: "delete"; element: number; expect_role: string; children: "lift" | "delete" }
+  | { op: "assign"; element: number; expect_role: string; pieces: { page: number; mcid: number }[] }
+  | { op: "tag_artifacts"; element: number; expect_role: string; position: "before" | "after"; page: number; sections: number[]; role: string; alt?: string }
+  | { op: "make_list"; element: number; expect_role: string; absorb: number[] }
+  | { op: "indent"; element: number; expect_role: string }
+  | { op: "outdent"; element: number; expect_role: string }
+  | { op: "make_toc"; element: number; expect_role: string }
+  | { op: "set_headers"; element: number; expect_role: string; headers: number[] }
+  | { op: "link_note"; element: number; expect_role: string; note: number | null }
+  | { op: "build_list"; element: number; expect_role: string; absorb?: number[]; rows: ListRow[] }
+  | { op: "take_pieces"; element: number; expect_role: string; pieces: { page: number; mcid: number }[]; role: string; alt?: string }
+  | { op: "cut_area"; element: number; expect_role: string; page: number; bbox: [number, number, number, number]; role: string; alt?: string };
+
+/** One row of a list being built from a tag's content: where it starts (item `at` of tag `el`, the edit's own tag
+ * when left out) and what it becomes: a list item at a level, or a tag of a type. */
+export type ListRow = { el?: number; at: number; level?: number; as?: string };
 
 export type MailStatus = { backend: string; from_name: string; from_address: string; reply_to: string | null };
 export type MailTestResult = { sent: boolean; to: string; backend: string; error: string | null };
@@ -751,3 +816,8 @@ export type AccessCheck = {
   remaining_pages: number | null;
   steps: { key: string; label: string; ok: boolean; detail: string; fix: string | null; blocking: boolean }[];
 };
+
+/** Unsaved tag edits kept on the server between sessions (one per person per document). */
+export interface TagDraft { user_id: string; user_email: string; based_on: number; edits: TagEdit[]; updated_at: string }
+export interface TagDraftInfo { user_id: string; user_email: string; based_on: number; edits_count: number; updated_at: string }
+export interface TagDrafts { mine: TagDraft | null; others: TagDraftInfo[] }

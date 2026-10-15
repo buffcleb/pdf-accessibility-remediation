@@ -56,6 +56,29 @@ exact file is pixel-identical to the original, that every file downloads, that n
 passed. `harness_output/<run>/harness_report.md` summarizes the run and links
 each document's report.
 
+## Regression documents
+
+Real documents that once broke something are kept in `samples/regression/`, with a `NOTES.md` saying what went wrong
+and which change fixed it. There are two folders: `full/` has each document whole; `quick/` has the same set for
+everyday runs, with long documents cut down to the pages that caused trouble (and links to `full/` for the short
+ones). Run as a batch after changes to the engine:
+
+```bash
+python harness/run_harness.py samples/regression/quick --provider mock --expect-compliant --out harness_output/regression_quick
+python harness/run_harness.py samples/regression/full --provider mock --expect-compliant --out harness_output/regression_full
+```
+
+`scripts/regression.sh` does the same without a running engine: it runs the quick set through the working tree's
+code in a throwaway container (the full set every fifth run, or with `--full`), prints a line per document, and
+exits non-zero if any fails. `--provider` and `--model` run it with real AI; those runs are never made longer than
+asked.
+
+A cut-down copy must show the old problem on the code from before the fix and pass now. A document whose own tags
+are kept can't be cut without changing what is tested, so its quick copy covers only what doesn't depend on them.
+
+Like everything under `samples/`, the folder is git-ignored: real documents are often confidential, so they never
+go into the repository. The automated tests reproduce each problem with a small synthetic document instead.
+
 ## OCR accuracy
 
 `ocr_eval.py` renders chosen pages of a **text** PDF (whose text is the ground truth), damages them (`--level clean`,

@@ -375,3 +375,19 @@ def test_prime_marks_in_spoken_text_are_words():
 
     assert _speak_primes("b sub F ′ and f ″") == "b sub F prime and f double prime"
     assert _speak_primes("don't change apostrophes") == "don't change apostrophes"
+
+
+def test_a_raised_sign_is_a_charge_not_a_power(tmp_path):
+    """An ion's charge was read as an exponent ("H to the power of +"): a sign alone is never a power."""
+    def draw(p):
+        for y, base, raised, rest in ((200, "H", "+", "is given up"), (270, "Fe", "2+", "is oxidized"),
+                                      (340, "Cl", "-", "is formed"), (410, "10", "-3", "is small")):
+            p.insert_text((100, y), base, fontsize=11, fontname="tiro")
+            w = fitz.get_text_length(base, "tiro", 11)
+            p.insert_text((100.5 + w, y - 5), raised, fontsize=7, fontname="tiro")
+            p.insert_text((100 + w + 16, y), rest, fontsize=11, fontname="tiro")
+        p.insert_text((100, 500), "Plain body text so the page has a paragraph.", fontsize=11, fontname="tiro")
+    said = " | ".join(b.actual_text for b in _blocks(_doc_with(draw, tmp_path / "ions.pdf")) if b.actual_text)
+    assert "H plus is given up" in said and "Fe 2 plus is oxidized" in said and "Cl minus is formed" in said, said
+    assert "10 to the power of -3 is small" in said, said   # a sign before a number is still a power
+    assert "to the power of +" not in said, said

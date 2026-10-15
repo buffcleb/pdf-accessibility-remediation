@@ -16,6 +16,18 @@ two differences: you pick **every group or one**, and you get more reports and c
 The **Usage** group is shown as **Usage and cost** for you. Cost columns (AI spend per document) appear in other
 reports too. What groups are charged is pages, not money, so cost is for super admins only.
 
+**AI usage** (also in the Usage group) shows you more than group admins see: a row per **model** as well as per AI
+level and kind of document, the **AI cost** in total, per document and per page, and (in **Columns**) the review
+model, the review's cost and tokens, the cost of **Let AI decide**, and how often a kind's model wasn't available and
+the level's General models were used. Use it to compare levels and models on real documents.
+
+Documents sent without an AI level use the engine's own default AI (its `AI_PROVIDER` setting): they're counted on
+a row of their own, **Engine default AI (no AI level)**. If most documents land there, the groups probably aren't
+offered an AI level, or have none as their default (Group → Services).
+
+Tokens, failed calls and models are recorded from this version on: older documents count in documents, calls and
+cost, but not in tokens (**Documents with token counts**, in Columns, says how many do).
+
 The original fixed-format CSV exports are still available, under **Fixed-format CSV exports**, for scripts that rely
 on them.
 

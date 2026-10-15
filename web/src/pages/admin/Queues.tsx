@@ -2,6 +2,7 @@ import { Fragment, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { get, post } from "../../api";
 import { ErrorNotice, Loading, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
+import { QueuesLive } from "./QueuesLive";
 
 type Queue = {
   key: string; label: string; kind: "documents" | "edits" | "reviews" | "mail";
@@ -11,7 +12,7 @@ type Queue = {
 type Item = {
   id: string; job_id: string | null; title: string; who: string; pages: number | null; options: string | null;
   created_at: string; started_at: string | null; finished_at: string | null; detail: string | null;
-  error_code: string | null; can_retry: boolean; can_cancel: boolean; can_process_now: boolean;
+  error_code: string | null; can_retry: boolean; can_cancel: boolean; can_stop?: boolean; can_remove?: boolean; can_process_now: boolean;
 };
 type State = "waiting" | "active" | "failed";
 
@@ -42,6 +43,24 @@ export function QueuesPage() {
   if (queues.loading && !queues.data) return <Loading />;
   if (!queues.data) return <ErrorNotice error={queues.error} />;
   const selected = queues.data.find((q) => q.key === params.get("queue")) ?? null;
+  const liveView = params.get("view") === "live";
+  const views = (
+    <nav className="report-pills" aria-label="Queues: which view">
+      <Link className="pill-link" to="/admin/queues" aria-current={liveView ? undefined : "page"}>By queue</Link>
+      <Link className="pill-link" to="?view=live" aria-current={liveView ? "page" : undefined}>Live</Link>
+    </nav>
+  );
+  if (liveView) {
+    return (
+      <>
+        <h1>Queues</h1>
+        <p className="muted">Everything the queues are doing now, in one list: what is in progress and how far it has got, what
+          is waiting and why, and what has just ended.</p>
+        {views}
+        <QueuesLive queues={queues.data} />
+      </>
+    );
+  }
 
   async function act(fn: () => Promise<Queue[]>) {
     setBusy(true);
@@ -64,6 +83,7 @@ export function QueuesPage() {
         nothing new until you resume it; documents for a paused service wait in its queue and go ahead on resume.
         Sign-in codes are always sent at once and can't be paused. <strong>Failed</strong> counts the last 7 days;
         <strong> Oldest</strong> is how long the oldest item has been waiting.</p>
+      {views}
       <ErrorNotice error={error} />
       <div className="table-wrap">
         <table className="queues">
@@ -132,10 +152,14 @@ function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () =
     ["failed", "Failed, last 7 days", queue.failed]];
   const noun = isMail ? "email" : queue.kind === "documents" ? "document" : queue.kind === "edits" ? "save" : "review";
 
-  async function act(item: Item, what: "retry" | "cancel" | "process-now") {
-    const verb = what === "retry" ? "Try again" : what === "cancel" ? "Cancel" : "Process now";
+  async function act(item: Item, what: "retry" | "cancel" | "process-now" | "stop" | "remove") {
+    const verb = { retry: "Try again", cancel: "Canceled", "process-now": "Process now", stop: "Stopped", remove: "Removed from the list" }[what];
     if (!window.confirm(what === "process-now"
       ? `Process "${item.title}" next? It goes ahead of the large-document rules as soon as a slot is free.`
+      : what === "stop"
+      ? `Stop "${item.title}"? It ends now and frees its place.${queue.kind === "documents" ? " The person's pages are given back and they're emailed; they can send it again." : queue.kind === "edits" ? " The save is lost; the previous version is unchanged." : ""}`
+      : what === "remove"
+      ? `Remove "${item.title}" from this list? ${isMail ? "The email" : "The " + noun} itself isn't changed${queue.kind === "documents" ? ": it stays in the person's documents as failed" : ""}; it just stops being listed here.`
       : what === "cancel"
       ? `Cancel "${item.title}"?${queue.kind === "documents" ? " The person's pages are given back and they're emailed." : ""}`
       : `Try "${item.title}" again?${queue.kind === "documents" ? " Its pages are held again on the person's own limits." : ""}`)) return;
@@ -191,6 +215,10 @@ function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () =
                         Try again<span className="visually-hidden"> {it.title}</span></button>}
                       {it.can_cancel && <button className="btn secondary small" onClick={() => void act(it, "cancel")}>
                         Cancel<span className="visually-hidden"> {noun} {it.title}</span></button>}
+                      {it.can_stop && <button className="btn secondary small" onClick={() => void act(it, "stop")}>
+                        Stop<span className="visually-hidden"> {noun} {it.title}</span></button>}
+                      {it.can_remove && <button className="btn secondary small" onClick={() => void act(it, "remove")}>
+                        Remove<span className="visually-hidden"> {noun} {it.title} from the list</span></button>}
                     </div></td>
                   </tr>
                 ))}

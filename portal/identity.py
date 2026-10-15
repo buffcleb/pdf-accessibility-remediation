@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from portal.config import get_portal_settings
 from portal.errors import ApiError
-from portal.models import Group, GroupDomain, RoleAssignment, User
+from portal.models import Group, GroupDomain, GroupEmail, RoleAssignment, User
 
 
 def normalize_email(raw: str) -> str:
@@ -59,6 +59,7 @@ class Eligibility:
     user: User | None          # existing account
     group: Group | None        # group a new account would join
     bootstrap: bool            # new account becomes a super admin
+    by_address: bool = False   # the group lists this address (rather than its domain)
 
     @property
     def allowed(self) -> bool:
@@ -66,12 +67,18 @@ class Eligibility:
 
 
 def eligibility(db: Session, email: str) -> Eligibility:
+    """An existing account; else the group that lists this address; else the group of its domain; else nothing
+    (or a bootstrap super admin)."""
     user = db.scalar(select(User).where(User.email == email))
     if user is not None:
         return Eligibility(user, user.group, False)
+    bootstrap = email in get_portal_settings().bootstrap_emails
+    # An address listed on a group comes first: it can place one person apart from the rest of their domain
+    listed = db.scalar(select(Group).join(GroupEmail).where(GroupEmail.email == email, Group.status == "active"))
+    if listed is not None:
+        return Eligibility(None, listed, bootstrap, by_address=True)
     group = db.scalar(
         select(Group).join(GroupDomain).where(GroupDomain.domain == domain_of(email), Group.status == "active"))
-    bootstrap = email in get_portal_settings().bootstrap_emails
     return Eligibility(None, group, bootstrap)
 
 

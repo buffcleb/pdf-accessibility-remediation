@@ -14,12 +14,12 @@ const ALLOWED_KIDS: Record<string, Set<string>> = {
   TOC: new Set(["TOC", "TOCI", "Caption"]),
 };
 const PARENT_ONLY: Record<string, Set<string>> = {
-  LI: new Set(["L"]), Lbl: new Set(["LI"]), LBody: new Set(["LI"]), TR: new Set(["Table", "THead", "TBody", "TFoot"]),
+  LI: new Set(["L"]), Lbl: new Set(["LI", "TOCI"]), LBody: new Set(["LI"]), TR: new Set(["Table", "THead", "TBody", "TFoot"]),
   TH: new Set(["TR"]), TD: new Set(["TR"]), THead: new Set(["Table"]), TBody: new Set(["Table"]), TFoot: new Set(["Table"]),
   TOCI: new Set(["TOC"]),
 };
 const NAMES: Record<string, string> = {
-  L: "list", LI: "list item", TR: "table row", Table: "table", TOC: "table of contents", THead: "table header",
+  L: "list", LI: "list item", TR: "table row", Table: "table", TOC: "table of contents", TOCI: "table of contents entry", THead: "table header",
   TBody: "table body", TFoot: "table footer", P: "paragraph",
 };
 const name = (r: string) => NAMES[r] ?? r;
@@ -74,3 +74,35 @@ export function actionNote(v: Verdict, next: string): string | null {
   if (v.action === "wrap_lbody") return "The text is wrapped in the item's body (LI > LBody).";
   return null;
 }
+
+// Tags that may only move among their own siblings (a copy of the engine's STAY_IN_PARENT)
+const STAY_IN_PARENT = new Set(["TH", "TD", "Lbl", "LBody"]);
+
+/** Can a tag `role` move from under `oldParent` to under `newParent`? A copy of the engine's check_move. */
+export function checkMove(role: string, oldParent: string | null, newParent: string | null, sameParent: boolean): Verdict {
+  const ok: Verdict = { ok: true, action: "none", reason: "" };
+  const no = (reason: string): Verdict => ({ ok: false, action: "none", reason });
+  if (oldParent === null) return no("The document's top tag can't be moved.");
+  if (newParent === null) return no("Tags can't be placed outside the document's top tag.");
+  if (STAY_IN_PARENT.has(role) && !sameParent) {
+    return no(role === "TH" || role === "TD"
+      ? "A table cell can only move within its own row: in another row it would make the rows uneven."
+      : `A list item's ${role === "Lbl" ? "label" : "body"} can only move within its own item.`);
+  }
+  if (ALLOWED_KIDS[newParent] && !ALLOWED_KIDS[newParent].has(role)) {
+    return no(`Inside a ${name(newParent)} a tag can only be ${[...ALLOWED_KIDS[newParent]].sort().join(", ")}.`);
+  }
+  if (PARENT_ONLY[role] && !PARENT_ONLY[role].has(newParent)) {
+    return no(`A ${name(role)} has to be inside a ${[...PARENT_ONLY[role]].sort().map(name).join(" or ")}.`);
+  }
+  if (TEXT.has(newParent) && newParent !== "Figure" && newParent !== "Formula" && BLOCKS.has(role)) {
+    return no(`A ${name(role)} can't go inside a ${name(newParent)}.`);
+  }
+  return ok;
+}
+
+// Tags that hold content of their own, so content can be moved into them (the engine's CONTENT_ROLES)
+export const CONTENT_ROLES = new Set([...HEADINGS, "P", "Caption", "BlockQuote", "Note", "Code", "Quote", "Span", "Reference",
+  "BibEntry", "Figure", "Formula", "TD", "TH", "LBody", "Lbl", "Link", "Form", "TOCI"]);
+// Types a new tag made from untagged items can have (the engine's NEW_AREA_ROLES)
+export const NEW_AREA_ROLES = ["P", "H1", "H2", "H3", "H4", "H5", "H6", "Figure", "Formula", "Caption", "Note", "Quote", "BlockQuote", "Code"];

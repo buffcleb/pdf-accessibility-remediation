@@ -10,6 +10,8 @@
    land in your junk folder; marking it "not junk" helps next time.
 4. Type the code in. You're signed in.
 
+![The sign-in page: the service name, "Sign in with your work email address. We'll email you a 6-digit code.", an Email address field and the button Email me a code.](../../images/signing-in.png)
+
 There's no password. Each time you sign in on a new browser, or after a while away, you get a new code. Signing
 out (top right) ends the session in this browser.
 
@@ -17,8 +19,14 @@ out (top right) ends the session in this browser.
 newest code works. If codes never arrive, your administrators can help (they have a way to issue one when email
 is having problems).
 
-**"Your email address isn't set up for this service":** your email's domain isn't linked to a group yet, so the
-service doesn't know who you are. Contact the people who run the service for your organization. The message
+**"Checking that this is a person, not a script…"** under the button: some services run a quick automatic check
+before sending a code. It usually finishes on its own in a second or two ("Check complete."); now and then it asks
+you to tick a box. If it says it couldn't run, a content blocker may be stopping it: allow
+`challenges.cloudflare.com`, or try another browser.
+
+**"Your email address isn't set up for this service":** neither your address nor your email's domain is linked to
+a group yet, so the service doesn't know who you are. (Administrators can allow a single address, such as a personal
+gmail.com one, without allowing everyone at that domain.) Contact the people who run the service for your organization. The message
 usually says who.
 
 ## Your group

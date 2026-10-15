@@ -10,7 +10,7 @@ import base64
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from portal.config import get_portal_settings
@@ -70,10 +70,12 @@ def send_queued(db: Session) -> int:
             db.commit()
             continue
         row.attempts += 1
+        row.backend = get_portal_settings().mail_backend
+        mail = Mail(to=row.to_addr, subject=row.subject, text=row.body, html=row.html,
+                    attachments=decode_attachments(row.attachments))
         try:
             # One try here; the outbox does the waiting between tries, so the worker never sleeps on mail
-            get_mailer().deliver(Mail(to=row.to_addr, subject=row.subject, text=row.body, html=row.html,
-                                      attachments=decode_attachments(row.attachments)), row.from_name, attempts=1)
+            get_mailer().deliver(mail, row.from_name, attempts=1)
         except MailError as e:
             row.last_error = str(e)[:1000]
             if e.retryable and row.attempts < tries:
@@ -87,17 +89,32 @@ def send_queued(db: Session) -> int:
             log.exception("email to %s failed", row.to_addr)
         else:
             row.status, row.finished_at, row.last_error = "sent", _now(), None
+            row.message_id = (mail.message_id or "")[:300] or None
             sent += 1
         db.commit()
     return sent
 
 
-def purge(db: Session, record_retention_days: int) -> int:
-    """Sent, canceled and combined (into a daily summary) emails go after 30 days; failed ones with the other
-    records."""
+def record(db: Session, mail: Mail, kind: str, error: str | None = None, attempts: int = 1) -> MailOutbox:
+    """Log an email sent at once rather than through the outbox (sign-in codes, test emails): sent or failed, with
+    its subject but never its body (a sign-in code). The caller commits."""
     now = _now()
-    n = db.execute(delete(MailOutbox).where(MailOutbox.status.in_(("sent", "canceled", "combined", "seen")),
-                                            MailOutbox.created_at < now - KEEP_SENT)).rowcount
-    n += db.execute(delete(MailOutbox).where(MailOutbox.status == "failed",
-                                             MailOutbox.created_at < now - timedelta(days=record_retention_days))).rowcount
-    return n
+    row = MailOutbox(kind=kind, to_addr=mail.to, subject=mail.subject, body="", status="failed" if error else "sent",
+                     attempts=attempts, last_error=(error or "")[:1000] or None, next_try_at=now, created_at=now,
+                     finished_at=now, backend=get_portal_settings().mail_backend,
+                     message_id=None if error else ((mail.message_id or "")[:300] or None))
+    db.add(row)
+    return row
+
+
+def purge(db: Session, record_retention_days: int) -> int:
+    """Emails that are done keep their record (the email log) for the records period; what they said (body,
+    HTML, attachments) goes after 30 days."""
+    now = _now()
+    done = ("sent", "canceled", "combined", "seen", "failed")
+    db.execute(update(MailOutbox).where(MailOutbox.status.in_(done), MailOutbox.created_at < now - KEEP_SENT,
+                                        MailOutbox.body != "")
+               .values(body="", html=None, attachments=None))
+    return db.execute(delete(MailOutbox).where(MailOutbox.status.in_(done),
+                                               MailOutbox.created_at < now - timedelta(days=record_retention_days))
+                      ).rowcount

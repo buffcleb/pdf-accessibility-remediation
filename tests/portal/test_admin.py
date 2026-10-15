@@ -44,6 +44,7 @@ def _matrix(w):
         ("get", f"/admin/groups/{b}", None, {"super"}),
         ("patch", f"/admin/groups/{b}", {"default_user_cap": 5}, {"super"}),
         ("post", f"/admin/groups/{b}/domains", {"domain": "b2.test"}, {"super"}),
+        ("post", f"/admin/groups/{b}/emails", {"email": "guest@gmail.test"}, {"super"}),
         ("get", f"/admin/groups/{b}/admins", None, {"super"}),
         ("get", "/admin/users", None, {"super"}),
         ("patch", f"/admin/users/{ua}", {"name": "User A"}, {"super"}),

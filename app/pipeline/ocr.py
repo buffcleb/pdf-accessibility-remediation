@@ -13,6 +13,7 @@ from pathlib import Path
 import pymupdf as fitz
 
 from app.config import get_settings
+from app.pipeline.analyzer import capped_dpi
 from app.pipeline.fonts import fix_inserted_cid_fonts, text_layer_font
 
 log = logging.getLogger(__name__)
@@ -92,6 +93,7 @@ def _tesseract_tsv(page: fitz.Page, language: str, dpi: int = 300) -> list[dict]
     exe = tesseract_cli()
     if exe is None:
         return []
+    dpi = capped_dpi(page, dpi)  # a page of absurd size is read at a lower resolution, not at gigabytes
     pix = page.get_pixmap(dpi=dpi, alpha=False)
     scale = 72.0 / dpi
     back = ~page.rotation_matrix  # rendered (rotated) space -> unrotated page space
@@ -149,11 +151,27 @@ def _drop_graphics(rows: list[dict], dropped: list | None = None) -> list[dict]:
     return kept
 
 
-def _tsv_lines(page: fitz.Page, language: str, dropped: list | None = None) -> list[OcrLine]:
+def _covered(box, text_boxes: list) -> bool:
+    """Whether half or more of a word's box lies on text the page already has."""
+    area = max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
+    for t in text_boxes:
+        ix = max(0.0, min(box[2], t[2]) - max(box[0], t[0]))
+        iy = max(0.0, min(box[3], t[3]) - max(box[1], t[1]))
+        if ix * iy >= 0.5 * area:
+            return True
+    return False
+
+
+def _tsv_lines(page: fitz.Page, language: str, dropped: list | None = None, existing: list | None = None) -> list[OcrLine]:
     """OCR lines straight from Tesseract's own words, so text and confidence come from one reading.
-    Lines run left to right on the upright page; their geometry is mapped back to unrotated space."""
+    Lines run left to right on the upright page; their geometry is mapped back to unrotated space.
+
+    existing: boxes of text the page already has (values typed onto a scanned form). OCR words on them are dropped,
+    so that text isn't read twice, and a line is split where they were, so each part keeps its own place."""
     groups: dict[tuple, list[dict]] = {}
     for r in _drop_graphics(_tesseract_tsv(page, language), dropped):
+        if existing and _covered(r["bbox"], existing):
+            r = {**r, "skip": True}
         groups.setdefault(r["key"], []).append(r)
     back = ~page.rotation_matrix
     d = fitz.Point(1, 0) * back - fitz.Point(0, 0) * back  # the upright reading direction, unrotated
@@ -164,13 +182,19 @@ def _tsv_lines(page: fitz.Page, language: str, dropped: list | None = None) -> l
         # Table rows come back as one line across the columns: split at wide gaps, so each cell's text sits
         # over its own cell
         height = max(r["visual"][3] for r in rows) - min(r["visual"][1] for r in rows)
-        seg = [rows[0]]
-        for prev, r in zip(rows, rows[1:]):
-            if r["visual"][0] - prev["visual"][2] > 1.5 * max(height, 1.0):
+        seg: list[dict] = []
+        for r in rows:
+            if r.get("skip"):  # the page's own text: the line breaks here
+                if seg:
+                    segments.append(seg)
+                seg = []
+                continue
+            if seg and r["visual"][0] - seg[-1]["visual"][2] > 1.5 * max(height, 1.0):
                 segments.append(seg)
                 seg = []
             seg.append(r)
-        segments.append(seg)
+        if seg:
+            segments.append(seg)
     out = []
     for rows in segments:
         vx0 = min(r["visual"][0] for r in rows)
@@ -226,15 +250,17 @@ def ocr_lines(src: str, pages: list[int], confidences: bool = True,
     try:
         for pno in pages:
             page = doc[pno]
+            # Text the page already has (values typed onto a scanned form) keeps its own text: OCR doesn't read it again
+            existing = [tuple(w[:4]) for w in page.get_text("words")]
             if confidences and settings.ocr_engine != "pymupdf" and tesseract_cli() is not None:
                 dropped: list = []
-                found = _tsv_lines(page, settings.ocr_language, dropped)
+                found = _tsv_lines(page, settings.ocr_language, dropped, existing)
                 if pictures is not None and dropped:
                     pictures.setdefault(pno, []).extend(dropped)
                 if found:
                     lines += found
                     continue
-            tp = page.get_textpage_ocr(language=settings.ocr_language, dpi=300, full=True)
+            tp = page.get_textpage_ocr(language=settings.ocr_language, dpi=capped_dpi(page, 300), full=True)
             data = page.get_text("dict", textpage=tp)
             words = _word_confidences(page, settings.ocr_language) if confidences else []
             for block in data["blocks"]:
@@ -243,6 +269,8 @@ def ocr_lines(src: str, pages: list[int], confidences: bool = True,
                     if not text or not line["spans"]:
                         continue
                     x0, y0, x1, y1 = line["bbox"]
+                    if existing and _covered((x0, y0, x1, y1), existing):
+                        continue  # mostly the page's own text (this OCR gives no words to keep apart)
                     cos, sin = line["dir"]
                     extent = (x1 - x0) if abs(cos) >= abs(sin) else (y1 - y0)
                     thickness = (y1 - y0) if abs(cos) >= abs(sin) else (x1 - x0)
@@ -287,3 +315,21 @@ def write_ocr_layer(src: str, dst: str, lines: list[OcrLine]) -> int:
 def ocr_pages(src: str, dst: str, pages: list[int]) -> int:
     """OCR the given pages of src and write dst with the text layer. Returns the number of lines inserted."""
     return write_ocr_layer(src, dst, ocr_lines(src, pages, confidences=False))
+
+
+def block_confidence(pages, lines: list[OcrLine]) -> None:
+    """Each text block of an OCR'd page gets the mean confidence of the OCR words whose middle lies in it (None when
+    the OCR gave no confidences): a scanned formula reads with low confidence, prose with high."""
+    words: dict[int, list[OcrWord]] = {}
+    for ln in lines:
+        words.setdefault(ln.page, []).extend(ln.words)
+    for page in pages:
+        mine = words.get(page.number)
+        if not mine:
+            continue
+        for b in page.blocks:
+            x0, y0, x1, y1 = b.bbox
+            inside = [w.conf for w in mine
+                      if x0 - 1 <= (w.bbox[0] + w.bbox[2]) / 2 <= x1 + 1 and y0 - 1 <= (w.bbox[1] + w.bbox[3]) / 2 <= y1 + 1]
+            if inside:
+                b.ocr_conf = sum(inside) / len(inside)

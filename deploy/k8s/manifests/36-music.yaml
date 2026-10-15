@@ -1,0 +1,40 @@
+# The music reading service (applied when MUSIC_READER=on in deploy.env): Audiveris and a loop that takes pictures
+# of music from the Redis list "omr:requests" and puts MusicXML back (docker/audiveris). The engine asks it for a
+# reading of each music example it finds; with no answer the example is described by the AI like any picture.
+#
+# Music is rare, so with scaling on (46-music-autoscale.yaml) no pod runs until there is something on the list.
+# A pod told to stop finishes the picture it has first.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: music-reader
+  namespace: ${NAMESPACE}
+spec:
+  ${MUSIC_REPLICAS}
+  selector:
+    matchLabels: { app: music-reader }
+  template:
+    metadata:
+      labels: { app: music-reader }
+    spec:
+      terminationGracePeriodSeconds: 180
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: music-reader
+          image: ${REGISTRY}/pdfrem-music:${MUSIC_TAG}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
+            # The same allowance the engine waits for a whole score with (per page)
+            - { name: OMR_PAGE_TIMEOUT_S, value: "${MUSIC_PAGE_SECONDS}" }
+          resources:
+            requests: { cpu: 250m, memory: 768Mi }
+            limits: { cpu: "2", memory: ${MUSIC_MEMORY_LIMIT}, ephemeral-storage: 4Gi }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 2Gi }

@@ -15,6 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -23,6 +24,22 @@ from app.ai import prompts
 from app.config import get_settings
 
 log = logging.getLogger(__name__)
+
+
+# Characters that have no place in document text quoted into a prompt: controls, and the bidi and zero-width
+# marks that can hide text from a person reading the prompt but not from the model
+_NOT_DATA = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]")
+
+
+# A box written as [left, top, right, bottom]
+_BOX = re.compile(r"\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]")
+
+
+def as_data(text: str, limit: int) -> str:
+    """Document text the way it is quoted into a prompt: cut to the limit, with control characters stripped.
+    The prompt also says, before and after it, that the text is data and never instructions."""
+    return _NOT_DATA.sub("", str(text or ""))[:limit]
+
 
 
 @dataclass
@@ -87,7 +104,12 @@ _PLACEHOLDER_ALT = re.compile(
 _REPEAT = re.compile(r"(.{4,120}?)(?:[\s,;.]*\1){2,}", re.S)
 
 
-def collapse_repeats(text: str, limit: int = 400) -> str:
+# What a description is asked to stay under, and where it is cut if it doesn't
+ALT_ASKED, ALT_LIMIT = 250, 400
+ALT_ASKED_LONG, ALT_LIMIT_LONG = 700, 900
+
+
+def collapse_repeats(text: str, limit: int = ALT_LIMIT) -> str:
     """Remove looping repetition ("Policy Title: Policy Title: ...") and cap length at a word boundary."""
     prev = None
     while prev != text:
@@ -151,7 +173,9 @@ class AIProvider(ABC):
     @abstractmethod
     async def _chat(self, model: str, system: str, prompt: str, images: list[bytes]) -> ChatResult: ...
 
-    async def chat_json(self, prompt: str, images: list[bytes] | None = None, model: str | None = None) -> dict:
+    async def chat_json(self, prompt: str, images: list[bytes] | None = None, model: str | None = None,
+                        salvage: Callable[[str], dict | None] | None = None) -> dict:
+        """salvage: for an answer that isn't whole JSON (cut off at the output limit), what can still be used of it."""
         model = model or self.model
         images = images or []
         last_exc: Exception | None = None
@@ -163,7 +187,12 @@ class AIProvider(ABC):
                     res = await self._chat(model, prompts.SYSTEM, prompt, images)
                     self.calls += 1
                     self.usage.add(res.usage)
-                    data = parse_json_object(res.text)
+                    try:
+                        data = parse_json_object(res.text)
+                    except (AIError, json.JSONDecodeError):
+                        data = salvage(res.text) if salvage else None
+                        if data is None:
+                            raise
                     self._log(model, prompt, len(images), res, None, time.monotonic() - started)
                     return data
                 except httpx.HTTPStatusError as exc:
@@ -206,9 +235,14 @@ class AIProvider(ABC):
         return base64.b64encode(png).decode()
 
     # -- accessibility tasks ----------------------------------------------
-    async def describe_image(self, png: bytes, page: int, context: str) -> dict:
-        data = await self.chat_json(prompts.IMAGE_ALT.format(page=page + 1, context=context[:1500]), [png])
-        alt = collapse_repeats(str(data.get("alt") or "").strip())
+    async def describe_image(self, png: bytes, page: int, context: str, long: bool = False) -> dict:
+        """long: a picture with several parts to say (a reaction scheme's steps): it is asked for, and allowed,
+        more than a photograph's few lines. Past the limit a description is cut at a word, so the model is told
+        the room it has."""
+        asked, limit = (ALT_ASKED_LONG, ALT_LIMIT_LONG) if long else (ALT_ASKED, ALT_LIMIT)
+        data = await self.chat_json(prompts.IMAGE_ALT.format(page=page + 1, context=as_data(context, 1500), data=prompts.DATA,
+                                                             chars=asked), [png])
+        alt = collapse_repeats(str(data.get("alt") or "").strip(), limit)
         if _PLACEHOLDER_ALT.match(alt):
             alt = ""  # "No text available", "N/A", "image" ... are not descriptions
         decorative = bool(data.get("decorative"))
@@ -224,7 +258,8 @@ class AIProvider(ABC):
     async def read_notation(self, png: bytes, page: int, extracted: str, kind_hint: str) -> dict:
         """Specialist notation the layout rules couldn't read: transcription, LaTeX and spoken form."""
         hint = {"unreadable": "math or symbol", "math": "mathematical"}.get(kind_hint, kind_hint)
-        data = await self.chat_json(prompts.NOTATION.format(kind_hint=hint, page=page + 1, extracted=extracted[:600]),
+        data = await self.chat_json(prompts.NOTATION.format(kind_hint=hint, page=page + 1, extracted=as_data(extracted, 600),
+                                                    data=prompts.DATA),
                                     [png])
         spoken = collapse_repeats(str(data.get("spoken") or "").strip())
         # Markup that leaks into the spoken form ("b_F", "x^2", "\\alpha") isn't speech
@@ -247,10 +282,31 @@ class AIProvider(ABC):
             "confidence": conf,
         }
 
+    async def find_formulas(self, png: bytes, page: int) -> list[tuple[float, float, float, float]]:
+        """Where a scanned page's displayed formulas are: boxes as fractions of the image (left, top, right, bottom)."""
+        def complete_boxes(text: str) -> dict | None:
+            # A long list cut off at the output limit (or a model repeating itself): the boxes written in full
+            boxes = [[float(v) for v in m] for m in _BOX.findall(text)]
+            return {"formulas": boxes} if boxes else None
+
+        data = await self.chat_json(prompts.FORMULA_REGIONS.format(page=page + 1), [png], salvage=complete_boxes)
+        found = data.get("formulas")
+        out = []
+        for item in found[:60] if isinstance(found, list) else []:
+            box = item.get("box") if isinstance(item, dict) else item
+            try:
+                x0, y0, x1, y1 = (max(0.0, min(1000.0, float(v))) for v in box)
+            except (TypeError, ValueError):
+                continue
+            box = (x0 / 1000, y0 / 1000, x1 / 1000, y1 / 1000)
+            if x1 - x0 >= 5 and y1 - y0 >= 3 and box not in out:  # room for something in it, and not said before
+                out.append(box)
+        return out
+
     async def correct_ocr_line(self, png: bytes, page: int, text: str, how: str) -> dict:
         """how: "correct" (fix the [[marked]] words) or "transcribe" (read the line afresh)."""
         prompt = prompts.OCR_CORRECT if how == "correct" else prompts.OCR_TRANSCRIBE
-        data = await self.chat_json(prompt.format(page=page + 1, text=text[:600]), [png])
+        data = await self.chat_json(prompt.format(page=page + 1, text=as_data(text, 600), data=prompts.DATA), [png])
         out = str(data.get("text") or "").strip()
         if not out:
             raise AIError("model returned no text for the line")
@@ -261,9 +317,10 @@ class AIProvider(ABC):
         return {"text": out.replace("[[", "").replace("]]", "")[:1000], "confidence": conf}
 
     async def analyze_table(self, png: bytes, page: int, grid: list[list[str]]) -> dict:
-        grid_txt = "\n".join(" | ".join(c[:30] for c in row[:14]) for row in grid[:30])
+        grid_txt = "\n".join(" | ".join(as_data(c, 30) for c in row[:14]) for row in grid[:30])
         data = await self.chat_json(
-            prompts.TABLE.format(page=page + 1, n_rows=len(grid), n_cols=len(grid[0]) if grid else 0, grid=grid_txt),
+            prompts.TABLE.format(page=page + 1, n_rows=len(grid), n_cols=len(grid[0]) if grid else 0, grid=grid_txt,
+                                 data=prompts.DATA),
             [png],
             model=self.table_model,
         )
@@ -280,11 +337,12 @@ class AIProvider(ABC):
         # Short numeric ids keep the answer small; small models otherwise ramble through long id lists.
         lines = "\n".join(
             f'- id={n} bbox=({r["bbox"][0]:.0f},{r["bbox"][1]:.0f},{r["bbox"][2]:.0f},{r["bbox"][3]:.0f}) '
-            f'text="{r["text"][:50]}"'
+            f'text="{as_data(r["text"], 50)}"'
             for n, r in enumerate(regions, start=1)
         )
         data = await self.chat_json(
-            prompts.READING_ORDER.format(page=page + 1, width=round(width), height=round(height), regions=lines),
+            prompts.READING_ORDER.format(page=page + 1, width=round(width), height=round(height), regions=lines,
+                                         data=prompts.DATA),
             [png],
         )
         try:
@@ -299,8 +357,8 @@ class AIProvider(ABC):
     async def judge_alt(self, png: bytes, kind: str, alt: str, context: str) -> dict:
         checklist = prompts.ALT_CHECKLISTS.get(kind, prompts.ALT_DEFAULT_CHECKLIST)
         data = await self.chat_json(
-            prompts.ALT_JUDGE.format(kind=kind or "unknown", alt=alt[:1000], context=context[:1200],
-                                     checklist=checklist), [png])
+            prompts.ALT_JUDGE.format(kind=kind or "unknown", alt=as_data(alt, 1000), context=as_data(context, 1200),
+                                     checklist=checklist, data=prompts.DATA), [png])
         verdict = str(data.get("verdict") or "").strip().lower()
         if verdict not in ("accurate", "partially_accurate", "inaccurate", "should_be_decorative"):
             raise AIError(f"judge returned an unknown verdict: {verdict!r}")

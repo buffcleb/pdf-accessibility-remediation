@@ -34,6 +34,8 @@ with Standard and Local AI uses 10 Standard pages and 10 Local AI pages. Some op
      *Local AI* or *Premium AI · Math and science*. Under it, a short description of the level.
 3. Choose **Remediate**, or **Check only** (below).
 
+![My documents for a person in Northfield University: Standard and Commercial AI pages left at the top; the Submit PDFs box with Choose PDFs, the AI line (Commercial AI, 292 pages left), More options, and the Remediate and Check only buttons; then Your documents, a list of five documents with their pages, status (Done, or Processing) and result (Passes PDF/UA-1).](../../images/my-documents.png)
+
 The documents appear under **Your documents** straight away, as *Waiting*, then *In progress* with the current
 step. You get an email when each is done, so you don't need to keep the page open.
 
@@ -82,8 +84,9 @@ If your administrators offer it, *Adobe Autotag* sends documents to Adobe PDF Se
   other result, plus Adobe's own report (an Excel file) among the report files.
 - Adobe doesn't describe images and doesn't guarantee its tags pass. So **Write alt text for images with AI** is
   ticked by default: you also get an **improved copy**, looking exactly the same, with AI descriptions of its
-  images and any font fixes that don't change how pages look. It's named for what it contains, for example
-  *Adobe + AI alt text*. It uses pages of the AI level you pick, given back if no image needed describing.
+  images, read-aloud text for math and chemistry the PDF's own text can't voice, any font fixes that don't change how
+  pages look, and bookmarks made from its headings. It's named for what it contains, for example *Adobe + AI alt
+  text*. It uses pages of the AI level you pick, given back if the AI wasn't needed.
 - Check only never goes to Adobe: checks are always made by this service.
 
 ## Confirming before sending
@@ -100,6 +103,8 @@ Documents wait their turn in a queue. You may see:
   how many run at once).
 - **Large document:** documents over a certain size (200 pages by default) take turns with smaller ones so they
   don't hold everyone else up. It may take longer to start.
+- **Waiting for a free place:** the option you chose (an AI level, for example) handles a set number of documents
+  at once. Yours starts when one of them finishes.
 - **Waiting for tomorrow:** an option has a daily page limit and it's been reached. The document waits until the
   next day, or until an administrator raises the limit; it doesn't fail.
 - **Paused by support:** support has paused that processing option for now. Documents wait and go ahead when it's

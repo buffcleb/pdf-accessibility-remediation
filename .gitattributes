@@ -1,0 +1,3 @@
+# Kept out of the public snapshot (scripts/publish.sh exports with git archive): internal reviews and status
+# notes, which name weaknesses and work in progress
+docs/evaluation/reviews/ export-ignore

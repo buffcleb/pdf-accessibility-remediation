@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import pdfplumber
 import pikepdf
 import pymupdf as fitz
-from pikepdf import Dictionary
+from pikepdf import Dictionary, Name
 
 from app.verification.integrity import TagIndex, _items
 from app.verification.model import Finding
@@ -71,13 +71,53 @@ def _patch_pdfplumber_marked_content() -> None:
 _patch_pdfplumber_marked_content()
 
 
+_ALT_LONG = 300
+_ALT_LONG_DRAWING = 1000  # above what a labeled figure's description is cut at (ALT_LIMIT_LONG, app/ai/base.py)
+
+
+def _gap(prev: dict, c: dict) -> bool:
+    """Whether a space stands between two glyphs drawn one after the other: the second starts a new line (back to the
+    left and lower down; a raised or lowered script carries on to the right), or a gap on the line is a word space drawn
+    by moving the pen rather than with a space character."""
+    size = max(prev.get("size") or 0.0, c.get("size") or 0.0, 1.0)
+    if c["x0"] < prev["x0"] and abs(c["top"] - prev["top"]) > 0.5 * size:
+        return not prev["text"].rstrip().endswith("-")  # a word broken at the line's end stays one word
+    return c["x0"] - prev["x1"] > 0.25 * size
+
+
+def glyph_text(chars: list) -> tuple[str, list[int]]:
+    """The text of these glyphs, in drawing order: whitespace collapsed, and a space where a line ends or a gap stands
+    for one (a paragraph's lines are drawn without a space between them). Also where each glyph's text starts in it,
+    so a place in the text can be found among the glyphs (splitting a tag there)."""
+    out: list[str] = []
+    starts: list[int] = []
+    last_space, prev = True, None
+    for c in chars:
+        t = c["text"]
+        if prev is not None and not last_space and t.strip() and _gap(prev, c):
+            out.append(" ")
+            last_space = True
+        starts.append(len(out))
+        for ch in t:
+            if ch.isspace():
+                if not last_space:
+                    out.append(" ")
+                    last_space = True
+            else:
+                out.append(ch)
+                last_space = False
+        if t.strip():
+            prev = c
+    return "".join(out).rstrip(), starts
+
+
 @dataclass
 class Content:
     chars: list = field(default_factory=list)
     images: list = field(default_factory=list)  # (bbox, digest, area)
     graphics: int = 0
     boxes: list = field(default_factory=list)
-    page_boxes: list = field(default_factory=list)  # (page 0-based, bbox) for the tag viewer
+    page_boxes: list = field(default_factory=list)  # (page 0-based, bbox) for the tag manager
 
     def add(self, other: "Content") -> None:
         self.chars += other.chars
@@ -88,7 +128,7 @@ class Content:
 
     @property
     def text(self) -> str:
-        return re.sub(r"\s+", " ", "".join(c["text"] for c in self.chars)).strip()
+        return glyph_text(self.chars)[0]
 
     @property
     def bbox(self):
@@ -108,6 +148,91 @@ class Content:
         return bool(vis) and sum(1 for c in vis if _BOLD.search(_SUBSET.sub("", c.get("fontname", "")))) / len(vis) > 0.6
 
 
+
+_PAINT = {"n", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*"}
+
+
+_INLINE_IMAGE = re.compile(rb"(?:^|[\s>\]}])BI(?=[\s/])")  # an inline image's opening operator
+
+
+def _may_draw_images(page: pikepdf.Page, xobjects) -> bool:
+    """Whether the page's own content can draw a picture: an image XObject among its resources, or an inline image
+    in its stream. A page that can't needs no clip walk; on a long text document that walk was most of the
+    checker's own time. A form XObject's pictures aren't drawn by the page's stream and aren't clipped here."""
+    if any(isinstance(x, pikepdf.Stream) and x.get("/Subtype") == Name.Image for _, x in xobjects.items()):
+        return True
+    try:
+        data = page.obj.Contents.read_bytes() if isinstance(page.obj.get("/Contents"), pikepdf.Stream) else \
+            b"\n".join(c.read_bytes() for c in (page.obj.get("/Contents") or []))
+    except (pikepdf.PdfError, AttributeError, TypeError):
+        return True  # unreadable: let the walk decide, as before
+    return _INLINE_IMAGE.search(data) is not None
+
+
+def _image_clips(page: pikepdf.Page) -> dict[int | None, list[fitz.Rect | None]]:
+    """For each marked-content id, the clip (PDF page space) of each image drawn directly in the page's content, in
+    drawing order (None: not clipped). pdfplumber places an image where its matrix puts it and ignores clipping, so
+    a picture drawn under a clip (a scanned page's figure is the scan drawn again, clipped to the figure) would seem
+    to cover the whole page. Any clipping path counts by its bounds."""
+    res = page.obj.get("/Resources") or Dictionary()
+    xobjects = res.get("/XObject") or Dictionary()
+    props = res.get("/Properties") or Dictionary()
+    out: dict[int | None, list[fitz.Rect | None]] = defaultdict(list)
+    if not _may_draw_images(page, xobjects):
+        return out  # nothing to clip: a page of text alone needn't have its content stream parsed again
+    ctm, clip = fitz.Identity, None
+    saved: list = []
+    path: list[fitz.Point] = []
+    clipping = False
+    marked: list[int | None] = []
+
+    def nums(operands) -> list[float]:
+        return [float(v) for v in operands]
+
+    for operands, op in pikepdf.parse_content_stream(page):
+        op = str(op)
+        if op == "q":
+            saved.append((ctm, clip))
+        elif op == "Q":
+            if saved:
+                ctm, clip = saved.pop()
+        elif op == "cm":
+            ctm = fitz.Matrix(*nums(operands)) * ctm
+        elif op in ("m", "l", "c", "v", "y"):
+            v = nums(operands)
+            path += [fitz.Point(v[k], v[k + 1]) * ctm for k in range(0, len(v), 2)]
+        elif op == "re":
+            x, y, w, h = nums(operands)
+            path += [fitz.Point(px, py) * ctm for px, py in ((x, y), (x + w, y), (x, y + h), (x + w, y + h))]
+        elif op in ("W", "W*"):
+            clipping = True
+        elif op in _PAINT:
+            if clipping and path:
+                bounds = fitz.Rect(min(p.x for p in path), min(p.y for p in path),
+                                   max(p.x for p in path), max(p.y for p in path))
+                clip = bounds if clip is None else (clip & bounds)
+            path, clipping = [], False
+        elif op == "BMC":
+            marked.append(None)
+        elif op == "BDC":
+            pl = operands[1] if len(operands) > 1 else None
+            if isinstance(pl, pikepdf.Name):
+                pl = props.get(pl)
+            mcid = pl.get("/MCID") if isinstance(pl, Dictionary) else None
+            marked.append(int(mcid) if mcid is not None else None)
+        elif op == "EMC":
+            if marked:
+                marked.pop()
+        elif op in ("Do", "INLINE IMAGE"):
+            if op == "Do":
+                x = xobjects.get(operands[0]) if operands else None
+                if x is None or x.get("/Subtype") != "/Image":
+                    continue
+            owner = next((m for m in reversed(marked) if m is not None), None)
+            out[owner].append(None if clip is None else fitz.Rect(clip))
+    return out
+
+
 class SemanticChecker:
     def __init__(self, path, pdf: pikepdf.Pdf, index: TagIndex, max_pages: int = 400):
         self.path = path
@@ -120,7 +245,7 @@ class SemanticChecker:
         self.artifact: dict[int, Content] = defaultdict(Content)
         self.tables: dict[int, list] = {}
         self.skipped: list[str] = []
-        self.by_mcid: dict[tuple[int, int], Content] = {}  # (page, mcid) -> content, for the tag viewer
+        self.by_mcid: dict[tuple[int, int], Content] = {}  # (page, mcid) -> content, for the tag manager
 
     def add(self, severity: str, issue: str, e=None, **kw) -> None:
         if e is not None:
@@ -168,7 +293,7 @@ class SemanticChecker:
                         return self.own.setdefault(idx, Content())
 
                     def piece(o) -> Content | None:
-                        """The content of the one marked-content item o belongs to (for the tag viewer)."""
+                        """The content of the one marked-content item o belongs to (for the tag manager)."""
                         mcid = o.get("mcid")
                         if mcid is None or o.get("tag") == "Artifact" or (i, mcid) not in by_page_mcid:
                             return None
@@ -184,8 +309,25 @@ class SemanticChecker:
                         if (pc := piece(c)) is not None:
                             pc.chars.append(c)
                             pc.boxes.append(b)
+                    # Images drawn under a clip show only inside it (see _image_clips); matched to pdfplumber's
+                    # images per marked-content id, in order, when the two agree on how many there are
+                    try:
+                        clips = _image_clips(self.pdf.pages[i])
+                    except Exception:  # noqa: BLE001 - unreadable content: use the images' full placement
+                        clips = {}
+                    counts = Counter(im.get("mcid") for im in page.images)
+                    seen: Counter = Counter()
+                    to_page = doc[i].transformation_matrix * (rot if rot is not None else fitz.Identity)
                     for im in page.images:
                         b = vbox(im)
+                        mcid = im.get("mcid")
+                        listed = clips.get(mcid, [])
+                        k = seen[mcid]
+                        seen[mcid] += 1
+                        if len(listed) == counts[mcid] and listed[k] is not None:
+                            shown = fitz.Rect(listed[k]) * to_page
+                            cut = fitz.Rect(b) & shown
+                            b = tuple(cut) if not cut.is_empty else tuple(shown)
                         try:
                             raw = im["stream"].get_rawdata() or b""
                             digest = hashlib.sha1(raw[:65536]).hexdigest()
@@ -229,13 +371,14 @@ class SemanticChecker:
         return None
 
     def subtree(self, e) -> Content:
+        """Everything under e, in document order (pre-order: its own content, then each child's in turn)."""
         out = Content()
         stack = [e.index]
         while stack:
             k = stack.pop()
             if k in self.own:
                 out.add(self.own[k])
-            stack.extend(self.index.elements[k].kids)
+            stack.extend(reversed(self.index.elements[k].kids))  # popped last-in first: push the first child last
         return out
 
     # ------------------------------------------------------------------ checks
@@ -254,7 +397,37 @@ class SemanticChecker:
         self._links(els)
         self._reading_order(els)
         self._language(els)
+        self._cut_off()
         return self._cap(self.findings)
+
+    def _cut_off(self) -> None:
+        """A page whose picture is much larger than the page: part of it can't be seen (a web page or a wide sheet
+        "printed" to PDF at the wrong size). Nothing in the file can bring the missing part back, so say so."""
+        try:
+            doc = fitz.open(self.path)
+        except Exception:  # noqa: BLE001 - this check is a courtesy; the others don't depend on it
+            return
+        try:
+            for n, page in enumerate(doc):
+                if n >= self.max_pages:
+                    break
+                pw, ph = page.rect.width, page.rect.height
+                worst = 0.0
+                for info in page.get_image_info():
+                    x0, y0, x1, y1 = info["bbox"]
+                    area = (x1 - x0) * (y1 - y0)
+                    if area < 0.25 * pw * ph:
+                        continue  # small pictures bleeding off the edge are a design choice
+                    seen = max(0.0, min(x1, pw) - max(x0, 0.0)) * max(0.0, min(y1, ph) - max(y0, 0.0))
+                    worst = max(worst, 1 - seen / area)
+                if worst >= 0.2:
+                    self.add("review", "part of the page is cut off", page=n + 1,
+                             detail=f"the page's picture is larger than the page, so about {round(worst * 100)}% of it "
+                                    "isn't shown (text and pictures stop at the page's edge)",
+                             action="Make the PDF again from the original so the whole page fits (for a web page, "
+                                    "print with \"fit to page\" or a smaller scale), then submit that file")
+        finally:
+            doc.close()
 
     def _body_size(self) -> float:
         sizes: Counter = Counter()
@@ -343,7 +516,12 @@ class SemanticChecker:
             elif len(alt.split()) < 2 and e.role == "Figure":
                 self.add("suggest", "alt text is very short", e, detail=f'alt: "{alt}"',
                          action="check it conveys the image's purpose", confidence=0.4)
-            if len(alt) > 300:
+            # A figure with labels written on it (a diagram, a reaction scheme) has parts and how they relate to
+            # say, which a photograph's few words don't cover: it is long only past what a description may hold.
+            # The labels are what tells: on a flattened page the same figure is a picture with its labels as the
+            # text layer over it, and has no drawing strokes left to go by.
+            labeled_drawing = e.role == "Figure" and bool(c.chars)
+            if len(alt) > (_ALT_LONG_DRAWING if labeled_drawing else _ALT_LONG):
                 self.add("suggest", "alt text is very long", e, detail=f"{len(alt)} characters",
                          action="shorten; move detail to the body text or a caption", confidence=0.5)
             for _, digest, _ in c.images:
@@ -380,7 +558,14 @@ class SemanticChecker:
             if not w:
                 continue
             page_area = w * h
+            tagged = [ch["vbox"] for (pg, _), piece in self.by_mcid.items() if pg == page
+                      for ch in piece.chars if ch["text"].strip()]
             for b, _, area in c.images:
+                # A picture with the page's tagged text lying over it is that text's background: a scanned page
+                # under its OCR text layer (sometimes in several layers), not a picture hidden from readers
+                over = sum(1 for v in tagged if b[0] <= (v[0] + v[2]) / 2 <= b[2] and b[1] <= (v[1] + v[3]) / 2 <= b[3])
+                if over >= 40 and over >= 0.8 * len(tagged):
+                    continue
                 if 0.10 * page_area <= area < 0.9 * page_area:
                     self.add("review", "large image marked as decorative (hidden from screen readers)",
                              page=page + 1, detail=f"{area / page_area:.0%} of the page",
@@ -388,7 +573,7 @@ class SemanticChecker:
             body = [ch for ch in c.chars if ch["text"].strip()
                     and h * 0.1 < (ch["vbox"][1] + ch["vbox"][3]) / 2 < h * 0.9]
             if len(body) > 40:
-                sample = re.sub(r"\s+", " ", "".join(ch["text"] for ch in body[:80])).strip()
+                sample = glyph_text(body[:80])[0]
                 self.add("high", "text in the body of the page is marked as an artifact", page=page + 1,
                          text=sample[:80], detail=f"{len(body)} characters hidden from assistive technology",
                          action="tag it as content unless it is a watermark or background", confidence=0.7)

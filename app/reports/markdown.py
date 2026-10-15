@@ -272,4 +272,35 @@ def render_job_markdown(job_id: str, meta: dict, status: str, result: dict | Non
         if m.get(key):
             out.append(f"| {label} | {m[key]} |")
     out.append("")
+    rows = stage_rows(m)
+    if rows:
+        out += ["### Time by stage", "", "| Stage | Seconds |", "|---|---|"]
+        out += [f"| {label} | {seconds:,.1f} |" for label, seconds in rows]
+        out += ["", "Writing the reports themselves isn't counted.", ""]
     return "\n".join(out)
+
+
+_STAGES = {
+    "validating_original": "Checking the original (PDF/UA validation)",
+    "analyzing": "Reading the layout (and OCR)",
+    "ai_ocr": "AI correction of OCR",
+    "ai_enrichment": "Music, then AI: alt text, tables, reading order, notation",
+    "tagging": "Tagging",
+    "ai_existing_figures": "AI: figures in existing tags",
+    "validating_output": "Checking the result (PDF/UA validation, font fixes)",
+    "destructive_fixes": "Font substitution",
+    "flattening": "Flattening pages and tagging them again",
+    "reporting": "Reports",
+    "verifying_tags": "Verifying the tags (and AI review)",
+}
+_PARTS = {"validator": "waiting for the validator", "music": "finding and reading music"}
+
+
+def stage_rows(metrics: dict) -> list[tuple[str, float]]:
+    """A job's time by stage, in the order the stages ran, as (name for a reader, seconds); then the time inside
+    those stages spent on particular things ("of which: ...")."""
+    recorded = metrics.get("stage_seconds") or {}
+    rows = [(_STAGES.get(k, k.replace("_", " ").capitalize()), float(v)) for k, v in recorded.items()
+            if k != "of_which" and float(v) >= 0.05]  # a stage that took no time says nothing
+    return rows + [(f"of which: {_PARTS.get(k, k)}", float(v)) for k, v in (recorded.get("of_which") or {}).items()
+                   if float(v) >= 0.05]

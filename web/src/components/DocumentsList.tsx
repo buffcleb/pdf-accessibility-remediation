@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { get, type Job } from "../api";
 import { useAuth } from "../auth";
-import { JobsTable } from "./JobsTable";
-import { ErrorNotice, Loading, fmtNum, useLoad } from "./ui";
+import { JobsTable, type Selection } from "./JobsTable";
+import { MarkDoneBar, canMarkDone } from "./removal";
+import { ErrorNotice, Loading, Notice, fmtNum, useLoad } from "./ui";
 
 export type DocumentsPage = { items: Job[]; total: number; page: number; page_size: number; active: number };
 
@@ -14,14 +15,31 @@ const RESULTS: [string, string][] = [["", "Any result"], ["passes", "Passes PDF/
 const AUDIT: [string, string][] = [["", "Both"], ["false", "Remediated"], ["true", "Audit only"]];
 const SIZES = [25, 50, 100, 200];
 
-/** The person's documents, a page at a time, with search, filters and sorting. The whole view lives in the
- * address, so Back and bookmarks work. Refreshes itself while any document is still being processed. */
-export function DocumentsList({ onStatusChange }: { onStatusChange?: (key: string) => void }) {
+/** Another list of documents than the signed-in person's own: a group's, for its admins. */
+export type DocumentsScope = {
+  /** Where the page of documents comes from (answers like /documents) */
+  endpoint: string;
+  /** The services and AI levels offered in the filter */
+  services: { key: string; label: string }[];
+  /** What a document's page calls the way back to this list */
+  backLabel: string;
+  /** Which rows can be selected, and the bar that acts on the selection; without them rows have no checkboxes */
+  can?: Selection["can"];
+  bar?: (selected: Set<string>, onDone: (message: string) => void) => ReactNode;
+};
+
+/** Documents, a page at a time, with search, filters and sorting: the person's own, or with `scope` a group's for
+ * its admins (each row then says whose it is and how it was processed, and the search also finds a person). The
+ * whole view lives in the address, so Back and bookmarks work. Refreshes itself while any document is still being
+ * processed. */
+export function DocumentsList({ onStatusChange, scope }: { onStatusChange?: (key: string) => void; scope?: DocumentsScope }) {
   const { me } = useAuth();
   const [params, setParams] = useSearchParams();
   const location = useLocation();
   const [search, setSearch] = useState(params.get("q") ?? "");
   const [moreOpen, setMoreOpen] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [doneMsg, setDoneMsg] = useState("");
   const size = Number(params.get("size")) || 25;
   const page = Number(params.get("page")) || 1;
   const sort = params.get("sort") ?? "-created_at";
@@ -34,7 +52,8 @@ export function DocumentsList({ onStatusChange }: { onStatusChange?: (key: strin
   api.set("page", String(page));
   api.set("page_size", String(size));
   const query = api.toString();
-  const docs = useLoad(() => get<DocumentsPage>(`/documents?${query}`), [query],
+  const endpoint = scope?.endpoint ?? "/documents";
+  const docs = useLoad(() => get<DocumentsPage>(`${endpoint}?${query}`), [endpoint, query],
     useCallback((d: DocumentsPage) => d.active > 0, []));
 
   // Tell the page when a document's status changes (to refresh pages left)
@@ -57,7 +76,9 @@ export function DocumentsList({ onStatusChange }: { onStatusChange?: (key: strin
     return () => window.clearTimeout(t);
   }, [search]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const services = (me?.services ?? []).filter((s) => s.available || s.used_pages > 0);
+  const services = scope?.services ?? (me?.services ?? []).filter((s) => s.available || s.used_pages > 0);
+  const what = scope ? "the group's documents" : "your documents";
+  const searchLabel = scope ? "Search by file name or person" : "Search by file name";
   const label = (list: [string, string][], v: string | null) => list.find(([k]) => k === v)?.[1] ?? v;
   const chips = [
     params.get("result") && { key: "result", text: label(RESULTS, params.get("result")) },
@@ -68,17 +89,22 @@ export function DocumentsList({ onStatusChange }: { onStatusChange?: (key: strin
   ].filter(Boolean) as { key: string; text: string }[];
   const filtering = !!(params.get("q") || params.get("status") || chips.length);
   const data = docs.data;
+  const done = (message: string) => {
+    setSelected(new Set());
+    setDoneMsg(message);
+    if (message) void docs.reload();
+  };
   const pages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
   const first = data && data.total ? (page - 1) * data.page_size + 1 : 0;
   const last = data ? Math.min(data.total, page * data.page_size) : 0;
 
   return (
     <div className="documents-list">
-      <form className="report-bar" role="search" aria-label="Search and filter your documents" onSubmit={(e) => e.preventDefault()}>
+      <form className="report-bar" role="search" aria-label={`Search and filter ${what}`} onSubmit={(e) => e.preventDefault()}>
         <div className="report-search-box">
-          <label htmlFor="dl-q" className="visually-hidden">Search by file name</label>
+          <label htmlFor="dl-q" className="visually-hidden">{searchLabel}</label>
           <span className="search-icon" aria-hidden="true">⌕</span>
-          <input id="dl-q" type="search" value={search} placeholder="Search by file name" onChange={(e) => setSearch(e.target.value)} />
+          <input id="dl-q" type="search" value={search} placeholder={searchLabel} onChange={(e) => setSearch(e.target.value)} />
         </div>
         <label htmlFor="dl-status" className="visually-hidden">Status</label>
         <select id="dl-status" className="report-select" value={params.get("status") ?? ""} onChange={(e) => update({ status: e.target.value })}>
@@ -131,10 +157,14 @@ export function DocumentsList({ onStatusChange }: { onStatusChange?: (key: strin
               setParams(keep, { replace: true });
             }}>Clear search and filters</button></>}
           </p>
+          {doneMsg && <Notice>{doneMsg}</Notice>}
+          {scope ? scope.bar?.(selected, done)
+            : <MarkDoneBar selected={selected} holdHours={data.items[0]?.removal_hold_hours ?? 24} onDone={done} />}
           {(data.total > 0 || !filtering) && (
-            <JobsTable jobs={data.items} sort={sort} onSort={(key) => update({ sort: sort === key ? `-${key}` : sort === `-${key}` ? key
+            <JobsTable jobs={data.items} sort={sort} showUser={!!scope} showService={!!scope}
+              selection={scope && !scope.can ? undefined : { can: scope?.can ?? canMarkDone, selected, onChange: setSelected }} onSort={(key) => update({ sort: sort === key ? `-${key}` : sort === `-${key}` ? key
               : key === "created_at" ? "-created_at" : key }, true)}
-              back={{ back: location.pathname + location.search, backLabel: "My documents" }} />
+              back={{ back: location.pathname + location.search, backLabel: scope?.backLabel ?? "My documents" }} />
           )}
           {data.total > Math.min(...SIZES) && (
             <nav className="pager" aria-label="Pages of documents">

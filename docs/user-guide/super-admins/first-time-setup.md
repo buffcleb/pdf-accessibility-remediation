@@ -29,6 +29,8 @@ first sign-in.
 7. **Set retention.** **Settings → Sign-in and data:** how long files and records are kept, sign-in timeouts, and
    whether new groups approve members first.
 8. **Create a group.** **Groups → Create group:** its name and email domains, so people on those domains join it.
+   For individual people (a gmail.com address, a guest), add their addresses under **People allowed by address**
+   on the group's settings instead of a domain.
    Make someone its group admin. ([Groups and people](groups-and-people.md))
 9. **Offer it services.** **+ Offer a service to a group:** the service, who gets it, pages for the pool and the
    default limit per person. Do it once for the processing option and once for each AI level. The set-up checks

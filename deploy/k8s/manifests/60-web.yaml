@@ -23,20 +23,21 @@ spec:
       labels: { app: web }
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
-      securityContext: { runAsUser: 101, runAsGroup: 101, runAsNonRoot: true }
+      securityContext: { runAsUser: 101, runAsGroup: 101, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: web
           image: ${REGISTRY}/pdfrem-web:${WEB_TAG}
           env:
             - { name: PORTAL_API_UPSTREAM, value: "http://portal-api:8080" }
             - { name: MAX_UPLOAD_SIZE, value: "${MAX_UPLOAD_SIZE}" }
+            - { name: TRUSTED_PROXIES, value: "${WEB_TRUSTED_PROXIES}" }
           ports: [{ containerPort: 8080 }]
           readinessProbe:
             httpGet: { path: /, port: 8080 }
             periodSeconds: 10
           resources:
             requests: { cpu: 20m, memory: 32Mi }
-            limits: { cpu: 500m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 128Mi, ephemeral-storage: 1536Mi }
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -46,9 +47,10 @@ spec:
             - { name: cache, mountPath: /var/cache/nginx }
             - { name: confd, mountPath: /etc/nginx/conf.d }
       volumes:
-        - { name: tmp, emptyDir: {} }
-        - { name: cache, emptyDir: {} }
-        - { name: confd, emptyDir: {} }
+        - { name: tmp, emptyDir: { sizeLimit: 64Mi } }
+        # A download to a slow client is spooled under the cache (proxy_max_temp_file_size, 1 GB by default)
+        - { name: cache, emptyDir: { sizeLimit: 1Gi } }
+        - { name: confd, emptyDir: { sizeLimit: 1Mi } }
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

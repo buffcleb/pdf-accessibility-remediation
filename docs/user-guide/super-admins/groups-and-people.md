@@ -7,6 +7,8 @@
 A **group** is who a service is shared with: a department, organization or team. Everyone belongs to exactly one,
 decided at their first sign-in by their email address.
 
+![Administration, Groups: a search box, a table with Northfield University, its email domain, the services on (Standard, Commercial AI) and its pages left, and Create a group.](../../images/admin-groups.png)
+
 **Groups** lists them all; **Create group** makes a new one. A group's own tabs are the same as a group admin's (see
 [the admin area](../group-admins/the-admin-area.md#your-groups-pages)), plus what only super admins can change, on
 **Group settings**:
@@ -14,10 +16,22 @@ decided at their first sign-in by their email address.
 - **Name**, the **default page limit per person**, and the group's own **message when out of pages** (empty uses the
   global message).
 - **Email domains:** everyone signing in with an address on one of these domains joins the group. A domain belongs
-  to one group only. A subdomain only matches if it's listed.
+  to one group only. A subdomain only matches if it's listed. Adding a public email provider (gmail.com,
+  outlook.com and so on) asks you to confirm, because anyone with a free account could then join.
+- **People allowed by address:** individual email addresses that may sign in and join this group, without their
+  domain. Use it for someone with a gmail.com address, a visitor or a contractor. An address here takes precedence
+  over the domains, so it can also put one person from partner.edu in a different group from the rest of
+  partner.edu. An address is on one group at a time (adding it to another offers to move it). Removing it stops new
+  sign-ups only: if they've already signed in, their account keeps working until you disable it in People.
 - **Group admins:** add or remove them. A group can have several.
 - **Disable group:** its people are signed out and can't sign in until it's enabled again.
 - **Correct the pool** (below).
+
+### A group for people without an organization domain
+
+For people who don't share an organization's email domain (individuals with personal addresses, guests), create a
+group such as **Individuals** with no email domains, and add each person under **People allowed by address**. It
+works like any other group: its own services, page pool, limits and admins.
 
 ## Pages and top-ups
 
@@ -46,6 +60,22 @@ or the AI it was charged for turned out not to be needed.
 - **make them a super admin**, or remove it.
 
 Personal limits are set in the group's **People** tab, as a group admin does.
+
+## Removing documents
+
+To clear out documents before the end of the retention period (test uploads, for example), open the group's
+**Documents** tab, tick the documents (or the heading's box for every one shown), give a **reason** (it's recorded
+in the audit log), then:
+
+- **Remove files now:** the files, report, versions and help requests about them go at once (as at the end of
+  retention); the documents stay in their owners' lists, marked "Files removed".
+- **Delete:** the files go at once and the documents leave every document list, their owners' included. Their
+  records stay, so reports, page usage and the ledger still count them; super admins can still open them (from
+  **Reports**), marked as deleted.
+
+Documents still waiting or in progress can't be ticked. Neither can be undone. A single document has the same two
+choices on its page, under **Downloads → Super admin: remove**, where you can also **Keep the files** of a document
+its owner marked done.
 
 ## When a sign-in code doesn't arrive
 

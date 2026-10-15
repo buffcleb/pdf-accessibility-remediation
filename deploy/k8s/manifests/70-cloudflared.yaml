@@ -16,7 +16,7 @@ spec:
       annotations:
         checksum/settings: "${TUNNEL_ENV_SHA}"
     spec:
-      securityContext: { runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true }
+      securityContext: { runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: cloudflared
           image: ${CLOUDFLARED_IMAGE}
@@ -30,7 +30,7 @@ spec:
             periodSeconds: 10
           resources:
             requests: { cpu: 20m, memory: 64Mi }
-            limits: { cpu: 500m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 256Mi, ephemeral-storage: 128Mi }
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

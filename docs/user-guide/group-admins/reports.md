@@ -13,9 +13,13 @@
 | | Remaining failures | The checks documents most often still fail, by rule (with a chart) |
 | **Usage** | Usage | Each person's limit and use per service; documents and pages in the period |
 | | Page ledger | Every change to the group's pages: top-ups, corrections, charges and refunds |
+| | AI usage | What each AI level did for your group's documents: documents, pages, AI calls (and how many failed), tokens, documents the AI wasn't charged for, and the average time, per level and kind of document, over time (with a chart) |
 | **Activity** | Sign-ins | Sign-ins, failed attempts, code requests and sign-outs |
+| | Email | Every email sent to your group's people: sign-in codes, document and help notifications, summaries; whether it went, when, and any error |
 | | Help requests | The group's requests and how long they took |
 | | Audit log | Every change to pages, limits, access and services in your group, including changes a super admin made there |
+
+![The Quality report: 100% pass PDF/UA-1, 4 remediated documents, 3 with review findings; a pass-rate chart by day; and a table by period and service with documents, passes, pass rate and review findings, with Columns, Export CSV and Email this view.](../../images/reports-quality.png)
 
 Cost figures (what the AI cost) are for super admins only.
 

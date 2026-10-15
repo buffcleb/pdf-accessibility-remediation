@@ -35,7 +35,7 @@ class VerificationReport:
     findings: list[Finding] = field(default_factory=list)
     ai: dict[str, Any] = field(default_factory=dict)
     skipped: list[str] = field(default_factory=list)
-    tagmap: dict | None = None  # for the tag viewer; written to its own file, not into the report
+    tagmap: dict | None = None  # for the tag manager; written to its own file, not into the report
 
     @property
     def errors(self) -> list[Finding]:

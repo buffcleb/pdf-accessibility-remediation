@@ -29,7 +29,9 @@ def text_layer_font() -> tuple[fitz.Font, str | None]:
 
 def fix_inserted_cid_fonts(path: str, font_name: str) -> int:
     """PyMuPDF writes Type 2 CIDFonts without /CIDToGIDMap (PDF/UA 7.21.3.2). Its CIDs are glyph ids,
-    so /Identity is exact. Only fonts we inserted (matched by name) are touched."""
+    so /Identity is exact. It also names the font descriptor after the font's full name ("DejaVu Sans Book")
+    where the PDF spec wants the font's /BaseFont ("DejaVuSans"; found by the Arlington model checker). Only
+    fonts we inserted (matched by name) are touched."""
     import pikepdf
 
     fixed = 0
@@ -39,11 +41,19 @@ def fix_inserted_cid_fonts(path: str, font_name: str) -> int:
             # PyMuPDF names the Type0 parent after the font's full name; fix its descendants.
             if not isinstance(obj, pikepdf.Dictionary) or obj.get("/Subtype") != pikepdf.Name.Type0:
                 continue
-            if str(obj.get("/BaseFont", ""))[1:] not in targets:
+            base = str(obj.get("/BaseFont", ""))[1:]
+            if base not in targets and base.split("+", 1)[-1] not in targets:  # also once subset ("ABCDEF+Name")
                 continue
             for desc in obj.get("/DescendantFonts") or []:
-                if desc.get("/Subtype") == pikepdf.Name.CIDFontType2 and "/CIDToGIDMap" not in desc:
+                if desc.get("/Subtype") != pikepdf.Name.CIDFontType2:
+                    continue
+                if "/CIDToGIDMap" not in desc:
                     desc.CIDToGIDMap = pikepdf.Name.Identity
+                    fixed += 1
+                fd = desc.get("/FontDescriptor")
+                if isinstance(fd, pikepdf.Dictionary) and desc.get("/BaseFont") is not None \
+                        and fd.get("/FontName") != desc.BaseFont:
+                    fd.FontName = desc.BaseFont
                     fixed += 1
         if fixed:
             pdf.save(path)

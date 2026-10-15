@@ -196,3 +196,4 @@ def test_adobe_improved_copy_is_named_by_what_was_done(setup):
     assert improved_label(resp(alt_text=3)) == "Adobe + AI alt text"
     assert improved_label(resp(glyph_lists=["Arial: incomplete CIDSet removed"])) == "Adobe + fixes"
     assert improved_label(resp(alt_text=1, glyph_widths=4)) == "Adobe + AI alt text and fixes"
+    assert improved_label(resp(bookmarks=12)) == "Adobe + fixes"   # bookmarks from the headings, nothing else

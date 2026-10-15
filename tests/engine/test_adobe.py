@@ -245,8 +245,13 @@ def test_adobe_route_end_to_end(api, samples, fake_adobe, monkeypatch):
     assert body["files"]["remediated_visual_fallback"] is None
     assert len(body["reports"]["adobe_reports"]) == 2
     assert body["reports"]["tag_verification"]["primary"]["integrity"]["passed"] is True
-    assert set(body["reports"]["tag_maps"]) == {"original", "primary"}
-    assert api.get(body["files"]["remediated_primary"]).content.startswith(b"%PDF")
+    # Adobe writes no bookmarks: the improved copy has them, from Adobe's headings; Adobe's file stays as it was
+    assert set(body["reports"]["tag_maps"]) == {"original", "primary", "enhanced"}
+    with fitz.open(stream=api.get(body["files"]["remediated_primary"]).content) as adobe, \
+            fitz.open(stream=api.get(body["files"]["enhanced"]).content) as improved:
+        made = len(improved.get_toc())
+        assert adobe.get_toc() == [] and made >= 2
+    assert f"Changes: {made} bookmark(s) made from the headings." in body["reports"]["remediation_summary"]
     xlsx = api.get(body["reports"]["adobe_reports"][0])
     assert xlsx.status_code == 200 and "spreadsheetml" in xlsx.headers["content-type"]
     md = api.get(f"/api/v1/jobs/{r.json()['job_id']}?format=markdown")
@@ -308,3 +313,31 @@ def test_adobe_ai_unavailable_still_returns_adobes_file(api, samples, fake_adobe
     assert body["status"] == "completed"
     assert body["metrics"]["ai_failures"] == 1 and body["metrics"]["images_described"] == 0
     assert any("every AI call failed" in w for w in body["warnings"])
+
+
+def test_doses_reach_the_adobe_improved_copy(api, tmp_path, fake_adobe):
+    """#20 part 3: a dose read by rule reaches the improved copy as ActualText; Adobe's file stays as it was."""
+    path = tmp_path / "dosing.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Dosing guide", fontsize=18)
+    page.insert_text((72, 140), "Give 5 mg/kg PO q6h with food.", fontsize=11)
+    page.insert_text((72, 170), "Each tablet holds the same amount of the active ingredient.", fontsize=11)
+    doc.save(path)
+    with path.open("rb") as fh:
+        r = api.post("/api/v1/remediate", files={"file": ("dosing.pdf", fh, "application/pdf")},
+                     data={"route": "adobe", "ai_provider": "mock"})
+    body = api.get(f"/api/v1/jobs/{r.json()['job_id']}").json()
+    assert body["status"] == "completed", body
+    reps = body["reports"]
+    assert body["files"]["enhanced"].endswith("_adobe_improved.pdf")
+
+    def said(ref):
+        return [e.get("actual_text") for e in api.get(ref).json()["elements"] if "mg/kg" in (e.get("text") or "")]
+
+    assert not any(said(reps["tag_maps"]["primary"]))                      # Adobe's file is untouched
+    improved = [s for s in said(reps["tag_maps"]["enhanced"]) if s]
+    assert improved and "milligrams per kilogram" in improved[0] and "every 6 hours" in improved[0]
+    assert body["metrics"]["notation_by_rule"] == 1 and body["metrics"]["notation_read_by_ai"] == 0
+    assert "specialist notation read aloud correctly in 1 tag(s)" in reps["remediation_summary"]
+    assert reps["tag_verification"]["enhanced"]["integrity"]["passed"]

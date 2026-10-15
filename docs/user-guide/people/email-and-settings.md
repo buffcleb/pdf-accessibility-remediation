@@ -9,6 +9,8 @@
 For each kind of email: **As they happen** (the default), **Once a day** (one email with all of them, at the
 service's send time) or **Off**.
 
+![The Settings page: Email notifications for Your documents and Help requests, each As they happen, Once a day or Off, with a "Not while I have it open" check box; and Email reports for Your documents, Monthly, Weekly, Daily or Off, with Email me a sample.](../../images/my-settings.png)
+
 | Kind | What it's about |
 |---|---|
 | **Your documents** | A document is done, couldn't be processed, or was canceled by support |

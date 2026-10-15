@@ -39,7 +39,11 @@ KIND_LABELS = {
     "math": "Math and notation",
     "visual": "Looks different from the original",
     "other": "Something else",
+    "failed": "The document couldn't be processed",
 }
+# Failures nobody needs to look into: someone stopped the document on purpose
+NO_REQUEST_FOR = {"stopped", "canceled"}
+SERVICE = "The service"
 STATUS_LABELS = {
     "open": "Open",
     "in_progress": "In progress",
@@ -156,7 +160,7 @@ def add_message(db: Session, req: HelpRequest, author: User, role: str, kind: st
     # would let the lazy load flush and fetch the new message, and the append would list it twice.
     messages = req.messages
     msg = HelpMessage(kind=kind, author_id=author.id if author else None,
-                      author_email=author.email if author else "system", author_role=role, body=body)
+                      author_email=author.email if author else SERVICE, author_role=role, body=body)
     messages.append(msg)
     now = _now()
     req.updated_at = now
@@ -238,9 +242,46 @@ def queue_mail(db: Session, mails: list[Mail], req: HelpRequest | None = None) -
     outbox.queue(db, mails, settings_store.load(db).mail_from_name, "help", about=f"help:{req.id}" if req else None)
 
 
-def new_request_mails(db: Session, req: HelpRequest, first: HelpMessage) -> list[Mail]:
+def failure_body(message: str | None, code: str | None) -> str:
+    """What the request's first message says about a failure: what the person was told, and the error's name.
+    The recorded detail is internal (file paths, engine messages), so it goes in a note for super admins."""
+    lines = ["This document couldn't be processed, so a help request was opened for it.", "",
+             f"What the person was told: {message or 'Remediation failed for this document.'}"]
+    if code:
+        lines.append(f"Error: {code}")
+    return "\n".join(lines)
+
+
+def open_for_failure(db: Session, job, code: str | None, detail: str | None) -> HelpRequest | None:
+    """A help request for a document that failed, opened by the service itself (when the setting is on, and unless
+    someone stopped the document on purpose or it already has a request). Super admins get the usual email."""
+    if code in NO_REQUEST_FOR or not settings_store.load(db).help_on_failure or job.user is None:
+        return None
+    if db.scalar(select(HelpRequest).where(HelpRequest.job_id == job.id,
+                                           HelpRequest.status.in_(("open", "in_progress", "waiting")))) is not None:
+        return None
+    req = HelpRequest(id=uuid.uuid4(), job_id=job.id, filename=job.filename, user_id=job.user_id, group_id=job.group_id,
+                      kind="failed", status="open")
+    db.add(req)
+    db.flush()
+    first = add_message(db, req, None, "system", "message", failure_body(job.error_message, code))
+    if detail and detail.strip():
+        add_message(db, req, None, "system", "note", f"Recorded with the failure: {detail.strip()[:1500]}")
+    db.flush()
+    db.refresh(req)
+    queue_mail(db, new_request_mails(db, req, first, detail), req)
+    req.staff_notified_at = _now()
+    return req
+
+
+def new_request_mails(db: Session, req: HelpRequest, first: HelpMessage, detail: str | None = None) -> list[Mail]:
     who = req.user.email
     group = req.group.name if req.group else "no group"
+    if first.author_role == "system":
+        text = (f"{req.filename}, submitted by {who} ({group}), couldn't be processed. A help request was opened for "
+                f"it.\n\n{first.body}\n" + (f"Recorded with the failure: {detail.strip()[:1500]}\n" if detail else "")
+                + f"\nOpen the request:\n{_url(f'/admin/help/{req.id}')}\n" + _footer(db))
+        return [Mail(to=to, subject=f"Failed document: {req.filename}", text=text) for to in _super_admins(db)]
     text = (f"{who} ({group}) asked for help with {req.filename}.\n\n"
             f"Kind of problem: {KIND_LABELS[req.kind]}\n"
             + (f"Version: {req.version_label}\n" if req.version_label else "")

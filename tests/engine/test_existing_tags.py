@@ -229,3 +229,293 @@ def test_artifacted_figure_moved_by_list_repair_is_still_removed(samples, tmp_pa
     tag_document(src, out, analysis, title="T", language="en-US", region_alts=[(0, img.bbox, None, True)])
     with pikepdf.open(out) as pdf:
         assert not [f for f in check_integrity(pdf)[0] if f.severity == "error"]
+
+
+def _list_split_by_note(tmp_path, second_label="2.", note_x=90):
+    """A tagged page: item 1, a note under it, items 2 and 3, tagged (as Word does) as L, P, L."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    lines = [(72, 700, "1. Is the work done inside the state?"),
+             (note_x, 684, "*If not, use the other request form instead."),
+             (72, 664, f"{second_label} Type of request: new or changed"),
+             (72, 646, "3. Length of the arrangement")]
+    ops = []
+    for mcid, (x, y, text) in enumerate(lines):
+        ops.append(f"/{'P' if mcid == 1 else 'LBody'} <</MCID {mcid}>> BDC BT /F1 11 Tf {x} {y} Td ({text}) Tj ET EMC")
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)))),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=pg))
+    mk = lambda s, parent, k=None: pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name(s), P=parent, Pg=pg,  # noqa: E731
+                                                                K=k if k is not None else Array()))
+
+    def item(lst, mcid):
+        li = mk("/LI", lst)
+        body = mk("/LBody", li, mcid)
+        li.K = Array([body])
+        return li, body
+
+    l1, l2 = mk("/L", doc), mk("/L", doc)
+    li1, b1 = item(l1, 0)
+    l1.K = Array([li1])
+    note = mk("/P", doc, 1)
+    li2, b2 = item(l2, 2)
+    li3, b3 = item(l2, 3)
+    l2.K = Array([li2, li3])
+    doc.K = Array([l1, note, l2])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([b1, note, b2, b3])])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / f"split_{second_label.strip('.')}_{note_x}.pdf"
+    pdf.save(src)
+    return src
+
+
+def _top_roles(path):
+    with pikepdf.open(path) as pdf:
+        doc = pdf.Root.StructTreeRoot.K[0]
+        return [str(k.S)[1:] for k in doc.K], doc
+
+
+def test_a_list_split_by_a_note_is_joined(tmp_path):
+    src = _list_split_by_note(tmp_path)
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    reasons = " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+    assert "joined" in reasons and "note under a list item" in reasons
+    with pikepdf.open(out) as pdf:
+        doc = pdf.Root.StructTreeRoot.K[0]
+        lists = [k for k in doc.K if str(k.S) == "/L"]
+        assert len(lists) == 1 and len(lists[0].K) == 3          # one list, three items
+        first_body = lists[0].K[0].K[0]
+        assert [str(k.S) for k in first_body.K if isinstance(k, pikepdf.Dictionary)] == ["/P"]  # the note, in item 1
+        assert "/P" not in [str(k.S) for k in doc.K]
+    # The tag manager summarizes the list in reading order
+    from app.verification.tagmap import build_tagmap
+    text = next(e for e in build_tagmap(out)["elements"] if e["role"] == "L")["text"]
+    assert text.index("1. Is") < text.index("*If not") < text.index("2. Type") < text.index("3. Length"), text
+
+
+def test_lists_that_dont_continue_are_left_alone(tmp_path):
+    for label, x in (("1.", 90), ("2.", 72)):  # numbering starts again; the note isn't indented
+        src = _list_split_by_note(tmp_path, second_label=label, note_x=x)
+        out = tmp_path / f"o_{label}_{x}.pdf"
+        tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+        assert _top_roles(out)[0] == ["L", "P", "L"], (label, x)
+
+
+def _table_tagged(tmp_path, shape):
+    """A two-row table tagged as Word does: "rows_in_table" (THead, then the other row directly in the Table) or
+    "header_only" (one row in THead, plus an empty TBody)."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    cells = [(72, 700, "Name"), (300, 700, "Role"), (72, 680, "Pat"), (300, 680, "Lead")]
+    ops = [f"/TD <</MCID {i}>> BDC BT /F1 11 Tf {x} {y} Td ({t}) Tj ET EMC" for i, (x, y, t) in enumerate(cells)]
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
+    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=[0, 0, 612, 792],
+                                             Resources=Dictionary(Font=Dictionary(F1=font)),
+                                             Contents=pdf.make_stream("\n".join(ops).encode()))))
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=pg))
+    mk = lambda s, parent, k=None: pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name(s), P=parent, Pg=pg,  # noqa: E731
+                                                                K=k if k is not None else Array()))
+    table = mk("/Table", doc)
+    head = mk("/THead", table)
+    leaves = []
+
+    def row(parent, first, role):
+        tr = mk("/TR", parent)
+        tds = [mk(role, tr, first), mk(role, tr, first + 1)]
+        leaves.extend(tds)
+        tr.K = Array(tds)
+        return tr
+
+    head.K = Array([row(head, 0, "/TH")])
+    if shape == "rows_in_table":
+        table.K = Array([head, row(table, 2, "/TD")])
+    else:  # header only: the body is empty and the second line is a plain paragraph
+        p = mk("/P", doc, 2)
+        p2 = mk("/P", doc, 3)
+        leaves.extend([p, p2])
+        table.K = Array([head, mk("/TBody", table)])
+    doc.K = Array([table] + ([] if shape == "rows_in_table" else [leaves[-2], leaves[-1]]))
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array(leaves)])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / f"table_{shape}.pdf"
+    pdf.save(src)
+    return src
+
+
+def _table_kids(path):
+    with pikepdf.open(path) as pdf:
+        doc = pdf.Root.StructTreeRoot.K[0]
+        table = next(k for k in doc.K if str(k.S) == "/Table")
+        return [(str(k.S)[1:], [str(r.S)[1:] for r in k.K] if str(k.S) in ("/THead", "/TBody") else None)
+                for k in table.K]
+
+
+def test_rows_after_a_thead_are_grouped_into_a_tbody(tmp_path):
+    src = _table_tagged(tmp_path, "rows_in_table")
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert _table_kids(out) == [("THead", ["TR"]), ("TBody", ["TR"])]
+    assert "grouped into a TBody" in " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+
+
+def test_a_header_only_table_gets_a_tbody(tmp_path):
+    src = _table_tagged(tmp_path, "header_only")
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert _table_kids(out) == [("TBody", ["TR"])]  # its header cells stay TH
+    with pikepdf.open(out) as pdf:
+        table = next(k for k in pdf.Root.StructTreeRoot.K[0].K if str(k.S) == "/Table")
+        assert [str(c.S) for c in table.K[0].K[0].K] == ["/TH", "/TH"]
+    assert "THead became the TBody" in " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+
+
+def _figure_alts(path):
+    with pikepdf.open(path) as pdf:
+        out = []
+
+        def walk(n):
+            k = n.get("/K")
+            for c in (list(k) if isinstance(k, pikepdf.Array) else [k]):
+                if isinstance(c, pikepdf.Dictionary) and "/S" in c:
+                    if str(c.S) == "/Figure":
+                        out.append(str(c.get("/Alt")) if "/Alt" in c else None)
+                    walk(c)
+        walk(pdf.Root.StructTreeRoot)
+        return out
+
+
+def test_office_automatic_alt_text_is_replaced_or_cleaned(samples, tmp_path):
+    """Office marks the alt text it writes itself ("Description automatically generated"): ours replaces it when
+    there is one; otherwise the note goes, as screen readers would read it out."""
+    def build(pdf, pg, doc):
+        fig = next(k for k in doc.K if str(k.S) == "/Figure")
+        fig.Alt = pikepdf.String("A chart\n\nDescription automatically generated")
+
+    src = _tagged_with(tmp_path, samples, lambda pdf, pg, doc: build(pdf, pg, doc))
+    analysis = prepare_analysis(src)
+    out = tmp_path / "cleaned.pdf"
+    tag_document(src, out, analysis, title="T", language="en-US")
+    assert _figure_alts(out) == ["A chart"]
+    for img in analysis.pages[0].images:
+        img.alt = "Bar chart of remediation progress by quarter"
+    out2 = tmp_path / "replaced.pdf"
+    res = tag_document(src, out2, analysis, title="T", language="en-US")
+    assert _figure_alts(out2) == ["Bar chart of remediation progress by quarter"]
+    assert "automatic alt text replaced" in " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+
+
+def test_a_line_tagged_as_a_figure_becomes_an_artifact(tmp_path):
+    """PowerPoint tags slide rules as figures: a line has no area, so it must be judged from its shape."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    content = b"/P <</MCID 0>> BDC BT /F1 11 Tf 72 700 Td (Roadmap) Tj ET EMC\n" \
+              b"/Figure <</MCID 1>> BDC 0 0 1 RG 1 w 30 670 m 900 670 l S EMC"
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
+    pdf.pages.append(pikepdf.Page(Dictionary(Type=Name.Page, MediaBox=[0, 0, 960, 792],
+                                             Resources=Dictionary(Font=Dictionary(F1=font)),
+                                             Contents=pdf.make_stream(content))))
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=pg))
+    p = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.P, P=doc, Pg=pg, K=0))
+    fig = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Figure, P=doc, Pg=pg, K=1))
+    doc.K = Array([p, fig])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([p, fig])])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / "rule.pdf"
+    pdf.save(src)
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert res.existing_tags["artifacted"] == 1 and _figure_alts(out) == []
+
+
+def _badges(tmp_path):
+    """A slide row of number badges as PowerPoint writes them: each badge is a small picture marked as its own
+    content but left out of the tag tree, with its number (tagged) printed on it; plus a photo whose corner the
+    last badge crosses."""
+    import pymupdf as fitz
+    from pikepdf import Array, Dictionary, Name
+
+    def png(w, h, rgb):
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, w, h), False)
+        pix.set_rect(pix.irect, rgb)
+        return pix.tobytes("png")
+
+    base = fitz.open()
+    page = base.new_page(width=960, height=792)
+    page.insert_image(fitz.Rect(0, 0, 10, 10), stream=png(40, 40, (90, 30, 160)))      # the disc
+    page.insert_image(fitz.Rect(20, 0, 30, 10), stream=png(80, 60, (200, 180, 150)))   # the photo
+    page.insert_text((0, 20), "x", fontname="helv")
+    disc, photo_im = [i[7] for i in page.get_images(full=True)]
+    ops = ["/P <</MCID 0>> BDC BT /helv 20 Tf 72 72 Td (Student First) Tj ET EMC",
+           f"/Figure <</MCID 1>> BDC q 200 0 0 150 560 100 cm /{photo_im} Do Q EMC"]
+    for i, x in enumerate((100, 220, 340, 460, 580)):  # the last badge crosses the photo's corner
+        ops.append(f"/P <</MCID {2 + 2 * i}>> BDC q 64 0 0 64 {x} 220 cm /{disc} Do Q EMC")  # never referenced
+        ops.append(f"/Span <</MCID {3 + 2 * i}>> BDC BT /helv 14 Tf {x + 27} 247 Td ({i + 1}) Tj ET EMC")
+    first, *rest = page.get_contents()
+    base.update_stream(first, "\n".join(ops).encode())
+    for xref in rest:  # the placeholder draws of the inserts
+        base.update_stream(xref, b"")
+    raw = tmp_path / "raw.pdf"
+    base.save(raw)
+
+    pdf = pikepdf.open(raw)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=pg))
+    mk = lambda s, k, **kw: pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name(s), P=doc, Pg=pg, K=k, **kw))  # noqa: E731
+    title = mk("/P", 0)
+    photo = mk("/Figure", 1, Alt=pikepdf.String("A student holding a laptop"))
+    numbers = [mk("/P", 3 + 2 * i) for i in range(5)]
+    doc.K = Array([title, photo, *numbers])
+    root.K = Array([doc])
+    parents = [title, photo] + [x for n in numbers for x in (None, n)]
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array(parents)])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / "badges.pdf"
+    pdf.save(src)
+    return src
+
+
+def test_number_badges_are_decorative_backgrounds(tmp_path):
+    """Each badge becomes an artifact; none becomes a Figure, an empty paragraph, or part of the photo's Figure."""
+    from app.verification.integrity import check_integrity
+    from app.verification.tagmap import build_tagmap
+
+    src = _badges(tmp_path)
+    analysis = prepare_analysis(src)
+    discs = [i for i in analysis.pages[0].images if (i.bbox[2] - i.bbox[0]) < 100]
+    assert len(discs) == 5 and all(i.decorative for i in discs)   # the number on each says what it is
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, analysis, title="T", language="en-US")
+    assert res.orphans_artifacted == 5
+    els = build_tagmap(out)["elements"]
+    figures = [e for e in els if e["role"] == "Figure"]
+    assert len(figures) == 1 and figures[0]["boxes"][0]["bbox"][0] > 500   # just the photo
+    assert not [e for e in els if e["role"] == "P" and not e.get("text")]  # no empty paragraph
+    assert sorted(e["text"] for e in els if e["role"] == "P" and e.get("text", "").isdigit()) == list("12345")
+    with pikepdf.open(out) as pdf:
+        assert not [f for f in check_integrity(pdf)[0] if f.severity == "error"]

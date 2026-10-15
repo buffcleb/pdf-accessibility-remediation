@@ -25,27 +25,33 @@ spec:
         checksum/settings: "${ENGINE_ENV_SHA}"
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
-      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:
         - name: check-jobdata
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
           volumeMounts: [{ name: jobdata, mountPath: /data }]
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
       containers:
         - name: engine-api
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
           env:
-            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: VERAPDF_URL, value: "http://verapdf:8080" }
           ports: [{ containerPort: 8000 }]
           readinessProbe:
             httpGet: { path: /api/v1/health, port: 8000 }
             periodSeconds: 10
           resources:
             requests: { cpu: 100m, memory: 256Mi }
-            limits: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi }
+          # Nothing is written outside /tmp (its caches point there) and the job folder
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
           volumeMounts:
             - { name: jobdata, mountPath: /data }
             - { name: tmp, mountPath: /tmp }
@@ -53,7 +59,7 @@ spec:
         - name: jobdata
           persistentVolumeClaim: { claimName: jobdata }
         - name: tmp
-          emptyDir: {}
+          emptyDir: { sizeLimit: 1Gi }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -61,7 +67,7 @@ metadata:
   name: engine-worker
   namespace: ${NAMESPACE}
 spec:
-  replicas: ${ENGINE_WORKERS}
+  ${ENGINE_WORKER_REPLICAS}
   selector:
     matchLabels: { app: engine-worker }
   template:
@@ -70,25 +76,41 @@ spec:
       annotations:
         checksum/settings: "${ENGINE_ENV_SHA}"
     spec:
+      # A worker told to stop (scaling down, a new release) finishes the document it's on first
+      terminationGracePeriodSeconds: ${WORKER_GRACE_SECONDS}
       imagePullSecrets: [{ name: pdfrem-ghcr }]
-      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:
         - name: check-jobdata
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
           volumeMounts: [{ name: jobdata, mountPath: /data }]
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
       containers:
         - name: engine-worker
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=${WORKER_CONCURRENCY}"]
           envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
           env:
-            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: VERAPDF_URL, value: "http://verapdf:8080" }
+            - { name: OMR_ENABLED, value: "${OMR_ENABLED}" }
+            - { name: MUSIC_MAX_EXAMPLES, value: "${MUSIC_MAX_EXAMPLES}" }
+            - { name: MUSIC_MAX_SCORE_LINES, value: "${MUSIC_MAX_SCORE_LINES}" }
+            - { name: MUSIC_PER_MEASURE, value: "${MUSIC_PER_MEASURE}" }
+            - { name: MUSIC_WHOLE_SCORE, value: "${MUSIC_WHOLE_SCORE}" }
+            - { name: MUSIC_WHOLE_SCORE_MAX_MB, value: "${MUSIC_WHOLE_SCORE_MAX_MB}" }
+            - { name: OMR_TIMEOUT_S, value: "${MUSIC_WAIT_SECONDS}" }
+            - { name: OMR_PAGE_TIMEOUT_S, value: "${MUSIC_PAGE_SECONDS}" }
           resources:
             requests: { cpu: 500m, memory: 1Gi }
-            limits: { cpu: "3", memory: ${WORKER_MEMORY_LIMIT} }
+            limits: { cpu: "3", memory: ${WORKER_MEMORY_LIMIT}, ephemeral-storage: 6Gi }
+          # Nothing is written outside /tmp (its caches point there) and the job folder
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
           volumeMounts:
             - { name: jobdata, mountPath: /data }
             - { name: tmp, mountPath: /tmp }
@@ -96,7 +118,7 @@ spec:
         - name: jobdata
           persistentVolumeClaim: { claimName: jobdata }
         - name: tmp
-          emptyDir: {}
+          emptyDir: { sizeLimit: 4Gi }  # OCR renders and the validator's copies; a document past this is evicted, not the node
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -114,24 +136,38 @@ spec:
         checksum/settings: "${ENGINE_ENV_SHA}"
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
-      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:
         - name: check-jobdata
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
           volumeMounts: [{ name: jobdata, mountPath: /data }]
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
       containers:
         - name: engine-adobe-worker
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "adobe", "-n", "adobe@%h", "--loglevel=INFO", "--concurrency=2"]
-          envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
+          envFrom: [{ secretRef: { name: pdfrem-engine-env } }, { secretRef: { name: pdfrem-adobe-env } }]
           env:
-            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: VERAPDF_URL, value: "http://verapdf:8080" }
+            - { name: OMR_ENABLED, value: "${OMR_ENABLED}" }
+            - { name: MUSIC_MAX_EXAMPLES, value: "${MUSIC_MAX_EXAMPLES}" }
+            - { name: MUSIC_MAX_SCORE_LINES, value: "${MUSIC_MAX_SCORE_LINES}" }
+            - { name: MUSIC_PER_MEASURE, value: "${MUSIC_PER_MEASURE}" }
+            - { name: MUSIC_WHOLE_SCORE, value: "${MUSIC_WHOLE_SCORE}" }
+            - { name: MUSIC_WHOLE_SCORE_MAX_MB, value: "${MUSIC_WHOLE_SCORE_MAX_MB}" }
+            - { name: OMR_TIMEOUT_S, value: "${MUSIC_WAIT_SECONDS}" }
+            - { name: OMR_PAGE_TIMEOUT_S, value: "${MUSIC_PAGE_SECONDS}" }
           resources:
             requests: { cpu: 100m, memory: 512Mi }
-            limits: { cpu: "2", memory: 2Gi }
+            limits: { cpu: "2", memory: 2Gi, ephemeral-storage: 4Gi }
+          # Nothing is written outside /tmp (its caches point there) and the job folder
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
           volumeMounts:
             - { name: jobdata, mountPath: /data }
             - { name: tmp, mountPath: /tmp }
@@ -139,7 +175,7 @@ spec:
         - name: jobdata
           persistentVolumeClaim: { claimName: jobdata }
         - name: tmp
-          emptyDir: {}
+          emptyDir: { sizeLimit: 2Gi }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -157,24 +193,30 @@ spec:
         checksum/settings: "${ENGINE_ENV_SHA}"
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
-      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true }
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:
         - name: check-jobdata
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["sh", "-c", "touch /data/.write-test && rm /data/.write-test || { echo 'The job folder (StorageClass ${SHARED_STORAGE_CLASS}) is not writable by uid 10001. In DSM, set the NFS rule of the share to map all users to admin.'; exit 1; }"]
           volumeMounts: [{ name: jobdata, mountPath: /data }]
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
       containers:
         - name: engine-beat
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
           envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
           env:
-            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: VERAPDF_URL, value: "http://verapdf:8080" }
           resources:
             requests: { cpu: 20m, memory: 128Mi }
-            limits: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: 200m, memory: 256Mi, ephemeral-storage: 256Mi }
+          # Nothing is written outside /tmp (its caches point there) and the job folder
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
           volumeMounts:
             - { name: jobdata, mountPath: /data }
             - { name: tmp, mountPath: /tmp }
@@ -182,4 +224,4 @@ spec:
         - name: jobdata
           persistentVolumeClaim: { claimName: jobdata }
         - name: tmp
-          emptyDir: {}
+          emptyDir: { sizeLimit: 128Mi }

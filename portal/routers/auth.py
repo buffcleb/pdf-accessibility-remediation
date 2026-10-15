@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, settings_store
+from portal import approval, audit, outbox, settings_store
 from portal.config import get_portal_settings
 from portal.db import get_db
 from portal.deps import Principal, current_principal
@@ -19,6 +19,7 @@ from portal.identity import eligibility, normalize_email, provision
 from portal.mail import MailError, get_mailer, sign_in_code_mail
 from portal.models import AuthSession, OtpChallenge, User
 from portal.schemas import MeOut, me_out
+from portal.security import botcheck
 from portal.security.ratelimit import RateLimiter, get_rate_limiter
 from portal.security.tokens import (
     constant_time_equal, issue_access_token, keyed_hash, new_otp_code, new_refresh_token, otp_hash,
@@ -35,6 +36,7 @@ REFRESH_GRACE_SECONDS = 20
 
 class CodeRequest(BaseModel):
     email: str = Field(max_length=320)
+    bot_check: str | None = Field(None, max_length=4096)  # the Turnstile widget's token, when the bot check is on
 
 
 class CodeVerify(BaseModel):
@@ -108,6 +110,15 @@ def request_code(body: CodeRequest, request: Request, background: BackgroundTask
         db.commit()
         raise too_many()
 
+    bot = botcheck.check(body.bot_check, ip)
+    if not bot.passed:
+        audit.record(db, request, "login.code_requested", actor_email=email, outcome="bot_check_failed",
+                     details={"check": bot.outcome, **({"detail": bot.detail} if bot.detail else {})})
+        db.commit()
+        raise ApiError(403, "bot_check_failed", "We couldn't confirm this request came from a person. Reload the page "
+                                                "and try again; if it keeps happening, contact the people who run "
+                                                "this service.")
+
     elig = eligibility(db, email)
     runtime = settings_store.load(db)
     if not elig.allowed:
@@ -122,19 +133,23 @@ def request_code(body: CodeRequest, request: Request, background: BackgroundTask
 
     code = issue_code(db, email, audit.client_ip(request))
     audit.record(db, request, "login.code_requested", actor=elig.user, actor_email=email,
-                 group_id=elig.user.group_id if elig.user else (elig.group.id if elig.group else None))
+                 group_id=elig.user.group_id if elig.user else (elig.group.id if elig.group else None),
+                 details={"bot_check": "unavailable (allowed)"} if bot.outcome == "unavailable" else None)
     db.commit()
     # Sent before answering, so a mail problem is reported to the person instead of a code that never arrives
+    mail = sign_in_code_mail(email, code, s.otp_minutes, runtime.service_name)
     try:
-        get_mailer().deliver(sign_in_code_mail(email, code, s.otp_minutes, runtime.service_name),
-                             from_name=runtime.mail_from_name)
+        get_mailer().deliver(mail, from_name=runtime.mail_from_name)
     except MailError as e:
         log.error("sign-in code to %s not sent: %s", email, e)
         audit.record(db, request, "login.code_not_sent", actor=elig.user, actor_email=email, outcome="failure",
                      details={"error": str(e)[:300]})
+        outbox.record(db, mail, "sign_in", error=str(e))
         db.commit()
         raise ApiError(503, "mail_failed", "We couldn't send your sign-in code just now. Try again in a few minutes; "
                                            "if it keeps happening, contact the people who run this service.")
+    outbox.record(db, mail, "sign_in")  # the email log: when it went, and its message ID (never the code)
+    db.commit()
     return {"status": "code_sent", "expires_in": s.otp_minutes * 60}
 
 

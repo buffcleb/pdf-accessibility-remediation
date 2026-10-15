@@ -89,6 +89,8 @@ class RuntimeSettings(BaseModel):
     # Retention
     file_retention_days: int = Field(30, ge=1, le=3650)
     record_retention_days: int = Field(2555, ge=30, le=36500)
+    # A document marked done keeps its files this long, so a mistake can be undone (0: at the next sweep)
+    early_removal_hold_hours: int = Field(24, ge=0, le=720)
 
     # Upload limits
     max_file_mb: int = Field(100, ge=1, le=2048)
@@ -134,6 +136,20 @@ class RuntimeSettings(BaseModel):
     classifier_threshold: float = Field(0.6, ge=0, le=1)
     classifier_pages: int = Field(3, ge=1, le=10)
 
+    # PDF/UA validation (veraPDF): its running service (fast; the engine falls back to the command line when the
+    # service doesn't answer) or the command line in the engine (Java started for every check); and whether to
+    # also check PDF/UA-2, shown for information (off: half as many checks)
+    verapdf_mode: str = Field("service", pattern="^(service|command_line)$")
+    verapdf_ua2: bool = True
+
+    # A document that fails gets a help request of its own, so every failure is looked at (and a known limitation
+    # can be closed with a note). Off: people can still ask for help with a failed document themselves
+    help_on_failure: bool = True
+
+    # "Describe with AI" in the tag manager (alt text for a drawn area, one paid AI call each): the default for
+    # everyone; a group, and a person in it, can be set otherwise (portal/ai_describe.py)
+    ai_describe_default: bool = False
+
     @field_validator("report_time_zone")
     @classmethod
     def _zone(cls, v):
@@ -178,6 +194,7 @@ class RuntimeSettingsUpdate(BaseModel):
     support_url: str | None = Field(None, max_length=500)
     file_retention_days: int | None = Field(None, ge=1, le=3650)
     record_retention_days: int | None = Field(None, ge=30, le=36500)
+    early_removal_hold_hours: int | None = Field(None, ge=0, le=720)
     max_file_mb: int | None = Field(None, ge=1, le=2048)
     max_pages_per_document: int | None = Field(None, ge=1, le=100000)
     max_files_per_upload: int | None = Field(None, ge=1, le=500)
@@ -202,6 +219,10 @@ class RuntimeSettingsUpdate(BaseModel):
     classifier_local_model: str | None = Field(None, max_length=200)
     classifier_threshold: float | None = Field(None, ge=0, le=1)
     classifier_pages: int | None = Field(None, ge=1, le=10)
+    verapdf_mode: str | None = Field(None, pattern="^(service|command_line)$")
+    verapdf_ua2: bool | None = None
+    help_on_failure: bool | None = None
+    ai_describe_default: bool | None = None
 
     @field_validator("report_time_zone")
     @classmethod

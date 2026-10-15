@@ -49,9 +49,9 @@ from the layout, with AI help where the layout is unclear.
 can be fixed.
 
 **Tags.** The hidden structure of an accessible PDF: which text is a heading, a paragraph, a list, a table cell
-or a figure, and in what order. The tag viewer shows them.
+or a figure, and in what order. The tag manager shows them.
 
-**Tag viewer and editor.** The portal's side-by-side view of two versions of a document, where you can check
+**Tag manager and editor.** The portal's side-by-side view of two versions of a document, where you can check
 every tag against the page and fix it.
 
 **Two files.** When a document can't pass without a visible change (usually because of a font), you get the

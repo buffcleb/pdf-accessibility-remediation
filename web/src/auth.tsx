@@ -10,6 +10,8 @@ export type AppConfig = {
   logoAlt?: string;
   supportUrl?: string | null;
   contactEmail?: string | null;
+  /** Cloudflare Turnstile's site key, when the service checks "Email me a code" for bots. */
+  botCheckSiteKey?: string | null;
 };
 
 type AuthState = {

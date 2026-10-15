@@ -1,9 +1,14 @@
 name: CI
 
+# Where jobs run: the repository variable CI_RUNNER names a self-hosted runner set (docs/operations/ci-runners.md).
+# Without it, GitHub's own runners, which are billed by the minute on a private repository.
+# Each job runs only when files it tests have changed; a change to this file runs them all.
+
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,15 +18,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: What changed
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+      portal: ${{ steps.filter.outputs.portal }}
+      web: ${{ steps.filter.outputs.web }}
+      scripts: ${{ steps.filter.outputs.scripts }}
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            engine:
+              - '.github/workflows/**'
+              - 'requirements*.txt'
+              - 'portal/requirements.txt'
+              - 'pytest.ini'
+              - 'tests/__init__.py'
+              - 'app/**'
+              - 'tests/engine/**'
+              - 'docker/verapdf-auto-install.xml'
+            portal:
+              - '.github/workflows/**'
+              - 'requirements*.txt'
+              - 'pytest.ini'
+              - 'tests/__init__.py'
+              - 'portal/**'
+              - 'tests/portal/**'
+            web:
+              - '.github/workflows/**'
+              - 'web/**'
+            scripts:
+              - '.github/workflows/**'
+              - 'scripts/**'
+            deps:
+              - '.github/workflows/**'
+              - 'requirements*.txt'
+              - 'portal/requirements.txt'
+              - 'web/package-lock.json'
+              - 'docker/web/**'
+
   engine:
     name: Engine tests
-    runs-on: ubuntu-24.04
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.engine == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 30
     env:
       VERAPDF_PATH: /opt/verapdf/verapdf
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -33,33 +88,51 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openjdk-17-jre-headless tesseract-ocr tesseract-ocr-eng \
-            fonts-dejavu-core fonts-liberation2 libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b
+            curl unzip gnupg fonts-dejavu-core fonts-liberation2 libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b
       - name: veraPDF
+        # The release the engine image installs (the ARGs in the Dockerfile), checked the same way against the
+        # project's release signature. A self-hosted runner keeps its files between runs: installed once per version
         run: |
-          curl -fsSL -o /tmp/verapdf.zip https://software.verapdf.org/releases/verapdf-installer.zip
-          unzip -q /tmp/verapdf.zip -d /tmp/verapdf
-          sudo java -jar "$(find /tmp/verapdf -name 'verapdf-izpack-installer-*.jar' | head -1)" docker/verapdf-auto-install.xml
-          /opt/verapdf/verapdf --version
+          version="$(sed -n 's/^ARG VERAPDF_VERSION=//p' Dockerfile)"
+          fingerprint="$(sed -n 's/^ARG VERAPDF_SIGNING_FINGERPRINT=//p' Dockerfile)"
+          url="$(sed -n 's/^ARG VERAPDF_URL=//p' Dockerfile | sed "s/\${VERAPDF_VERSION}/$version/")"
+          if ! /opt/verapdf/verapdf --version 2>/dev/null | grep -qF "$version"; then
+            dir="$(mktemp -d)"
+            curl -fsSL -o "$dir/verapdf.zip" "$url" && curl -fsSL -o "$dir/verapdf.zip.asc" "$url.asc"
+            export GNUPGHOME="$dir/gnupg"; mkdir -m 700 "$GNUPGHOME"
+            curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$fingerprint" | gpg --batch --import
+            gpg --batch --with-colons --fingerprint | grep -q "^fpr:::::::::$fingerprint:"
+            gpg --batch --verify "$dir/verapdf.zip.asc" "$dir/verapdf.zip"
+            unzip -q "$dir/verapdf.zip" -d "$dir"
+            sudo rm -rf /opt/verapdf
+            sudo java -jar "$(find "$dir" -name 'verapdf-izpack-installer-*.jar' | head -1)" docker/verapdf-auto-install.xml
+            rm -rf "$dir"
+          fi
+          /opt/verapdf/verapdf --version | grep -F "$version"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest -q tests/engine
 
   portal:
     name: Portal tests
-    runs-on: ubuntu-24.04
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.portal == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16-alpine
+        # The official image, from Amazon's public mirror: Docker Hub limits anonymous pulls from shared runners
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_USER: portal
           POSTGRES_PASSWORD: test
           POSTGRES_DB: portal
-        ports: ["55432:5432"]
+        # Any free port on the runner: a fixed one can still be held by the run before on a runner that stays up
+        ports: ["5432"]
         options: >-
           --health-cmd "pg_isready -U portal" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -68,29 +141,73 @@ jobs:
             requirements-dev.txt
             portal/requirements.txt
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q tests/portal
+      - name: Can the runner reach the database?
+        # A firewall on a self-hosted runner can accept the connection on the published port and then drop what
+        # Docker forwards to the container: the port looks open and every query times out
+        run: |
+          port="${{ job.services.postgres.ports['5432'] }}"
+          id="${{ job.services.postgres.id }}"
+          ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$id")"
+          for target in "127.0.0.1 $port" "${ip%% *} 5432"; do
+            set -- $target
+            if timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then echo "$1 port $2: open"; else echo "$1 port $2: NOT reachable"; fi
+          done
+      - run: python -m pytest -q -rs tests/portal
+        env:
+          PORTAL_TEST_DATABASE_REQUIRED: "1"
+          PORTAL_TEST_DATABASE_URL: postgresql+psycopg://portal:test@localhost:${{ job.services.postgres.ports['5432'] }}/portal
 
   web:
     name: Web build
-    runs-on: ubuntu-24.04
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.web == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     defaults:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"  # the version Dockerfile.web builds the production app with
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+      - run: npm test
 
   scripts:
     name: Shell scripts
-    runs-on: ubuntu-24.04
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.scripts == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - run: shellcheck scripts/*.sh
+      - uses: actions/checkout@v7
+      - name: shellcheck (GitHub's runners have it; a self-hosted one may not)
+        run: command -v shellcheck || { sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck; }
+      - run: shellcheck scripts/*.sh docker/web/*.sh
+
+  deps:
+    name: Dependency audit
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.deps == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      # The known advisories against what the three requirements files resolve to. One is left out on purpose:
+      # PYSEC-2026-3412 (CVE-2026-49452) is CSS injection through presentational attributes of untrusted HTML,
+      # and the only HTML WeasyPrint sees here is the report the engine builds itself from escaped text
+      # (app/reports/pdf.py); no fix version exists. Remove the exception when one does.
+      - run: pip-audit -r requirements.txt -r portal/requirements.txt -r requirements-dev.txt --progress-spinner off --ignore-vuln PYSEC-2026-3412 --ignore-vuln CVE-2026-49452
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - run: npm audit --audit-level=high
+        working-directory: web

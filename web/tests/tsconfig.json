@@ -1,0 +1,16 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "bundler",
+    "noEmit": false,
+    "outDir": "../.test-build",
+    "rootDir": "..",
+    "types": [],
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "./*.test.ts",
+    "./node.d.ts"
+  ]
+}

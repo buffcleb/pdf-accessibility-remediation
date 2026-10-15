@@ -117,3 +117,35 @@ def test_regions_become_figures_and_their_labels_go_with_them():
     assert sf.add_to_page(page, [CHART, (100, 600, 300, 700)]) == 2
     assert [i.id for i in page.images] == ["p0s0", "p0s1"] and all(i.xref == 0 for i in page.images)
     assert [b.id for b in page.blocks] == ["b2", "b3"]
+
+
+def test_the_tag_viewer_outlines_only_the_figure(tmp_path):
+    """The verifier's boxes (and so the tag manager's outlines) follow the clip: the Figure is the chart, not the
+    whole scan it's drawn from."""
+    from app.verification.tagmap import build_tagmap
+
+    src = _scan(tmp_path)
+    doc = fitz.open(src)
+    name = doc[0].get_images(full=True)[0][7]
+    x0, y0, x1, y1 = CHART
+    content = (f"/Artifact BMC q {W} 0 0 {H} 0 0 cm /{name} Do Q EMC\n"
+               f"/Figure <</MCID 0>> BDC q {x0} {H - y1} {x1 - x0} {y1 - y0} re W n {W} 0 0 {H} 0 0 cm /{name} Do Q EMC\n")
+    xref = doc[0].get_contents()[0]
+    doc.update_stream(xref, content.encode())
+    doc.save(tmp_path / "tagged.pdf")
+    with pikepdf.open(tmp_path / "tagged.pdf", allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0].obj
+        root = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.StructTreeRoot))
+        doc_el = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.StructElem, S=pikepdf.Name.Document, P=root))
+        fig = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.StructElem, S=pikepdf.Name.Figure, P=doc_el,
+                                                   Pg=page, K=0, Alt="Bar chart"))
+        doc_el.K = pikepdf.Array([fig])
+        root.K = doc_el
+        root.ParentTree = pdf.make_indirect(pikepdf.Dictionary(Nums=pikepdf.Array([0, pikepdf.Array([fig])])))
+        page.StructParents = 0
+        pdf.Root.StructTreeRoot = root
+        pdf.Root.MarkInfo = pikepdf.Dictionary(Marked=True)
+        pdf.save(tmp_path / "tagged.pdf")
+    tm = build_tagmap(tmp_path / "tagged.pdf")
+    box = next(e for e in tm["elements"] if e["role"] == "Figure")["boxes"][0]["bbox"]
+    assert all(abs(a - b) < 1 for a, b in zip(box, CHART)), box

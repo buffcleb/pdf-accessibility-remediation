@@ -3,16 +3,19 @@
 #
 #   scripts/build.sh                     build and push, tagged with the current commit
 #   scripts/build.sh --no-push           build only (loads nothing; checks that everything builds)
-#   scripts/build.sh --only web          just one image: engine, portal or web (repeatable)
+#   scripts/build.sh --only web          just one image: engine, portal, web or music (repeatable)
 #   scripts/build.sh --tag v1.2          use this tag instead of the commit
 #
 # Images: $REGISTRY/pdfrem-engine (the remediation engine: API and workers), $REGISTRY/pdfrem-portal (portal API
 # and worker) and $REGISTRY/pdfrem-web (the web app). Each gets the tag and :latest. Each image's tag is written
 # to deploy/k8s/.last-build (ENGINE_TAG, PORTAL_TAG, WEB_TAG) so scripts/deploy.sh deploys exactly what was built.
+# A fourth, $REGISTRY/pdfrem-music (the music reading service, docker/audiveris), is built when deploy.env has
+# MUSIC_READER=on, or when asked for with --only music (MUSIC_TAG).
 #
 # Options:
 #   --tag TAG            image tag (default: the short commit, with -dirty if there are uncommitted changes)
-#   --only NAME          engine | portal | web (repeatable; default all three)
+#   --only NAME          engine | portal | web | music (repeatable; default the first three, and music when
+#                        MUSIC_READER=on)
 #   --no-push            build without pushing
 #   --platform P         default linux/amd64 (the cluster's nodes)
 #   --allow-dirty        build even with uncommitted changes (the tag says -dirty)
@@ -38,7 +41,7 @@ TAG="" PUSH=1 PLATFORM="linux/amd64" DIRTY_OK=0 ONLY=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="${2:?--tag needs a value}"; shift ;;
-    --only) ONLY+=("${2:?--only needs engine, portal or web}"); shift ;;
+    --only) ONLY+=("${2:?--only needs engine, portal, web or music}"); shift ;;
     --no-push) PUSH=0 ;;
     --platform) PLATFORM="${2:?--platform needs a value}"; shift ;;
     --allow-dirty) DIRTY_OK=1 ;;
@@ -47,9 +50,12 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ ${#ONLY[@]} -gt 0 ] || ONLY=(engine portal web)
+if [ ${#ONLY[@]} -eq 0 ]; then
+  ONLY=(engine portal web)
+  [ "${MUSIC_READER:-off}" = on ] && ONLY+=(music)
+fi
 [ -n "$REGISTRY" ] || die "set REGISTRY (e.g. ghcr.io/your-account) in deploy/k8s/deploy.env or the environment"
-for n in "${ONLY[@]}"; do case "$n" in engine|portal|web) ;; *) die "--only takes engine, portal or web" ;; esac; done
+for n in "${ONLY[@]}"; do case "$n" in engine|portal|web|music) ;; *) die "--only takes engine, portal, web or music" ;; esac; done
 
 command -v docker >/dev/null || die "docker isn't installed"
 docker buildx version >/dev/null 2>&1 || die "docker buildx isn't available"
@@ -72,7 +78,12 @@ if [ "$PUSH" = 1 ]; then
     || die "sign-in to $host failed"
 fi
 
-dockerfile() { case "$1" in engine) echo Dockerfile ;; portal) echo Dockerfile.portal ;; web) echo Dockerfile.web ;; esac; }
+dockerfile() {
+  case "$1" in
+    engine) echo Dockerfile ;; portal) echo Dockerfile.portal ;; web) echo Dockerfile.web ;;
+    music) echo docker/audiveris/Dockerfile ;;
+  esac
+}
 
 for n in "${ONLY[@]}"; do
   image="$REGISTRY/pdfrem-$n"

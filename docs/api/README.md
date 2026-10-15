@@ -22,7 +22,7 @@ If `SERVICE_API_KEY` is set, every call except `/health` needs an `X-API-Key` he
 
 | Field | |
 |---|---|
-| `file` | The PDF (at most `MAX_UPLOAD_MB`; password-protected files are refused) |
+| `file` | The PDF (at most `MAX_UPLOAD_MB` and `MAX_PAGES` pages; password-protected files are refused) |
 | `ai_provider` | `gateway` (the AI gateway; normal), `none` (no AI), `mock` (tests only), or for development `localai`, `ollama`, `openrouter` |
 | `ai_model` | The gateway model, e.g. `local-vision`; defaults to `GATEWAY_DEFAULT_MODEL` |
 | `ai_tier` | Optional: the portal's AI level, attached to each AI call for spend reporting |
@@ -41,8 +41,10 @@ If `SERVICE_API_KEY` is set, every call except `/health` needs an `X-API-Key` he
 | `verify_ai` | `true` | Run the AI review layer |
 | `notation_ai` | `true` | Let the AI read notation the layout rules can't |
 | `ocr_ai` | `true` | Let the AI correct OCR words Tesseract was unsure of |
+| `validator` | the service when configured | How veraPDF runs for this job: `service` (kept running, `VERAPDF_URL`) or `command_line` |
+| `verapdf_ua2` | `true` | Also check PDF/UA-2 (shown for information; the verdict is PDF/UA-1) |
 | `return_base64` | `false` | Return files inline in the JSON instead of as links |
-| `debug` | `false` | Keep working files and AI prompt and response logs |
+| `debug` | `false` | Keep working files and AI prompt and response logs (the document's text with them, on the job folder until `JOB_TTL_HOURS`) |
 
 Returns `202 {"job_id": "…", "status": "processing"}`.
 
@@ -54,7 +56,9 @@ curl -F "file=@report.pdf" -F "ai_provider=gateway" -F "ai_model=local-vision" h
 
 `GET /api/v1/jobs/{job_id}`
 
-While the job runs, `status` is `processing`, with a `progress` stage. When it finishes:
+While the job runs, `status` is `processing`, with a `progress` stage. A job whose worker was killed before it could
+record a failure (the hard time limit, out of memory) is reported as `failed` with error `time_limit_exceeded` or
+`worker_lost`, not left as `processing`. When it finishes:
 
 ```jsonc
 {
@@ -64,7 +68,9 @@ While the job runs, `status` is `processing`, with a `progress` stage. When it f
     "remediated_visual_fallback": null                                  // set only when there are two files
   },
   "metrics": { "pages_processed": 14, "ai_tokens_used": {"prompt_tokens": 14500, "completion_tokens": 2300},
-               "processing_time_seconds": 45.2, "ai_calls": 31, "images_described": 9, "ai_cost_usd": 0.0, ... },
+               "processing_time_seconds": 45.2, "ai_calls": 31, "images_described": 9, "ai_cost_usd": 0.0,
+               "stage_seconds": {"validating_original": 3.1, "analyzing": 6.0, "ai_enrichment": 18.4, "tagging": 2.2,
+                                 "validating_output": 4.9, "verifying_tags": 9.8, "of_which": {"validator": 7.2}}, ... },
   "reports": {
     "verapdf_compliance_report": "...after (primary) XML...",
     "verapdf_before": "...XML for the original...",
@@ -103,15 +109,16 @@ A failed job has `status: failed` with an `error` code and message, for example 
 
 ## Apply tag edits
 
-`POST /api/v1/edit` (multipart): applies the tag viewer's edits to a remediated PDF and checks the result.
+`POST /api/v1/edit` (multipart): applies the tag manager's edits to a remediated PDF and checks the result.
 
 | Field | |
 |---|---|
 | `file` | The PDF to edit (a remediated output) |
-| `edits` | JSON list of edit operations (role changes, alt text, read-aloud text, language, cells, reading order, merge, split) |
+| `edits` | JSON list of edit operations (role changes, alt text, read-aloud text, language, cells, reading order, merge, split, delete, moving content between tags, tagging artifacts) |
 | `review` | `none` (default), `sampled` (flagged items plus a sample) or `full` (every figure). With no edits, a review re-reviews the file as it is |
 | `judge_model` | Optional review model |
 | `reference` | Optional: the version a corrected file replaces; the visual comparison is made against it |
+| `validator`, `verapdf_ua2` | Optional: how veraPDF runs, as in the remediation flags |
 
 Returns a job id, polled like a remediation.
 
@@ -134,7 +141,13 @@ Returns `{kind, confidence, probabilities, backend, model, notation, hints, page
 ## Other endpoints
 
 - `GET /api/v1/ai/models`: the models the gateway serves.
-- `GET /api/v1/health`: Redis, veraPDF, the AI providers and Adobe's status.
+- `GET /api/v1/health`: Redis, veraPDF (the command line, and `verapdf_service` when one is configured), the AI
+  providers and Adobe's status.
+- `POST /api/v1/jobs/{job_id}/stop`: stops a job that's waiting or in progress. It reports as failed with error
+  `stopped`, and the worker process running it is ended. A finished job is left as it is (`"stopped": false`).
+- `GET /api/v1/capacity`: `{"workers": 2, "documents_at_once": 4}`, the workers answering now and how many
+  documents they process at once between them (`null` when none answer). The portal uses it to decide how many
+  documents to hand over when workers are scaled with the queue.
 
 ## Many documents: the harness
 

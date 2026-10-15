@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- veraPDF service (verapdf/rest) settings. The engine reads pages, fonts and glyph widths from failed checks, so it
+     needs up to 200 of them per rule with their messages, as the command line gives it (app/validation/verapdf.py).
+     The image's own file shows 1 check per rule without messages. -->
+<validatorConfig recordPasses="false" maxFails="-1" debug="false" showErrorMessages="true" isLogsEnabled="true" loggingLevel="WARNING" maxNumberOfDisplayedFailedChecks="200" showProgress="false" defaultFlavour="PDFA_1_B" flavour="NO_FLAVOUR"/>

@@ -8,11 +8,40 @@ services:
       interval: 5s
       retries: 10
 
+  # veraPDF kept running (its REST service), so checks don't start Java each time. The engine falls back to its own
+  # command line when this doesn't answer. The image is amd64 only (emulated on Apple silicon).
+  verapdf:
+    image: verapdf/rest:v1.30.2
+    platform: linux/amd64
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx512m -XX:+UseSerialGC"
+      VERAPDF_MAX_FILE_SIZE: "2048"
+    volumes:
+      - ./deploy/verapdf/validator.xml:/opt/verapdf-rest/config/validator.xml:ro
+    restart: unless-stopped
+
+  # The music reading service (Audiveris): reads the notes of music examples. Not started by default:
+  #   docker compose --profile music up -d music-reader   and   OMR_ENABLED=true in .env
+  # amd64 only (emulated on Apple silicon).
+  music-reader:
+    build:
+      context: .
+      dockerfile: docker/audiveris/Dockerfile
+    platform: linux/amd64
+    profiles: ["music"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   api:
     build: .
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      VERAPDF_URL: http://verapdf:8080
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
@@ -27,6 +56,7 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      VERAPDF_URL: http://verapdf:8080
     volumes:
       - jobdata:/data
     depends_on:
@@ -42,6 +72,7 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      VERAPDF_URL: http://verapdf:8080
     volumes:
       - jobdata:/data
     depends_on:
@@ -71,7 +102,7 @@ services:
 
   # AI gateway: every model the service uses goes through here (config/litellm.yaml)
   litellm:
-    image: ghcr.io/berriai/litellm:main-stable
+    image: ghcr.io/berriai/litellm:v1.105.0
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     env_file: .env
     environment:

@@ -1,0 +1,83 @@
+# Scaling with the work (applied when AUTOSCALE is on: deploy.env, or by default when the cluster has KEDA).
+#
+# - Engine workers follow the portal's queue: one pod per ${WORKER_CONCURRENCY} documents waiting or being
+#   processed, between ${ENGINE_WORKERS} and ${ENGINE_WORKERS_MAX} pods (KEDA reads the count from the portal's
+#   database). Documents held by a pause, a daily limit or a service's "at once" limit don't count: more workers
+#   wouldn't start them.
+# - veraPDF and the AI gateway follow their CPU use (Kubernetes' own autoscaler, from metrics-server).
+#
+# Scaling down is slow on purpose, and a worker being stopped finishes its document first (40-engine.yaml).
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: portal-db
+  namespace: ${NAMESPACE}
+spec:
+  secretTargetRef:
+    - { parameter: password, name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD }
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: engine-worker
+  namespace: ${NAMESPACE}
+spec:
+  scaleTargetRef: { name: engine-worker }
+  minReplicaCount: ${ENGINE_WORKERS}
+  maxReplicaCount: ${ENGINE_WORKERS_MAX}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies: [{ type: Pods, value: 2, periodSeconds: 60 }]
+        scaleDown:
+          stabilizationWindowSeconds: ${SCALE_DOWN_SECONDS}
+          policies: [{ type: Pods, value: 1, periodSeconds: 120 }]
+  triggers:
+    - type: postgresql
+      metricType: AverageValue
+      authenticationRef: { name: portal-db }
+      metadata:
+        host: postgres.${NAMESPACE}.svc.cluster.local
+        port: "5432"
+        userName: portal
+        dbName: portal
+        sslmode: disable
+        targetQueryValue: "${WORKER_CONCURRENCY}"
+        query: >-
+          select (select count(*) from jobs where status in ('submitted','processing')
+          or (status = 'queued' and coalesce(progress->>'stage','') not in
+          ('paused','waiting_daily_cap','waiting_at_once')))
+          + (select count(*) from document_versions where status in ('queued','submitted','processing'))
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: verapdf
+  namespace: ${NAMESPACE}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: verapdf }
+  minReplicas: 1
+  maxReplicas: ${VERAPDF_MAX}
+  metrics:
+    # One check keeps about one CPU busy: add a copy when they average more than that
+    - type: Resource
+      resource: { name: cpu, target: { type: AverageValue, averageValue: "1" } }
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: ${SCALE_DOWN_SECONDS} }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: litellm
+  namespace: ${NAMESPACE}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: litellm }
+  minReplicas: 1
+  maxReplicas: ${LITELLM_MAX}
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: AverageValue, averageValue: 600m } }
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: ${SCALE_DOWN_SECONDS} }

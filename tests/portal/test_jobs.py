@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pikepdf
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from portal import outbox, quota, worker
@@ -45,6 +45,9 @@ class FakeEngine:
         self.models = ["local-vision", "commercial"]
         self.classified: list = []
         self.classify_answer: dict | Exception = {"kind": "general", "confidence": 1.0}
+        self.described: list = []
+        self.describe_answer: dict | Exception = {"alt": "Two rings joined by a bond", "kind": "chart", "decorative": False,
+                                                  "model": "commercial", "cost_usd": 0.0012}
 
     def classify(self, filename, fileobj, kinds, backend, model=None, pages=3):
         self.classified.append((filename, [k["key"] for k in kinds], backend, model, pages))
@@ -52,12 +55,19 @@ class FakeEngine:
             raise self.classify_answer
         return dict(self.classify_answer)
 
+    def describe(self, filename, fileobj, page, bbox, model, long=False):
+        self.described.append((filename, page, list(bbox), model, long, len(fileobj.read())))
+        if isinstance(self.describe_answer, Exception):
+            raise self.describe_answer
+        return dict(self.describe_answer)
+
     def ai_models(self):
         return list(self.models)
 
     def submit(self, filename, fileobj, report_only, ai=None, full_review=False, route="standard", branding=None,
-               no_ai=False):
+               no_ai=False, validator=None):
         jid = uuid.uuid4().hex
+        self.validators = getattr(self, "validators", []) + [validator]
         self.submitted.append((filename, report_only))
         self.routes.append(route)
         self.ai_choices.append(ai)
@@ -67,8 +77,9 @@ class FakeEngine:
         self.jobs[jid] = {"status": "processing", "progress": {"stage": "tagging"}}
         return jid
 
-    def submit_edit(self, filename, fileobj, edits, review="none", judge=None, reference=None):
+    def submit_edit(self, filename, fileobj, edits, review="none", judge=None, reference=None, validator=None):
         jid = uuid.uuid4().hex
+        self.validators = getattr(self, "validators", []) + [validator]
         self.submitted.append((filename, "edit", edits, review))
         self.references = getattr(self, "references", []) + [reference.read() if reference else None]
         self.judges.append(judge)
@@ -133,6 +144,13 @@ class FakeEngine:
 
     def fail(self, jid, code="tag_integrity_failed"):
         self.jobs[jid] = {"status": "failed", "error": {"error": code, "detail": "internal detail"}}
+
+    def stop(self, jid):
+        self.stopped = getattr(self, "stopped", []) + [jid]
+        if getattr(self, "stop_unreachable", False):
+            from portal.engine import EngineUnavailable
+            raise EngineUnavailable("connection refused")
+        self.jobs[jid] = {"status": "failed", "error": {"error": "stopped", "detail": "stopped"}}
 
 
 @pytest.fixture
@@ -246,6 +264,8 @@ def test_upload_reserves_and_completion_commits(setup):
     assert next(f for f in job["files"] if f["kind"] == "report_pdf")["label"] == "Report (PDF)"
     # The engine is told how to brand the PDF report (and never given a model name for it)
     assert s["engine"].brandings[-1]["service_name"] and "ai_label" not in s["engine"].brandings[-1]
+    # ...and how to run veraPDF: by default its running service, with PDF/UA-2 shown for information
+    assert s["engine"].validators[-1] == {"validator": "service", "verapdf_ua2": True}
     me = s["c"]["user"].get(f"{API}/me").json()
     assert me["used_pages"] == 3 and me["reserved_pages"] == 0
     grp = s["c"]["admin_a"].get(f"{API}/groups/{a}").json()["balance"]
@@ -506,3 +526,38 @@ def test_big_batch_is_queued_and_shared_fairly(setup):
     running = [e for e, st in rows if st == "submitted"]
     assert running.count("user@a.test") == 2 and running.count("user2@a.test") == 1
     assert [st for e, st in rows if e == "user@a.test"].count("queued") == 6
+
+
+def test_super_admins_choose_how_verapdf_runs(setup):
+    s = setup
+    topup(s, s["a"].id, 100)
+    r = s["c"]["super"].patch(f"{API}/admin/settings", json={"verapdf_mode": "command_line", "verapdf_ua2": False})
+    assert r.status_code == 200, r.text
+    assert s["c"]["super"].patch(f"{API}/admin/settings", json={"verapdf_mode": "fast"}).status_code == 422
+    assert upload(s["c"]["user"], ("a.pdf", pdf_bytes(1))).status_code == 200
+    run_worker(s["db"])
+    assert s["engine"].validators[-1] == {"validator": "command_line", "verapdf_ua2": False}
+
+
+def test_jobs_at_the_engine_follow_its_running_workers(setup, monkeypatch):
+    """With workers scaled by the queue, the portal hands over as many documents as there are places."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    ps = worker.get_portal_settings()
+    monkeypatch.setattr(ps, "engine_max_in_flight", 2)
+    monkeypatch.setattr(ps, "engine_capacity_cache_seconds", 0.0)
+    monkeypatch.setattr(worker, "_capacity", (0.0, None))  # restored afterwards, so later tests don't see this engine's
+    s["c"]["super"].patch(f"{API}/admin/settings", json={"max_concurrent_jobs_per_user": 50})
+    docs = [(f"d{n}.pdf", pdf_bytes(1)) for n in range(8)]
+    assert upload(s["c"]["user"], *docs).status_code == 200
+    at_engine = lambda: s["db"].scalar(select(func.count()).select_from(Job).where(Job.status == "submitted"))  # noqa: E731
+
+    worker.submit_queued(s["db"])  # the engine can't say: the configured number
+    assert at_engine() == 2
+    s["engine"].capacity = lambda: 6  # three pods of two
+    worker.submit_queued(s["db"])
+    assert at_engine() == 6
+    monkeypatch.setattr(ps, "engine_in_flight_ceiling", 7)
+    s["engine"].capacity = lambda: 40
+    worker.submit_queued(s["db"])
+    assert at_engine() == 7

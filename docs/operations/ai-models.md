@@ -47,18 +47,33 @@ VERIFY_JUDGE_MODEL=local-judge
 ```
 
 - **Adding models:** add entries to `config/litellm.yaml`, for the same family in the cloud, larger models or
-  commercial models. Each writer needs a reviewer from a different family; the file has examples (`cloud-judge` for
+  commercial models. Each writer needs a reviewer from a different family; the file has examples (`open-judge` for
   Qwen writers, `commercial-judge` for Claude). Set their keys, then restart the gateway. A super admin then publishes
   each writer as an AI level and picks its review model.
+- **Writers the file ships with:** `open-small-vision` (the local model's family, hosted), `open-large-vision` (a
+  much larger model of that family), `commercial-small-vision` (a commercial vendor's small model, for a cheaper
+  paid level), `commercial-medium-vision` and `commercial-large-vision` (its largest, for a kind of document such
+  as *Math and science*). Reviewers: `open-judge` and `commercial-judge`. A name says family, size and role, never
+  the model or its version, so the model behind it can be replaced without touching the AI levels.
+  Renaming or removing an entry leaves any level or kind that names it without a model: pick another for it in
+  **Administration > Services**.
 - **Reviews follow the level:** a document's AI review, and later re-reviews of its saved versions, use the review
   model of the level (or kind) it was processed with, so a cloud level's documents aren't reviewed by a local model,
   or the other way round. The review's cost is part of the job's AI cost.
-- **Admin UI** at the gateway's `/ui` (locally `http://localhost:4000/ui`), linked for super admins in the portal
-  (`PORTAL_GATEWAY_ADMIN_URL`):
+- **Admin UI** at the gateway's `/ui` (locally `http://localhost:4000/ui`). Super admins get a link to it in the
+  portal when `PORTAL_GATEWAY_ADMIN_URL` is set (the local stack sets it; on Kubernetes it's `GATEWAY_ADMIN_URL` in
+  `deploy.env`, empty by default because the UI isn't exposed there: use `kubectl port-forward svc/litellm 4000`).
+  Without an address the same place in the portal opens a short note on how to reach it:
   - models, with a playground;
   - spend per model, key and tag (every call is tagged `job:<id>` and `tier:<key>`);
   - request logs and errors;
   - **virtual keys:** give the engine its own key with a budget and rate limit, instead of the master key.
+- **Signing in to the admin UI:** `UI_USERNAME` and `UI_PASSWORD` (in the engine's settings) are a shared login
+  with full control, and the UI warns about it. Give each admin an account of their own (Internal Users, with
+  the admin role), check they can sign in, then turn the shared login off: `GATEWAY_SHARED_LOGIN=off` in
+  `deploy/k8s/deploy.env` (it adds `disable_env_credential_login: true` to the gateway's `general_settings`; with
+  Docker Compose, add that line to `config/litellm.yaml` yourself). The engine isn't affected: it uses the master
+  key, not this login.
 - **Spend backstop:** `max_budget` and `budget_duration` in `config/litellm.yaml` (default $50 per 30 days) cap total
   spend, on top of the portal's page quotas. Local models are listed at zero cost.
 - **Cost per job:** the gateway reports each call's cost; the engine adds it up (`metrics.ai_cost_usd`,
@@ -114,8 +129,8 @@ engineering units) is read by the job's AI model ([how](../architecture/engine-p
 - **Quality follows the model.** On a research paper, the local 8B model was rarely wrong but often imprecise; a
   commercial model read about two thirds of formulas exactly. Use a stronger level, or a *Math and science* kind, for
   math-heavy documents where accuracy matters ([test report](../evaluation/test-reports/2026-10-07-notation-ai-tiers.md)).
-- **Known gaps:** chemistry, medical and engineering notation are covered by synthetic tests only; the Adobe route
-  doesn't use it yet.
+- **The Adobe route** reads notation too: the readings go onto Adobe's matching text tags in the improved copy
+  ([how](../architecture/adobe-route.md)).
 
 When a document has two output files, a figure or formula that appears in both is reviewed once.
 `VERIFY_MAX_OUTPUT_TOKENS` (default 1500) gives the reviewer room for its explanation.

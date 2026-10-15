@@ -45,7 +45,7 @@ open questions are in section 13.
 - Integration with the ticketing system's API. Ticket numbers are recorded, not checked.
 - A user belonging to more than one group.
 
-(Editing tags in the browser, first planned as out of scope, was built: see the tag viewer in section 14.)
+(Editing tags in the browser, first planned as out of scope, was built: see the tag manager in section 14.)
 
 ## 2. Architecture
 

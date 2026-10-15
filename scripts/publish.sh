@@ -14,6 +14,8 @@
 #     (*.test, example.org, example.com, example.edu, GitHub no-reply);
 #   - the text matches a line of .publish-deny: your own private words (hostnames, names, …), one
 #     case-insensitive extended regular expression per line. That file is git-ignored, so it is never published.
+#   - a file repeats a sentence from a document in samples/regression (scripts/sample_text_check.py). The
+#     documents are other people's; this runs where they and the .venv are, and says so where they aren't.
 # Then it shows the files changed since the last snapshot and asks before committing and pushing.
 #
 # Options:
@@ -104,6 +106,16 @@ if [ -f .publish-deny ]; then
   done < .publish-deny
 else
   log "no .publish-deny file: only the built-in checks run"
+fi
+
+# The sample documents are never exported; a sentence copied out of one into a test or a report would be.
+if [ -d samples/regression ] && [ -x .venv/bin/python ]; then
+  log "checking for text from the sample documents"
+  while IFS= read -r hit; do
+    problem "text from a sample document: $hit"
+  done < <(.venv/bin/python scripts/sample_text_check.py "$EXPORT" samples/regression || true)
+else
+  log "no samples/regression or no .venv here: text from the sample documents is not checked"
 fi
 
 log "running gitleaks"

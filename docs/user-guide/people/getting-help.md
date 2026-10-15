@@ -8,7 +8,8 @@ service to look at it.
 ## Asking
 
 1. On the document's page, choose **Ask for help** (on the side, or in the slim menu if downloads are hidden).
-   In the tag viewer, **Report a problem here** does the same for the selected tag.
+   In the tag manager, **Report a problem** at the top right does the same for the document, and, with a tag
+   selected, **Report a problem here** for that tag.
 2. Say **what's wrong** (required). Be specific: the page, what you expected, what you got.
 3. Pick the **kind of problem**: alt text, reading order, tables, headings, math, looks different, or something
    else.
@@ -16,7 +17,20 @@ service to look at it.
 5. Attach files if they help: PDF, PNG, JPEG or plain text, up to 10 MB each and 50 MB per request.
 6. Send it.
 
+![The Ask for help with this document form: What's wrong? (required), Kind of problem, Which version, Page (optional), Add a file, and the buttons Send request and Cancel.](../../images/help-form.png)
+
 There's one request at a time per document.
+
+## When a document fails
+
+A document that couldn't be processed has no result to point into, so its page shows the reason and a help
+panel, nothing else.
+
+- Usually a help request has already been opened for it by the service, so the people who run it look into every
+  failure. You'll see it on the document's page: add anything that might help ("it's a scan of a signed form").
+- If there isn't one, choose **Ask for help** and say what you know about the document. There's no kind, version
+  or page to pick.
+- A document that someone stopped on purpose doesn't get a request.
 
 ## Following it
 
@@ -30,7 +44,7 @@ There's one request at a time per document.
 ## When it's resolved
 
 - The request says **what was done**, links the **fixed version**, and lists any **pages given back**.
-- **Compare in the tag viewer** shows your version on the left and the fixed one on the right.
+- **Compare in the tag manager** shows your version on the left and the fixed one on the right.
 - If it's still not right, **Reopen this request** within 14 days of it finishing. After that, ask for help
   again.
 

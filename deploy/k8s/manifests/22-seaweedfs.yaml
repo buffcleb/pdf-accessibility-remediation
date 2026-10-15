@@ -22,16 +22,18 @@ spec:
     metadata:
       labels: { app: seaweedfs }
     spec:
+      # weed needs nothing root can do; fsGroup makes the data volume (made by root before this) writable to it
+      securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, fsGroupChangePolicy: OnRootMismatch, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: seaweedfs
-          image: chrislusf/seaweedfs:4.48
+          image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
           command: ["/bin/sh", "-c"]
           args:
             - >
-              mkdir -p /etc/sw &&
+              q() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; } &&
               printf '{"identities":[{"name":"portal","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}'
-              "$S3_ACCESS" "$S3_SECRET" > /etc/sw/s3.json &&
-              mkdir -p /etc/seaweedfs && printf '[s3.sse]\nkek = "%s"\n' "$S3_SSE_KEK" > /etc/seaweedfs/security.toml &&
+              "$(q "$S3_ACCESS")" "$(q "$S3_SECRET")" > /etc/sw/s3.json &&
+              printf '[s3.sse]\nkek = "%s"\n' "$(q "$S3_SSE_KEK")" > /etc/seaweedfs/security.toml &&
               exec weed server -ip.bind=0.0.0.0 -dir=/data -s3 -s3.port=8333 -s3.config=/etc/sw/s3.json -volume.max=0 -master.volumeSizeLimitMB=1024
           env:
             - name: S3_ACCESS
@@ -46,8 +48,16 @@ spec:
             periodSeconds: 10
           resources:
             requests: { cpu: 100m, memory: 256Mi }
-            limits: { cpu: "1", memory: 1Gi }
-          volumeMounts: [{ name: data, mountPath: /data }]
+            limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 1Gi }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            # The two files the start command writes from the secrets (a quote or backslash in a value is escaped)
+            - { name: config, mountPath: /etc/sw }
+            - { name: config-sec, mountPath: /etc/seaweedfs }
+      volumes:
+        - { name: config, emptyDir: { sizeLimit: 1Mi } }
+        - { name: config-sec, emptyDir: { sizeLimit: 1Mi } }
   volumeClaimTemplates:
     - metadata: { name: data }
       spec:

@@ -98,15 +98,19 @@ and a human review list. The same applies to any other remediation tool's output
 
 ## Known limitations
 
-- **Specialist notation:** chemistry, medical and engineering notation are tested on synthetic documents only.
-  `AI_NOTATION_MAX` (100 regions by default) takes the first regions in page order, so very math-heavy documents keep
-  the layout rules' readings on later pages. The Adobe route doesn't read notation with AI yet. MathML isn't added yet.
+- **Specialist notation:** tested on 19 real chemistry, medical and engineering documents
+  ([report](test-reports/2026-10-11-notation-real-documents.md)). `AI_NOTATION_MAX` (100 regions by default) takes the
+  first regions in page order, so a very math-heavy document keeps the layout rules' readings on later pages unless it's
+  raised, as the [long-document settings](../operations/limits.md) do. MathML isn't added yet.
 - **PDF/UA-2** is validated for information only. Passing it needs PDF 2.0 output and the PDF 2.0 structure namespace,
   which aren't implemented. veraPDF has no standalone WCAG profile; WCAG and Section 508 conformance rest on PDF/UA-1
   plus the AI-written alt text, tables and reading order, and a person should still review the results.
 - **Forms** are only partly handled: field tooltips are added, but form-specific rules aren't fully covered.
-- **Retained tags:** when existing tags are kept, newly tagged content is placed after the kept elements of the same
-  page rather than interleaved. A reading-order mismatch is reported, not reordered automatically.
+- **Retained tags:** when existing tags are kept, their order is changed only on slide-like (landscape) pages, where
+  it's put in the page's reading order if it clearly disagrees. On portrait pages newly tagged content is placed after
+  the kept elements of the same page, and a reading-order mismatch is reported, not reordered. Hidden text is
+  judged by whole boxes: text under a shape drawn over it counts as hidden only when the shape's bounding box
+  covers it.
 - **Scanned pages:** tables aren't detected (their cells are tagged as paragraphs); pages scanned sideways aren't
   checked for figures; handwriting hasn't been tested, so treat transcriptions of it as drafts.
 - **Edge cases in tagging:** text inside form XObjects drawn more than once is tagged as one unit; rotated text in
@@ -117,7 +121,7 @@ and a human review list. The same applies to any other remediation tool's output
 - **The engine's job store** is a shared folder. Spreading the engine over several hosts needs a shared
   (ReadWriteMany) volume, or an object-storage backend behind `app/storage.py`.
 - **Not built yet:** SAML sign-in (designed), bounce handling for email, a classifier for AI levels (not just kinds),
-  and further fixes on top of Adobe's tags beyond alt text and fonts.
+  and further fixes on top of Adobe's tags beyond alt text, notation and fonts.
 
 ## Comparing with another remediation service
 

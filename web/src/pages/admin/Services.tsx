@@ -1,8 +1,9 @@
 import { useState, type FormEvent } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { del, get, patch, post, type Group, type Service } from "../../api";
 import { ErrorNotice, Loading, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
+import { modelChoices } from "./models";
 import { Adjust, GatewayLink, Topup } from "./shared";
 
 function where(s: Service) {
@@ -91,6 +92,7 @@ export function ServiceDetail() {
   const [draft, setDraft] = useState<Partial<Service>>({});
   const [error, setError] = useState<unknown>(null);
   const [saved, setSaved] = useState(false);
+  const navigate = useNavigate();
   useUnsavedChanges(Object.keys(draft).length > 0);
   const service = services.data?.find((x) => x.key === key);
   useTitle(service?.label ?? "Service");
@@ -110,6 +112,18 @@ export function ServiceDetail() {
       services.setData(services.data!.map((y) => (y.key === updated.key ? updated : y)));
       setDraft({});
       setSaved(true);
+    } catch (err) {
+      setError(err);
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm(`Delete "${service!.label}"? Its kinds of document and every group's settings and pages for it are `
+      + "deleted with it. Documents already processed keep their record. This can't be undone.")) return;
+    setError(null);
+    try {
+      await del(`/admin/services/${encodeURIComponent(service!.key)}`);
+      navigate("/admin/services");
     } catch (err) {
       setError(err);
     }
@@ -176,6 +190,9 @@ export function ServiceDetail() {
                 <input id="sd-job" type="number" min={1} value={s.max_pages_per_job ?? ""} onChange={(e) => set({ max_pages_per_job: num(e.target.value) })} /></div>
               <div className="field"><label htmlFor="sd-day">Most pages sent per day <span className="hint">(empty = no limit; extra documents wait)</span></label>
                 <input id="sd-day" type="number" min={0} value={s.daily_cap_pages ?? ""} onChange={(e) => set({ daily_cap_pages: num(e.target.value) })} /></div>
+              <div className="field"><label htmlFor="sd-once">Most documents at once <span className="hint">(empty = no limit; extra documents wait.
+                Set it to what can't grow with the rest: a local AI's GPUs, a provider's rate limit)</span></label>
+                <input id="sd-once" type="number" min={1} value={s.max_at_once ?? ""} onChange={(e) => set({ max_at_once: num(e.target.value) })} /></div>
             </div>
             <label className="check"><input type="checkbox" checked={s.confirm_before_send} onChange={(e) => set({ confirm_before_send: e.target.checked })} />
               <span>Ask people to confirm each document, with its page count, before it's sent</span></label>
@@ -201,10 +218,7 @@ export function ServiceDetail() {
         )}
         {tab === "model" && ai && (
           <>
-            <div className="field" style={{ maxWidth: 360 }}><label htmlFor="sd-model">Gateway model</label>
-              <input id="sd-model" type="text" value={s.gateway_model ?? ""} onChange={(e) => set({ gateway_model: e.target.value })} /></div>
-            <div className="field" style={{ maxWidth: 420 }}><label htmlFor="sd-judge">Review model <span className="hint">(a different model family; empty = the default)</span></label>
-              <input id="sd-judge" type="text" value={s.gateway_judge_model ?? ""} onChange={(e) => set({ gateway_judge_model: e.target.value || null })} /></div>
+            <ModelFields model={s.gateway_model} judge={s.gateway_judge_model} onChange={set} />
             <label className="check"><input type="checkbox" checked={s.allow_full_review} onChange={(e) => set({ allow_full_review: e.target.checked })} />
               <span>Allow "review every figure" <span className="muted small">(more AI calls per document)</span></span></label>
             <label className="check"><input type="checkbox" checked={s.allow_notation} onChange={(e) => set({ allow_notation: e.target.checked })} />
@@ -246,6 +260,17 @@ export function ServiceDetail() {
         )}
         <ErrorNotice error={error} />
       </form>}
+      {tab === "general" && ai && (
+        <div className="panel">
+          <h3>Delete this AI level</h3>
+          <p className="muted">
+            {service.enabled ? "Switch it off and save first. " : ""}It can be deleted once no document is waiting or in
+            progress with it. Documents already processed keep their record; reports show them under <span className="mono">{service.key}</span>.
+          </p>
+          <button className="btn secondary danger-text" type="button" disabled={service.enabled || Object.keys(draft).length > 0}
+            onClick={() => void remove()}>Delete AI level</button>
+        </div>
+      )}
       {tab === "pages" && service.global_limited && (
         <>
           <Topup base={`/admin/services/${encodeURIComponent(service.key)}`} fixedService={service.key} onDone={services.reload}
@@ -353,6 +378,28 @@ function KindsPanel({ service, onChange }: { service: Service; onChange: (s: Ser
       </form>
       <ErrorNotice error={error} />
     </div>
+  );
+}
+
+/** An AI level's writer and review model, chosen from what the gateway serves. */
+function ModelFields({ model, judge, onChange }: {
+  model: string | null; judge: string | null; onChange: (p: Partial<Service>) => void;
+}) {
+  const models = useAIModels();
+  const served = models.data?.models ?? [];
+  return (
+    <>
+      {models.error ? <ErrorNotice error={models.error} /> : null}
+      <div className="field" style={{ maxWidth: 360 }}><label htmlFor="sd-model">Gateway model</label>
+        <select id="sd-model" value={model ?? ""} onChange={(e) => onChange({ gateway_model: e.target.value })}>
+          {modelChoices(model, served).map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+        </select></div>
+      <div className="field" style={{ maxWidth: 420 }}><label htmlFor="sd-judge">Review model <span className="hint">(a different model family)</span></label>
+        <select id="sd-judge" value={judge ?? ""} onChange={(e) => onChange({ gateway_judge_model: e.target.value || null })}>
+          <option value="">Default review model</option>
+          {modelChoices(judge, served, model).map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+        </select></div>
+    </>
   );
 }
 

@@ -15,7 +15,7 @@ from portal.db import get_db
 from portal.deps import Principal, require_super_admin
 from portal.errors import ApiError, conflict, not_found
 from portal.identity import Eligibility, domain_of, lookup_email, normalize_domain, normalize_email, provision
-from portal.models import AuditEvent, AuthSession, Group, GroupDomain, RoleAssignment, Service, User
+from portal.models import AuditEvent, AuthSession, Group, GroupDomain, GroupEmail, RoleAssignment, Service, User
 from portal.routers.common import AuditOut, LedgerOut, audit_query
 from portal.schemas import GroupOut, UserOut, group_out, user_out
 
@@ -52,10 +52,25 @@ class GroupUpdate(BaseModel):
 
 class DomainIn(BaseModel):
     domain: str = Field(max_length=253)
+    public_ok: bool = False  # yes, really allow everyone at a public email provider
 
 
-def _claim_domain(db: Session, group: Group, raw: str) -> str:
+# Public email providers: allowing one of these lets anyone with a free account in. Listing a person's address
+# (below) is almost always what's meant.
+PUBLIC_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "yahoo.com", "ymail.com",
+    "icloud.com", "me.com", "mac.com", "aol.com", "proton.me", "protonmail.com", "pm.me", "gmx.com", "gmx.net",
+    "mail.com", "zoho.com", "yandex.com", "yandex.ru", "fastmail.com", "hey.com", "tutanota.com", "qq.com",
+    "163.com", "126.com", "comcast.net", "verizon.net", "att.net", "sbcglobal.net",
+}
+
+
+def _claim_domain(db: Session, group: Group, raw: str, public_ok: bool = False) -> str:
     domain = normalize_domain(raw)
+    if domain in PUBLIC_EMAIL_DOMAINS and not public_ok:
+        raise conflict("public_domain", f"{domain} is a public email provider: anyone with a free {domain} address could "
+                                        "sign in and join this group. To let one person in, add their address under "
+                                        "People allowed by address instead.")
     existing = db.get(GroupDomain, domain)
     if existing is not None:
         if existing.group_id == group.id:
@@ -143,7 +158,7 @@ def add_domain(group_id: uuid.UUID, body: DomainIn, request: Request,
     group = db.get(Group, group_id)
     if group is None:
         raise not_found("Group")
-    domain = _claim_domain(db, group, body.domain)
+    domain = _claim_domain(db, group, body.domain, body.public_ok)
     audit.record(db, request, "group.domain_added", actor=p.user, target_type="group", target_id=group.id,
                  group_id=group.id, details={"domain": domain})
     try:
@@ -171,6 +186,70 @@ def remove_domain(group_id: uuid.UUID, domain: str, request: Request,
     return group_out(group)
 
 
+# --- people allowed by address --------------------------------------------------------------------
+
+class GroupEmailIn(BaseModel):
+    email: str = Field(max_length=320)
+    note: str | None = Field(None, max_length=300)
+    move: bool = False  # it's listed on another group: move it here
+
+
+@router.post("/groups/{group_id}/emails", response_model=GroupOut, status_code=201)
+def add_group_email(group_id: uuid.UUID, body: GroupEmailIn, request: Request,
+                    p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Let one person into the group by their address, without their domain. It takes precedence over a domain
+    match. Someone who already has an account keeps theirs (and its group): move them in People instead."""
+    group = db.get(Group, group_id)
+    if group is None:
+        raise not_found("Group")
+    email = normalize_email(body.email)
+    user = db.scalar(select(User).where(User.email == email))
+    if user is not None and user.group_id != group.id:
+        where = user.group.name if user.group else "no group"
+        raise conflict("has_account", f"{email} already has an account (in {where}). Accounts keep their group: "
+                                      "to move them, use People (all groups) → Manage → Move.")
+    existing = db.get(GroupEmail, email)
+    if existing is not None and existing.group_id != group.id:
+        if not body.move:
+            raise conflict("email_taken", f"{email} is already allowed by address on the group "
+                                          f"\"{existing.group.name}\". Move it to this group?")
+        old = existing.group
+        existing.group_id, existing.note, existing.added_by = group.id, body.note or existing.note, p.user.email
+        audit.record(db, request, "group.email_removed", actor=p.user, target_type="group", target_id=old.id,
+                     group_id=old.id, details={"email": email, "moved_to": group.name})
+    elif existing is None:
+        db.add(GroupEmail(email=email, group_id=group.id, note=(body.note or "").strip() or None,
+                          added_by=p.user.email))
+    else:
+        existing.note = (body.note or "").strip() or existing.note
+    audit.record(db, request, "group.email_added", actor=p.user, target_type="group", target_id=group.id,
+                 group_id=group.id, details={"email": email, **({"note": body.note} if body.note else {})})
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise conflict("email_taken", f"{email} was just added to another group.") from None
+    db.refresh(group)
+    return group_out(group)
+
+
+@router.delete("/groups/{group_id}/emails/{email}", response_model=GroupOut)
+def remove_group_email(group_id: uuid.UUID, email: str, request: Request,
+                       p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """They can no longer sign up by this address. An account they already have keeps working: disable it in
+    People to stop that."""
+    group = db.get(Group, group_id)
+    row = db.get(GroupEmail, lookup_email(email))
+    if group is None or row is None or row.group_id != group.id:
+        raise not_found("Address")
+    db.delete(row)
+    audit.record(db, request, "group.email_removed", actor=p.user, target_type="group", target_id=group.id,
+                 group_id=group.id, details={"email": row.email})
+    db.commit()
+    db.refresh(group)
+    return group_out(group)
+
+
 # --- group admins --------------------------------------------------------------------------------
 
 class AdminIn(BaseModel):
@@ -191,16 +270,18 @@ def list_group_admins(group_id: uuid.UUID, _: Principal = Depends(require_super_
 def add_group_admin(group_id: uuid.UUID, body: AdminIn, request: Request,
                     p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
     """Make a member of the group its admin. If they haven't signed in yet, their account is created
-    now, provided their email domain belongs to this group."""
+    now, provided their email domain belongs to this group or the group lists their address."""
     group = db.get(Group, group_id)
     if group is None:
         raise not_found("Group")
     email = normalize_email(body.email)
     user = db.scalar(select(User).where(User.email == email))
     if user is None:
-        if not any(d.domain == domain_of(email) for d in group.domains):
+        if not any(d.domain == domain_of(email) for d in group.domains) and \
+                not any(e.email == email for e in group.emails):
             raise ApiError(422, "domain_mismatch",
-                           f"{email} isn't in one of this group's email domains, so it can't join the group.")
+                           f"{email} isn't in one of this group's email domains or allowed by address, so it can't "
+                           "join the group.")
         user = provision(db, email, "email", Eligibility(None, group, False))
         audit.record(db, request, "user.provisioned", actor=p.user, target_type="user", target_id=user.id,
                      group_id=group.id, details={"method": "admin", "email": email})
@@ -489,6 +570,7 @@ class ServiceOut(BaseModel):
     reserved_pages: int
     remaining_pages: int | None
     daily_cap_pages: int | None
+    max_at_once: int | None
     pages_sent_today: int
     max_pages_per_job: int | None
     confirm_before_send: bool
@@ -520,6 +602,7 @@ class ServiceUpdate(BaseModel):
     metered: bool | None = None
     global_limited: bool | None = None
     daily_cap_pages: int | None = Field(None, ge=0, le=100_000_000)
+    max_at_once: int | None = Field(None, ge=1, le=10_000)
     max_pages_per_job: int | None = Field(None, ge=1, le=1_000_000)
     confirm_before_send: bool | None = None
     sort: int | None = Field(None, ge=0, le=10_000)
@@ -535,7 +618,7 @@ def service_out(db: Session, s: Service) -> ServiceOut:
         global_limited=s.pool_pages is not None, pool_pages=s.pool_pages, used_pages=s.used_pages,
         reserved_pages=s.reserved_pages,
         remaining_pages=None if s.pool_pages is None else max(0, s.pool_pages - s.used_pages - s.reserved_pages),
-        daily_cap_pages=s.daily_cap_pages, pages_sent_today=quota.pages_sent_today(db, s.key),
+        daily_cap_pages=s.daily_cap_pages, max_at_once=s.max_at_once, pages_sent_today=quota.pages_sent_today(db, s.key),
         max_pages_per_job=s.max_pages_per_job, confirm_before_send=s.confirm_before_send,
         gateway_model=s.gateway_model, gateway_judge_model=s.gateway_judge_model,
         allow_full_review=s.allow_full_review, allow_notation=s.allow_notation, allow_ocr_ai=s.allow_ocr_ai,
@@ -714,6 +797,42 @@ def update_service(key: str, body: ServiceUpdate, request: Request, p: Principal
                                                                                                    **changes})
     db.commit()
     return service_out(db, s)
+
+
+@router.delete("/services/{key}", status_code=204)
+def delete_ai_tier(key: str, request: Request, p: Principal = Depends(require_super_admin),
+                   db: Session = Depends(get_db)):
+    """Remove an AI level for good: its kinds of document, and every group's and person's settings and page
+    counts for it, go with it. It must be switched off and have no document waiting or in progress, so nothing
+    loses its level half way. Documents already processed with it keep their record, the page ledger and the
+    audit log keep their rows, and reports show the level by its key from then on."""
+    from sqlalchemy import delete
+
+    from portal import queues
+    from portal.models import DocumentVersion, GroupService, Job, QueuePause
+    s = db.scalar(select(Service).where(Service.key == key).with_for_update())
+    if s is None:
+        raise not_found("Service")
+    if s.kind != "ai_tier":
+        raise ApiError(422, "not_ai_tier", "Only AI levels can be deleted.")
+    if s.enabled:
+        raise conflict("service_on", "Switch this AI level off before deleting it.")
+    documents = db.scalar(select(func.count()).select_from(Job).where(
+        Job.ai_tier == key, Job.status.in_(("held", "queued", "submitted", "processing")))) or 0
+    versions = db.scalar(select(func.count()).select_from(DocumentVersion).join(Job, Job.id == DocumentVersion.job_id).where(
+        Job.ai_tier == key, or_(DocumentVersion.status.in_(("queued", "submitted", "processing")),
+                                DocumentVersion.review_status.in_(("queued", "running"))))) or 0
+    if documents or versions:
+        raise conflict("service_in_use", f"{documents + versions} document(s) are waiting or in progress with this AI "
+                                         "level. Delete it when they have finished.")
+    groups = db.scalar(select(func.count()).select_from(GroupService).where(GroupService.service_key == key)) or 0
+    audit.record(db, request, "service.deleted", actor=p.user, target_type="service",
+                 details={"service": key, "label": s.label, "gateway_model": s.gateway_model,
+                          "gateway_judge_model": s.gateway_judge_model, "external": s.external,
+                          "used_pages": s.used_pages, "groups": groups})
+    db.execute(delete(QueuePause).where(QueuePause.key == queues.service_key(key)))  # a pause of nothing
+    db.delete(s)  # kinds, group and user rows follow by the database's cascade
+    db.commit()
 
 
 @router.post("/services/{key}/topups", response_model=LedgerOut, status_code=201)

@@ -1,4 +1,4 @@
-"""Tag maps: where each structure element's content sits on the page, for the portal's tag viewer.
+"""Tag maps: where each structure element's content sits on the page, for the portal's tag manager.
 
 Element indices are the same pre-order indices the verification findings carry (`element`), so the
 viewer can join findings to the boxes it draws. Boxes are in visual page space (points, origin top
@@ -13,11 +13,13 @@ import pymupdf as fitz
 from pikepdf import Array, Dictionary
 
 from app.config import get_settings
-from app.verification.integrity import TagIndex, _items, _is_elem, check_integrity
+from app.tagging.table_headers import headers_named, id_of
+from app.verification.integrity import TagIndex, _items, _is_elem, _mcid, check_integrity
 from app.verification.semantic import SemanticChecker
 
 SCHEMA = 1
 TEXT_CHARS = 200
+SAY_CHARS = 5000  # an element's own text in full, for reading aloud (where it differs from "text")
 PART_CHARS = 80
 
 
@@ -49,7 +51,72 @@ def page_sizes(path: Path) -> list[dict]:
         return [{"w": round(p.rect.width, 2), "h": round(p.rect.height, 2)} for p in doc]
 
 
-def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | None) -> dict:
+def _pieces(index: TagIndex, checker: SemanticChecker | None) -> list[dict]:
+    """Each tagged piece of content in a page's own stream (one marked-content sequence): where it is, what it is
+    and which tag holds it, so the editor can move pieces between tags."""
+    if checker is None:
+        return []
+    out = []
+    for (page, mcid), c in sorted(checker.by_mcid.items()):
+        if page >= len(index.page_objgens) or not c.boxes:
+            continue
+        users = index.refs.get((index.page_objgens[page], mcid))
+        if not users:
+            continue
+        box = c.boxes[0]
+        for b in c.boxes[1:]:
+            box = _union(box, b)
+        kind = "text" if c.text else "image" if c.images else "drawing"
+        out.append({"page": page + 1, "mcid": mcid, "el": users[0], "bbox": [round(v, 2) for v in box], "kind": kind,
+                    **({"text": c.text[:PART_CHARS]} if c.text else {})})
+    return out
+
+
+def artifact_sections(path: Path) -> list[dict]:
+    """The artifact sections of each page's own stream, numbered as the content marker and the editor number them,
+    with where they are and what they draw, so the editor can tag one."""
+    from app.tagging.content_marker import ContentMarker
+
+    out = []
+    with pikepdf.open(path) as probe, fitz.open(path) as doc:
+        for n, page in enumerate(probe.pages):
+            fp = doc[n]
+            m = fp.transformation_matrix * fp.rotation_matrix
+            marker = ContentMarker(probe, page, (m.a, m.b, m.c, m.d, m.e, m.f), lambda *a: ("artifact:Layout", "Artifact"))
+            for sm in marker.run().streams[:1]:  # the page's own stream
+                for seq, info in sorted(sm.artifacts.items()):
+                    if info["bbox"] is None:
+                        continue
+                    text = fp.get_textbox(fitz.Rect(info["bbox"])).strip() if "text" in info["kinds"] else ""
+                    out.append({"page": n + 1, "seq": seq, "bbox": [round(v, 2) for v in info["bbox"]],
+                                "kinds": sorted(info["kinds"]), "type": info["type"] or None,
+                                **({"nested": True} if info["nested"] else {}),
+                                **({"text": " ".join(text.split())[:PART_CHARS]} if text else {})})
+    return out
+
+
+def annotation_places(path: Path) -> dict[int, tuple[int, tuple, str | None]]:
+    """Where each annotation sits (form fields, links): object number -> (page, box in the page's visual space, its
+    name: a field's tooltip, a link's description). A tag that holds only an annotation has no content to place it
+    by, so without this it has no box: it can't be shown on the page, and belongs to no page in particular."""
+    out: dict[int, tuple[int, tuple, str | None]] = {}
+    with pikepdf.open(path) as pdf, fitz.open(path) as doc:
+        for n, page in enumerate(pdf.pages):
+            fp = doc[n]
+            m = fp.transformation_matrix * fp.rotation_matrix
+            for a in page.get("/Annots") or []:
+                rect = a.get("/Rect") if isinstance(a, pikepdf.Dictionary) and a.is_indirect else None
+                if rect is None or len(rect) != 4:
+                    continue
+                r = (fitz.Rect(*(float(v) for v in rect)) * m).normalize()
+                name = a.get("/TU") or (a.get("/Parent").get("/TU") if a.get("/Parent") is not None else None) \
+                    or a.get("/Contents") or a.get("/T")
+                out[a.objgen[0]] = (n, (r.x0, r.y0, r.x1, r.y1), _text(name))
+    return out
+
+
+def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | None,
+                artifacts: list[dict] | None = None, annots: dict | None = None) -> dict:
     els = index.elements
     # Own content per element and page, then folded up into ancestors. Children always have higher
     # pre-order indices than their parents, so one reverse pass is enough.
@@ -58,6 +125,18 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
         for idx, content in checker.own.items():
             for page, box in content.page_boxes:
                 own[idx][page] = _union(own[idx].get(page), box)
+    # A tag's annotations (a form field, a link) are part of what it holds: they give it a place too
+    names: dict[int, str] = {}
+    annotated: set[int] = set()
+    for e in els:
+        for it in _items(e.obj.get("/K")) if annots else []:
+            target = it.get("/Obj") if isinstance(it, pikepdf.Dictionary) and not _is_elem(it) else None
+            place = annots.get(target.objgen[0]) if target is not None and target.is_indirect else None
+            if place is not None:
+                own[e.index][place[0]] = _union(own[e.index].get(place[0]), place[1])
+                annotated.add(e.index)
+                if place[2]:
+                    names.setdefault(e.index, place[2])
     subtree = [dict(o) for o in own]
     for e in reversed(els):
         if e.parent is not None:
@@ -65,6 +144,12 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
             for page, box in subtree[e.index].items():
                 parent[page] = _union(parent.get(page), box)
 
+    # The header cells each cell names (Headers -> IDs -> elements), for the tag manager's cell headers
+    by_id = {id_of(e.obj): e.index for e in els if id_of(e.obj)}
+    # What each tag points at (/Ref: a footnote mark's note), by element
+    by_obj = {e.obj.objgen: e.index for e in els if e.obj.is_indirect}
+    refs = {e.index: [by_obj[r.objgen] for r in e.obj.Ref if isinstance(r, Dictionary) and r.is_indirect and r.objgen in by_obj]
+            for e in els if isinstance(e.obj.get("/Ref"), Array)}
     order = 0
     out = []
     for e in els:
@@ -86,15 +171,25 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
             "actual_text": _text(e.obj.get("/ActualText")),
             "lang": _text(e.obj.get("/Lang")),
             "scope": _scope(e.obj) if e.role in ("TH", "TD") else None,
+            "headers": [by_id[h] for h in headers_named(e.obj) if h in by_id] or None if e.role in ("TH", "TD") else None,
+            "refs": refs.get(e.index) or None,
             "text": text,
+            # what a screen reader announces for a form field or link that has no text of its own
+            "name": names.get(e.index) if not text else None,
+            "annot": True if e.index in annotated else None,  # it holds a form field, link or other annotation
             "order": None,
             "parts": _parts(e, index, checker),
         }
+        if has_own and checker is not None:
+            say = checker.own[e.index].text[:SAY_CHARS] if e.index in checker.own else ""
+            if say != (text or ""):
+                item["say"] = say  # empty when all its text is in child tags
         if has_own:
             item["order"] = order
             order += 1
         out.append({k: v for k, v in item.items() if v is not None or k in ("parent", "order")})
-    return {"schema": SCHEMA, "pages": pages, "elements": out}
+    return {"schema": SCHEMA, "pages": pages, "elements": out, "pieces": _pieces(index, checker),
+            "artifacts": artifacts or []}
 
 
 def _parts(e, index: TagIndex, checker: SemanticChecker | None) -> list[dict] | None:
@@ -112,7 +207,9 @@ def _parts(e, index: TagIndex, checker: SemanticChecker | None) -> list[dict] | 
             out.append({"k": k, "kind": "tag", "el": child})
             continue
         if isinstance(item, int) or (hasattr(item, "get") and "/MCID" in item):
-            mcid = int(item) if isinstance(item, int) else int(item.MCID)
+            mcid = _mcid(item)
+            if mcid is None:
+                continue  # an id that isn't an integer names no piece
             page = e.page
             if not isinstance(item, int) and item.get("/Pg") is not None:
                 page = page_of.get(item.Pg.objgen, page)
@@ -144,4 +241,4 @@ def build_tagmap(path: Path) -> dict:
             return {"schema": SCHEMA, "pages": pages, "elements": []}
         checker = SemanticChecker(path, pdf, index, get_settings().verify_max_pages)
         checker._collect()
-        return tagmap_from(pages, index, checker)
+        return tagmap_from(pages, index, checker, artifact_sections(path), annotation_places(path))

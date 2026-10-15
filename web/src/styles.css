@@ -53,6 +53,14 @@ p { margin: 0; max-width: 70ch; }
 
 /* Header */
 .topbar { background: var(--surface); border-bottom: 1px solid var(--line); }
+/* The header stays in view while the page scrolls, where the window is tall enough to spare the room. Its height
+   is kept in --topbar-h (set from the header itself, components/Layout.tsx) for what sticks or scrolls under it. */
+:root { --topbar-h: 53px; }
+@media (min-height: 480px) {
+  .topbar { position: sticky; top: 0; z-index: 40; }
+  html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
+}
+@media (max-height: 479.98px) { :root { --topbar-h: 0px !important; } }
 .topbar-inner { max-width: 1100px; margin: 0 auto; padding: 10px 16px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 .brand { font-weight: 700; color: var(--fg); text-decoration: none; display: flex; gap: 8px; align-items: center; }
 .brand img { width: 26px; height: 26px; }
@@ -186,24 +194,83 @@ details > summary { cursor: pointer; font-weight: 600; }
 
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
 
-/* --- Tag viewer --------------------------------------------------------------------------- */
+/* --- Tag manager --------------------------------------------------------------------------- */
 main.wide { max-width: none; padding-inline: 16px; }
-.pv-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 340px; gap: 12px; align-items: start; }
-@media (max-width: 1200px) { .pv-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .pv-side { grid-column: 1 / -1; position: static !important; max-height: none !important; } }
-@media (max-width: 760px) { .pv-grid { grid-template-columns: minmax(0, 1fr); } }
+/* Two panes with a divider that can be dragged (--pv-l and --pv-r are their shares, set by the viewer), then the
+   edit panel */
+.pv-grid { display: grid; grid-template-columns: minmax(0, var(--pv-l, 1fr)) 10px minmax(0, var(--pv-r, 1fr)) 10px var(--pv-side, 340px); gap: 12px 4px; align-items: start; }
+/* Narrower: the edit panel goes under the panes, full width, and has no divider of its own */
+@media (max-width: 1200px) { .pv-grid { grid-template-columns: minmax(0, var(--pv-l, 1fr)) 10px minmax(0, var(--pv-r, 1fr)); } .pv-split-side { display: none; } .pv-side { grid-column: 1 / -1; position: static !important; max-height: none !important; overflow: visible !important; } }
+@media (max-width: 760px) { .pv-grid { grid-template-columns: minmax(0, 1fr); } .pv-split { display: none; } }
+.pv-split { align-self: stretch; min-height: 120px; cursor: col-resize; position: relative; touch-action: none; border-radius: 5px; }
+.pv-split::before { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 4px; border-radius: 2px; background: var(--line); }
+.pv-split:hover::before, .pv-split.dragging::before, .pv-split:focus-visible::before { background: var(--accent); }
+.pv-split:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+/* The viewer's heading: one row, the title in the middle, so the pages get the height. It stays in view under the
+   site's header; its height is kept in --pv-top-h (set by the viewer) for the panes and the edit panel below it. */
+main.viewer { padding-top: 0; gap: 10px; }
+.pv-top { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 4px 16px; align-items: center;
+  padding: 8px 0 6px; background: var(--bg); border-bottom: 1px solid var(--line); }
+@media (min-height: 480px) { .pv-top { position: sticky; top: var(--topbar-h); z-index: 30; } }
+.pv-top-back { margin: 0; }
+.pv-top-title { text-align: center; min-width: 0; }
+.pv-top-title h1 { font-size: 1.3rem; margin: 0; overflow-wrap: anywhere; }
+.pv-top-title .sub { margin: 0; color: var(--muted); }
+.pv-top-actions { justify-content: flex-end; }
+@media (max-width: 760px) { .pv-top { grid-template-columns: minmax(0, 1fr); } .pv-top-title { text-align: left; } .pv-top-actions { justify-content: flex-start; } }
 .pv-pane { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; min-width: 0; }
 .pv-head { display: flex; gap: 10px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+/* The top of each pane (its version, view and zoom controls) stays in view: where the page scrolls (a narrow or short
+   window) it sticks under the viewer's heading instead of going up with the page. Above the tag outlines and their
+   pop-ups, below the heading. */
+.pv-head { position: sticky; top: 0; z-index: 12; background: var(--surface); border-radius: 10px 10px 0 0; }
+@media (min-height: 480px) { .pv-head { top: calc(var(--topbar-h) + var(--pv-top-h, 0px)); } }
 .pv-head select { width: auto; max-width: 100%; }
-.pv-body { height: calc(100vh - 230px); min-height: 420px; overflow: auto; background: var(--bg); position: relative; }
+.pv-tree-help summary { cursor: pointer; }
+.pv-tree-help[open] { flex-basis: 100%; order: 10; } /* opened, it takes a line of its own under the controls */
+/* The version picker gives way before the row's controls drop to a second line: it starts narrow and takes the
+   room that is left, up to its own width */
+.pv-head > select { flex: 1 1 9rem; min-width: 0; max-width: max-content; }
+.pv-body { height: calc(100vh - var(--topbar-h) - var(--pv-top-h, 0px) - 110px); min-height: 420px; overflow: auto; background: var(--bg); position: relative; }
 .pv-msg { padding: 16px; }
+/* Wide and tall enough for the three side by side: the viewer fills the window under the site's header and stays
+   there; the tree, the pages and the editing panel each scroll inside themselves, and the window doesn't. Notices
+   and the reader above the panes take their room from the panes. (Narrower, the panel goes under the panes and the
+   page scrolls as before.) */
+@media (min-width: 1201px) and (min-height: 600px) {
+  /* clip, not just hidden: a hidden box can still be scrolled by the page itself (focusing a row, bringing a
+     control into view), which would slide the tops of the panes up out of sight */
+  main.viewer { height: calc(100vh - var(--topbar-h)); padding-bottom: 12px; overflow: hidden; overflow: clip; }
+  main.viewer > * { flex: none; }
+  main.viewer > .pv-grid { flex: 1 1 0; min-height: 0; grid-template-rows: minmax(0, 1fr); align-items: stretch; }
+  main.viewer .pv-pane { min-height: 0; }
+  /* A pane scrolled to its end doesn't hand the scroll on to the window, which would move the panes away */
+  main.viewer .pv-body { height: auto; flex: 1 1 0; min-height: 0; overscroll-behavior: contain; }
+  /* relative, not sticky: it no longer needs to stick, and what's hidden inside it (text for screen readers) has to
+     stay inside it, not stretch the window */
+  main.viewer .pv-side { position: relative; top: auto; max-height: none; min-height: 0; overscroll-behavior: contain; }
+  main.viewer .pv-split { min-height: 0; }
+}
 .pv-pages { padding: 12px; display: flex; flex-direction: column; gap: 16px; align-items: center; }
 .pv-pages.zoomed { align-items: flex-start; width: max-content; }
 .pv-zoom { display: flex; gap: 4px; align-items: center; }
 .pv-zoom select { width: auto; }
+/* Viewing controls at the end of a pane's header row (they wrap under the version picker when the pane is narrow) */
+.pv-tools { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.pv-tools select { width: auto; max-width: 100%; }
+.pv-tools .check { margin: 0; white-space: nowrap; }
+.pv-zoom > span { white-space: nowrap; }
+.pv-tools .btn.small { padding-top: 2px; padding-bottom: 2px; }
 .pv-parts { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
 .pv-parts li { display: flex; gap: 8px; align-items: center; border-left: 2px solid var(--line); padding-left: 8px; }
 .pv-page { position: relative; background: #fff; box-shadow: 0 1px 3px rgb(0 0 0 / 0.25); flex: none; }
 .pv-canvas { position: absolute; inset: 0; }
+.pv-area { position: absolute; border: 2px dashed #1f4e8c; background: rgb(31 78 140 / 0.08); pointer-events: none; z-index: 4; }
+.pv-area.drawing { border-style: solid; }
+.pv-area-draw { position: absolute; inset: 0; cursor: crosshair; z-index: 5; touch-action: none; }
+.pv-area-list { list-style: none; padding: 0; margin: 4px 0 8px; max-height: 220px; overflow: auto; }
+.pv-area-list li { margin: 2px 0; }
+.pv-area-list .check { align-items: flex-start; }
 .pv-pageno { position: absolute; right: 6px; bottom: 4px; font-size: 11px; color: #667; background: rgb(255 255 255 / 0.8); padding: 0 4px; border-radius: 3px; }
 .pv-pagenote { position: absolute; left: 4px; top: 4px; font-size: 11px; background: #fbf0d9; color: #6b4600; padding: 1px 6px; border-radius: 4px; border: 1px solid #e0b25c; z-index: 2; }
 .pv-box { position: absolute; padding: 0; margin: 0; border: 1.5px solid var(--box, #5b6b82); background: transparent; border-radius: 2px; cursor: pointer; z-index: 1; }
@@ -216,22 +283,99 @@ main.wide { max-width: none; padding-inline: 16px; }
 .pv-box.selected { outline: 3px solid var(--focus); outline-offset: 1px; z-index: 4; }
 .pv-box.decorative { border-style: dotted; opacity: 0.6; }
 .pv-chip { position: absolute; left: -1px; top: -15px; font: 600 10px/14px var(--mono); background: var(--box, #5b6b82); color: #fff; padding: 0 4px; border-radius: 3px 3px 3px 0; white-space: nowrap; pointer-events: none; }
+/* The types, in a dialog opened from the tag menu: two columns so they fit without scrolling */
+.confirm-dialog.pv-types { width: min(680px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); overflow-y: auto; }
+.pv-type-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 6px; margin: 12px 0; }
+.pv-type { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; font: inherit; color: inherit; background: none; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+.pv-type:hover, .pv-type:focus-visible { background: rgb(31 78 140 / 0.16); }
+.pv-type:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.pv-type-name { font-weight: 600; }
+.pv-type[aria-disabled="true"] { cursor: default; background: none; border-style: dashed; }
+.pv-type[aria-disabled="true"] .pv-type-name { color: var(--muted); font-weight: 400; }
+/* The tag in a dialog ("Edit tag…"): the panel's form, with room to read */
+.confirm-dialog.pv-tagdlg { width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); overflow-y: auto; }
+.confirm-dialog.pv-splitdlg { width: min(560px, calc(100vw - 32px)); max-width: none; }
+.confirm-dialog.pv-areadlg { width: min(640px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); overflow-y: auto; }
+.confirm-dialog.pv-areadlg .pv-area-list { max-height: 40vh; }
+.confirm-dialog.pv-savedlg { width: min(640px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); overflow-y: auto; }
+.confirm-dialog.pv-savedlg .pv-pending { max-height: 30vh; overflow-y: auto; }
+.confirm-dialog.pv-reviewdlg { width: min(520px, calc(100vw - 32px)); max-width: none; }
+/* Splitting a figure: the figure drawn, each piece outlined to click, pieces already made into a new tag in its color */
+.confirm-dialog.pv-figdlg { width: min(720px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); overflow-y: auto; }
+.pv-fig-frame { position: relative; margin: 8px auto; background: #fff; border: 1px solid var(--line); max-width: 100%; }
+.pv-fig-frame canvas { display: block; }
+.pv-fig-nodraw { position: absolute; inset: 8px; margin: 0; }
+/* The outlines show the pieces and take the keyboard; the pointer goes to the layer under them, which picks the smallest
+   piece under it or draws a box */
+.pv-fig-pick { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
+.pv-fig-mode { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.pv-fig-cut { position: absolute; border: 2px solid var(--g, var(--focus)); background: color-mix(in srgb, var(--g, #1f4e8c) 14%, transparent); pointer-events: none; z-index: 2; }
+.pv-fig-cut .pv-fig-no { background: var(--g); }
+.pv-fig-box { position: absolute; border: 2px dashed var(--focus); background: rgb(31 78 140 / 0.10); pointer-events: none; z-index: 3; }
+.pv-fig-piece { position: absolute; padding: 0; background: transparent; border: 1.5px dashed #5b6b82; border-radius: 2px; pointer-events: none; }
+.pv-fig-piece:focus-visible { background: rgb(31 78 140 / 0.12); outline: 2px solid var(--focus); outline-offset: 1px; z-index: 2; }
+.pv-fig-piece[aria-pressed="true"] { border: 2.5px solid var(--focus); background: rgb(31 78 140 / 0.18); }
+.pv-fig-piece.taken { cursor: default; border-style: solid; }
+.pv-fig-no { position: absolute; top: -9px; left: -9px; min-width: 16px; height: 16px; border-radius: 8px; color: #fff; font-size: 11px; line-height: 16px; text-align: center; background: inherit; }
+.g0 { --g: #b4462b; } .g1 { --g: #2b7a3d; } .g2 { --g: #6a3fb4; } .g3 { --g: #a06b00; } .g4 { --g: #0f7d7d; } .g5 { --g: #9a2a6a; }
+.pv-fig-piece.taken { border-color: var(--g); background: color-mix(in srgb, var(--g) 18%, transparent); }
+.pv-fig-piece.taken .pv-fig-no { background: var(--g); }
+.pv-fig-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: var(--g); vertical-align: middle; }
+.pv-fig-tools { display: flex; gap: 10px; align-items: center; }
+.pv-fig-make { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; border-top: 1px solid var(--line); padding-top: 8px; margin-top: 4px; }
+.pv-fig-make .field { margin: 0; }
+.pv-fig-make .field:has(textarea) { flex: 1 1 260px; }
+.pv-fig-ask { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.pv-fig-groups { margin: 8px 0; padding-left: 20px; }
+/* The list builder: one row per line, its controls in a column at the left and its text set in by its level */
+.confirm-dialog.pv-builder { width: min(860px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.confirm-dialog.pv-builder:not([open]) { display: none; }
+.pv-rows { list-style: none; margin: 8px 0; padding: 0; overflow-y: auto; min-height: 80px; border: 1px solid var(--line); border-radius: 8px; }
+.pv-row { display: flex; align-items: flex-start; gap: 12px; padding: 6px 10px; }
+.pv-row + .pv-row { border-top: 1px solid var(--line); }
+.pv-row:focus-within { background: rgb(31 78 140 / 0.08); }
+.pv-row-tools { display: flex; gap: 4px; flex: none; align-items: center; }
+.pv-row-tools select { width: 8.5em; padding: 3px 6px; }
+.pv-row-tools .btn { padding: 2px 8px; }
+.pv-row-body { display: flex; gap: 8px; min-width: 0; flex: 1; padding-top: 3px; }
+.pv-row-mark { flex: none; color: var(--muted); min-width: 1.2em; font-size: 0.85rem; }
+.pv-row.plain .pv-row-text { font-weight: 600; }
+.pv-row-text { overflow-wrap: anywhere; min-width: 0; }
+.pv-row-more { display: block; color: var(--muted); }
+/* The tag menu (right-click, Shift+F10, or the panel's Actions button) */
+.pv-menu { position: fixed; z-index: 40; width: 260px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 20px rgb(0 0 0 / 0.25); padding: 6px; font-size: 0.9rem; }
+.pv-menu-title { margin: 2px 8px 4px; font-weight: 600; }
+.pv-menu-group + .pv-menu-group { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 4px; }
+.pv-menu-head { margin: 2px 8px; color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.pv-menu-item { display: flex; flex-direction: column; align-items: flex-start; width: 100%; text-align: left; font: inherit; color: inherit; background: none; border: 0; border-radius: 5px; padding: 5px 8px; cursor: pointer; }
+.pv-menu-item:hover, .pv-menu-item:focus-visible { background: rgb(31 78 140 / 0.16); }
+.pv-menu-item:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.pv-menu-item[aria-disabled="true"] { cursor: default; }
+.pv-menu-item[aria-disabled="true"] > span:first-child { color: var(--muted); }
+.pv-menu-item[aria-disabled="true"]:hover { background: none; }
+.pv-menu-note { color: var(--muted); font-size: 0.8rem; }
+/* A line that opens a submenu: its name, and an arrow at the right; dimmed when nothing in it can be chosen now */
+.pv-menu-item.pv-menu-parent { flex-direction: row; justify-content: space-between; align-items: center; }
+.pv-menu-item.pv-menu-parent[aria-expanded="true"] { background: rgb(31 78 140 / 0.12); }
+.pv-menu-item.pv-menu-parent.none > span:first-child { color: var(--muted); }
+.pv-menu-arrow { color: var(--muted); font-size: 1.1rem; line-height: 1; }
+.pv-menu.pv-submenu { z-index: 41; width: 300px; }
+.pv-actions-row { display: flex; align-items: center; gap: 10px; }
 .pv-pop { position: absolute; z-index: 10; width: 330px; max-width: 90%; background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 20px rgb(0 0 0 / 0.25); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; pointer-events: none; font-size: 0.9rem; }
 .pv-pop-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .pv-finding { border-left: 3px solid var(--line); padding-left: 8px; display: flex; flex-direction: column; gap: 2px; }
 .pv-finding.sev-high { border-color: var(--bad); } .pv-finding.sev-review { border-color: var(--warn); } .pv-finding.sev-suggest { border-color: var(--accent); }
-.pv-side { position: sticky; top: 8px; max-height: calc(100vh - 140px); overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+.pv-side { position: sticky; top: calc(var(--topbar-h) + var(--pv-top-h, 0px) + 8px); max-height: calc(100vh - var(--topbar-h) - var(--pv-top-h, 0px) - 24px); overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
 .pv-section { display: flex; flex-direction: column; gap: 10px; }
 .pv-fields { border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.pv-order { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
-.pv-order li { display: flex; gap: 6px; align-items: center; justify-content: space-between; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; background: var(--surface); counter-increment: order; }
-.pv-order li::before { content: counter(order); font: 600 11px var(--mono); color: var(--muted); min-width: 18px; }
-.pv-order li.selected { border-color: var(--focus); }
-.pv-order li[draggable="true"] { cursor: grab; }
-.pv-order-item { text-align: left; text-decoration: none; flex: 1; min-width: 0; overflow: hidden; }
-.pv-order-btns { display: flex; gap: 2px; flex: none; }
+/* A cell's headers: one checkbox per header cell of its table; a long table's list scrolls */
+.pv-headers { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px 8px; margin: 0; max-height: 16em;
+  overflow: auto; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pv-headers legend { font-weight: 600; padding: 0 4px; }
 .pv-pending { padding-left: 1.2em; margin: 0; display: flex; flex-direction: column; gap: 4px; }
-.pv-grid.no-side { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.pv-grid.no-side { grid-template-columns: minmax(0, var(--pv-l, 1fr)) 10px minmax(0, var(--pv-r, 1fr)); }
+/* Drawn from an unsaved change (a list being built): dashed until it's saved */
+.pv-box.pending { border-style: dashed; border-width: 2px; }
 .pv-box.hl { outline: 3px dashed var(--focus); outline-offset: 2px; background: rgb(31 78 140 / 0.15); z-index: 5; }
 .pv-tree-body { background: var(--surface); }
 .pv-tree-btns { margin-left: auto; display: flex; gap: 10px; }
@@ -239,8 +383,28 @@ main.wide { max-width: none; padding-inline: 16px; }
 .pv-tree-row { display: flex; align-items: center; gap: 6px; padding-top: 2px; padding-bottom: 2px; padding-right: 6px; border-radius: 4px; cursor: pointer; min-width: 0; }
 .pv-tree-row:hover { background: rgb(31 78 140 / 0.08); }
 .pv-tree-row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.pv-tree-row.ghost { box-shadow: inset 2px 0 0 var(--note); } /* part of an unsaved list, drawn before it's saved */
+/* An isolated tag: the rest of the tree and the page are veiled, three quarters covered */
+.pv-tree-row.veiled { opacity: 0.25; }
+.pv-veil { position: absolute; inset: 0; pointer-events: none; z-index: 6; }
+.pv-veil-fill { fill: var(--bg); opacity: 0.75; }
 .pv-tree-row.selected { background: rgb(31 78 140 / 0.16); box-shadow: inset 3px 0 0 var(--focus); }
 .pv-tree-row.decorative .pv-tree-text { font-style: italic; color: var(--muted); }
+/* Tags that were in the document as uploaded: a light blue row and the word "original" (never color alone).
+   Unsaved changes and the selection, defined below, show over it. */
+.pv-tree-row.orig { background: var(--accent-soft); }
+.pv-tree-row.orig:hover { background: rgb(31 78 140 / 0.18); }
+.pv-tree-row.orig.selected { background: rgb(31 78 140 / 0.26); box-shadow: inset 3px 0 0 var(--focus); }
+.pv-tree-orig { flex: none; color: var(--accent); font-weight: 600; white-space: nowrap; }
+.pv-tree-key { margin: 0 0 4px; padding: 0 6px; }
+/* Tags with unsaved changes: tinted, with a bar and a word saying what changed (never color alone) */
+.pv-tree-row.edited { background: var(--note-soft); box-shadow: inset 3px 0 0 var(--note); }
+.pv-tree-row.edited.selected { background: rgb(31 78 140 / 0.16); box-shadow: inset 3px 0 0 var(--focus); }
+.pv-tree-undo { flex: none; border: 1px solid var(--note); background: var(--surface); color: var(--note); border-radius: 4px; padding: 0 6px; line-height: 18px; cursor: pointer; font-size: 13px; }
+.pv-tree-undo:hover, .pv-tree-undo:focus-visible { background: var(--note); color: var(--surface); }
+.pv-tree-head { padding: 8px 6px 2px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); margin-bottom: 2px; }
+.pv-tree-no { flex: none; width: 2.2em; text-align: right; font-variant-numeric: tabular-nums; }
+.pv-tree-edit { flex: none; color: var(--note); font-weight: 600; white-space: nowrap; }
 .pv-tree-tog { flex: none; width: 16px; height: 18px; padding: 0; border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 11px; line-height: 18px; }
 .pv-tree-role { flex: none; font: 600 11px/16px var(--mono); color: #fff; background: var(--box, #5b6b82); padding: 0 5px; border-radius: 3px; }
 .pv-tree-role.r-heading { --box: #7a3fb0; } .pv-tree-role.r-figure { --box: #17703f; } .pv-tree-role.r-table { --box: #b45f06; }
@@ -250,6 +414,10 @@ main.wide { max-width: none; padding-inline: 16px; }
 .pv-tree-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pv-tree-page { flex: none; font-variant-numeric: tabular-nums; }
 .pv-tabs { display: flex; gap: 4px; align-items: center; border-bottom: 1px solid var(--line); margin: -4px 0 0; }
+/* The editing panel's tabs and Save stay at its top while the panel scrolls: inside the panel where it scrolls by
+   itself (wide windows), under the viewer's heading where the page scrolls */
+.pv-side .pv-tabs { position: sticky; top: calc(var(--topbar-h) + var(--pv-top-h, 0px)); z-index: 2; background: var(--surface); padding-top: 4px; }
+@media (min-width: 1201px) { .pv-side .pv-tabs { top: -14px; } }
 .pv-tabs [role="tab"] { border: 1px solid transparent; border-bottom: 0; background: none; padding: 6px 10px; border-radius: 6px 6px 0 0; cursor: pointer; color: var(--muted); font: inherit; font-size: 0.9rem; margin-bottom: -1px; }
 .pv-tabs [role="tab"].active { border-color: var(--line); background: var(--surface); color: var(--fg); font-weight: 600; }
 .pv-tabs [role="tab"]:focus-visible { outline: 2px solid var(--focus); }
@@ -267,6 +435,15 @@ main.wide { max-width: none; padding-inline: 16px; }
 .svc-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 .svc-card h3 { margin: 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .ext-link { white-space: nowrap; }
+/* The live view of the queues: the "Now" cell holds a state, a stage and a bar, so it gets the room */
+.queue-live-table td:nth-child(5) { min-width: 240px; }
+.queue-live-table .meter { margin-top: 4px; max-width: 260px; }
+.report-pills button.pill-link { background: none; font: inherit; color: inherit; cursor: pointer; }
+/* A button that reads as a link: it opens something on this page instead of going somewhere */
+.link-button { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; text-align: left; }
+.confirm-dialog.gateway-help { width: min(560px, calc(100vw - 32px)); max-width: none; }
+.gateway-help ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }
+.gateway-help pre { margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; font-family: var(--mono); font-size: 0.85rem; }
 
 .brand-logo { max-height: 32px; width: auto; }
 .login-logo { max-height: 64px; max-width: 240px; width: auto; align-self: flex-start; }
@@ -354,6 +531,11 @@ tr.row-panel td { background: var(--accent-soft); padding-top: 0; }
 
 .confirm-dialog { background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: 20px;
   max-width: min(440px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 14px; }
+/* A dialog that explains choices (deleting a tag): room for them, and nothing spills out however long a quoted
+   text is or wherever on the page the dialog was opened from */
+.confirm-dialog:has(.choices) { width: min(640px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); overflow-y: auto; }
+.confirm-dialog p, .confirm-dialog .check span { overflow-wrap: anywhere; min-width: 0; }
+.confirm-dialog .choices { max-height: none; overflow: visible; margin: 0; }
 .confirm-dialog:not([open]) { display: none; }
 .confirm-dialog::backdrop { background: rgb(0 0 0 / 0.45); }
 
@@ -644,8 +826,22 @@ th .sort-btn:hover { color: var(--accent); }
 .doc-file-name { font-weight: 700; color: var(--accent); }
 .doc-file-hint { font-size: 0.82rem; color: var(--muted); }
 .doc-file + .linkbtn { align-self: flex-start; }
+/* The human-reviewed file: first among the downloads, and marked out */
+.doc-reviewed { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 2px solid var(--accent); border-radius: 10px;
+  background: var(--accent-soft); }
+.doc-reviewed select { max-width: 100%; }
+.doc-reviewed .btn { align-self: flex-start; }
 .doc-technical summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
 .doc-technical ul { margin: 6px 0 0; padding-left: 18px; }
+th.select-col, td.select-col { width: 2.2rem; text-align: center; }
+.selection-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; padding: 8px 12px;
+  border-radius: 10px; background: var(--accent-soft); }
+.doc-removal { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; border-top: 1px solid var(--line); padding-top: 10px; }
+.doc-removal:empty { display: none; }
+.doc-removal p { margin: 0; }
+.doc-admin-removal summary { cursor: pointer; color: var(--muted); }
+.doc-admin-removal[open] { display: flex; flex-wrap: wrap; gap: 8px; }
+.doc-admin-removal[open] summary { flex-basis: 100%; }
 .review { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .review-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .review-chips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -679,7 +875,7 @@ th .sort-btn:hover { color: var(--accent); }
 }
 
 .doc-side-toggle { align-self: flex-end; }
-.doc-rail { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; position: sticky; top: 12px; }
+.doc-rail { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; position: sticky; top: calc(var(--topbar-h) + 12px); }
 .doc-rail-btn { font: inherit; font-size: 0.85rem; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 12px;
   border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--fg); cursor: pointer; min-width: 84px; }
 .doc-rail-btn:hover { border-color: var(--accent); color: var(--accent); }
@@ -689,3 +885,22 @@ th .sort-btn:hover { color: var(--accent); }
 }
 #doc-downloads:focus, #doc-help:focus { outline: none; }
 #doc-downloads:focus-visible > *, #doc-help:focus-visible > * { box-shadow: 0 0 0 3px var(--focus); }
+.plain-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.bot-check { margin-top: 12px; }
+.bot-check p { margin: 4px 0 0; }
+.pv-tree-row[data-drop="before"] { box-shadow: inset 0 2px 0 var(--accent); }
+.pv-tree-row[data-drop="after"] { box-shadow: inset 0 -2px 0 var(--accent); }
+.pv-tree-row[data-drop="before-no"], .pv-tree-row[data-drop="after-no"] { box-shadow: inset 0 0 0 1px var(--bad, #b42318); cursor: no-drop; }
+.pv-tree-row[draggable="true"] { cursor: grab; }
+.pv-tree-note { margin: 0 0 4px; min-height: 1.2em; }
+.pv-page-input { width: 4.5em; }
+.pv-top .pv-reader { grid-column: 1 / -1; margin: 0; }
+.pv-reader-about summary { cursor: pointer; }
+.pv-reader { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 8px 12px; margin: 0 0 12px; }
+.pv-reader-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.pv-reader-row select { width: auto; max-width: 100%; }
+.pv-reader-title { font-size: 1rem; margin: 0; }
+.pv-reader-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.pv-reader-close { margin-left: auto; }
+.pv-reader-now { margin: 6px 0 2px; }
+.pv-reader kbd { font: 600 11px var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }

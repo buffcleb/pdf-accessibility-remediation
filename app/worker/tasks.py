@@ -8,6 +8,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 
 from app.pipeline.orchestrator import AIProviderUnavailable, JobOptions, run_remediation
 from app.storage import JobStore, purge_expired_jobs
+from app.validation.verapdf import job_validator
 from app.verification.model import IntegrityError
 from app.worker.celery_app import celery_app
 
@@ -27,7 +28,8 @@ def remediate(self, job_id: str) -> dict:
             log.debug("progress update failed", exc_info=True)
 
     try:
-        result = asyncio.run(run_remediation(store, options, progress))
+        with job_validator(meta.get("flags")):
+            result = asyncio.run(run_remediation(store, options, progress))
         store.write_result(result)
         return {"job_id": job_id, "status": "completed"}
     except AIProviderUnavailable as exc:
@@ -64,7 +66,8 @@ def remediate_adobe(self, job_id: str) -> dict:
     from app.pipeline.adobe_job import adobe_error, run_adobe
 
     store = JobStore(job_id)
-    options = JobOptions.from_meta(store.read_meta() or {})
+    meta = store.read_meta() or {}
+    options = JobOptions.from_meta(meta)
 
     def progress(stage: str, pct: int) -> None:
         try:
@@ -73,7 +76,8 @@ def remediate_adobe(self, job_id: str) -> dict:
             log.debug("progress update failed", exc_info=True)
 
     try:
-        store.write_result(asyncio.run(run_adobe(store, options, progress)))
+        with job_validator(meta.get("flags")):
+            store.write_result(asyncio.run(run_adobe(store, options, progress)))
         return {"job_id": job_id, "status": "completed"}
     except AdobeError as exc:
         log.error("adobe job %s failed: %s", job_id, exc)
@@ -94,7 +98,7 @@ def remediate_adobe(self, job_id: str) -> dict:
 
 @celery_app.task(bind=True, name="app.worker.tasks.edit_tags")
 def edit_tags(self, job_id: str) -> dict:
-    """Apply people's tag edits (from the portal's tag viewer) and validate the result."""
+    """Apply people's tag edits (from the portal's tag manager) and validate the result."""
     from app.pipeline.edit_job import run_edit
     from app.tagging.editor import EditError
 
@@ -107,7 +111,8 @@ def edit_tags(self, job_id: str) -> dict:
             log.debug("progress update failed", exc_info=True)
 
     try:
-        store.write_result(asyncio.run(run_edit(store, progress)))
+        with job_validator((store.read_meta() or {}).get("flags")):
+            store.write_result(asyncio.run(run_edit(store, progress)))
         return {"job_id": job_id, "status": "completed"}
     except EditError as exc:
         store.write_error({"error": "edit_rejected", "detail": str(exc)})

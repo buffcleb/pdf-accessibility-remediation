@@ -150,9 +150,12 @@ def ask_for_help(job_id: uuid.UUID, request: Request,
     job = db.get(Job, job_id)
     if job is None or job.user_id != p.user.id:
         raise not_found("Job")
-    if job.status != "completed" or job.files_deleted_at is not None:
+    failed = job.status == "failed"
+    if not failed and (job.status != "completed" or job.files_deleted_at is not None):
         raise ApiError(422, "not_ready", "You can ask for help once the document has finished and while its files are kept.")
-    if kind not in HELP_KINDS:
+    if failed:
+        kind, version, page, tag = "failed", None, None, None  # there is no result to point into
+    elif kind not in HELP_KINDS or kind == "failed":
         raise ApiError(422, "invalid", "Choose a kind of problem from the list.")
     body = body.strip()
     if not body:
@@ -438,7 +441,7 @@ def resolve(request_id: uuid.UUID, body: Resolve, request: Request,
             p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
     """Finish a request: resolved (usually with a new version) or closed without changes. The note is posted to
     the person; pages can be given back through the usual audited usage correction."""
-    from portal import quota
+    from portal import quota, services
     from portal.routers.admin import _actor
 
     req, role = _visible(db, request_id, p, lock=True)
@@ -461,6 +464,8 @@ def resolve(request_id: uuid.UUID, body: Resolve, request: Request,
         owner = db.get(User, req.user_id)
         ai_given_back = bool((job.cost or {}).get("ai_refunded"))
         for key in [k for k in (job.charged_services or [job.processing]) if not (ai_given_back and k == job.ai_tier)]:
+            if services.get_service(db, key) is None:
+                continue  # an AI level deleted since: its pools went with it, so there is nowhere to give pages back
             quota.correct_usage(db, owner, -body.refund_pages, _actor(p, request),
                                 comment=f"Help request about {req.filename}", ticket_ref=None, service=key)
         req.pages_refunded = body.refund_pages

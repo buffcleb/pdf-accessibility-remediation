@@ -15,6 +15,8 @@ waiting. The choice is remembered.
 
 A badge on **Administration** counts what's waiting for you, such as people waiting for approval.
 
+![A group admin's view of Northfield University: tabs for Overview, Services and pages, People, Help requests, Documents, Reports and Group settings; Needs attention showing All clear; 492 of 500 Standard pages and 292 of 300 Commercial AI pages left; the access check; and the page ledger.](../../images/group-admin.png)
+
 ## Attention
 
 The first page: what needs action, most serious first, each with what to do about it.

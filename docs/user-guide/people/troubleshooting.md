@@ -7,7 +7,7 @@
 | What you see | What it means | What to do |
 |---|---|---|
 | No code arrives | It may be in junk, or delayed | Wait a minute, check junk, then **Send a new code**. If codes never arrive, contact your administrators: they can issue one another way |
-| "Your email address isn't set up for this service" | Your email's domain isn't linked to a group | Contact the people who run the service for your organization |
+| "Your email address isn't set up for this service" | Neither your address nor your email's domain is linked to a group | Contact the people who run the service for your organization; they can add your domain, or just your address |
 | "That code is wrong or has expired" | Codes last 10 minutes, and only the newest works | Request a new code and use that one |
 | "Your account has been disabled" | An administrator disabled it | Contact your group's administrator |
 | "Waiting for approval" on My documents | Your group approves new people first | Wait for the email; **Check again** refreshes |
@@ -29,6 +29,7 @@
 |---|---|---|
 | **Waiting** for a long time | Others are ahead, or you already have several documents running | Nothing; it goes ahead in turn |
 | **Large document** | Big documents take turns with smaller ones | Nothing; it may take longer to start |
+| **Waiting for a free place** | The option you chose is handling as many documents as it can at once | Nothing; it starts when one finishes |
 | **Waiting for tomorrow** | An option's daily limit has been reached | It goes ahead the next day, or ask an administrator |
 | **Paused by support** | Support paused that option for now | It goes ahead when it's resumed |
 | **Failed** | Something went wrong; the page says what | Try again, or ask for help. If the AI was unavailable, your pages are given back |
@@ -41,7 +42,8 @@
 | "Doesn't yet pass PDF/UA-1" | Some rules still fail | See **Still failing** in the report. Font problems are usually solved in the modified file, if there is one |
 | Two files | The document can't pass without a visible change | See [Which file to use](your-results.md#which-file-to-use) |
 | A long review list | Many things a machine couldn't be sure about | Start with **High**; suggestions are optional |
-| Alt text that's wrong | AI-written descriptions are drafts | Fix it in the [tag viewer](tag-viewer.md), or ask for help |
-| The files are gone | Files are kept for a set time (shown on the document), then removed | Upload the document again if you still need it |
+| Alt text that's wrong | AI-written descriptions are drafts | Fix it in the [tag manager](tag-manager/figures.md), or ask for help |
+| The files are gone | Files are kept for a set time (shown on the document), then removed; or the document was [marked done](your-results.md#when-youre-done-with-a-document) | Upload the document again if you still need it |
+| I marked a document done by mistake | The files are kept for a short hold first | On its page, choose **Keep the files** before the time shown |
 
 Still stuck? [Ask for help](getting-help.md) on the document's page.

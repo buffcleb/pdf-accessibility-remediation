@@ -12,7 +12,7 @@ def _req(headers: dict, host: str = "192.0.2.7"):
 
 
 def _settings(monkeypatch, **kw):
-    s = SimpleNamespace(trust_proxy_headers=True, client_ip_header="cf-connecting-ip", **kw)
+    s = SimpleNamespace(trust_proxy_headers=True, client_ip_header="cf-connecting-ip", trusted_proxy_hops=1, **kw)
     monkeypatch.setattr(audit, "get_portal_settings", lambda: s)
     return s
 
@@ -20,7 +20,7 @@ def _settings(monkeypatch, **kw):
 def test_cloudflares_header_by_default(monkeypatch):
     _settings(monkeypatch)
     assert audit.client_ip(_req({"cf-connecting-ip": "203.0.113.9", "x-client-ip": "198.51.100.1"})) == "203.0.113.9"
-    assert audit.client_ip(_req({"x-forwarded-for": "198.51.100.4, 192.0.2.1"})) == "198.51.100.4"
+    assert audit.client_ip(_req({"x-forwarded-for": "198.51.100.4"})) == "198.51.100.4"
     assert audit.client_ip(_req({"cf-connecting-ip": "not-an-ip"})) is None
 
 
@@ -34,3 +34,18 @@ def test_untrusted_headers_are_ignored(monkeypatch):
     s = _settings(monkeypatch)
     s.trust_proxy_headers = False
     assert audit.client_ip(_req({"cf-connecting-ip": "203.0.113.9"})) == "192.0.2.7"
+
+
+def test_forwarded_for_is_read_from_the_end_so_it_cant_be_made_up(monkeypatch):
+    """A load balancer adds the address it saw at the end; whatever the caller sent stays in front of it."""
+    s = _settings(monkeypatch)
+    s.client_ip_header = "x-forwarded-for"
+    assert audit.client_ip(_req({"x-forwarded-for": "192.0.2.99, 203.0.113.9"})) == "203.0.113.9"
+    assert audit.client_ip(_req({"x-forwarded-for": "203.0.113.9"})) == "203.0.113.9"
+    # ...and a made-up Cloudflare header is ignored when Cloudflare isn't the proxy
+    assert audit.client_ip(_req({"cf-connecting-ip": "192.0.2.99", "x-forwarded-for": "203.0.113.9"})) == "203.0.113.9"
+    # Two trusted proxies in a row (a CDN, then a load balancer): two places from the end
+    s.trusted_proxy_hops = 2
+    assert audit.client_ip(_req({"x-forwarded-for": "192.0.2.99, 203.0.113.9, 198.51.100.20"})) == "203.0.113.9"
+    assert audit.client_ip(_req({"x-forwarded-for": "203.0.113.9"})) == "203.0.113.9"
+    assert audit.client_ip(_req({})) == "192.0.2.7"

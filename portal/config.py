@@ -67,12 +67,19 @@ class PortalSettings(BaseSettings):
     rate_otp_per_email: int = 5
     rate_otp_per_ip: int = 30
     rate_verify_per_ip: int = 50
+    # Cloudflare Turnstile bot check on "Email me a code" (off unless both keys are set; see security/botcheck.py)
+    turnstile_site_key: str = ""
+    turnstile_secret_key: str = ""
+    turnstile_fail_open: bool = True  # Cloudflare unreachable: allow (the rate limits still apply) rather than refuse
 
     # Trust X-Forwarded-For from a proxy in front of the API (Cloudflare, ALB, nginx)
     trust_proxy_headers: bool = False
     # With trusted proxy headers: the header holding the caller's address. Cloudflare sets cf-connecting-ip; behind
     # the Cloudflare Worker front end (which forwards /api/ to the cluster) the Worker passes it as x-client-ip.
     client_ip_header: str = "cf-connecting-ip"
+    # Behind proxies that aren't Cloudflare, set the header to x-forwarded-for: the caller's address is then the one
+    # this many places from the end of X-Forwarded-For (each trusted proxy adds one; the web app's nginx sends one)
+    trusted_proxy_hops: int = 1
 
     # Object storage (any S3 API: AWS S3, SeaweedFS, MinIO...). Leave the endpoint empty for AWS.
     storage_backend: str = "s3"  # s3 | memory (tests)
@@ -89,15 +96,24 @@ class PortalSettings(BaseSettings):
     engine_api_key: str = ""
     engine_ai_provider: str = "localai"
     engine_ai_model: str = ""
-    engine_max_in_flight: int = 4  # jobs the portal keeps at the engine at once
+    # Jobs the portal keeps at the engine at once: at least this many, and as many as the engine's running workers
+    # process at once when that's more (workers scaled with the queue), up to the ceiling
+    engine_max_in_flight: int = 4
+    engine_in_flight_ceiling: int = 64
+    engine_capacity_cache_seconds: float = 30.0
     engine_timeout_seconds: float = 60.0
-    # Where super admins open the AI gateway's (LiteLLM's) admin UI, linked from Administration.
-    # Empty hides the link.
-    gateway_admin_url: str = "http://localhost:4000/ui"
+    # Where super admins open the AI gateway's (LiteLLM's) admin UI, linked from Administration. Empty (the default)
+    # shows how to reach it instead of a link: set it only to an address super admins' browsers can reach
+    # (docker-compose.portal.yml sets the local stack's http://localhost:4000/ui).
+    gateway_admin_url: str = ""
 
     # Background worker
     worker_poll_seconds: float = 3.0
     worker_sweep_minutes: int = 60
+    # Review items (what to check, most serious first) kept with a document and with each saved version, to list in
+    # the app. The rest stay in the JSON report. Raise it with the engine's VERIFY_AI_MAX_ITEMS, or part of what
+    # was reviewed has nowhere to show.
+    review_findings_max: int = 300
 
     @property
     def cors_origin_list(self) -> list[str]:

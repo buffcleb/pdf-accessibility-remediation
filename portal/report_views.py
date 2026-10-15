@@ -27,7 +27,7 @@ from portal import audit, email_reports, live_reports, outbox, settings_store
 from portal.config import get_portal_settings
 from portal.email_reports import CATCH_UP, latest_period, period_label
 from portal.errors import ApiError, not_found
-from portal.mail import ATTACHMENTS, Mail
+from portal.mail import Mail, attachment_limit
 from portal.models import MailOutbox, ReportSend, RoleAssignment, SavedReport, User
 
 log = logging.getLogger(__name__)
@@ -239,9 +239,10 @@ def compose(db: Session, view: SavedReport, recipient: User, frequency: str, sta
         w.writerows(all_rows)
         data_bytes = buf.getvalue().encode("utf-8-sig")
         name = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in view.name.lower()).strip("-") or "report"
-        if get_portal_settings().mail_backend not in ATTACHMENTS:
+        limit = attachment_limit()
+        if limit == 0:
             csv_note = "This mail service can't send attachments: download the CSV from the report in the app."
-        elif len(data_bytes) > MAX_ATTACHMENT:
+        elif len(data_bytes) > min(MAX_ATTACHMENT, limit or MAX_ATTACHMENT):
             csv_note = "The CSV is too big to attach: download it from the report in the app."
         else:
             attachments.append((f"{name}-{start.astimezone(zone).date().isoformat()}.csv", "text/csv; charset=utf-8",

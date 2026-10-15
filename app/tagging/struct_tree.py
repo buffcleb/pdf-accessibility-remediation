@@ -11,9 +11,11 @@ from pikepdf import Array, Dictionary, Name, String
 
 from app.pipeline.lists import fix_row_order, label_order, nest
 from app.pipeline.models import DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, TextBlock, bbox_intersection
-from app.pipeline.structure import row_top
-from app.tagging.content_marker import StreamMarks, apply
-from app.tagging.existing_tags import _is_struct_elem
+from app.pipeline.structure import caption_pairs, footnote_words, row_top
+from app.tagging.content_marker import StreamMarks, apply, mcid_of
+from app.tagging.existing_tags import _is_struct_elem, _role_map, resolve_role
+from app.tagging.table_headers import header_links, id_of, is_complex, write_id_tree
+from app.tagging.targets import MARK_ROLES, mark_key
 
 ObjGen = tuple[int, int]
 log = logging.getLogger(__name__)
@@ -33,6 +35,10 @@ class BuildStats:
     figures_with_alt: int = 0
     figures_without_alt: int = 0
     tables: int = 0
+    tables_linked: int = 0  # complex tables whose cells name their headers (Headers and ID)
+    footnotes: int = 0  # footnotes tagged as Note, linked from the text that points at them
+    footnote_references: int = 0  # footnote marks tagged as a Reference of their own, in the text they are in
+    notes_given_ids: int = 0  # Notes kept from the document that had no ID (PDF/UA requires one)
     links: int = 0
     annotations: int = 0
     contents_added: int = 0
@@ -82,6 +88,8 @@ class StructTreeBuilder:
         self.refs: dict[str, list[Ref]] = defaultdict(list)
         self.key_elems: dict[str, pikepdf.Object] = {}  # leaf key -> element (for annotation placement)
         self.key_page: dict[str, int] = {}
+        self.inserted: list[pikepdf.Object] = []  # elements added under the document tag (kept trees place them)
+        self.ids: set[bytes] | None = None  # element IDs in the tree, gathered when the first is made
 
     # ------------------------------------------------------------------ entry
     def build(self, marks: dict[int, list[StreamMarks]], retain_root: bool) -> pikepdf.Object:
@@ -99,8 +107,71 @@ class StructTreeBuilder:
         self._normalize_headings(doc)
         if not retain_root:
             self._sectionize(doc)
+        self._link_notes()
+        self._link_table_notes()
+        self._note_ids(root)
         self._parent_tree(root)
+        if self.ids is not None:
+            self._id_tree(root)
         return root
+
+    def _link_notes(self) -> None:
+        """Each footnote mark tagged as a Reference names its footnote's tag in /Ref (PDF 2.0: the elements this one
+        refers to). Where a mark couldn't be tagged apart (it was drawn in one piece with its word), the text it is in
+        names the footnote instead."""
+        for page in self.analysis.pages:
+            for b in page.blocks:
+                if not b.notes:
+                    continue
+                rest = []
+                for i, note in enumerate(b.mark_notes):
+                    target = self.key_elems.get(note) if note else None
+                    ref = self.key_elems.get(mark_key(b.id, i))
+                    if target is None:
+                        continue
+                    if ref is not None:
+                        ref.Ref = Array([target])
+                    elif target not in rest:
+                        rest.append(target)
+                rest += [self.key_elems[n] for n in b.notes if n in self.key_elems and not b.mark_notes]
+                src = self.key_elems.get(b.id)
+                if src is not None and rest:
+                    src.Ref = Array(rest)
+
+    def _link_table_notes(self) -> None:
+        """Each cell carrying a table note's symbol names the note in /Ref."""
+        for page in self.analysis.pages:
+            for t in page.tables:
+                for c in t.cells if t.notes else []:
+                    cell = self.key_elems.get(t.cell_target_id(c))
+                    targets = [self.key_elems[n] for sym, n in t.notes.items() if sym in (c.text or "") and n in self.key_elems]
+                    if cell is not None and targets:
+                        cell.Ref = Array(targets)
+
+    def _note_ids(self, root) -> None:
+        """Every Note needs an ID (PDF/UA-1 7.9), a kept document's own included ("Footnote" mapped to Note too)."""
+        role_map = _role_map(root)
+        for e in _iter_elems(root):
+            if resolve_role(str(e.get("/S", ""))[1:], role_map) == "Note" and not id_of(e) and e.is_indirect:
+                e.ID = self._new_id(f"note-{e.objgen[0]}")
+                self.stats.notes_given_ids += 1
+
+    def _new_id(self, want: str) -> String:
+        """An element ID no other element in the tree has (kept tags may have their own)."""
+        if self.ids is None:
+            root = self.pdf.Root.get("/StructTreeRoot")
+            self.ids = {id_of(e) for e in _iter_elems(root)} if isinstance(root, Dictionary) else set()
+            self.ids.discard(b"")
+        name, n = want.encode(), 1
+        while name in self.ids:
+            n += 1
+            name = f"{want}-{n}".encode()
+        self.ids.add(name)
+        return String(name)
+
+    def _id_tree(self, root) -> None:
+        if any(id_of(e) for e in _iter_elems(root)):  # the tables that would have had them may have come to nothing
+            write_id_tree(self.pdf, root, _iter_elems(root))
 
     def _sectionize(self, doc) -> None:
         """Group each heading with the content that follows it into nested Sect elements, so the
@@ -147,11 +218,17 @@ class StructTreeBuilder:
             if key in self.key_elems or not refs:
                 continue
             page = refs[0].page_index
-            e = self._elem("P", doc, page)
-            if self._attach_refs(e, key, page):
-                self._insert_for_page(doc, page, [e])
+            el = self.analysis.pages[page].element(key) if page < len(self.analysis.pages) else None
+            if isinstance(el, ImageRegion):
+                # A picture keeps its Figure tag and alt text (an empty P would say nothing)
+                new = self._figure(el, doc)
+            else:
+                e = self._elem("P", doc, page)
+                new = [e] if self._attach_refs(e, key, page) else []
+            if new:
+                self._insert_for_page(doc, page, new)
                 self.stats.leftover_content += 1
-                log.warning("content for %s had no element; tagged as P", key)
+                log.warning("content for %s had no element; tagged as %s", key, str(new[0].S)[1:])
 
     def _normalize_headings(self, doc) -> None:
         """PDF/UA 7.4.2: in final (reading) order the first heading is H1 and levels never skip."""
@@ -195,6 +272,45 @@ class StructTreeBuilder:
         self.stats.elements[role] += 1
         return self.pdf.make_indirect(d)
 
+    def _attach_text(self, elem: pikepdf.Object, block: TextBlock, page_index: int) -> bool:
+        """A text block's content, with each footnote mark marked apart (targets.mark_key) as a Reference inside it,
+        in the order the page draws them. When every mark became a Reference and the read-aloud text was only there to
+        say them, each Reference says "footnote 1" and the text reads as drawn."""
+        marks = [(mark_key(block.id, i), mk) for i, (mk, note) in enumerate(zip(block.marks, block.mark_notes))
+                 if note and block.role in MARK_ROLES]
+        found = [(k, mk) for k, mk in marks if self.refs.get(k)]
+        if not found:
+            return self._attach_refs(elem, block.id, page_index)
+        tagged = [(r, None) for r in self.refs.get(block.id, [])] + [(r, km) for km in found for r in self.refs[km[0]]]
+        made: dict[str, pikepdf.Object] = {}
+        all_said = block.says_marks_only and len(found) == len(marks)
+        for r, km in sorted(tagged, key=lambda t: (t[0].page_index, t[0].is_form, t[0].mcid)):
+            item = r.mcid if not r.is_form and r.page_index == page_index else self._mcr(r)
+            if km is None:
+                elem.K.append(item)
+                continue
+            ref = made.get(km[0])
+            if ref is None:
+                ref = made[km[0]] = self._elem("Reference", elem, page_index)
+                if all_said:
+                    ref.ActualText = String(footnote_words(km[1]))
+                elem.K.append(ref)
+                self.key_elems[km[0]] = ref
+                self.stats.footnote_references += 1
+            ref.K.append(item)
+        if all_said and "/ActualText" in elem:
+            del elem["/ActualText"]  # the References say the marks; the words are read as drawn
+        elem.Pg = self.page_objs[page_index]
+        self.key_elems[block.id] = elem
+        self.key_page[block.id] = page_index
+        return True
+
+    def _mcr(self, r: Ref) -> Dictionary:
+        mcr = Dictionary(Type=Name.MCR, Pg=self.page_objs[r.page_index], MCID=r.mcid)
+        if r.is_form:
+            mcr.Stm = r.owner
+        return mcr
+
     def _attach_refs(self, elem: pikepdf.Object, key: str, page_index: int) -> bool:
         refs = self.refs.get(key)
         if not refs:
@@ -231,6 +347,10 @@ class StructTreeBuilder:
                     out.append(lst)
             run.clear()
 
+        pairs = caption_pairs(page)  # caption id -> figure or table id; each caption is placed with its partner
+        caption_of = {partner: cap for cap, partner in pairs.items()}
+        order = {eid: n for n, eid in enumerate(page.reading_order)}
+
         for eid in page.reading_order:
             el = page.element(eid)
             if isinstance(el, TextBlock) and el.role == "LI":
@@ -239,7 +359,7 @@ class StructTreeBuilder:
             flush_run()
 
             if isinstance(el, TextBlock):
-                if el.role == "Artifact":
+                if el.role == "Artifact" or el.id in pairs:
                     continue
                 role = "P" if el.role == "Caption" else el.role
                 e = self._elem(role, doc, page.number)
@@ -248,14 +368,17 @@ class StructTreeBuilder:
                     e.Alt = String(el.actual_text or el.text)
                 elif el.actual_text:
                     e.ActualText = String(el.actual_text)
-                if self._attach_refs(e, el.id, page.number):
+                if self._attach_text(e, el, page.number):
                     out.append(e)
+                    if role == "Note":  # PDF/UA: a note has an ID, for what points at it
+                        e.ID = self._new_id(f"note-{el.id}")
+                        self.stats.footnotes += 1
             elif isinstance(el, ImageRegion):
                 if el.decorative:
                     continue
-                out.extend(self._figure(el, doc))
+                out.extend(self._captioned(self._figure(el, doc), el, page, caption_of, order, doc))
             elif isinstance(el, TableRegion):
-                out.extend(self._table(el, doc))
+                out.extend(self._captioned(self._table(el, doc), el, page, caption_of, order, doc))
         flush_run()
 
         unmatched = f"p{page.number}:unmatched"
@@ -265,6 +388,43 @@ class StructTreeBuilder:
                 out.append(e)
                 self.stats.unmatched_paragraphs += 1
         return out
+
+    def _text_elem(self, block: TextBlock, role: str, parent, page_no: int) -> pikepdf.Object | None:
+        e = self._elem(role, parent, page_no)
+        if block.actual_text:
+            e.ActualText = String(block.actual_text)
+        return e if self._attach_refs(e, block.id, page_no) else None
+
+    def _captioned(self, elems: list[pikepdf.Object], region: ImageRegion | TableRegion, page: PageAnalysis,
+                   caption_of: dict[str, str], order: dict[str, int], doc) -> list[pikepdf.Object]:
+        """A figure or table with its caption. A table's Caption is its own first or last child. A figure's Caption
+        goes beside it, the two grouped in a Sect: alt text stands for everything inside the Figure, so a Caption
+        inside it wouldn't be read (PDF Association, WTPDF: the caption is the first or last child of the
+        figure's parent). Not a Div: PDF 2.0 treats Div as transparent, which would make the Caption a middle
+        child of whatever holds the Div. The caption comes first if it's read first (printed above)."""
+        cap_id = caption_of.get(region.id)
+        if cap_id is None:
+            return elems
+        block = page.element(cap_id)
+        first = order.get(cap_id, 0) < order.get(region.id, 0)
+        main = elems[0] if len(elems) == 1 else None
+        role = str(main.S)[1:] if main is not None else ""
+        if role not in ("Figure", "Table"):  # nothing tagged, or a layout table's paragraphs: a plain paragraph
+            p = self._text_elem(block, "P", doc, page.number)
+            return elems if p is None else ([p] + elems if first else elems + [p])
+        if role == "Table":
+            cap = self._text_elem(block, "Caption", main, page.number)
+            if cap is not None:
+                kids = list(main.K)
+                main.K = Array([cap] + kids if first else kids + [cap])
+            return elems
+        group = self._elem("Sect", doc, page.number)
+        cap = self._text_elem(block, "Caption", group, page.number)
+        if cap is None:
+            return elems
+        main.P = group
+        group.K = Array([cap, main] if first else [main, cap])
+        return [group]
 
     def _list(self, level, parent, page_no: int) -> pikepdf.Object | None:
         """One list level: L > LI > LBody, with each item's nested lists inside its LBody after its text."""
@@ -321,8 +481,12 @@ class StructTreeBuilder:
             attrs.Summary = String(t.summary)
         table = self._elem("Table", doc, t.page, A=attrs)
         by_row: dict[int, list] = defaultdict(list)
-        for c in t.normalized_cells():
+        cells = t.normalized_cells()
+        for c in cells:
             by_row[c.row].append(c)
+        # A table Scope can't describe links each cell to its headers by name (see table_headers)
+        links = header_links(cells, t.header_rows, t.header_cols) if is_complex(cells, t.header_rows, t.header_cols) else {}
+        ids = {h: self._new_id(f"{t.id}-r{h[0]}c{h[1]}") for heads in links.values() for h in heads}
         any_content = False
         for r in sorted(by_row):
             tr = self._elem("TR", table, t.page)
@@ -337,7 +501,11 @@ class StructTreeBuilder:
                     cattrs.RowSpan = c.row_span
                 if c.col_span > 1:
                     cattrs.ColSpan = c.col_span
+                if (c.row, c.col) in links:
+                    cattrs.Headers = Array([ids[h] for h in links[(c.row, c.col)]])
                 cell = self._elem(role, tr, t.page)
+                if (c.row, c.col) in ids:
+                    cell.ID = ids[(c.row, c.col)]
                 if len(cattrs) > 1:
                     cell.A = cattrs
                 if c.actual_text:
@@ -349,12 +517,14 @@ class StructTreeBuilder:
         if not any_content:
             return []
         self.stats.tables += 1
+        self.stats.tables_linked += bool(links)
         return [table]
 
     def _insert_for_page(self, doc, page_no: int, new: list[pikepdf.Object]) -> None:
         """Append new elements after the last existing top-level element on the same or an earlier page."""
         if not new:
             return
+        self.inserted.extend(new)
         for e in new:
             e.P = doc
         kids = list(doc.K) if isinstance(doc.get("/K"), Array) else ([doc.K] if doc.get("/K") is not None else [])
@@ -376,11 +546,18 @@ class StructTreeBuilder:
             if not isinstance(annots, Array):
                 continue
             pa = self.analysis.pages[pi]
+            # Some producers write annotations straight into the page's list, not as objects of their own. A tag
+            # can only point at an object, so those links and fields were left untagged (PDF/UA 7.18.1, 7.18.5):
+            # each becomes an object, in place
+            for n in range(len(annots)):
+                if isinstance(annots[n], Dictionary) and not annots[n].is_indirect:
+                    annots[n] = self.pdf.make_indirect(annots[n])
             for annot in annots:
                 if not isinstance(annot, Dictionary) or not annot.is_indirect:
                     continue
                 subtype = str(annot.get("/Subtype", ""))
-                if subtype in ("/Popup", "/PrinterMark", "/TrapNet") or int(annot.get("/F", 0)) & 2:
+                flags = annot.get("/F", 0)
+                if subtype in ("/Popup", "/PrinterMark", "/TrapNet") or (isinstance(flags, int) and flags & 2):
                     continue
                 role = "Link" if subtype == "/Link" else "Form" if subtype == "/Widget" else "Annot"
                 if annot.objgen in referenced:
@@ -482,8 +659,9 @@ class StructTreeBuilder:
                 elif isinstance(it, Dictionary):
                     if "/MCID" in it and not _is_struct_elem(it):
                         owner = it.get("/Stm") or it.get("/Pg") or pg
-                        if owner is not None:
-                            streams[owner.objgen][int(it.MCID)] = elem
+                        mcid = mcid_of(it)
+                        if owner is not None and mcid is not None:
+                            streams[owner.objgen][mcid] = elem
                             owners[owner.objgen] = owner
                     elif "/Obj" in it and not _is_struct_elem(it):
                         annots.append((it.Obj, elem))

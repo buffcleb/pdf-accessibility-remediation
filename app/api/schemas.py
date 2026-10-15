@@ -15,6 +15,9 @@ class RemediationFlags(BaseModel):
     verify_ai: bool = Field(default=True, description="Run the AI review layer of tag verification")
     notation_ai: bool = Field(default=True, description="Let the AI read specialist notation the layout rules can't")
     ocr_ai: bool = Field(default=True, description="Let the AI correct OCR words Tesseract was unsure of")
+    validator: Literal["service", "command_line"] | None = Field(
+        default=None, description="veraPDF's running service or its command line; default: the service when configured")
+    verapdf_ua2: bool = Field(default=True, description="Also check PDF/UA-2 (shown for information)")
     report_branding: dict[str, str] | None = Field(
         default=None, description="For the PDF report: service_name, organization, accent_color (#rrggbb), ai_label")
 
@@ -55,7 +58,9 @@ class Reports(BaseModel):
     markdown_report: str | None = None  # same report rendered as Markdown
     report_pdf: str | None = None  # same report as an accessible PDF/UA-1 PDF, for people
     tag_verification: dict[str, Any] | None = None
-    tag_maps: dict[str, str | None] | None = None  # original / primary / visual_fallback, for the tag viewer
+    tag_maps: dict[str, str | None] | None = None  # original / primary / visual_fallback, for the tag manager
+    music_files: str | None = None  # a zip of MusicXML: the notation of each music example that was read
+    music_score: str | None = None  # sheet music: the whole piece as one MusicXML file
     edits_applied: list[str] | None = None  # edit jobs: one line per tag edit
     adobe_reports: list[str] | None = None  # Adobe's own accessibility report(s) (xlsx), Adobe route only
 

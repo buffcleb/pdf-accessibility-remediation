@@ -30,13 +30,18 @@ class AIChoice:
 class Engine(Protocol):
     def submit(self, filename: str, fileobj: BinaryIO, report_only: bool, ai: "AIChoice | None" = None,
                full_review: bool = False, route: str = "standard", branding: dict | None = None,
-               no_ai: bool = False) -> str: ...
+               no_ai: bool = False, validator: dict | None = None) -> str: ...
     def submit_edit(self, filename: str, fileobj: BinaryIO, edits: list[dict], review: str = "none",
-                    judge: str | None = None, reference: BinaryIO | None = None) -> str: ...
+                    judge: str | None = None, reference: BinaryIO | None = None,
+                    validator: dict | None = None) -> str: ...
     def status(self, engine_job_id: str) -> dict: ...
     def classify(self, filename: str, fileobj: BinaryIO, kinds: list[dict], backend: str, model: str | None = None,
                  pages: int = 3) -> dict: ...
+    def describe(self, filename: str, fileobj: BinaryIO, page: int, bbox: list[float], model: str | None,
+                 long: bool = False) -> dict: ...
     def fetch(self, path: str, out: BinaryIO) -> int: ...
+    def capacity(self) -> int | None: ...
+    def stop(self, engine_job_id: str) -> None: ...
 
 
 class HttpEngine:
@@ -50,12 +55,13 @@ class HttpEngine:
 
     def submit(self, filename: str, fileobj: BinaryIO, report_only: bool, ai: "AIChoice | None" = None,
                full_review: bool = False, route: str = "standard", branding: dict | None = None,
-               no_ai: bool = False) -> str:
+               no_ai: bool = False, validator: dict | None = None) -> str:
         """ai: the job's AI tier (a gateway model); without one, the configured default provider is used.
         full_review: the AI review checks every figure instead of the flagged ones plus a sample.
         route: the engine route of the job's processing service (standard | adobe).
         branding: for the PDF report (service and organization name, accent color, the AI level by name).
-        no_ai: no AI at all, for an audit whose AI level is set to make audits without it."""
+        no_ai: no AI at all, for an audit whose AI level is set to make audits without it.
+        validator: how veraPDF runs ({"validator": "service" | "command_line", "verapdf_ua2": bool})."""
         provider, model = (("gateway", ai.model) if ai else ("none", None) if no_ai else (self.provider, self.model))
         data = {"ai_provider": provider,
                 "flags": json.dumps({"report_only": report_only, **({"full_review": True} if full_review else {}),
@@ -63,7 +69,8 @@ class HttpEngine:
                                      **({"ocr_ai": False} if ai and not ai.ocr else {}),
                                      **({"verify_ai": False, "notation_ai": False, "ocr_ai": False}
                                         if no_ai else {}),
-                                     **({"report_branding": branding} if branding else {})})}
+                                     **({"report_branding": branding} if branding else {}),
+                                     **(validator or {})})}
         if model:
             data["ai_model"] = model
         if route != "standard":
@@ -84,11 +91,15 @@ class HttpEngine:
         return r.json()["job_id"]
 
     def submit_edit(self, filename: str, fileobj: BinaryIO, edits: list[dict], review: str = "none",
-                    judge: str | None = None, reference: BinaryIO | None = None) -> str:
+                    judge: str | None = None, reference: BinaryIO | None = None,
+                    validator: dict | None = None) -> str:
         """Apply edits (none, for a review only) and validate; review="sampled" adds the AI tag review.
         judge: the document's AI tier's review model. reference: for a corrected file, the version it replaces,
         which the visual comparison is made against."""
         data = {"edits": json.dumps(edits), "review": review}
+        if validator:
+            data["validator"] = validator.get("validator", "service")
+            data["verapdf_ua2"] = "true" if validator.get("verapdf_ua2", True) else "false"
         if judge:
             data["judge_model"] = judge
         files = {"file": (filename, fileobj, "application/pdf")}
@@ -121,6 +132,25 @@ class HttpEngine:
             raise EngineError(_detail(r))
         return r.json()
 
+    def describe(self, filename: str, fileobj: BinaryIO, page: int, bbox: list[float], model: str | None,
+                 long: bool = False) -> dict:
+        """Alt text for an area of a page from the AI (a gateway model; the engine's default without one): {alt,
+        kind, decorative, model, cost_usd, ...}. Answers at once. EngineUnavailable when the engine or the AI can't
+        be reached; EngineError when the request is refused."""
+        data = {"page": str(page), "bbox": json.dumps(bbox), "long": "true" if long else "false",
+                "ai_provider": "gateway" if model else self.provider}
+        if model or self.model:
+            data["ai_model"] = model or self.model
+        try:
+            r = self.client.post("/api/v1/describe", data=data, files={"file": (filename, fileobj, "application/pdf")})
+        except httpx.HTTPError as e:
+            raise EngineUnavailable(str(e)) from e
+        if r.status_code >= 500 or r.status_code == 429:
+            raise EngineUnavailable(_detail(r))
+        if r.status_code >= 400:
+            raise EngineError(_detail(r))
+        return r.json()
+
     def ai_models(self) -> list[str]:
         """Models the engine's AI gateway serves."""
         try:
@@ -130,6 +160,25 @@ class HttpEngine:
         if r.status_code >= 400:
             raise EngineUnavailable(_detail(r))
         return list(r.json().get("models") or [])
+
+    def capacity(self) -> int | None:
+        """Documents the engine's running workers process at once; None when it can't say."""
+        try:
+            r = self.client.get("/api/v1/capacity", timeout=10)
+            r.raise_for_status()
+            return r.json().get("documents_at_once")
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    def stop(self, engine_job_id: str) -> None:
+        """Stop a job at the engine (waiting or in progress). EngineUnavailable if the engine can't be reached; a
+        job the engine no longer has is already gone."""
+        try:
+            r = self.client.post(f"/api/v1/jobs/{engine_job_id}/stop", timeout=20)
+        except httpx.HTTPError as e:
+            raise EngineUnavailable(str(e)) from e
+        if r.status_code >= 500 or r.status_code == 429:
+            raise EngineUnavailable(f"HTTP {r.status_code}")
 
     def status(self, engine_job_id: str) -> dict:
         try:

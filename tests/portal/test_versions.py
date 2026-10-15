@@ -1,4 +1,4 @@
-"""Tag viewer versions: engine outputs become versions; tag edits make new reviewed versions."""
+"""Tag manager versions: engine outputs become versions; tag edits make new reviewed versions."""
 from __future__ import annotations
 
 import uuid
@@ -220,3 +220,269 @@ def test_only_editors_can_request_a_review(setup):
     assert s["c"]["admin_a"].post(url).status_code == 202
     ev = s["c"]["admin_a"].get(f"{API}/groups/{s['a'].id}/audit", params={"action": "version.review_requested"}).json()
     assert ev[0]["details"]["by_admin"] is True
+
+
+# --- unsaved edits kept between sessions (#145) ------------------------------------------------------------------
+
+def _draft(s, job_id, client="user"):
+    return s["c"][client].get(f"{API}/jobs/{job_id}/tag-draft").json()
+
+
+def test_unsaved_edits_are_kept_and_come_back(setup):
+    s = setup
+    job_id = _completed_job(s)
+    assert _draft(s, job_id) == {"mine": None, "others": []}
+    more = EDITS + [{"op": "set_alt", "element": 5, "expect_role": "Figure", "alt": "A chart of sales by month"}]
+    r = s["c"]["user"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": EDITS})
+    assert r.status_code == 200 and r.json()["based_on"] == 1
+    assert s["c"]["user"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": more}).status_code == 200
+    mine = _draft(s, job_id)["mine"]                      # one draft per person: the second replaced the first
+    assert mine["edits"] == more and mine["user_email"] == "user@a.test"
+    # Saving a version from it uses it up
+    _save(s, job_id)
+    assert _draft(s, job_id)["mine"] is None
+
+
+def test_no_edits_removes_the_draft_and_bad_ones_are_refused(setup):
+    s = setup
+    job_id = _completed_job(s)
+    put = lambda body: s["c"]["user"].put(f"{API}/jobs/{job_id}/tag-draft", json=body)  # noqa: E731
+    assert put({"based_on": 1, "edits": EDITS}).status_code == 200
+    assert put({"based_on": 1, "edits": []}).json() is None and _draft(s, job_id)["mine"] is None
+    assert put({"based_on": 99, "edits": EDITS}).status_code == 404            # no such version
+    assert put({"based_on": 1, "edits": [{"op": "explode", "element": 1}]}).status_code == 422
+    assert put({"based_on": 1, "edits": EDITS}).status_code == 200
+    assert s["c"]["user"].delete(f"{API}/jobs/{job_id}/tag-draft").status_code == 204
+    assert _draft(s, job_id)["mine"] is None
+
+
+def test_list_edits_are_kept_and_sent_to_the_engine(setup):
+    """Making one list of several tags, changing an item's level, building a list, splitting a figure, making a
+    list a table of contents and naming a cell's headers are edits the portal passes on."""
+    s = setup
+    job_id = _completed_job(s)
+    edits = [{"op": "make_list", "element": 3, "expect_role": "P", "absorb": [4, 5]},
+             {"op": "indent", "element": 4, "expect_role": "P"}, {"op": "outdent", "element": 4, "expect_role": "P"},
+             {"op": "build_list", "element": 7, "expect_role": "P", "absorb": [8],
+              "rows": [{"at": 0, "as": "H3"}, {"at": 2, "level": 1}, {"el": 8, "at": 0, "level": 2}]},
+             {"op": "take_pieces", "element": 9, "expect_role": "Figure", "pieces": [{"page": 1, "mcid": 4}], "role": "Figure", "alt": "One panel"},
+             {"op": "cut_area", "element": 9, "expect_role": "Figure", "page": 1, "bbox": [300, 200, 420, 290], "role": "Figure", "alt": "One structure"},
+             {"op": "make_toc", "element": 12, "expect_role": "L"},
+             {"op": "set_headers", "element": 20, "expect_role": "TD", "headers": [15, 17]},
+             {"op": "link_note", "element": 22, "expect_role": "P", "note": 30}]
+    assert s["c"]["user"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": edits}).status_code == 200
+    assert _draft(s, job_id)["mine"]["edits"] == edits
+    assert s["c"]["user"].post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": edits}).status_code == 201
+
+
+def test_each_person_has_their_own_and_can_start_from_anothers(setup):
+    s = setup
+    job_id = _completed_job(s)
+    s["c"]["user"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": EDITS})
+    # The group admin, who can edit too, sees that the owner has unsaved changes (who, when, how many; not what)
+    seen = _draft(s, job_id, "admin_a")
+    assert seen["mine"] is None and len(seen["others"]) == 1
+    other = seen["others"][0]
+    assert other["user_email"] == "user@a.test" and other["edits_count"] == 1 and "edits" not in other
+    # ...and can start their own from them; the owner's stay as they are
+    copied = s["c"]["admin_a"].get(f"{API}/jobs/{job_id}/tag-draft/{other['user_id']}")
+    assert copied.status_code == 200 and copied.json()["edits"] == EDITS
+    s["c"]["admin_a"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": copied.json()["edits"] + EDITS})
+    assert len(_draft(s, job_id)["mine"]["edits"]) == 1 and len(_draft(s, job_id, "admin_a")["mine"]["edits"]) == 2
+    assert len(_draft(s, job_id)["others"]) == 1
+
+
+def test_only_people_who_can_edit_have_drafts(setup):
+    s = setup
+    job_id = _completed_job(s)
+    s["c"]["user"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": EDITS})
+    owner = _draft(s, job_id)["mine"]["user_id"]
+    # A super admin who isn't this group's admin can view the document, but sees and keeps no drafts
+    assert _draft(s, job_id, "super") == {"mine": None, "others": []}
+    assert s["c"]["super"].put(f"{API}/jobs/{job_id}/tag-draft", json={"based_on": 1, "edits": EDITS}).status_code == 403
+    assert s["c"]["super"].get(f"{API}/jobs/{job_id}/tag-draft/{owner}").status_code == 403
+    # Someone who can't see the document at all
+    assert s["c"]["user2"].get(f"{API}/jobs/{job_id}/tag-draft").status_code == 404
+    assert s["c"]["admin_b"].get(f"{API}/jobs/{job_id}/tag-draft/{owner}").status_code == 404
+
+
+# --- saving into the same reviewed version (#145) ----------------------------------------------------------------
+
+def _finish(s, number, ok=True):
+    db = s["db"]
+    worker.submit_versions(db)
+    ver = db.scalar(select(DocumentVersion).where(DocumentVersion.number == number))
+    if ok:
+        s["engine"].complete_edit(ver.engine_job_id)
+    else:
+        s["engine"].fail(ver.engine_job_id)
+    worker.poll_versions(db)
+    db.expire_all()
+
+
+def _listed(s, job_id):
+    return s["c"]["user"].get(f"{API}/jobs/{job_id}/versions").json()["versions"]
+
+
+def test_saving_into_a_reviewed_version_replaces_it_and_keeps_its_name(setup):
+    s = setup
+    job_id = _completed_job(s)
+    first = _save(s, job_id)
+    _finish(s, first["number"])
+    was = _listed(s, job_id)[-1]
+    again = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                                json={"based_on": first["number"], "edits": EDITS, "replace": True})
+    assert again.status_code == 201, again.text
+    new = again.json()
+    assert new["label"] == "Human reviewed 1" and new["replacing"] == first["number"] and new["status"] == "queued"
+    assert [v["label"] for v in _listed(s, job_id) if v["kind"] == "reviewed"] == ["Human reviewed 1"] * 2  # while saving
+    _finish(s, new["number"])
+    now = [v for v in _listed(s, job_id) if v["kind"] == "reviewed"]
+    assert len(now) == 1 and now[0]["number"] == new["number"] and now[0]["label"] == "Human reviewed 1"
+    assert now[0]["pdf_name"] == was["pdf_name"] and now[0]["pdf_file_id"] != was["pdf_file_id"]
+    assert now[0]["undo_until"] is not None and now[0]["replacing"] is None
+    # The one before is out of sight, and the next new version doesn't reuse its name
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{first['number']}/pdf").status_code == 404
+    assert _save(s, job_id)["label"] == "Human reviewed 2"
+
+
+def test_only_a_reviewed_version_can_be_saved_into(setup):
+    s = setup
+    job_id = _completed_job(s)
+    r = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS, "replace": True})
+    assert r.status_code == 422 and r.json()["detail"]["error"] == "not_replaceable"
+
+
+def test_a_save_into_can_be_undone_for_a_day(setup):
+    from datetime import timedelta
+
+    s, db = setup, setup["db"]
+    job_id = _completed_job(s)
+    first = _save(s, job_id)
+    _finish(s, first["number"])
+    was = _listed(s, job_id)[-1]
+    new = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                              json={"based_on": first["number"], "edits": EDITS, "replace": True}).json()
+    _finish(s, new["number"])
+    assert s["c"]["super"].post(f"{API}/jobs/{job_id}/versions/{new['number']}/undo-save").status_code == 403
+    undone = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions/{new['number']}/undo-save")
+    assert undone.status_code == 200, undone.text
+    back = [v for v in _listed(s, job_id) if v["kind"] == "reviewed"]
+    assert len(back) == 1 and back[0]["number"] == first["number"] and back[0]["pdf_file_id"] == was["pdf_file_id"]
+    assert back[0]["undo_until"] is None
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{first['number']}/pdf").status_code == 200
+    assert s["c"]["user"].post(f"{API}/jobs/{job_id}/versions/{first['number']}/undo-save").status_code == 409
+
+    # After a day the one before is removed for good, and there is nothing to undo
+    new = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                              json={"based_on": first["number"], "edits": EDITS, "replace": True}).json()
+    _finish(s, new["number"])
+    old = db.scalar(select(DocumentVersion).where(DocumentVersion.number == first["number"]))
+    old.superseded_at -= timedelta(hours=25)
+    db.commit()
+    assert worker.purge_superseded(db) == 1
+    db.expire_all()
+    assert db.scalar(select(DocumentVersion).where(DocumentVersion.number == first["number"])) is None
+    assert _listed(s, job_id)[-1]["undo_until"] is None
+    assert s["c"]["user"].post(f"{API}/jobs/{job_id}/versions/{new['number']}/undo-save").status_code == 409
+
+
+def test_a_failed_save_into_leaves_the_version_as_it_was(setup):
+    s = setup
+    job_id = _completed_job(s)
+    first = _save(s, job_id)
+    _finish(s, first["number"])
+    new = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                              json={"based_on": first["number"], "edits": EDITS, "replace": True}).json()
+    _finish(s, new["number"], ok=False)
+    vs = {v["number"]: v for v in _listed(s, job_id)}
+    assert vs[first["number"]]["status"] == "ready" and vs[first["number"]]["label"] == "Human reviewed 1"
+    assert vs[new["number"]]["status"] == "failed" and vs[new["number"]]["label"] == "Human reviewed 1 (not saved)"
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{first['number']}/pdf").status_code == 200
+
+
+# --- "Describe with AI": alt text for an area, allowed by service default, group and person ---------------------
+
+def _me(client):
+    return client.get(f"{API}/me").json()
+
+
+def _with_ai_level(s, job_id):
+    """The document as processed with an AI level that has a gateway model."""
+    from tests.portal.test_ai_tiers import _tier
+    key = _tier(s, "Vision AI", "local-vision")
+    job = s["db"].get(Job, uuid.UUID(job_id))
+    job.ai_tier = key
+    s["db"].commit()
+
+
+def test_describe_follows_service_default_then_group_then_person(setup):
+    s = setup
+    user = s["c"]["user"]
+    uid = _me(user)["id"]
+    assert _me(user)["can_describe"] is False                                  # off by default
+    assert s["c"]["super"].patch(f"{API}/admin/settings", json={"ai_describe_default": True}).status_code == 200
+    assert _me(user)["can_describe"] is True                                   # the service default
+    r = s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}", json={"ai_describe": False})
+    assert r.status_code == 200 and r.json()["ai_describe"] is False
+    assert _me(user)["can_describe"] is False                                  # the group overrides it
+    r = s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": True})
+    assert r.status_code == 200 and r.json()["ai_describe"] is True
+    assert _me(user)["can_describe"] is True                                   # and the person the group
+    assert _me(s["c"]["user2"])["can_describe"] is False                       # others in the group follow the group
+    # null goes back to following the level above
+    s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": None})
+    s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}", json={"ai_describe": None})
+    assert _me(user)["can_describe"] is True
+
+
+def test_only_admins_set_describe_for_a_group_and_its_people(setup):
+    s = setup
+    uid = _me(s["c"]["user"])["id"]
+    assert s["c"]["user"].patch(f"{API}/groups/{s['a'].id}", json={"ai_describe": True}).status_code in (403, 404)
+    assert s["c"]["admin_b"].patch(f"{API}/groups/{s['a'].id}", json={"ai_describe": True}).status_code in (403, 404)
+    assert s["c"]["admin_b"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": True}).status_code in (403, 404)
+    assert s["c"]["admin_a"].patch(f"{API}/admin/settings", json={"ai_describe_default": True}).status_code == 403
+    assert s["c"]["super"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": True}).status_code == 200
+
+
+def test_describe_an_area_writes_alt_text_and_records_its_cost(setup):
+    s = setup
+    job_id = _completed_job(s)
+    _with_ai_level(s, job_id)
+    body = {"page": 1, "bbox": [100, 100, 300, 260], "long": True}
+    url = f"{API}/jobs/{job_id}/versions/1/describe"
+    r = s["c"]["user"].post(url, json=body)
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "ai_describe_off"      # not turned on yet
+    uid = _me(s["c"]["user"])["id"]
+    s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": True})
+    r = s["c"]["user"].post(url, json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["alt"] == "Two rings joined by a bond" and r.json()["cost_usd"] == 0.0012
+    name, page, bbox, model, long, size = s["engine"].described[-1]
+    assert (page, bbox, model, long) == (1, [100, 100, 300, 260], "local-vision", True) and size > 0
+    s["c"]["user"].post(url, json=body)
+    s["db"].expire_all()
+    cost = s["db"].get(Job, uuid.UUID(job_id)).cost
+    assert cost["describe_calls"] == 2 and abs(cost["describe_usd"] - 0.0024) < 1e-9
+    # someone else in the group can't, even when allowed, and nor can anyone without a box
+    s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}", json={"ai_describe": True})
+    assert s["c"]["user2"].post(url, json=body).status_code in (403, 404)
+    assert s["c"]["user"].post(url, json={"page": 1, "bbox": [10, 10, 10, 50]}).status_code == 422
+
+
+def test_describe_needs_an_ai_level_and_says_when_the_ai_is_down(setup):
+    from portal.engine import EngineUnavailable
+    s = setup
+    job_id = _completed_job(s)
+    s["c"]["super"].patch(f"{API}/admin/settings", json={"ai_describe_default": True})
+    url = f"{API}/jobs/{job_id}/versions/1/describe"
+    body = {"page": 1, "bbox": [100, 100, 300, 260]}
+    s["db"].get(Job, uuid.UUID(job_id)).ai_tier = None
+    s["db"].commit()
+    r = s["c"]["user"].post(url, json=body)
+    assert r.status_code == 409 and r.json()["detail"]["error"] == "no_ai_level"
+    _with_ai_level(s, job_id)
+    s["engine"].describe_answer = EngineUnavailable("gateway down")
+    r = s["c"]["user"].post(url, json=body)
+    assert r.status_code == 503 and r.json()["detail"]["error"] == "ai_unavailable"

@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     public_base_url: str = ""  # prefix for download URLs; empty -> relative URLs
     service_api_key: str = ""  # optional shared secret with the upstream service (X-API-Key)
     max_upload_mb: int = 200
+    max_pages: int = 2000  # a document with more pages is refused at submission (0: no limit); the portal's own cap is 2,000
     job_ttl_hours: int = 24
     task_time_limit_s: int = 3600
 
@@ -24,6 +25,7 @@ class Settings(BaseSettings):
     default_language: str = "en-US"
     pdfua_part: int = 1  # PDF/UA part declared in XMP (1 = ISO 14289-1)
     verapdf_path: str = "verapdf"
+    verapdf_url: str = ""  # veraPDF's REST service (kept running), e.g. http://verapdf:8080; empty: command line only
     verapdf_flavours: str = "ua1,ua2"  # first flavour is the primary compliance verdict; others are informational
     verapdf_timeout_s: int = 600
     raster_dpi: int = 200  # used for AI page renders and destructive flattening
@@ -49,6 +51,23 @@ class Settings(BaseSettings):
     # Specialist notation the layout rules can't read (math, chemistry, medical, engineering) goes to the AI
     ai_notation_enabled: bool = True
     ai_notation_max: int = 100  # blocks per document
+    ai_images_max: int = 1000  # figures described per document; the rest have no alt text, and the report says so
+    ai_tables_max: int = 100  # tables whose headers and spans the AI works out; the rest keep the layout rules'
+    ai_order_pages_max: int = 200  # pages with columns given an AI reading order; the rest keep the layout rules'
+    # Figure tags a document arrived with that have no description: how many the AI describes
+    ai_existing_figures_max: int = 1000
+    # Music notation: each example becomes one figure; with the reading service (Audiveris, asked over Redis) its
+    # alt text is a reading of the notes, otherwise the AI describes it like any picture
+    music_enabled: bool = True
+    music_max_examples: int = 80  # per document
+    music_per_measure: bool = True  # a line of music that was read becomes one figure per measure
+    # Sheet music (most pages are music): more lines are read, and the whole piece is also read as one MusicXML file
+    music_max_score_lines: int = 600
+    music_whole_score: bool = True
+    music_whole_score_max_mb: int = 40
+    omr_enabled: bool = False
+    omr_timeout_s: int = 240  # wait for an answer; the first one of a document includes the service starting
+    omr_page_timeout_s: int = 90  # a whole score: this much longer for each of its pages
 
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str = ""

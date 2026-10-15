@@ -7,8 +7,9 @@ document** below: it covers the whole trip in a few minutes. The pages that foll
 
 1. [Signing in](signing-in.md): the emailed code, joining your group, waiting for approval
 2. [Submitting documents](submitting-documents.md): uploading, choosing the AI, Check only, pages
-3. [Your results](your-results.md): the document page, which file to use, the report, the review list
-4. [Checking and fixing tags](tag-viewer.md): the side-by-side tag viewer and editor
+3. [Your results](your-results.md): the document page, which file to use, the report, the review list, removing
+   files when you're done
+4. [The tag manager](tag-manager/README.md): checking and fixing tags, side by side with the pages
 5. [Getting help](getting-help.md): asking support to look at a document
 6. [Email and settings](email-and-settings.md): notifications and email reports
 7. [Troubleshooting](troubleshooting.md): messages you might see, and what to do
@@ -29,7 +30,7 @@ See also the [glossary](../glossary.md).
    ("✓ Passes PDF/UA-1"), with **Download**. [More on your results](your-results.md).
 5. **Check the review list.** The **Needs review** tab lists what a machine couldn't be sure about, most
    important first: alt text that may be wrong, a heading that may be body text, a passage in another
-   language. Fix what matters in the tag viewer ([how](tag-viewer.md)), or ask for help.
+   language. Fix what matters in the tag manager ([how](tag-manager/README.md)), or ask for help.
 6. **Use the file.** Download it and publish it in place of the original.
 
 ### What to expect
@@ -37,6 +38,16 @@ See also the [glossary](../glossary.md).
 - **Your document looks exactly the same.** Tags are hidden structure; nothing on the page moves. The only
   exception is a document that can't pass without a visible change (usually a font problem). Then you get two
   files, and the page explains which to use.
+- **Bookmarks follow the headings.** A document with at least two headings gets bookmarks (the outline in a
+  PDF reader's side panel), one per heading, nested like the headings. If the document already has bookmarks that
+  work, they're kept. When you change headings in the tag manager, bookmarks the tool made follow on the next save.
+- **Tables with several levels of headings** ("2025" over "Q1" and "Q2") have each cell linked to all its
+  headings, so a screen reader can say "2026, Q2, North" for a number rather than just "Q2". This needs the AI's
+  reading of the table: which rows and columns are headings and which headings span.
+- **Footnotes are tagged as notes** when the text has a raised mark ("results¹") and the small print at the foot of
+  the page starts with the same mark. Small numbered lines nothing points at stay as they were. A note under a table
+  that starts with a symbol (*, †) used in the table's cells is tagged the same way, and the cell reads "500
+  (footnote asterisk)".
 - **The AI writes drafts.** Image descriptions and readings of math or other notation are written by AI and
   marked for checking. Charts, diagrams and formulas are the ones most worth a look.
 - **Passing isn't the whole story.** The accessibility check covers the rules a machine can test. A person

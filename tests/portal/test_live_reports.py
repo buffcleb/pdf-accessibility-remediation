@@ -11,7 +11,7 @@ from sqlalchemy import select
 from portal.models import AuditEvent, Job
 from tests.portal.test_jobs import API, fake_engine, pdf_bytes, run_worker, setup, topup, upload  # noqa: F401
 
-REPORTS = ["documents", "usage", "ledger", "sign_ins", "help", "audit", "quality", "failures"]
+REPORTS = ["documents", "usage", "ledger", "sign_ins", "help", "audit", "quality", "failures", "ai_usage"]
 SUPER_ONLY = ["cost", "daily", "report_emails"]
 
 
@@ -191,7 +191,7 @@ def test_cost_and_daily_use(data):
     assert daily["chart"]["ref"] is True and daily["chart"]["points"][0]["_ref"] == 10
 
 
-@pytest.mark.parametrize("name", ["quality", "failures", "cost", "daily"])
+@pytest.mark.parametrize("name", ["quality", "failures", "cost", "daily", "ai_usage"])
 def test_grouped_reports_sort_by_every_column(data, name):
     cols = _get(data, "super", name)["columns"]
     for c in cols:
@@ -215,3 +215,90 @@ def test_group_admins_never_see_cost(data):
     assert all(j.get("cost") is None for j in admin.get(f"{API}/groups/{s['a'].id}/jobs").json())
     assert admin.get(f"{API}/jobs/{job_id}").json().get("cost") is None
     assert s["c"]["super"].get(f"{API}/jobs/{job_id}").json()["cost"] == {"ai_usd": 0.25}
+
+
+def _ai_jobs(s):
+    """Two documents on the Local AI level (one served by a different model), one without AI."""
+    db = s["db"]
+    r = s["c"]["super"].post(f"{API}/admin/services", json={"label": "Local AI", "gateway_model": "local-vision"})
+    assert r.status_code == 201, r.text
+    level = r.json()["key"]
+    jobs = list(db.scalars(select(Job).order_by(Job.created_at)))
+    use = {"ai_calls": 4, "ai_failures": 1, "prompt_tokens": 1000, "completion_tokens": 200,
+           "review_prompt_tokens": 300, "review_completion_tokens": 50, "writer_model": "qwen-vl",
+           "review_model": "gemma", "review_usd": 0.01, "seconds": 30}
+    jobs[0].ai_tier, jobs[0].cost = level, {**use, "ai_usd": 0.05}
+    jobs[1].ai_tier, jobs[1].cost = level, {**use, "ai_usd": 0.15, "writer_model": "other-vl", "ai_refunded": True,
+                                                 "classifier_usd": 0.0001}
+    jobs[2].cost = {"ai_usd": 0, "ai_calls": 0}
+    db.commit()
+    return level
+
+
+def test_ai_usage_by_level_and_model(data):
+    s = data
+    level = _ai_jobs(s)
+    body = _get(s, "super", "ai_usage")
+    rows = body["rows"]
+    assert {r["writer_model"] for r in rows} == {"qwen-vl", "other-vl"}   # one row per model
+    assert all(r["level"] == "Local AI" for r in rows), rows              # documents without AI aren't in it
+    t = body["totals"]
+    assert t["documents"] == 2 and t["calls"] == 8 and t["failed"] == 2 and t["refunded"] == 1
+    assert t["tokens"] == 2 * 1550 and t["ai_usd"] == 0.2 and t["measured"] == 2
+    head = {h["label"]: h for h in body["headline"]}
+    assert head["AI calls"]["hint"] == "2 failed" and head["AI cost"]["value"] == "$0.20"
+    assert {m["key"] for m in body["chart"]["measures"]} == {"ai_usd", "calls", "tokens", "documents"}
+    # Filters: the AI level, and audits
+    assert _get(s, "super", "ai_usage", level=level)["totals"]["documents"] == 2
+    assert _get(s, "super", "ai_usage", audit="yes")["totals"].get("documents", 0) == 0
+
+
+def test_group_admins_see_ai_usage_without_cost_or_models(data):
+    s = data
+    _ai_jobs(s)
+    body = _get(s, "admin_a", "ai_usage")
+    keys = {c["key"] for c in body["columns"]}
+    assert not keys & {"ai_usd", "usd_per_doc", "usd_per_page", "writer_model", "review_model", "classifier_usd"}
+    assert len(body["rows"]) == 1 and body["rows"][0]["documents"] == 2  # grouped by level only: no model rows
+    assert "AI cost" not in {h["label"] for h in body["headline"]}
+    assert {m["key"] for m in body["chart"]["measures"]} == {"calls", "tokens", "documents"}
+
+
+def test_the_worker_keeps_what_the_ai_did():
+    from types import SimpleNamespace
+
+    from portal import worker
+    job = SimpleNamespace(ai_tier="ai:local", ai_model="fallback-model")
+    m = {"ai_tokens_used": {"prompt_tokens": 10, "completion_tokens": 5}, "ai_cost_usd": 0.02, "ai_failures": 1,
+         "ai_model": "qwen-vl", "verification_ai_tokens": {"prompt_tokens": 3, "completion_tokens": 1},
+         "verification_ai_cost_usd": 0.01, "processing_time_seconds": 12.5}
+    worker_judge = worker._judge_for
+    worker._judge_for = lambda db, j: "gemma"
+    try:
+        use = worker._ai_use(None, job, m)
+    finally:
+        worker._judge_for = worker_judge
+    assert use == {"writer_usd": 0.02, "review_usd": 0.01, "prompt_tokens": 10, "completion_tokens": 5,
+                   "review_prompt_tokens": 3, "review_completion_tokens": 1, "ai_failures": 1,
+                   "writer_model": "qwen-vl", "review_model": "gemma", "seconds": 12.5}
+    # No AI level, but the engine's own default AI was used: recorded all the same (no level's review model)
+    default = worker._ai_use(None, SimpleNamespace(ai_tier=None, ai_model=None), m)
+    assert default["prompt_tokens"] == 10 and default["writer_model"] == "qwen-vl" and default["review_model"] is None
+    assert worker._ai_use(None, SimpleNamespace(ai_tier=None, ai_model=None),
+                          {"ai_calls": 0, "processing_time_seconds": 3.0}) == {"seconds": 3.0}
+
+
+def test_documents_on_the_engines_default_ai_are_counted(data):
+    """Sent without an AI level, a document uses the engine's own default AI: it's counted under its own row."""
+    s = data
+    db = s["db"]
+    jobs = list(db.scalars(select(Job).order_by(Job.created_at)))
+    jobs[0].cost = {"ai_usd": 0, "ai_calls": 153, "ai_failures": 0, "writer_model": "qwen3-vl-8b-instruct"}
+    for j in jobs[1:]:
+        j.cost = {"ai_usd": 0, "ai_calls": 0}  # no AI at all: not in the report
+    db.commit()
+    body = _get(s, "super", "ai_usage")
+    assert [(r["level"], r["writer_model"], r["calls"]) for r in body["rows"]] == \
+        [("Engine default AI (no AI level)", "qwen3-vl-8b-instruct", 153)]
+    assert _get(s, "super", "ai_usage", level="default")["totals"]["documents"] == 1
+    assert "default" in [o["value"] for f in body["filters"] if f["key"] == "level" for o in f["options"]]

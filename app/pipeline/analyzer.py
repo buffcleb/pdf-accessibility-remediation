@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import Counter
 from pathlib import Path
 
 import pymupdf as fitz
 
-from app.pipeline.structure import BULLET_ONLY, BULLET_START
+from app.pipeline.structure import BULLET_ONLY, BULLET_START, FOOTNOTE_MARK
+from app.pipeline import plots, schemes
 from app.pipeline.models import (
     append_block,
     join_statements,
@@ -40,16 +42,35 @@ def _rect(b) -> BBox:
     return (round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2))
 
 
+# The long side, in pixels, of any page render that isn't for the AI (those have their own cap, below). A page's size
+# is the producer's to set, and a render at a fixed dpi of a page a hundred thousand points across is gigabytes.
+MAX_RENDER_PX = 10_000
+
+
+def capped_dpi(page: fitz.Page, dpi: int, max_px: int = MAX_RENDER_PX) -> int:
+    """The dpi to render a whole page at: `dpi`, lowered so the long side stays within max_px pixels."""
+    long_side = max(page.rect.width, page.rect.height) * dpi / 72.0
+    return max(1, int(dpi * max_px / long_side)) if long_side > max_px else dpi
+
+
 def render_png(doc: fitz.Document, page_no: int, dpi: int = 150, clip: BBox | None = None, max_px: int = 2000) -> bytes:
     """Render a page (or a clip of it, in visual page space) to PNG for vision models,
     capped at max_px on the long side."""
     page = doc[page_no]
-    area = fitz.Rect(clip) if clip else page.rect
+    area = (fitz.Rect(clip) & page.rect) if clip else page.rect
+    if clip and not fitz.Rect(clip).intersects(page.rect):
+        raise ValueError(f"nothing to render: {tuple(round(v, 1) for v in clip)} is off page {page_no + 1}")
+    # A sliver (a hairline, a rule) is padded to at least a pixel each way, so it still makes an image
+    least = 72.0 / dpi
+    if area.width < least or area.height < least:
+        cx, cy = (area.x0 + area.x1) / 2, (area.y0 + area.y1) / 2
+        hw, hh = max(area.width, least) / 2, max(area.height, least) / 2
+        area = fitz.Rect(cx - hw, cy - hh, cx + hw, cy + hh) & page.rect
     zoom = dpi / 72.0
     long_side = max(area.width, area.height) * zoom
     if long_side > max_px:
         zoom *= max_px / long_side
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=fitz.Rect(clip) if clip else None, alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=area if clip else None, alpha=False)
     return pix.tobytes("png")
 
 
@@ -60,6 +81,8 @@ _LABEL_RUN = re.compile(r"^\s*\(?([a-zA-Z]|[ivxlcIVXLC]{1,5}|\d{1,3})[.)]\s*$")
 # A superscript reads as a power after a number, a single-letter variable or a closing bracket.
 _DOTS = ".,\u00b7"
 _POWER_BASE = re.compile(r"(\d|(^|[^A-Za-z])[A-Za-z]|\))\s*$")
+# A superscript that is only a sign, or a digit and a sign ("+", "−", "2+", "3−"): a charge
+_CHARGE = re.compile(r"^(\d?)([+\-−–⊕⊖])$")
 
 
 class _Run:
@@ -85,10 +108,20 @@ class _VLine:
         self.base = run.base
         self.size = run.size
         self.x0, self.x1 = run.x0, run.x1
+        # (baseline, size) of the runs that sit on the line itself (not its scripts), without repeats: what a
+        # new run is compared with to join a line exactly. A line of a thousand characters has one or two of
+        # these; comparing with every run made the grouping cubic on a page's worth of characters
+        self.anchors: set[tuple[float, float]] = {(run.base, run.size)} if run.script is None else set()
 
     def add(self, r: _Run) -> None:
         self.runs.append(r)
         self.x0, self.x1 = min(self.x0, r.x0), max(self.x1, r.x1)
+        if r.script is None:
+            self.anchors.add((r.base, r.size))
+
+    def on_baseline(self, r: _Run) -> bool:
+        """Whether r sits exactly on the baseline of a run already on this line."""
+        return any(abs(base - r.base) <= 0.05 * size for base, size in self.anchors)
 
     @property
     def body(self) -> list[_Run]:
@@ -108,8 +141,7 @@ def _visual_lines(runs: list[_Run]) -> list[_VLine]:
         # off (subscripts often drop just a sixth of a character: "A" + "base")
         host = None
         # Sitting exactly on the baseline of text already in a line, close by: part of that line
-        exact = [ln for ln in lines if ln.x0 - 1.5 * ln.size <= r.x0 <= ln.x1 + 1.5 * ln.size and any(
-            q.script is None and abs(q.base - r.base) <= 0.05 * q.size for q in ln.runs)]
+        exact = [ln for ln in lines if ln.x0 - 1.5 * ln.size <= r.x0 <= ln.x1 + 1.5 * ln.size and ln.on_baseline(r)]
         if exact:
             min(exact, key=lambda ln: abs(r.base - ln.base)).add(r)
             continue
@@ -210,6 +242,10 @@ def _word_text(word: list[_Run], spoken: bool) -> str:
         if spoken and r.script == "sup" and out and (n := _prime_count(text)):
             # A raised prime is a mark on the symbol, not a power: F′ is "F prime"
             out += " " + _PRIME_WORDS.get(n, f"{n} primes") + (" " if more else "")
+        elif spoken and r.script == "sup" and out and (charge := _CHARGE.match(text.strip())):
+            # A raised sign is a charge or a mark on the symbol, never a power: H⁺ is "H plus", Fe²⁺ "Fe 2 plus"
+            sign = "plus" if charge.group(2) in "+⊕" else "minus"
+            out += " " + (f"{charge.group(1)} " if charge.group(1) else "") + sign + (" " if more else "")
         elif spoken and r.script == "sup" and out and _POWER_BASE.search(out):
             out += {"2": " squared", "3": " cubed"}.get(text, f" to the power of {text}") + (" " if more else "")
         elif spoken and r.script == "sub" and out:
@@ -218,6 +254,38 @@ def _word_text(word: list[_Run], spoken: bool) -> str:
             out += text
         i = j + 1
     return out
+
+
+def _raised_marks(pieces: list[list[_Run]]) -> tuple[list[str], list[str], list[tuple], str | None]:
+    """The footnote-like marks raised after words in these lines ("results¹", "noted.*"; not after a digit, where a
+    raised number is a power), the text each is written right after ("results", "noted."), where each is drawn, and
+    the raised mark the first line starts with (a footnote's own number)."""
+    marks: list[str] = []
+    after: list[str] = []
+    boxes: list[tuple] = []
+    lead = None
+    for n, piece in enumerate(pieces):
+        words = _words(piece)
+        for w, word in enumerate(words):
+            i = 0
+            while i < len(word):
+                if word[i].script != "sup":
+                    i += 1
+                    continue
+                j = i
+                while j + 1 < len(word) and word[j + 1].script == "sup":
+                    j += 1
+                text = "".join(r.text for r in word[i:j + 1]).strip()
+                if FOOTNOTE_MARK.match(text):
+                    before = next((r.text for r in reversed(word[:i]) if r.text.strip()), "")
+                    if before and not before.isdigit():
+                        marks.append(text)
+                        after.append(_word_text(word[:i], False))
+                        boxes.append(bbox_union([(r.x0, r.y0, r.x1, r.y1) for r in word[i:j + 1] if r.text.strip()]))
+                    elif not before and n == 0 and w == 0 and (j + 1 < len(word) or len(words) > 1):
+                        lead = text  # starts the block, with the note's words after it
+                i = j + 1
+    return marks, after, boxes, lead
 
 
 def _spoken_line(runs: list[_Run]) -> tuple[str, str]:
@@ -339,19 +407,58 @@ def _stacked_text(runs: list, spoken: bool) -> str:
 
 
 def _fraction_bars(page: fitz.Page) -> list[tuple[float, float, float]]:
-    """Short horizontal rules that could be fraction bars: (x0, x1, y)."""
-    bars = []
+    """Short horizontal rules that could be fraction bars: (x0, x1, y). A rule that is part of a box or a grid (a
+    table cell's border: another rule carries on from its end, or an upright one meets it) is not one."""
+    bars, across, upright = [], [], []
     limit = 0.6 * page.rect.width
     for d in page.get_drawings():
         for it in d.get("items") or []:
             if it[0] == "l":
                 p1, p2 = it[1], it[2]
-                if abs(p1.y - p2.y) <= 0.3 and 2.5 <= abs(p2.x - p1.x) <= limit:
-                    bars.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
+                if abs(p1.y - p2.y) <= 0.3 and abs(p2.x - p1.x) >= 2.5:
+                    across.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
+                elif abs(p1.x - p2.x) <= 0.3 and abs(p2.y - p1.y) >= 2.5:
+                    upright.append(((p1.x + p2.x) / 2, min(p1.y, p2.y), max(p1.y, p2.y)))
             elif it[0] == "re":
                 r = fitz.Rect(it[1])
-                if r.height <= 1.5 and 2.5 <= r.width <= limit and d.get("fill") is not None:
-                    bars.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+                if r.height <= 1.5 and r.width >= 2.5 and d.get("fill") is not None:
+                    across.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+                elif r.width <= 1.5 and r.height >= 2.5 and d.get("fill") is not None:
+                    upright.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+                elif r.width >= 2.5 and r.height >= 2.5 and d.get("color") is not None:
+                    # A stroked box: its four sides
+                    across += [(r.x0, r.x1, r.y0), (r.x0, r.x1, r.y1)]
+                    upright += [(r.x0, r.y0, r.y1), (r.x1, r.y0, r.y1)]
+    near = 1.5
+    # Rules by their row (and uprights by their column), in one-point bins, so each rule is compared with the few
+    # that could meet it rather than with every rule on the page: a page drawn as thousands of short rules (a hatch,
+    # a plotted curve) was quadratic here
+    rows: dict[int, list] = {}
+    for o in across:
+        rows.setdefault(math.floor(o[2]), []).append(o)
+    columns: dict[int, list] = {}
+    for v in upright:
+        columns.setdefault(math.floor(v[0]), []).append(v)
+
+    def rules_near(y: float):
+        k = math.floor(y)
+        return (o for b in (k - 1, k, k + 1) for o in rows.get(b, ()))
+
+    def uprights_near(x: float):
+        k = math.floor(x)
+        return (v for b in range(k - 2, k + 3) for v in columns.get(b, ()))
+
+    for bar in across:
+        x0, x1, y = bar
+        if x1 - x0 > limit:
+            continue
+        if any(o is not bar and abs(o[2] - y) <= 1.0 and (abs(o[1] - x0) <= near or abs(o[0] - x1) <= near)
+               for o in rules_near(y)):
+            continue  # one rule carries on where this one ends: a row of cell borders
+        if any(v[1] - near <= y <= v[2] + near and (abs(v[0] - x0) <= near or abs(v[0] - x1) <= near)
+               for x in (x0, x1) for v in uprights_near(x)):
+            continue  # a corner
+        bars.append(bar)
     return bars
 
 
@@ -369,6 +476,46 @@ def _with_spaces(part: list, spaces: list) -> list:
     return part + [r for r in spaces if x0 <= (r.x0 + r.x1) / 2 <= x1 and abs(r.base - base) <= 0.3 * size]
 
 
+def _underline(bar, num: list, den: list) -> bool:
+    """The rule under a line of underlined text (a link that wraps onto a second line): as wide as the text over it
+    and just under its baseline, with the next line a full line space below."""
+    bx0, bx1, by = bar
+    size = max(r.size for r in num)
+    base = sorted(r.base for r in num)[len(num) // 2]
+    spans = abs(min(r.x0 for r in num) - bx0) <= 0.15 * size and abs(max(r.x1 for r in num) - bx1) <= 0.15 * size
+    den_base = sorted(r.base for r in den)[len(den) // 2]
+    return spans and by - base <= 0.17 * size and den_base - by >= 1.0 * size
+
+
+def _prose(part: list) -> bool:
+    """Words, not math: a word of four letters or more with no digit or operator anywhere, or three such words
+    whatever else is there (a sentence that mentions a number)."""
+    text, last = "", None
+    for r in sorted(part, key=lambda r: (round(r.base), r.x0)):
+        # The spaces between words aren't among the part's pieces: a gap stands for one
+        if last is not None and (round(r.base) != round(last.base) or r.x0 - last.x1 > 0.15 * r.size):
+            text += " "
+        text, last = text + r.text, r
+    words, run = 0, 0
+    for c in text + " ":
+        if c.isalpha():
+            run += 1
+        else:
+            words += run >= 4
+            run = 0
+    if words >= 3:
+        return True
+    return words >= 1 and not any(c.isdigit() or c in "+=×÷·∙±−√∑∫∂∆πθ^" for c in text)
+
+
+def _beside(bar, pool: list, parts: list) -> bool:
+    """Something on the bar's own line, right beside it ("slope =" before rise over run)."""
+    bx0, bx1, by = bar
+    size = max(r.size for r in parts)
+    return any(r.text.strip() and r not in parts and r.y0 < by < r.y1
+               and (0 <= bx0 - r.x1 <= 1.5 * size or 0 <= r.x0 - bx1 <= 1.5 * size) for r in pool)
+
+
 def _find_fraction(bar, pool: list):
     """(numerator, denominator, host) for a bar, or None. A fraction has something tight above and below
     the bar, within its width and centered on it, and neither line runs on past the bar's ends (which is
@@ -381,6 +528,11 @@ def _find_fraction(bar, pool: list):
     num = [r for r in inside if (r.y0 + r.y1) / 2 < by and by - r.y1 <= 0.45 * r.size]
     den = [r for r in inside if (r.y0 + r.y1) / 2 > by and r.y0 - by <= 0.45 * r.size]
     if not num or not den:
+        return None
+    if _underline(bar, num, den):
+        return None
+    # Words over or under a rule with nothing beside it: a ruled-off line of text, not rise over run after "slope ="
+    if (_prose(num) or _prose(den)) and not _beside(bar, pool, num + den):
         return None
     for part in (num, den):
         x0, x1 = min(r.x0 for r in part), max(r.x1 for r in part)
@@ -604,6 +756,7 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
             body = [pc for pc in g if not BULLET_ONLY.match(_join(pc, spoken=False))] or g
             size, _ = _style([r for pc in body for r in pc])
             first = sorted(r.base for r in g[0] if r.text.strip() and not r.script) or [None]
+            marks, mark_after, mark_boxes, lead = _raised_marks(g) if has_scripts else ([], [], [], None)
             blocks.append(
                 TextBlock(
                     id="",
@@ -616,6 +769,10 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
                     actual_text=spoken if (spoken != text or reorder) else None,
                     has_scripts=has_scripts,
                     baseline=first[len(first) // 2],
+                    marks=marks,
+                    mark_after=mark_after,
+                    mark_boxes=mark_boxes,
+                    lead_mark=lead,
                 )
             )
     blocks = _merge_paragraph_lines(_attach_bullets(blocks))
@@ -706,6 +863,46 @@ def _extract_tables(page: fitz.Page, page_no: int) -> list[TableRegion]:
             cell.is_header = cell.row < region.header_rows
         tables.append(region)
     return tables
+
+
+def _looks_scanned(doc, img) -> bool:
+    """Whether a page-sized picture looks like a scan rather than a photograph or a slide's background: black and
+    white (1 bit, or fax or JBIG2 compression, which only scanners and fax software write), or gray at scanner
+    resolution (150 dpi or more). A color picture isn't taken: a slide's background photo looks the same."""
+    if not img.xref:
+        return False
+    def key(name):
+        try:
+            return doc.xref_get_key(img.xref, name)[1] or ""
+        except Exception:  # noqa: BLE001 - an odd image dictionary is simply not a scan
+            return ""
+    if key("BitsPerComponent") == "1" or any(f in key("Filter") for f in ("CCITTFax", "JBIG2")):
+        return True
+    width_pt = max(1.0, img.bbox[2] - img.bbox[0])
+    return _gray(doc, img.xref) and (img.width or 0) / width_pt * 72 >= 150
+
+
+def _gray(doc, xref: int) -> bool:
+    """Whether an image has one color component: DeviceGray, CalGray, or an ICC profile with /N 1 (how scanners
+    and PyMuPDF often write gray)."""
+    try:
+        kind, value = doc.xref_get_key(xref, "ColorSpace")
+        if kind == "xref":
+            value = doc.xref_object(int(value.split()[0]), compressed=True)
+        if "/DeviceGray" in value or "/CalGray" in value:
+            return True
+        m = re.search(r"/ICCBased\s+(\d+)\s+0\s+R", value)
+        return bool(m) and doc.xref_get_key(int(m.group(1)), "N")[1] == "1"
+    except Exception:  # noqa: BLE001 - an odd color space is simply not a gray scan
+        return False
+
+
+def _sparse_text(page) -> bool:
+    """A few typed values, not a page of text (a scan that was already OCR'd has its whole text, invisible)."""
+    words = page.get_text("words")
+    chars = sum(len(w[4]) for w in words)
+    area = sum((w[2] - w[0]) * (w[3] - w[1]) for w in words)
+    return chars <= 400 and area <= 0.1 * page.rect.width * page.rect.height
 
 
 def _compact_grid(cells: list[TableCell], n_rows: int, n_cols: int) -> tuple[list[TableCell], int, int]:
@@ -878,6 +1075,29 @@ def _is_page_rule(d: dict, page: fitz.Page) -> bool:
     return r.height > 0.5 * page.rect.height or r.width > 0.6 * page.rect.width
 
 
+def _segments(page: fitz.Page, rot: fitz.Matrix) -> list[tuple[float, float, float, float]]:
+    """The straight strokes drawn on a page (page rules left out), as the page is seen."""
+    out = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001 - odd drawings: no line art is found, as before
+        return out
+    for d in drawings:
+        if _is_page_rule(d, page):
+            continue
+        for item in d.get("items") or []:
+            if item[0] == "l":
+                a, b = item[1] * rot, item[2] * rot
+                out.append((a.x, a.y, b.x, b.y))
+            elif item[0] == "re":
+                # A stroke drawn as a hairline rectangle (drawing programs set an arrow's shaft this way)
+                r = fitz.Rect(item[1]) * rot
+                if min(r.width, r.height) <= 1.5 < max(r.width, r.height) <= 110:   # longer is a frame or a rule
+                    mx, my = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+                    out.append((r.x0, my, r.x1, my) if r.width >= r.height else (mx, r.y0, mx, r.y1))
+    return out
+
+
 def _extract_vector_figures(page: fitz.Page, page_no: int, start: int, tables: list[TableRegion],
                             blocks: list[TextBlock], rot: fitz.Matrix) -> list[ImageRegion]:
     """Charts/diagrams drawn with vector paths (not images). Frames around text and table grids are excluded."""
@@ -898,6 +1118,10 @@ def _extract_vector_figures(page: fitz.Page, page_no: int, start: int, tables: l
         if area > 0.9 * page_area or min(bbox[2] - bbox[0], bbox[3] - bbox[1]) < 18:
             continue
         shapes = sum(1 for r in all_drawings if r.intersects(fitz.Rect(bbox)))
+        # A curve is often one path of hundreds of short segments: that is a graph, not "a couple of arrows"
+        segments = sum(len(d.get("items") or []) for d, r in zip(drawings, all_drawings) if r.intersects(fitz.Rect(bbox)))
+        if segments >= 40:
+            shapes = max(shapes, 8)
         # Small drawings count only when made of many shapes (a calculator display, a chess board),
         # not a couple of arrows or a rule.
         if area < 0.02 * page_area and (area < 0.004 * page_area or shapes < 8):
@@ -980,6 +1204,20 @@ def analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[d
         pa.blocks = [b for b in pa.blocks
                      if not any(bbox_intersection(b.bbox, v.bbox) >= 0.9 * (bbox_area(b.bbox) or 1.0) for v in vectors)]
 
+    # Graphs drawn as hundreds of specks: one figure each, with their rules and labels
+    dense = plots.find_dense_regions(pa.images, pa.blocks, pa.width, pa.height)
+    if dense:
+        plots.add_to_page(pa, dense)
+
+    # Chemical structures and reaction schemes drawn with lines: one figure each, with the labels on them
+    segments = _segments(page, rot)
+    if segments:
+        words = [(_rect(fitz.Rect(w[:4]) * rot), w[4]) for w in page.get_text("words")]
+        drawn = schemes.find_regions(segments, words, [(b.bbox, b.text, b.bold) for b in pa.blocks], pa.width, pa.height,
+                                     avoid=[t.bbox for t in pa.tables])
+        if drawn:
+            schemes.add_to_page(pa, drawn, words)
+
     # Text belonging to a table is tagged through the table cells, not as paragraphs. The cells keep the
     # spoken form of any math the blocks inside them read (fractions, exponents).
     if pa.tables:
@@ -1003,8 +1241,11 @@ def analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[d
                 cells[key].actual_text = " ".join(b.actual_text or b.text for b in blocks)
 
     page_area = pa.width * pa.height
-    big_image = any(bbox_area(i.bbox) > 0.8 * page_area for i in pa.images)
-    pa.is_scanned = big_image and not page.get_text("text").strip()
+    big = [i for i in pa.images if bbox_area(i.bbox) > 0.8 * page_area]
+    # A scan, or a scan with a few values typed onto it (a filled-in form): the typed text is real, but the printed
+    # form is only in the picture and needs reading
+    pa.is_scanned = bool(big) and (not page.get_text("text").strip()
+                                   or (any(_looks_scanned(doc, i) for i in big) and _sparse_text(page)))
 
     issues = _font_issues(doc, page, page_no)
     pa.font_issues = sorted({p for i in issues for p in i["problems"]})

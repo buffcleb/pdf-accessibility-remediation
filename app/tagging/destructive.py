@@ -21,6 +21,7 @@ import logging
 import pymupdf as fitz
 
 from app.config import get_settings
+from app.pipeline.analyzer import capped_dpi
 from app.pipeline.fonts import fix_inserted_cid_fonts, text_layer_font
 from app.pipeline.ocr import write_invisible_line
 
@@ -54,7 +55,7 @@ def _text_spans(page: fitz.Page, font: fitz.Font) -> list[tuple]:
     become .notdef glyphs, PDF/UA 7.21.8). If most of the page's text has no usable Unicode (fonts
     without ToUnicode), OCR the page instead when Tesseract is available."""
     spans, total, bad = [], 0, 0
-    look = page.get_pixmap(dpi=36, alpha=False, annots=False)
+    look = page.get_pixmap(dpi=capped_dpi(page, 36), alpha=False, annots=False)
     for block in page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]:
         for line in block.get("lines", []):
             for span in line["spans"]:
@@ -78,7 +79,7 @@ def _text_spans(page: fitz.Page, font: fitz.Font) -> list[tuple]:
 
         if tesseract_available():
             settings = get_settings()
-            tp = page.get_textpage_ocr(language=settings.ocr_language, dpi=300, full=True)
+            tp = page.get_textpage_ocr(language=settings.ocr_language, dpi=capped_dpi(page, 300), full=True)
             ocr = []
             for block in page.get_text("dict", textpage=tp)["blocks"]:
                 for line in block.get("lines", []):
@@ -152,7 +153,8 @@ def flatten_pages(src: str, dst: str, pages: list[int],
                 page.set_rotation(0)
             rules = _rules(page)
             rect = page.rect
-            zoom = settings.raster_dpi / 72.0
+            # A page of absurd size is rasterized at a lower dpi, not at gigabytes; ordinary pages at RASTER_DPI
+            zoom = capped_dpi(page, settings.raster_dpi) / 72.0
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, annots=False)
             images = [(info["xref"], info["bbox"]) for info in page.get_image_info(xrefs=True) if info.get("xref")]
             vector_clips = [

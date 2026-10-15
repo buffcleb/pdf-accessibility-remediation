@@ -66,12 +66,14 @@ def test_off_sends_nothing_and_the_default_applies_to_everyone_else(setup):
     topup(s, s["a"].id, 100)
     s["c"]["user"].put(N, json={"choices": {"documents": "off"}})
     _finish(s, "quiet.pdf")
-    assert _to("user@a.test") == [] and not db.scalar(select(MailOutbox).where(MailOutbox.to_addr == "user@a.test"))
+    assert _to("user@a.test") == [] and not db.scalar(select(MailOutbox).where(MailOutbox.to_addr == "user@a.test",
+                                                                        MailOutbox.kind != "sign_in"))
     # A super admin's default: once a day for people who haven't chosen
     assert s["c"]["super"].patch(f"{API}/admin/settings", json={"notify_default_documents": "daily"}).status_code == 200
     assert s["c"]["super"].patch(f"{API}/admin/settings", json={"notify_default_help": "sometimes"}).status_code == 422
     _finish(s, "later.pdf", who="user2")
-    assert db.scalar(select(MailOutbox).where(MailOutbox.to_addr == "user2@a.test")).status == "held"
+    assert db.scalar(select(MailOutbox).where(MailOutbox.to_addr == "user2@a.test",
+                                             MailOutbox.kind != "sign_in")).status == "held"
     assert s["c"]["user2"].get(N).json()["choices"][0]["choice"] == "daily"
 
 

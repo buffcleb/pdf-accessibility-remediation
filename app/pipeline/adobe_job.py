@@ -4,16 +4,18 @@
   2. Split if it's beyond Adobe's per-request limits; send each part to Adobe (through the shared rate
      limiter); merge the tagged parts back onto the original
   3. Validate Adobe's output as it is (veraPDF, tag integrity, tag review)  -> "after" report
-  4. With an AI model: write alt text for the figures Adobe left without it, as tag edits to a
-     separate copy (pixel-identical to Adobe's), and validate that copy too  -> "enhanced"
+  4. With an AI model: write alt text for the figures Adobe left without it, and readings of specialist notation
+     (math, chemistry, doses) as ActualText on Adobe's text tags, as tag edits to a separate copy (pixel-identical
+     to Adobe's), and validate that copy too  -> "enhanced"
 
 Adobe's file is always kept unchanged (merged, for a large document). Problems in it are reported,
-never fixed in it; the alt text goes only into the separate copy.
+never fixed in it; the alt text and readings go only into the separate copy.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import time
 
@@ -24,8 +26,8 @@ from app.ai.registry import get_provider
 from app.pipeline.enrichment import EnrichmentStats
 from app.config import get_settings
 from app.pipeline.orchestrator import (
-    MAX_REGION_FIGURES, JobOptions, Progress, _delta, _describe_regions, _move_xml, _primary, _snapshot, _tagmap_file, _validate, _verdict_line,
-    _visual_fidelity, _write_json_report, _xml_name,
+    JobOptions, Progress, _bookmarks, _delta, _describe_regions, _move_xml, _primary, _snapshot, _tagmap_file,
+    _validate, _verdict_line, _visual_fidelity, _write_json_report, _xml_name,
 )
 from app.storage import JobStore
 from app.validation.audit import audit_pdf
@@ -110,7 +112,8 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
     enhanced_name = None
     vera_enhanced = None
     enrichment = EnrichmentStats()
-    improvements: dict = {"alt_text": 0, "decorative": 0, "unicode_maps": [], "glyph_lists": [], "glyph_widths": 0}
+    improvements: dict = {"alt_text": 0, "decorative": 0, "notation": 0, "unicode_maps": [], "glyph_lists": [],
+                          "glyph_widths": 0}
     ai_stats = {"calls": 0, "failures": 0, "cost": 0.0, "tokens": {"prompt_tokens": 0, "completion_tokens": 0},
                 "model": None}
     candidate = work / "improved.pdf"
@@ -118,21 +121,29 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
     ai = get_provider(opts.provider, opts.model, log_path=(work / "ai_log.jsonl") if opts.debug else None)
     if ai is not None:
         progress("ai_alt_text", 82)
-        edits = await _alt_text_edits(ai, opts, primary, out / (tag_maps["primary"] or ""), primary_map,
-                                      enrichment, warnings, ai_stats)
+        edits = await _ai_edits(ai, opts, primary, src, out / (tag_maps["primary"] or ""), primary_map,
+                                enrichment, warnings, ai_stats)
         if edits:
             from app.tagging.editor import EditError, apply_edits
             try:
                 await asyncio.to_thread(apply_edits, primary, candidate, edits)
             except EditError as exc:
-                warnings.append(f"the AI alt text couldn't be added to Adobe's tags: {exc}")
+                warnings.append(f"the AI alt text and readings couldn't be added to Adobe's tags: {exc}")
                 shutil.copyfile(primary, candidate)
+                enrichment.notation = []
             else:
-                improvements["alt_text"] = sum(1 for e in edits if e["op"] == "set_alt")
+                improvements["alt_text"] = sum(1 for e in edits
+                                               if e["op"] == "set_alt" and e["expect_role"] == "Figure")
                 improvements["decorative"] = sum(1 for e in edits if e["op"] == "set_decorative")
+                improvements["notation"] = sum(1 for e in edits if e["op"] == "set_actual_text"
+                                               or (e["op"] == "set_alt" and e["expect_role"] == "Formula"))
     progress("font_fixes", 86)
     improvements.update(await asyncio.to_thread(_font_fixes, primary, candidate, work, stem, warnings))
     vera_candidate = improvements.pop("vera")
+    # Adobe doesn't write bookmarks. Its tags' headings are the copy's (alt text and font fixes don't touch them),
+    # so Adobe's tag map says where they go
+    # (after any veraPDF check of the copy, which doesn't look at the outline)
+    improvements["bookmarks"] = (await _bookmarks(candidate, primary_map))[0]["bookmarks"]
     changed = any(improvements[k] for k in improvements)
     if changed and not (await asyncio.to_thread(_visual_fidelity, primary, candidate))["identical"]:
         warnings.append("the improved copy didn't render identically to Adobe's file, so it was discarded")
@@ -147,7 +158,10 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
             # The AI review checks the AI's alt text; font fixes alone need no AI review.
             rep = await verify_output(enhanced, VerifyOptions(
                 ai=opts.verify_ai and improvements["alt_text"] > 0, full_review=opts.full_review, seed=opts.job_id,
-                judge_model=opts.judge_model))
+                judge_model=opts.judge_model,
+                # the AI's readings are listed for a person to check, as on the standard route
+                ai_read=[(n["page"], n["bbox"], n["kind"], n["spoken"]) for n in enrichment.notation
+                         if not n.get("by_rule")]))
             verification["enhanced"] = rep.to_dict()
             tag_maps["enhanced"] = await _tagmap_file(out, stem, "enhanced", enhanced, rep.tagmap)
             if rep.ai.get("error"):
@@ -184,6 +198,9 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
         "ai_cost_usd": round(ai_stats["cost"], 6), "ai_tokens_used": ai_stats["tokens"],
         "ai_provider": opts.provider, "ai_model": ai_stats["model"],
         "images_described": enrichment.images_described,
+        "notation_read_by_ai": sum(1 for n in enrichment.notation if not n.get("by_rule")),
+        "notation_by_rule": sum(1 for n in enrichment.notation if n.get("by_rule")),
+        "notation_ai_rejected": enrichment.notation_rejected,
         "route": "adobe",
         "adobe": adobe,
     }
@@ -218,6 +235,9 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
             "tag_maps": tag_maps,
             "adobe_reports": adobe_reports or None,
             "ai_findings": enrichment.findings[:100],
+            # Specialist notation read onto Adobe's tags (page 1-based, region, kind, read-aloud text, LaTeX,
+            # confidence)
+            "ai_notation": [{**n, "page": n["page"] + 1} for n in enrichment.notation][:300] or None,
         },
         "warnings": warnings,
     }
@@ -260,27 +280,50 @@ def _describe(imp: dict) -> str:
         parts.append(f"AI alt text for {imp['alt_text']} figure(s)")
     if imp.get("decorative"):
         parts.append(f"{imp['decorative']} figure(s) judged decorative")
+    if imp.get("notation"):
+        parts.append(f"specialist notation read aloud correctly in {imp['notation']} tag(s)")
     if imp.get("glyph_lists"):
         parts.append(f"incomplete glyph lists removed from {len(imp['glyph_lists'])} font(s)")
     if imp.get("unicode_maps"):
         parts.append(f"Unicode maps completed for {len(imp['unicode_maps'])} font(s)")
     if imp.get("glyph_widths"):
         parts.append(f"{imp['glyph_widths']} glyph width(s) corrected")
+    if imp.get("bookmarks"):
+        parts.append(f"{imp['bookmarks']} bookmark(s) made from the headings")
     return ("Changes: " + "; ".join(parts) + ".") if parts else ""
 
 
-async def _alt_text_edits(ai, opts: JobOptions, pdf, tagmap_path, tagmap: dict | None,
-                          enrichment: EnrichmentStats, warnings: list[str], stats: dict) -> list[dict]:
-    """Tag edits that give every Figure without alt text a description (or mark it decorative)."""
+async def _ai_edits(ai, opts: JobOptions, pdf, original, tagmap_path, tagmap: dict | None,
+                    enrichment: EnrichmentStats, warnings: list[str], stats: dict) -> list[dict]:
+    """Tag edits that give every Figure without alt text a description (or mark it decorative), and Adobe's text tags
+    whose notation the PDF's own text can't voice a reading as ActualText. The notation is found and read on the
+    original, as on the standard route: Adobe's file draws the same pages, but its text, extracted, can carry
+    ActualText of its tags in place of what is drawn, and the readings are checked against what is drawn."""
     import json
+
+    from app.pipeline.enrichment import read_notation
+    from app.pipeline.notation import has_doses, need
+    from app.pipeline.orchestrator import prepare_analysis
 
     if tagmap is None:
         tagmap = json.loads(tagmap_path.read_text()) if tagmap_path.is_file() else {"elements": []}
     figures = [e for e in tagmap.get("elements", [])
                if e.get("role") == "Figure" and not (e.get("alt") or "").strip() and e.get("boxes")]
-    if not figures:
+    limit = get_settings().ai_existing_figures_max
+    if len(figures) > limit:
+        enrichment.findings.append(f"{len(figures) - limit} figure(s) beyond the limit of {limit} "
+                                   "(AI_EXISTING_FIGURES_MAX) weren't described by the AI and have no alt text")
+    figures = figures[:limit]
+    # Adobe's tags say what is a paragraph or a formula, but not where the sub- and superscripts are: our own look at
+    # the pages finds the notation, as on the standard route, and its readings go onto Adobe's tags that hold it
+    analysis = None
+    if opts.notation_ai and get_settings().ai_notation_enabled:
+        analysis = await asyncio.to_thread(prepare_analysis, original)
+        if not any(need(b) for p in analysis.pages for b in p.blocks) and \
+                not any(has_doses(c.text or "") for p in analysis.pages for t in p.tables for c in t.cells):
+            analysis = None  # nothing the rules can't read: no AI needed for it
+    if not figures and analysis is None:
         return []
-    figures = figures[:MAX_REGION_FIGURES]
     ai.tags = {"job": opts.job_id, **({"tier": opts.ai_tier} if opts.ai_tier else {})}
     async with ai:
         try:
@@ -291,7 +334,13 @@ async def _alt_text_edits(ai, opts: JobOptions, pdf, tagmap_path, tagmap: dict |
             stats["failures"] = 1
             return []
         regions = [(f["boxes"][0]["page"] - 1, tuple(f["boxes"][0]["bbox"])) for f in figures]
-        described = await _describe_regions(ai, pdf, regions, enrichment)
+        described = await _describe_regions(ai, pdf, regions, enrichment) if figures else []
+        if analysis is not None:
+            before = len(enrichment.findings)
+            await read_notation(ai, original, analysis, enrichment)
+            # Each region's "read by AI; check it" is said once below, for what reached Adobe's tags; what wasn't used
+            # (didn't match the page, failed) stays as it is
+            enrichment.findings[before:] = [f for f in enrichment.findings[before:] if "notation read by AI (" not in f]
     stats.update(calls=ai.calls, failures=ai.failures, cost=ai.usage.cost_usd, model=ai.model,
                  tokens={"prompt_tokens": ai.usage.prompt_tokens, "completion_tokens": ai.usage.completion_tokens})
     if ai.failures and not ai.calls:
@@ -306,7 +355,131 @@ async def _alt_text_edits(ai, opts: JobOptions, pdf, tagmap_path, tagmap: dict |
             edits.append({"op": "set_decorative", "element": f["i"], "expect_role": "Figure"})
         else:
             edits.append({"op": "set_alt", "element": f["i"], "expect_role": "Figure", "alt": alt})
+    if analysis is not None:
+        read, unplaced = notation_edits(analysis, tagmap)
+        edits += read
+        # Only what reached a tag is reported, and listed for review
+        placed = {tuple(e["bbox"]) for e in read}
+        enrichment.notation = [n for n in enrichment.notation if tuple(n["bbox"]) in placed]
+        by_ai = sum(1 for n in enrichment.notation if not n.get("by_rule"))
+        if read:
+            enrichment.findings.insert(0, f"{len(read)} reading(s) of specialist notation written onto Adobe's tags as "
+                                          f"read-aloud text ({by_ai} read by AI: check them)")
+        if unplaced:
+            enrichment.findings.insert(0, f"{unplaced} reading(s) of specialist notation matched no text tag of "
+                                          "Adobe's (Adobe's tags divide that text differently, or already say "
+                                          "something of their own); read as Adobe tagged it")
+        for e in read:
+            del e["bbox"]
     return edits
+
+
+# Adobe's tags that can take a reading: text tags with nothing of their own to say, holding only plain Spans (a list
+# item: its label and body)
+_TEXT_ROLES = {"P", "LBody", "LI", "Lbl", "TD", "TH", "Span", "Caption", "Formula", "H", "H1", "H2", "H3", "H4", "H5",
+               "H6", "Quote", "BlockQuote", "Note"}
+
+
+def _same_text(tag: str, block: str) -> str | None:
+    """Whether the tag holds the block's text: "exact" for the same characters, whatever the spacing and line-end
+    hyphens, and in any order (the lines of a table cell can come out in another order), a character with no readable
+    meaning matching any (the two ways of extracting text decode such a glyph differently, and those are the blocks
+    that need a reading). "loose" for the same letters and digits in any order, whatever the symbols and marks between
+    them: math comes out of the two in another order, an accent as a mark over its letter in one and a character
+    before it in the other. None otherwise. The tag map's text stops at 200 characters, so a tag's text that long is
+    compared as far as it goes."""
+    from collections import Counter
+
+    from app.pipeline.notation import _UNREADABLE
+    from app.verification.tagmap import TEXT_CHARS
+
+    t, b = (re.sub(r"[\s\-\u00ad]", "", x) for x in (tag, block))
+    if not t:
+        return None
+    if len(tag) >= TEXT_CHARS:
+        b = b[:len(t)]
+    if t == b or Counter(t) == Counter(b):
+        return "exact"
+    readable = [(x, y) for x, y in zip(t, b) if not (_UNREADABLE.match(x) or _UNREADABLE.match(y))]
+    if len(t) == len(b) and len(readable) < len(t) and all(x == y for x, y in readable):
+        return "exact"
+    letters = [Counter(c for c in x if c.isalnum() and c.isascii()) for x in (t, b)]
+    if sum(letters[0].values()) >= 2 and letters[0] == letters[1]:
+        return "loose"
+    return None
+
+
+def notation_edits(analysis, tagmap: dict) -> tuple[list[dict], int]:
+    """set_actual_text edits (set_alt on a Formula) that put the analysis's notation readings (and doses read by rule,
+    in blocks and table cells) onto Adobe's tags: the tag on the same page that holds the reading's text, where the two
+    boxes overlap (the closest overlap if two do; at least half, when only the letters and digits agree). Boxes alone
+    don't say it: a tag's box hugs its glyphs, a block's spans its lines. Nor does text alone: math fonts come out of
+    the two ways of extracting text as different letters, so a tag whose box is the reading's (85% overlap) takes it
+    whatever its text. Each edit carries the reading's box ("bbox", the analysis's) for the caller. Returns the edits
+    and how many readings found no such tag."""
+    from app.pipeline.models import bbox_area, bbox_intersection
+    from app.pipeline.notation import has_doses
+
+    wanted: list[tuple[int, tuple, str, str]] = []
+    for page in analysis.pages:
+        for b in page.blocks:
+            if b.notation_reading and b.actual_text and b.role != "Artifact":
+                wanted.append((page.number, tuple(b.bbox), b.text, b.actual_text))
+        for table in page.tables:
+            for c in table.cells:
+                if c.actual_text and c.bbox and has_doses(c.text or ""):
+                    wanted.append((page.number, tuple(c.bbox), c.text or "", c.actual_text))
+    if not wanted:
+        return [], 0
+    els = {e["i"]: e for e in tagmap.get("elements", [])}
+
+    def quiet(e) -> bool:
+        return not (e.get("alt") or "").strip() and not (e.get("actual_text") or "").strip() and not e.get("annot")
+
+    def plain(e, inside: set[str]) -> bool:
+        """Everything inside is plain: roles from inside, nothing to say of their own."""
+        for k in e.get("kids") or []:
+            kid = els.get(k)
+            if kid is None or kid.get("role") not in inside or not quiet(kid) or not plain(kid, {"Span"}):
+                return False
+        return True
+
+    candidates: dict[int, list] = {}
+    for e in els.values():
+        boxes = e.get("boxes") or []
+        if e.get("role") not in _TEXT_ROLES or not quiet(e) or len(boxes) != 1 or not e.get("text"):
+            continue
+        if not plain(e, {"Span", "Lbl", "LBody"} if e["role"] == "LI" else {"Span"}):
+            continue
+        candidates.setdefault(boxes[0]["page"] - 1, []).append((e, tuple(boxes[0]["bbox"])))
+    edits, unplaced, used = [], 0, set()
+    for page, box, text, said in wanted:
+        best, best_score = None, 0.0
+        for e, eb in candidates.get(page, []):
+            if e["i"] in used:
+                continue
+            same = _same_text(e["text"], text)
+            inter = bbox_intersection(box, eb)
+            union = bbox_area(box) + bbox_area(eb) - inter
+            score = inter / union if union > 0 else 0.0
+            if same == "loose" and score < 0.5:
+                continue  # only the letters agree: the boxes must too
+            if same is None and score < 0.85:
+                continue  # the text disagrees (math fonts decode differently): only the same box will do
+            if score > best_score:
+                best, best_score = e, score
+        if best is not None:
+            used.add(best["i"])
+            # A formula's spoken form is its alt text, as on the standard route (PDF/UA asks a Formula for one)
+            if best["role"] == "Formula":
+                edits.append({"op": "set_alt", "element": best["i"], "expect_role": "Formula", "alt": said,
+                              "bbox": list(box)})
+            else:
+                edits.append({"op": "set_actual_text", "element": best["i"], "expect_role": best["role"], "text": said,
+                              "bbox": list(box)})
+        else:
+            unplaced += 1
+    return edits, unplaced
 
 
 def adobe_error(exc: AdobeError) -> dict:

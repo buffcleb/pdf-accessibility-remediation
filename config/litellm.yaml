@@ -25,36 +25,54 @@ model_list:
       input_cost_per_token: 0
       output_cost_per_token: 0
 
-  # --- the same family hosted in the cloud, larger models, commercial models --------------------------
+  # More than one local AI server: repeat an entry with the same model_name and another api_base (another
+  # environment variable, e.g. LOCAL_AI_BASE_URL_2). The gateway spreads requests over the entries of one name.
+  # How many documents use a local model at once is set in the portal, not here: the AI level's "Most documents
+  # at once" (Administration > Services), so the rest wait in the queue and none fail on a busy GPU.
+
+  # --- hosted models: open-weight and commercial -----------------------------------------------------
+  # Names say family, size and role (open-large-vision), never the model or its version: the model behind a name
+  # can be replaced here without touching the AI levels that point at it. The family is what a writer and its
+  # judge must differ in.
   # Each AI level (and kind of document) has a writer model and a review (judge) model. Pair every writer with a judge from a
   # DIFFERENT model family (a model tends to approve its own mistakes), e.g. Qwen writes, Gemma reviews.
   #
   # Writers:
-  - model_name: cloud-vision
+  - model_name: open-small-vision         # the local model's family, hosted
     litellm_params:
       model: openrouter/qwen/qwen3-vl-8b-instruct
       api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: large-vision
+  - model_name: open-large-vision         # a much larger model of that family
     litellm_params:
       model: openrouter/qwen/qwen3-vl-235b-a22b-instruct
       api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: commercial
+  - model_name: commercial-small-vision   # a commercial vendor's small model, at a fraction of the price
+    litellm_params:
+      model: openrouter/anthropic/claude-haiku-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: commercial-medium-vision  # its everyday model
     litellm_params:
       model: openrouter/anthropic/claude-sonnet-5.5
       api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: commercial-large-vision   # the vendor's largest: for a kind of document that needs it (Math and science)
+    litellm_params:
+      model: openrouter/anthropic/claude-opus-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
   #
   # Judges:
-  - model_name: cloud-judge           # Gemma, hosted: reviews cloud-vision and large-vision (Qwen)
+  - model_name: open-judge            # Gemma, hosted: reviews the open writers (Qwen), and
+                                      # commercial-small-vision (a reviewer shouldn't cost more than its writer)
     litellm_params:
       model: openrouter/google/gemma-4-31b-it
       api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: commercial-judge      # Gemini: reviews the commercial (Claude) writer
+  - model_name: commercial-judge      # Gemini: reviews commercial-medium-vision and commercial-large-vision (Claude)
     litellm_params:
       model: openrouter/google/gemini-3.8-flash
       api_key: os.environ/OPENROUTER_API_KEY
   #
   # Then in the portal (Administration > Services > Add an AI level), choose each level's writer and review
-  # model, e.g. "Cloud AI" = cloud-vision + cloud-judge, "Commercial AI" = commercial + commercial-judge.
+  # model, e.g. "Large AI" = open-large-vision + open-judge, "Commercial AI" = commercial-medium-vision + commercial-judge.
+  # A level or kind of document that names a model no longer listed here must be pointed at one that is.
 
 litellm_settings:
   drop_params: true                    # backends that don't take an option (JSON mode, reasoning) ignore it
@@ -62,7 +80,7 @@ litellm_settings:
   num_retries: 2
   # Backstop for spend across all models, on top of the portal's page quotas: USD per budget period.
   # Set it for your deployment; local models cost nothing, so it only bites on cloud/commercial use.
-  max_budget: 50
+  max_budget: 150
   budget_duration: 30d
 
 general_settings:

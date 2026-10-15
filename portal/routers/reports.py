@@ -17,7 +17,7 @@ from portal.deps import Principal, current_principal, group_for_admin, require_a
 from portal.errors import not_found
 from portal.models import AuditEvent, Group, Job, QuotaLedger, User
 from portal.routers.common import LedgerOut
-from portal.routers.jobs import JobOut, job_out
+from portal.routers.jobs import DocumentsPage, JobOut, documents_page, job_out
 from portal.schemas import effective_cap, group_balance
 
 router = APIRouter(tags=["reports"])
@@ -55,17 +55,33 @@ def group_jobs(group_id: uuid.UUID, status: str | None = Query(None, max_length=
                limit: int = Query(100, ge=1, le=1000), before: datetime | None = None,
                p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     group = group_for_admin(group_id, p, db)
-    stmt = select(Job).where(Job.group_id == group.id)
+    stmt = select(Job).where(Job.group_id == group.id, Job.deleted_at.is_(None))
     if status:
         stmt = stmt.where(Job.status == status)
     if user_id:
         stmt = stmt.where(Job.user_id == user_id)
     if before:
         stmt = stmt.where(Job.created_at < before)
-    days = settings_store.load(db).file_retention_days
+    runtime = settings_store.load(db)
     # Cost is for super admins only: what groups are charged isn't the per-page cost
-    return [job_out(j, days, with_user=True, show_cost=p.is_super_admin)
+    return [job_out(j, runtime, with_user=True, show_cost=p.is_super_admin)
             for j in db.scalars(stmt.order_by(Job.created_at.desc()).limit(limit))]
+
+
+@router.get("/groups/{group_id}/documents", response_model=DocumentsPage)
+def group_documents(group_id: uuid.UUID, q: str = Query("", max_length=200), status: str | None = Query(None, max_length=20),
+                    result: str | None = Query(None, max_length=20), service: str | None = Query(None, max_length=64),
+                    audit: bool | None = None, since: datetime | None = None, until: datetime | None = None,
+                    sort: str = Query("-created_at", max_length=20), page: int = Query(1, ge=1, le=100_000),
+                    page_size: int = Query(25, ge=1, le=200),
+                    p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """A group's documents for its admins, a page at a time, searched, filtered and sorted like a person's own
+    list; the search also finds a person by email. A group with thousands of documents showed only its newest 200."""
+    group = group_for_admin(group_id, p, db)
+    # Cost is for super admins only: what groups are charged isn't the per-page cost
+    return documents_page(db, [Job.group_id == group.id], q=q, status=status, result=result, service=service,
+                          audit=audit, since=since, until=until, sort=sort, page=page, page_size=page_size,
+                          people=True, show_cost=p.is_super_admin)
 
 
 @router.get("/groups/{group_id}/ledger", response_model=list[LedgerOut])

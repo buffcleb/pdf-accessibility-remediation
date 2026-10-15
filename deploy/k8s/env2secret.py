@@ -1,9 +1,14 @@
-"""Print a Kubernetes Secret (JSON) from an env file, read the way Docker Compose reads it: KEY=VALUE lines, comments
+"""Print a Kubernetes Secret (JSON) from env files, read the way Docker Compose reads them: KEY=VALUE lines, comments
 and blank lines ignored, surrounding quotes removed. (kubectl's --from-env-file keeps the quotes, which breaks
 values such as PEM keys.)
 
-    python3 env2secret.py NAME NAMESPACE FILE | kubectl apply -f -
+    python3 env2secret.py NAME NAMESPACE FILE... [--keys REGEX] [--drop REGEX] | kubectl apply -f -
+
+With more than one file a later file's value wins. --keys keeps only the keys the pattern matches (anchored at the
+start, as re.match does); --drop leaves those out. Each pod gets a secret holding what it reads and nothing more,
+so a foothold in one of them doesn't hand over the keys of the others (deploy.sh builds five this way).
 """
+import argparse
 import json
 import re
 import sys
@@ -29,13 +34,33 @@ def parse(path: str) -> dict[str, str]:
     return out
 
 
-def main() -> None:
-    name, namespace, path = sys.argv[1:4]
-    data = parse(path)
-    json.dump({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-               "metadata": {"name": name, "namespace": namespace,
-                            "labels": {"app.kubernetes.io/part-of": "pdf-remediation"}},
-               "stringData": data}, sys.stdout)
+def select(data: dict[str, str], keys: str | None, drop: str | None) -> dict[str, str]:
+    """The entries whose key matches --keys (all, when not given) and does not match --drop."""
+    keep = re.compile(keys) if keys else None
+    out = re.compile(drop) if drop else None
+    return {k: v for k, v in data.items()
+            if (keep is None or keep.match(k)) and (out is None or not out.match(k))}
+
+
+def secret(name: str, namespace: str, data: dict[str, str]) -> dict:
+    return {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+            "metadata": {"name": name, "namespace": namespace,
+                         "labels": {"app.kubernetes.io/part-of": "pdf-remediation"}},
+            "stringData": data}
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("name")
+    ap.add_argument("namespace")
+    ap.add_argument("files", nargs="+")
+    ap.add_argument("--keys", help="keep only the keys this pattern matches")
+    ap.add_argument("--drop", help="leave out the keys this pattern matches")
+    args = ap.parse_args(argv)
+    data: dict[str, str] = {}
+    for path in args.files:
+        data.update(parse(path))
+    json.dump(secret(args.name, args.namespace, select(data, args.keys, args.drop)), sys.stdout)
 
 
 if __name__ == "__main__":

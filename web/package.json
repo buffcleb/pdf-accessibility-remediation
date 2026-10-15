@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "prebuild": "node scripts/copy-pdfjs.mjs",
-    "predev": "node scripts/copy-pdfjs.mjs"
+    "predev": "node scripts/copy-pdfjs.mjs",
+    "test": "tsc -p tests && node -e \"require('fs').writeFileSync('.test-build/package.json','{\\\"type\\\":\\\"commonjs\\\"}')\" && node --test .test-build/tests/*.test.js"
   },
   "dependencies": {
     "dompurify": "^3.4.16",

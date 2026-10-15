@@ -1,19 +1,62 @@
-import { useState, type FormEvent, type ReactNode } from "react";
-import { del, get, patch, post, type Group, type LedgerEntry, type User } from "../../api";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { ApiError, del, get, patch, post, type Group, type LedgerEntry, type User } from "../../api";
 import { LedgerTable } from "../../components/tables";
 import { ErrorNotice, Notice, fmtNum, useLoad } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
+import { GATEWAY_HELP } from "./gatewayHelp";
 
-export /** The AI gateway's (LiteLLM's) admin UI, when the portal is configured with its address. */
+export /** The AI gateway's (LiteLLM's) admin UI: a link when the portal is configured with its address, and
+ * otherwise how to reach it. A deployment that keeps the UI inside the cluster has no address to link, and a link
+ * that isn't there (or goes nowhere) leaves a super admin without a way to find it. */
 function GatewayLink({ children }: { children?: ReactNode }) {
   const links = useLoad(() => get<{ gateway_admin_url: string | null }>("/admin/links"), []);
-  const href = links.data?.gateway_admin_url;
-  if (!href) return null;
+  const [open, setOpen] = useState(false);
+  if (!links.data) return null;
+  const href = links.data.gateway_admin_url;
+  const label = children ?? "AI gateway (LiteLLM)";
+  if (href) {
+    return (
+      <a href={href} target="_blank" rel="noreferrer noopener" className="ext-link">
+        {label} <span aria-hidden="true">↗</span>
+        <span className="visually-hidden"> (opens in a new tab)</span>
+      </a>
+    );
+  }
   return (
-    <a href={href} target="_blank" rel="noreferrer noopener" className="ext-link">
-      {children ?? "AI gateway (LiteLLM)"} <span aria-hidden="true">↗</span>
-      <span className="visually-hidden"> (opens in a new tab)</span>
-    </a>
+    <>
+      <button type="button" className="link-button" aria-haspopup="dialog" onClick={() => setOpen(true)}>{label}</button>
+      {open && <GatewayHelpDialog onClose={() => setOpen(false)} />}
+    </>
+  );
+}
+
+function GatewayHelpDialog({ onClose }: { onClose: () => void }) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const d = ref.current;
+    if (d && !d.open) d.showModal();
+    close.current?.focus();  // not the command's box, which a browser focuses first because it can scroll
+  }, []);
+  return (
+    <dialog ref={ref} className="confirm-dialog gateway-help" aria-labelledby="gw-help-h" onClose={onClose}>
+      <h2 id="gw-help-h">Opening the AI gateway</h2>
+      <p>The gateway's own pages (every AI call, its cost and errors, models and keys) aren't published by this
+        deployment, so there is no address to link to. Whoever runs the cluster opens them from their own machine:</p>
+      <ol>
+        <li>Run this, with the deployment's namespace, and leave it running:
+          <pre><code>{GATEWAY_HELP.command}</code></pre></li>
+        <li>Open <span className="mono">{GATEWAY_HELP.address}</span> in a browser on the same machine and sign in.</li>
+      </ol>
+      <p className="small muted">If port 4000 is taken there, use <span className="mono">{GATEWAY_HELP.otherPort}</span> and
+        port 4001 in the address.</p>
+      <p><a href={GATEWAY_HELP.guideUrl} target="_blank" rel="noreferrer noopener" className="ext-link">
+        Operations guide: {GATEWAY_HELP.guideHeading.toLowerCase()} <span aria-hidden="true">↗</span>
+        <span className="visually-hidden"> (opens in a new tab)</span></a></p>
+      <div className="actions">
+        <button ref={close} className="btn" type="button" onClick={() => ref.current?.close()}>Close</button>
+      </div>
+    </dialog>
   );
 }
 
@@ -243,6 +286,17 @@ export function Domains({ group, onChange }: { group: Group; onChange: (g: Group
       onChange(await post<Group>(`/admin/groups/${group.id}/domains`, { domain }));
       setDomain("");
     } catch (err) {
+      // A public email provider (gmail.com…): almost always one person's address was meant
+      if (err instanceof ApiError && err.body.error === "public_domain") {
+        if (!window.confirm(`${err.body.message}\n\nAllow everyone at ${domain.trim()} anyway?`)) return;
+        try {
+          onChange(await post<Group>(`/admin/groups/${group.id}/domains`, { domain, public_ok: true }));
+          setDomain("");
+        } catch (again) {
+          setError(again);
+        }
+        return;
+      }
       setError(err);
     }
   }
@@ -274,6 +328,74 @@ export function Domains({ group, onChange }: { group: Group; onChange: (g: Group
           <input id="dom-new" type="text" placeholder="example.edu" value={domain} onChange={(e) => setDomain(e.target.value)} />
         </div>
         <button className="btn secondary" type="submit" disabled={!domain.trim()}>Add</button>
+      </form>
+      <ErrorNotice error={error} />
+    </section>
+  );
+}
+
+/** People allowed into the group by their address, without their whole domain (a gmail.com user, say). */
+export function GroupEmails({ group, onChange }: { group: Group; onChange: (g: Group) => void }) {
+  const [email, setEmail] = useState("");
+  const [note, setNote] = useState("");
+  const [error, setError] = useState<unknown>(null);
+  useUnsavedChanges(email.trim() !== "");
+
+  async function add(e: FormEvent, move = false) {
+    e.preventDefault();
+    setError(null);
+    try {
+      onChange(await post<Group>(`/admin/groups/${group.id}/emails`, { email, note: note.trim() || null, move }));
+      setEmail("");
+      setNote("");
+    } catch (err) {
+      if (!move && err instanceof ApiError && err.body.error === "email_taken" && window.confirm(err.body.message)) {
+        await add(e, true);
+        return;
+      }
+      setError(err);
+    }
+  }
+  async function remove(addr: string, hasAccount: boolean) {
+    const after = hasAccount
+      ? "They've already signed in: their account keeps working (disable it in People to stop that)."
+      : "They won't be able to sign up.";
+    if (!window.confirm(`Remove ${addr}? ${after}`)) return;
+    try {
+      const g = await del<Group>(`/admin/groups/${group.id}/emails/${encodeURIComponent(addr)}`);
+      if (g) onChange(g);
+    } catch (err) {
+      setError(err);
+    }
+  }
+  return (
+    <section className="panel" aria-labelledby="gem-h">
+      <h3 id="gem-h">People allowed by address</h3>
+      <p className="muted small">Let one person in without allowing their whole domain, for example someone with a gmail.com
+        address. An address here takes precedence over the email domains, so it can also place one person in this group
+        apart from the rest of their organization.</p>
+      {group.emails.length === 0 ? <p className="muted small">None yet.</p> : (
+        <ul className="plain-list">
+          {group.emails.map((e) => (
+            <li key={e.email}>
+              <strong>{e.email}</strong>{e.note && <span className="muted"> · {e.note}</span>}
+              <span className="muted small"> · {e.has_account ? "signed in" : "hasn't signed in yet"}</span>{" "}
+              <button type="button" className="linkbtn small" onClick={() => void remove(e.email, e.has_account)}>
+                Remove<span className="visually-hidden"> {e.email}</span></button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <form onSubmit={(e) => void add(e)} className="form-row">
+        <div className="field">
+          <label htmlFor="gem-new">Email address</label>
+          <input id="gem-new" type="email" placeholder="person@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+        </div>
+        <div className="field">
+          <label htmlFor="gem-note">Note <span className="hint">(optional)</span></label>
+          <input id="gem-note" type="text" maxLength={300} placeholder="Who they are" value={note} onChange={(e) => setNote(e.target.value)} />
+        </div>
+        <button className="btn secondary" type="submit" disabled={!email.trim()}>Add</button>
       </form>
       <ErrorNotice error={error} />
     </section>

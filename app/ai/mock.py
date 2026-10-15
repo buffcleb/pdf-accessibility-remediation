@@ -38,6 +38,8 @@ class MockProvider(AIProvider):
             # Return the OCR text unchanged (brackets removed): tests patch this to steer corrections.
             m = re.search(r'(?:read the line as|produced):\n"""(.*?)"""', prompt, re.S)
             out = {"text": (m.group(1) if m else "").replace("[[", "").replace("]]", ""), "confidence": 0.9}
+        elif "displayed formula" in prompt:
+            out = {"formulas": []}  # tests patch this to place formulas
         elif "shows a table" in prompt:
             out = {"header_rows": 1, "header_cols": 0, "spans": [], "summary": "Test data table.", "is_layout_table": False}
         elif "reading order" in prompt:

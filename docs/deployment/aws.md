@@ -64,6 +64,7 @@ PORTAL_SES_REGION=<region>
 PORTAL_APP_URL=https://pdf.example.org
 PORTAL_COOKIE_SECURE=true
 PORTAL_TRUST_PROXY_HEADERS=true             # the caller's address from the ALB's X-Forwarded-For
+PORTAL_CLIENT_IP_HEADER=x-forwarded-for     # read from the end: the ALB adds the address it saw last
 
 # engine
 REDIS_URL=rediss://<elasticache-endpoint>:6379/0
@@ -75,9 +76,9 @@ SERVICE_API_KEY=…                           # and the same value as PORTAL_ENG
 With `PORTAL_S3_ACCESS_KEY` and `PORTAL_S3_SECRET_KEY` empty, the portal's S3 client uses the task role's credentials:
 give the portal tasks' role access to the bucket (and the KMS key).
 
-**Keep the caller's address:** have the ALB send `/api/*` straight to the portal API, and everything else to the web app.
-The web app's own proxy replaces `X-Forwarded-For` with its own peer address, so going through it would record the
-ALB's address in the audit log instead of the person's.
+**Keep the caller's address:** have the ALB send `/api/*` straight to the portal API, and everything else to the web
+app. Or send everything to the web app and set its `TRUSTED_PROXIES` to the ALB's subnets (the VPC's CIDR range):
+it then passes on the address the ALB reports. Without that, the web app reports its own peer, the ALB.
 
 ## AI models on AWS
 

@@ -2,6 +2,7 @@ import { useRef, useState, type FormEvent } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { ApiError, requestCode, verifyCode } from "../api";
 import { useAuth } from "../auth";
+import { BotCheck } from "../components/BotCheck";
 import { SiteFooter } from "../components/Layout";
 import { ErrorNotice, Notice, useTitle } from "../components/ui";
 
@@ -16,6 +17,11 @@ export function Login() {
   const [error, setError] = useState<unknown>(null);
   const [blocked, setBlocked] = useState<string | null>(null);
   const codeRef = useRef<HTMLInputElement>(null);
+  // The bot check, when the service has it on: each code request uses up one token, so it's renewed after each
+  const siteKey = config.botCheckSiteKey;
+  const [botToken, setBotToken] = useState<string | null>(null);
+  const [botReset, setBotReset] = useState(0);
+  const waitingForCheck = !!siteKey && !botToken;
 
   if (me) {
     const to = (location.state as { from?: string } | null)?.from ?? "/";
@@ -28,7 +34,7 @@ export function Login() {
     setError(null);
     setBlocked(null);
     try {
-      await requestCode(email);
+      await requestCode(email, botToken);
       setStep("code");
       setCode("");
       window.setTimeout(() => codeRef.current?.focus(), 0);
@@ -41,6 +47,7 @@ export function Login() {
       }
     } finally {
       setBusy(false);
+      if (siteKey) setBotReset((n) => n + 1);
     }
   }
 
@@ -75,7 +82,7 @@ export function Login() {
             {blocked && <Notice kind="warn" title="Can't sign in">{blocked}</Notice>}
             <ErrorNotice error={error} />
             <div className="actions">
-              <button className="btn" type="submit" disabled={busy || !email.includes("@")}>
+              <button className="btn" type="submit" disabled={busy || !email.includes("@") || waitingForCheck}>
                 {busy ? "Sending…" : "Email me a code"}
               </button>
             </div>
@@ -100,12 +107,14 @@ export function Login() {
               <button className="linkbtn" type="button" onClick={() => setStep("email")}>
                 Use a different email
               </button>
-              <button className="linkbtn" type="button" disabled={busy} onClick={(e) => void sendCode(e as unknown as FormEvent)}>
+              <button className="linkbtn" type="button" disabled={busy || waitingForCheck}
+                onClick={(e) => void sendCode(e as unknown as FormEvent)}>
                 Send a new code
               </button>
             </div>
           </form>
         )}
+        {siteKey && <BotCheck siteKey={siteKey} onToken={setBotToken} resetKey={botReset} />}
       </div>
       <SiteFooter />
     </main>

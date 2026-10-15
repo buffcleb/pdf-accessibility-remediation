@@ -88,6 +88,26 @@ class TextBlock:
     # Baseline of the first line: where a row of text sits, even when something in it (a stacked fraction,
     # an exponent) reaches higher than the rest of the line
     baseline: float | None = None
+    # actual_text is a reading of specialist notation (the AI's, or doses put in words by rule), not the layout
+    # rules' own: it is also written onto a document's own tags when those are kept
+    notation_reading: bool = False
+    # Footnotes: the raised marks after words in this block ("results¹", "noted.*"), the raised mark it starts with
+    # (a footnote's own number), and, once footnotes are found, the mark this block is the note for and the
+    # footnotes its marks point to (block ids)
+    marks: list[str] = field(default_factory=list)
+    mark_after: list[str] = field(default_factory=list)  # for each mark, the text it is written right after
+    mark_boxes: list[tuple] = field(default_factory=list)  # ...and where it is drawn
+    # ...and, once footnotes are found, the footnote each mark points at (its block id; None where it has none), and
+    # whether the read-aloud text was written only to say the marks as footnotes
+    mark_notes: list = field(default_factory=list)
+    says_marks_only: bool = False
+    lead_mark: str | None = None
+    # Scanned pages: the mean OCR confidence of the words in this block (0-100; None when not OCR'd or unknown), and
+    # whether the AI, asked where the page's formulas are, found one here
+    ocr_conf: float | None = None
+    scan_formula: bool = False
+    note_mark: str | None = None
+    notes: list[str] = field(default_factory=list)
 
 
 def append_block(dst: "TextBlock", src: "TextBlock") -> None:
@@ -98,6 +118,19 @@ def append_block(dst: "TextBlock", src: "TextBlock") -> None:
         dst.actual_text = spoken
     dst.bbox = bbox_union([dst.bbox, src.bbox])
     dst.has_scripts = dst.has_scripts or src.has_scripts
+    dst.marks = dst.marks + src.marks
+    dst.mark_after = dst.mark_after + src.mark_after
+    dst.mark_boxes = dst.mark_boxes + src.mark_boxes
+
+
+def merge_blocks(page, head: "TextBlock", others: list) -> None:
+    """Join blocks onto head, as one block: the fragments of a displayed equation read as one, the blocks a
+    reading covers after flattening. The others leave the page's blocks and its reading order."""
+    for b in others:
+        append_block(head, b)
+        page.blocks.remove(b)
+        if b.id in page.reading_order:
+            page.reading_order.remove(b.id)
 
 
 @dataclass
@@ -112,6 +145,13 @@ class ImageRegion:
     decorative: bool = False
     kind: str = "image"  # image, formula, chart, music, handwriting, ...
     latex: str | None = None
+    # A figure made of many small pieces (a music example, a graph drawn dot by dot): every picture drawn inside
+    # its box is part of it, however small
+    holds_pieces: bool = False
+    labels: str | None = None  # the text inside it (axis values, names), for whoever describes it
+    # What kind of line drawing the analysis found it to be ("scheme": chemical structures, a reaction), when it
+    # knows: whoever describes it is told, since a crop of strokes and letters doesn't say so by itself
+    drawing: str | None = None
 
 
 @dataclass
@@ -144,6 +184,7 @@ class TableRegion:
     irregular: bool = False
     ai_used: bool = False
     header_evidence: bool = False  # layout strongly suggests row 0 is a header row
+    notes: dict = field(default_factory=dict)  # the notes under it, by the symbol its cells carry ("*" -> block id)
 
     def cell_target_id(self, cell: TableCell) -> str:
         return f"{self.id}:{cell.key}"

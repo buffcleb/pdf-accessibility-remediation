@@ -75,10 +75,14 @@ def test_choosing_a_metered_tier_needs_its_pages_and_records_cost(setup):
     assert s["engine"].ai_choices[-1] == AIChoice(big, "large-vision")
     s["engine"].complete(job.engine_job_id)
     s["engine"].jobs[job.engine_job_id]["metrics"] = {"ai_cost_usd": 0.0412, "verification_ai_cost_usd": 0.0088,
-                                                      "ai_calls": 7}
+                                                      "ai_calls": 7, "ai_model": "large-vision"}
     run_worker(db)
     db.refresh(job)
-    assert job.status == "completed" and job.cost == {"ai_usd": 0.05, "ai_calls": 7, "ai_tier": big}
+    assert job.status == "completed"
+    assert {k: job.cost[k] for k in ("ai_usd", "ai_calls", "ai_tier")} == {"ai_usd": 0.05, "ai_calls": 7, "ai_tier": big}
+    # What the AI usage report reads: the writing and review costs apart, and the model that served it
+    assert job.cost["writer_usd"] == 0.0412 and job.cost["review_usd"] == 0.0088
+    assert job.cost["writer_model"] == "large-vision"
     # Without a default tier and none chosen, the engine's own default AI is used
     s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}/services/ai:local-ai", json={"enabled": False})
     r = upload(user, ("c.pdf", pdf_bytes(1))).json()[0]
@@ -98,8 +102,14 @@ def test_tiers_follow_the_same_opt_in_and_local_only_rules(setup):
     assert r.status_code == 422  # standard isn't an AI tier
 
 
-def test_gateway_admin_link_is_for_super_admins_only(setup):
+def test_gateway_admin_link_is_for_super_admins_only(setup, monkeypatch):
+    from portal.config import get_portal_settings
+
     s = setup
+    # No link unless an address is configured (a made-up default would point at the admin's own machine)
+    monkeypatch.setattr(get_portal_settings(), "gateway_admin_url", "")
+    assert s["c"]["super"].get(f"{API}/admin/links").json()["gateway_admin_url"] is None
+    monkeypatch.setattr(get_portal_settings(), "gateway_admin_url", "https://gateway.example.org/ui")
     r = s["c"]["super"].get(f"{API}/admin/links")
     assert r.status_code == 200 and r.json()["gateway_admin_url"].endswith("/ui")
     assert s["c"]["admin_a"].get(f"{API}/admin/links").status_code == 403

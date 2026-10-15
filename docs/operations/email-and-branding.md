@@ -12,7 +12,7 @@ provider is chosen with `PORTAL_MAIL_BACKEND`; secrets come only from the enviro
 | `smtp` | Any SMTP relay: your organization's, Mailpit locally, or Cloudflare Email Service's SMTP submission | `PORTAL_SMTP_HOST`, `_PORT`, `_STARTTLS` or `_SSL`, `_USERNAME`, `_PASSWORD` |
 | `ses` | Amazon SES through its API | `PORTAL_SES_REGION`, optional `PORTAL_SES_CONFIGURATION_SET`; credentials from the AWS environment or the machine's role |
 | `plunk` | Plunk's HTTP API | `PORTAL_PLUNK_API_KEY` (secret key), `PORTAL_PLUNK_BASE_URL` |
-| `cloudflare` | Cloudflare Email Service's REST API | `PORTAL_CLOUDFLARE_ACCOUNT_ID`, `PORTAL_CLOUDFLARE_API_TOKEN`. No sender name and no attachments; for those, use Cloudflare's SMTP submission with the `smtp` backend (below) |
+| `cloudflare` | Cloudflare Email Service's REST API | `PORTAL_CLOUDFLARE_ACCOUNT_ID`, `PORTAL_CLOUDFLARE_API_TOKEN`. Attachments are sent (a message can be 5 MiB in all). No sender name; for that, use Cloudflare's SMTP submission with the `smtp` backend (below) |
 | `console` | Local demos: logged, not sent | – |
 
 **Cloudflare Email Service over SMTP** (sender names and attachments work):
@@ -26,8 +26,9 @@ PORTAL_SMTP_USERNAME=api_token
 PORTAL_SMTP_PASSWORD=<a Cloudflare API token allowed to send email>
 ```
 
-**Attachments.** Scheduled report views can attach a CSV. That needs the `smtp` or `ses` backend; with the others the
-email says to download it from the app.
+**Attachments.** Scheduled report views can attach a CSV. The `smtp`, `ses` and `cloudflare` backends send it; with
+`plunk` the email says to download it from the app. A CSV over 5 MB isn't attached (over about 3.4 MB with
+`cloudflare`, whose messages can be 5 MiB in all once the file is encoded); the email says to download it instead.
 
 - **Sender:** `PORTAL_MAIL_FROM` gives the address (on a domain the provider has verified) and a default name. The
   name can be changed in **Administration → Settings → Branding**. `PORTAL_MAIL_REPLY_TO` is optional.
@@ -58,6 +59,10 @@ that bounce.
 
 ### When sign-in codes don't arrive
 
+First look in [the email log](#the-email-log) (filter **Kind: Sign-in code** and search the address): it says
+whether the code was handed to the mail provider, when, with which message ID, or the error if it wasn't. With the
+message ID you can find it in the provider's logs (Cloudflare, SES) or ask the recipient's mail team to trace it.
+
 `scripts/sign-in-code.sh` issues a new sign-in code and prints it, for when email isn't working:
 
 ```bash
@@ -68,6 +73,19 @@ Add `--k8s` for a Kubernetes deployment. It applies the same checks as the sign-
 to sign in, the account not disabled); the code works once, replaces any code sent before, and expires as usual. The
 portal stores only a hash of each code, so a mailed code can't be read back. Each use is in the audit log
 (`login.code_issued`, with who ran it and why), never the code. Pass it on privately.
+
+### The email log
+
+**Reports → Activity → Email** lists every email the service sent or tried to send: sign-in codes, document and
+help notifications, daily summaries, email reports and test emails. Each row has when, to whom, the kind, the
+subject, the status (sent, failed, waiting or retrying, held while email is paused, not sent because the person had
+already seen it in the portal, combined into a daily summary), the last error, the backend, and (in **Columns**) the
+**message ID**: the message's `Message-ID` header, or the provider's own ID (SES, Cloudflare), to find the same email
+in the provider's logs or in the recipient's mail trace. Search takes an address, a subject or a message ID.
+
+Sign-in codes and test emails are recorded without their body, so the code is never stored. Other emails keep what
+they said for 30 days (so a failed one can be retried); after that only the record stays, for the records retention
+period. Super admins see every email; group admins see emails to their group's people.
 
 ## Branding
 

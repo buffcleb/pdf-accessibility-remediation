@@ -12,7 +12,7 @@ type Queue = {
 type Item = {
   id: string; job_id: string | null; title: string; who: string; pages: number | null; options: string | null;
   created_at: string; started_at: string | null; finished_at: string | null; detail: string | null;
-  error_code: string | null; can_retry: boolean; can_cancel: boolean; can_stop?: boolean; can_remove?: boolean; can_process_now: boolean;
+  error_code: string | null; can_retry: boolean; can_cancel: boolean; can_stop?: boolean; can_restart?: boolean; can_remove?: boolean; can_process_now: boolean;
 };
 type State = "waiting" | "active" | "failed";
 
@@ -152,12 +152,14 @@ function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () =
     ["failed", "Failed, last 7 days", queue.failed]];
   const noun = isMail ? "email" : queue.kind === "documents" ? "document" : queue.kind === "edits" ? "save" : "review";
 
-  async function act(item: Item, what: "retry" | "cancel" | "process-now" | "stop" | "remove") {
-    const verb = { retry: "Try again", cancel: "Canceled", "process-now": "Process now", stop: "Stopped", remove: "Removed from the list" }[what];
+  async function act(item: Item, what: "retry" | "cancel" | "process-now" | "stop" | "restart" | "remove") {
+    const verb = { retry: "Try again", cancel: "Canceled", "process-now": "Process now", stop: "Stopped", restart: "Restarted", remove: "Removed from the list" }[what];
     if (!window.confirm(what === "process-now"
       ? `Process "${item.title}" next? It goes ahead of the large-document rules as soon as a slot is free.`
       : what === "stop"
       ? `Stop "${item.title}"? It ends now and frees its place.${queue.kind === "documents" ? " The person's pages are given back and they're emailed; they can send it again." : queue.kind === "edits" ? " The save is lost; the previous version is unchanged." : ""}`
+      : what === "restart"
+      ? `Restart "${item.title}"? The engine stops its copy and it goes back to the queue, keeping its place. Nothing is charged again and nobody is emailed.`
       : what === "remove"
       ? `Remove "${item.title}" from this list? ${isMail ? "The email" : "The " + noun} itself isn't changed${queue.kind === "documents" ? ": it stays in the person's documents as failed" : ""}; it just stops being listed here.`
       : what === "cancel"
@@ -215,6 +217,8 @@ function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () =
                         Try again<span className="visually-hidden"> {it.title}</span></button>}
                       {it.can_cancel && <button className="btn secondary small" onClick={() => void act(it, "cancel")}>
                         Cancel<span className="visually-hidden"> {noun} {it.title}</span></button>}
+                      {it.can_restart && <button className="btn secondary small" onClick={() => void act(it, "restart")}>
+                        Restart<span className="visually-hidden"> {noun} {it.title}</span></button>}
                       {it.can_stop && <button className="btn secondary small" onClick={() => void act(it, "stop")}>
                         Stop<span className="visually-hidden"> {noun} {it.title}</span></button>}
                       {it.can_remove && <button className="btn secondary small" onClick={() => void act(it, "remove")}>

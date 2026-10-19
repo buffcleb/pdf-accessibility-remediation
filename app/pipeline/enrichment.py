@@ -32,17 +32,39 @@ class EnrichmentStats:
     # Specialist notation read by the AI: {"page", "bbox", "kind", "reason", "spoken", "latex", "confidence"}
     notation: list[dict] = field(default_factory=list)
     notation_rejected: int = 0
+    # ...by reason (numbers left out), for the job's metrics: the findings stop at 100, the counts don't
+    notation_rejected_by: dict = field(default_factory=dict)
     # Scanned pages the AI was asked about (where their formulas are), and its boxes that held no OCR text (a model
     # can carry a pattern of boxes on into blank space; or the OCR missed the writing): nothing to read there
     scan_formula_pages: int = 0
     scan_formulas_without_text: int = 0
     dose_cells: int = 0  # table cells whose doses were put in words by rule
+    # Limits this document reached (#312): {"setting", "value", "wanted", "effect"}, one per setting
+    limits_hit: list = field(default_factory=list)
+
+    def limit_hit(self, setting: str, value: int, wanted: int, effect: str, count: bool = False) -> None:
+        """Record that a limit cut something short: setting is its name (the environment variable, or the constant),
+        value what it is set to, wanted what this document would have used. count: a limit met once per page (or
+        other unit): wanted counts the times, and adds up."""
+        for x in self.limits_hit:
+            if x["setting"] == setting:
+                x["wanted"] = x["wanted"] + wanted if count else max(x["wanted"], wanted)
+                return
+        self.limits_hit.append({"setting": setting, "value": value, "wanted": wanted, "effect": effect,
+                                **({"count": True} if count else {})})
     # OCR lines corrected or transcribed by the AI: {"page", "bbox", "mode", "before", "after", "changes"}
     ocr: list[dict] = field(default_factory=list)
     ocr_rejected: int = 0
     # Music examples: {"page", "bbox", "read" (by the music reading service), "measures", "notes", "full", "error"}
     music: list[dict] = field(default_factory=list)
     music_score: int = 0  # sheet music: files the whole piece was read into (one, or one per movement)
+    math_formulas: int = 0  # formulas saved as MathML too (app/pipeline/mathml.py, #403)
+    # The formulas with their MathML and MathCAT's reading (mathml.collect, read_by_rule), and how many of them the
+    # two readings disagree on
+    formulas: list[dict] = field(default_factory=list)
+    math_disagree: int = 0
+    math_picture_disagree: int = 0  # of them, how many the formula reading service's reading disagrees with
+    math_embedded: int = 0  # of them, MathML attached to their tags in the PDF (a PDF 2.0 file, #403)
 
 
 def render_slots() -> asyncio.Semaphore:
@@ -141,8 +163,10 @@ async def _notation(ai, doc, analysis, stats) -> None:
     """Blocks whose notation the layout rules can't read reliably get the AI's reading, if its
     transcription matches the characters on the page."""
     from app.pipeline.models import bbox_union, merge_blocks
-    from app.pipeline.notation import (around_an_equation, consistent, consistent_scanned, doses_in_cells, scanned_math, in_a_sentence, join_broken_words, need, one_style, place_in_reading, readable,
-                                       say_doses, spans, spoken_consistent, with_its_surroundings)
+    from app.pipeline.notation import (DIVISION_NOT_WRITTEN, around_an_equation, consistent, consistent_scanned, doses_in_cells,
+                                       drawn_fraction, scanned_math, in_a_sentence, join_broken_words, need, one_style,
+                                       place_in_reading, readable, rejection_reason, say_doses, spans,
+                                       spoken_consistent, with_its_surroundings)
 
     # Doses and prescription shorthand are put in words by rule: there is one right way to say "5 mg/mL", it needs
     # no picture, and an AI reading it from a scan once turned "mcg" into "meg"
@@ -176,6 +200,7 @@ async def _notation(ai, doc, analysis, stats) -> None:
     todo = [(p, g) for p, g in todo if not all(id(b) in by_rule for b in g)]
     todo = [(p, g) for p, g in todo if readable(" ".join(b.text for b in g)) >= 2]
     if len(todo) > limit:
+        stats.limit_hit("AI_NOTATION_MAX", limit, len(todo), "regions of specialist notation kept the layout rules' reading")
         stats.findings.append(f"{len(todo) - limit} region(s) of specialist notation beyond the limit of {limit} "
                               "kept the layout rules' reading")
         todo = todo[:limit]
@@ -222,6 +247,8 @@ async def _notation(ai, doc, analysis, stats) -> None:
         failed = len(results) - len(read)
         if failed:
             stats.notation_rejected += failed
+            reason = "a formula or dose in a sentence couldn't be read or didn't match the page"
+            stats.notation_rejected_by[reason] = stats.notation_rejected_by.get(reason, 0) + failed
         if not read:
             stats.findings.append(f"{where}: AI reading of {why.kind} notation not used ({failed} formula(s) or dose(s) "
                                   "in a sentence couldn't be read or didn't match the page); layout rules used")
@@ -281,9 +308,16 @@ async def _notation(ai, doc, analysis, stats) -> None:
                 ok, problem = consistent(text, res["transcription"], res.get("latex"))
         res["spoken"] = with_its_surroundings(res["spoken"], lead, label)
         if ok and not scanned:
-            ok, problem = spoken_consistent(text, res["spoken"], " ".join(b.actual_text or "" for b in group))
+            rules = " ".join(b.actual_text or "" for b in group)
+            ok, problem = spoken_consistent(text, res["spoken"], rules)
+            if not ok and problem == DIVISION_NOT_WRITTEN and drawn_fraction(
+                    doc[page.number], (x0, y0, x1, y1), max(b.font_size or 10 for b in group)):
+                # A stacked fraction: its "over" is the bar the page draws
+                ok, problem = spoken_consistent(text, res["spoken"], rules, fraction_drawn=True)
         if not ok:
             stats.notation_rejected += 1
+            reason = rejection_reason(problem)
+            stats.notation_rejected_by[reason] = stats.notation_rejected_by.get(reason, 0) + 1
             stats.findings.append(f"{where}: AI reading of {why.kind} notation not used ({problem}); layout rules used")
             return
         head = group[0]
@@ -316,7 +350,11 @@ async def _scanned_formulas(ai, doc, analysis, stats) -> None:
     from app.pipeline.models import bbox_intersection
     from app.pipeline.notation import scanned_math
 
-    pages = [p for p in analysis.pages if any(scanned_math(b) for b in p.blocks)][:SCAN_FORMULA_PAGES]
+    pages = [p for p in analysis.pages if any(scanned_math(b) for b in p.blocks)]
+    if len(pages) > SCAN_FORMULA_PAGES:
+        stats.limit_hit("SCAN_FORMULA_PAGES", SCAN_FORMULA_PAGES, len(pages),
+                        "scanned pages weren't asked where their formulas are")
+        pages = pages[:SCAN_FORMULA_PAGES]
     if not pages:
         return
     slots = render_slots()
@@ -356,6 +394,7 @@ async def _images(ai, doc, analysis, stats, dpi) -> None:
     limit = get_settings().ai_images_max
     todo = [(p, i) for p in analysis.pages for i in p.images if not i.decorative and not i.alt]
     if len(todo) > limit:
+        stats.limit_hit("AI_IMAGES_MAX", limit, len(todo), "figures weren't described by the AI and have no alt text")
         stats.findings.append(f"{len(todo) - limit} figure(s) beyond the limit of {limit} (AI_IMAGES_MAX) weren't "
                               f"described by the AI and have no alt text (the first is on page {todo[limit][0].number + 1})")
         todo = todo[:limit]
@@ -405,6 +444,7 @@ async def _tables(ai, doc, analysis, stats, dpi) -> None:
     tables = [t for p in analysis.pages for t in p.tables]
     limit = get_settings().ai_tables_max
     if len(tables) > limit:
+        stats.limit_hit("AI_TABLES_MAX", limit, len(tables), "tables kept the layout rules' headers and structure")
         stats.findings.append(f"{len(tables) - limit} table(s) beyond the limit of {limit} (AI_TABLES_MAX) kept the "
                               f"layout rules' headers and structure (from page {tables[limit].page + 1} on)")
         tables = tables[:limit]
@@ -507,6 +547,7 @@ async def _reading_order(ai, doc, analysis, stats) -> None:
     pages = [p for p in analysis.pages if needs_ai_reading_order(p) and len(p.reading_order) > 1]
     limit = get_settings().ai_order_pages_max
     if len(pages) > limit:
+        stats.limit_hit("AI_ORDER_PAGES_MAX", limit, len(pages), "pages with columns kept the layout rules' reading order")
         stats.findings.append(f"{len(pages) - limit} page(s) with columns beyond the limit of {limit} "
                               f"(AI_ORDER_PAGES_MAX) kept the layout rules' reading order (from page "
                               f"{pages[limit].number + 1} on)")
@@ -514,6 +555,8 @@ async def _reading_order(ai, doc, analysis, stats) -> None:
 
     async def one(p: PageAnalysis) -> None:
         if len(p.reading_order) > MAX_ORDER_REGIONS:
+            stats.limit_hit("MAX_ORDER_REGIONS", MAX_ORDER_REGIONS, 1, "pages had too many regions for an AI reading order "
+                            "and kept the layout rules'", count=True)
             stats.findings.append(f"page {p.number + 1}: {len(p.reading_order)} regions; too many for AI reading "
                                   "order, layout heuristic used")
             return

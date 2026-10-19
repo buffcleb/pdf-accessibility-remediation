@@ -19,6 +19,7 @@ from portal.models import AuditEvent, Group, Job, QuotaLedger, User
 from portal.routers.common import LedgerOut
 from portal.routers.jobs import DocumentsPage, JobOut, documents_page, job_out
 from portal.schemas import effective_cap, group_balance
+from portal.security.ratelimit import per_person
 
 router = APIRouter(tags=["reports"])
 
@@ -169,7 +170,7 @@ REPORTS = {
 }
 
 
-@router.get("/groups/{group_id}/reports/{name}.csv")
+@router.get("/groups/{group_id}/reports/{name}.csv", dependencies=[Depends(per_person("export"))])
 def group_report(group_id: uuid.UUID, name: str, request: Request, since: datetime | None = None,
                  until: datetime | None = None, p: Principal = Depends(current_principal),
                  db: Session = Depends(get_db)):
@@ -185,7 +186,7 @@ def group_report(group_id: uuid.UUID, name: str, request: Request, since: dateti
     return _csv(rows, header, f"{name}-{group.name.lower().replace(' ', '-')}")
 
 
-@router.get("/admin/reports/{name}.csv")
+@router.get("/admin/reports/{name}.csv", dependencies=[Depends(per_person("export"))])
 def all_report(name: str, request: Request, since: datetime | None = None, until: datetime | None = None,
                p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
     if name == "groups":
@@ -242,7 +243,7 @@ def list_live_reports(p: Principal = Depends(require_any_admin)):
             for r in live_reports.available(p.is_super_admin)]
 
 
-@router.get("/reports/{name}.csv")
+@router.get("/reports/{name}.csv", dependencies=[Depends(per_person("export"))])
 def export_live_report(name: str, request: Request, since: datetime | None = None, until: datetime | None = None,
                        q: str = "", sort: str = "", cols: str | None = Query(None, max_length=2000),
                        group_id: uuid.UUID | None = None, p: Principal = Depends(require_any_admin),

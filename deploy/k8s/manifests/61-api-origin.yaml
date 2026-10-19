@@ -10,6 +10,8 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # Only the proxies in front of it (Cloudflare's ranges): anyone else could name themselves in its header (#336)
+    nginx.ingress.kubernetes.io/whitelist-source-range: "${API_ORIGIN_ALLOWED_SOURCES}"
 spec:
   ingressClassName: nginx
   rules:

@@ -57,7 +57,10 @@ portal API on your servers, so the app and its API stay on one origin (the sign-
 > Tested locally with `wrangler dev` against a stand-in API; not yet deployed to production. The self-contained
 > setup (the web app served from your servers) is the default.
 
-1. In `deploy/k8s/deploy.env`: `FRONTEND=worker`, and `API_ORIGIN_HOST` (e.g. `pdf-origin.example.org`).
+1. In `deploy/k8s/deploy.env`: `FRONTEND=worker`, `API_ORIGIN_HOST` (e.g. `pdf-origin.example.org`),
+   `API_ORIGIN_ALLOWED_SOURCES` (Cloudflare's published ranges, https://www.cloudflare.com/ips/: the only sources
+   the API origin answers) and `API_ORIGIN_SOURCE_CIDR` (where the ingress controller's traffic comes from; the node
+   network for one that runs on the nodes, as RKE2's does). `deploy.sh` refuses to go on without them.
 2. Route `API_ORIGIN_HOST` through the tunnel (public hostname → `portal-api.pdf-remediation.svc.cluster.local:8080`)
    and protect it with **Cloudflare Access**: an application for that host with a service-token policy. Put the token
    in `deploy/k8s/worker.env` as `ACCESS_CLIENT_ID=…` and `ACCESS_CLIENT_SECRET=…`.
@@ -67,8 +70,10 @@ portal API on your servers, so the app and its API stay on one origin (the sign-
    `CLOUDFLARE_API_TOKEN`, or `npx wrangler login` once). `--dry-run` checks without publishing. Remove the tunnel's
    public hostname for the app first: the Worker's custom domain takes its place.
 
-The Worker is `deploy/cloudflare-worker/worker.js`; security headers come from `web/public/_headers`. To go back, set
-`FRONTEND=cluster`, rerun `scripts/deploy.sh`, delete the Worker, and route the hostname through the tunnel again.
+With the Worker there's no web pod, so no Grafana; Prometheus, its alerts and Administration › System are the
+same. The Worker is `deploy/cloudflare-worker/worker.js`; security headers come from `web/public/_headers`. To go
+back, set `FRONTEND=cluster`, rerun `scripts/deploy.sh`, delete the Worker, and route the hostname through the
+tunnel again.
 
 ## Running more of it on Cloudflare
 
@@ -82,7 +87,7 @@ What maps well:
 | Web app | A Worker with static assets (above) | Ready |
 | Stored files | **R2** (S3-compatible) | Set `PORTAL_S3_ENDPOINT_URL` to the account's R2 endpoint, with an R2 API token's keys, and drop SeaweedFS |
 | Email | **Cloudflare Email Service** over SMTP | Ready ([settings](../operations/email-and-branding.md#email)) |
-| Edge protection | WAF, rate limiting, **Turnstile** on the sign-in page (planned), Access for admin areas | Configured in Cloudflare |
+| Edge protection | WAF, rate limiting, **Turnstile** on the sign-in page ([above](#a-bot-check-on-sign-in)), Access for admin areas | Configured in Cloudflare |
 
 What doesn't map directly:
 

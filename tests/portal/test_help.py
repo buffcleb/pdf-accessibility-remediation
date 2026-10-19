@@ -387,3 +387,29 @@ def test_a_document_someone_stopped_gets_no_request(setup):
 def test_the_failed_kind_is_not_one_to_choose(setup):
     s = setup
     assert _ask(s, _completed(s), kind="failed").status_code == 422
+
+
+def test_a_super_admins_own_request_doesnt_stay_unread(setup):
+    """A super admin who asks for help with their own document is staff on the request too: what they do on it isn't
+    news to them, and opening it clears the count on My documents."""
+    s = setup
+    from portal.models import User
+    job_id = _completed(s)
+    job = s["db"].get(Job, uuid.UUID(job_id))
+    job.user_id = s["db"].scalar(select(User).where(User.email == "root@admin.test")).id   # the super admin's own
+    s["db"].commit()
+    req = _ask(s, job_id, client="super").json()
+    base = f"{API}/help/{req['id']}"
+    assert s["c"]["super"].get(base).json()["role"] == "super_admin"
+    s["c"]["super"].post(f"{base}/messages", data={"body": "Looking at it myself."})
+    s["c"]["super"].post(f"{base}/status", json={"status": "closed"})
+    assert s["c"]["super"].get(f"{API}/me").json()["help_unread"] == 0
+
+    # One left unread before this was fixed: opening it clears it
+    hr = s["db"].get(HelpRequest, uuid.UUID(req["id"]))
+    s["db"].refresh(hr)
+    hr.person_seen_at = None
+    s["db"].commit()
+    assert s["c"]["super"].get(f"{API}/me").json()["help_unread"] == 1
+    s["c"]["super"].get(base)
+    assert s["c"]["super"].get(f"{API}/me").json()["help_unread"] == 0

@@ -23,6 +23,12 @@
 #   --config-in-place    put the config files back where they were instead (current ones are first copied
 #                        to <file>.pre-restore-<time>)
 #   --all                --db --litellm --files --config
+#   --sql                instead of restoring --db (and/or --litellm), write each dump as plain SQL into
+#                        ./backups/sql-<backup>-<time>/ to read and copy from by hand. Nothing live is touched
+#   --into-scratch       instead of replacing the portal database, restore the backup into a separate database,
+#                        portal_restore (replaced if it exists), beside the live one, to query and copy from
+#   --table NAME         with --sql or --into-scratch: only this table (repeatable)
+#   --data-only          with --sql or --into-scratch: the rows only, no schema
 #   --no-stop            don't stop and start services around database restores
 #   --k8s                restore into the Kubernetes deployment (deploy/k8s/deploy.env's cluster and namespace;
 #                        or set K8S_NAMESPACE). Services are scaled to 0 and back instead of stopped
@@ -64,6 +70,7 @@ PORTAL_CLI_DEFAULT="$PORTAL_COMPOSE run --rm --no-deps -T portal-api python -m p
 PORTAL_CLI="${PORTAL_CLI:-$PORTAL_CLI_DEFAULT}"
 
 FROM="" DB=0 LITELLM=0 FILES=0 CONFIG=0 IN_PLACE=0 STOP=1 DRY=0 YES=0 OVERWRITE=0 FILES_PREFIX=""
+SQL=0 SCRATCH=0 DATA_ONLY=0 TABLES=()
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 usage() { sed -n '2,/^set -Eeuo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
@@ -81,6 +88,10 @@ while [ $# -gt 0 ]; do
     --config) CONFIG=1 ;;
     --config-in-place) CONFIG=1; IN_PLACE=1 ;;
     --all) DB=1; LITELLM=1; FILES=1; CONFIG=1 ;;
+    --sql) SQL=1 ;;
+    --into-scratch) SCRATCH=1 ;;
+    --table) TABLES+=("${2:?--table needs a table name}"); shift ;;
+    --data-only) DATA_ONLY=1 ;;
     --no-stop) STOP=0 ;;
     --dry-run) DRY=1 ;;
     -y|--yes) YES=1 ;;
@@ -92,6 +103,16 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$FROM" ] || die "--from is required (see --help)"
+if [ "$SQL" = 1 ] || [ "$SCRATCH" = 1 ]; then
+  [ "$SQL" = 0 ] || [ "$SCRATCH" = 0 ] || die "--sql and --into-scratch are separate: pick one"
+  [ $((DB + LITELLM)) -gt 0 ] || DB=1  # the portal database unless told otherwise
+  [ "$SCRATCH" = 0 ] || [ "$LITELLM" = 0 ] || die "--into-scratch is for the portal database"
+  [ $((FILES + CONFIG)) = 0 ] || die "--sql and --into-scratch are for the databases only"
+else
+  if [ ${#TABLES[@]} != 0 ] || [ "$DATA_ONLY" != 0 ]; then
+    die "--table and --data-only go with --sql or --into-scratch"
+  fi
+fi
 [ $((DB + LITELLM + FILES + CONFIG)) -gt 0 ] || die "name what to restore: --db, --litellm, --files, --config or --all"
 
 sha256_check() { if command -v sha256sum >/dev/null; then sha256sum -c --quiet SHA256SUMS; else shasum -a 256 -c --quiet SHA256SUMS; fi; }
@@ -135,8 +156,17 @@ fi
 
 # --- confirm -----------------------------------------------------------------------------------
 plan=()
-[ "$DB" = 0 ] || plan+=("REPLACE the portal database (current one saved first)")
-[ "$LITELLM" = 0 ] || plan+=("REPLACE the LiteLLM database (current one saved first)")
+if [ "$SQL" = 1 ]; then
+  if [ $((DB + LITELLM)) = 2 ]; then which="portal and LiteLLM databases"
+  elif [ "$DB" = 1 ]; then which="portal database"
+  else which="LiteLLM database"; fi
+  plan+=("write the $which as SQL${TABLES[*]:+ (${TABLES[*]})} into backups/ (nothing live changes)")
+elif [ "$SCRATCH" = 1 ]; then
+  plan+=("restore the portal database into the scratch database portal_restore${TABLES[*]:+ (${TABLES[*]})}, replacing it if it exists (the live one is untouched)")
+else
+  [ "$DB" = 0 ] || plan+=("REPLACE the portal database (current one saved first)")
+  [ "$LITELLM" = 0 ] || plan+=("REPLACE the LiteLLM database (current one saved first)")
+fi
 [ "$FILES" = 0 ] || plan+=("restore stored files${FILES_PREFIX:+ under $FILES_PREFIX} ($([ "$OVERWRITE" = 1 ] && echo "overwriting existing" || echo "keeping existing"))")
 [ "$CONFIG" = 0 ] || plan+=("$([ "$IN_PLACE" = 1 ] && echo "put config files back in place (current ones kept as *.pre-restore-$STAMP)" || echo "unpack config into backups/restored-config-$STAMP/")")
 echo "Restore from $SRC:" >&2
@@ -184,6 +214,37 @@ restore_db() {  # exec-command, user, db, dump file, label
   log "restoring the $label"
   $exec pg_restore -U "$user" -d "$db" --clean --if-exists --no-owner --single-transaction < "$SRC/$dump"
 }
+
+# Only some of a dump: the tables asked for, the rows without the schema (a plain loop: macOS's bash 3.2 has no mapfile)
+parts=()
+for t in "${TABLES[@]+"${TABLES[@]}"}"; do parts+=(-t "$t"); done
+[ "$DATA_ONLY" = 0 ] || parts+=(--data-only)
+
+if [ "$SQL" = 1 ]; then
+  dest="$ROOT/backups/sql-$(basename "$SRC")-$STAMP"
+  run mkdir -p "$dest"
+  for pair in "$DB:portal.dump:$PORTAL_DB_EXEC" "$LITELLM:litellm.dump:$LITELLM_DB_EXEC"; do
+    [ "${pair%%:*}" = 1 ] || continue
+    rest="${pair#*:}"; dump="${rest%%:*}"; exec="${rest#*:}"
+    log "writing $dest/${dump%.dump}.sql${TABLES[*]:+ (${TABLES[*]})}"
+    if [ "$DRY" = 0 ]; then
+      $exec pg_restore --no-owner "${parts[@]+"${parts[@]}"}" -f - < "$SRC/$dump" > "$dest/${dump%.dump}.sql"
+    fi
+  done
+  [ "$DRY" = 1 ] || log "SQL written to $dest (nothing live was changed)"
+  exit 0
+fi
+
+if [ "$SCRATCH" = 1 ]; then
+  log "restoring into the scratch database portal_restore (the live portal database is untouched)"
+  run $PORTAL_DB_EXEC psql -U postgres -q -c "drop database if exists portal_restore" -c "create database portal_restore owner portal"
+  if [ "$DRY" = 0 ]; then
+    $PORTAL_DB_EXEC pg_restore -U portal -d portal_restore --no-owner "${parts[@]+"${parts[@]}"}" < "$SRC/portal.dump"
+    log "done: connect with psql -U portal -d portal_restore (inside the database's container or pod); drop it with"
+    log "  psql -U postgres -c 'drop database portal_restore' when finished"
+  fi
+  exit 0
+fi
 
 if [ "$DB" = 1 ]; then
   if [ "$STOP" = 1 ] && [ "$DRY" = 0 ]; then

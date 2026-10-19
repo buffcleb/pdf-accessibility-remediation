@@ -323,6 +323,33 @@ function LimitSettings() {
             value={s.classifier_pages} onChange={(n) => set({ classifier_pages: n })} />
         </div>
       </Section>
+      <Section title="Alerts" intro={"Problems the service notices about itself are emailed to every super admin and " +
+        "shown on Attention: one email when one starts, a reminder while it lasts, and one when it clears. When the " +
+        "portal itself is down it can't email: point an outside uptime check at /api/v1/status, which answers 503 " +
+        "while there's a problem."}>
+        <div className="grid">
+          <NumberField id="l-aqueue" label="Queue not moving after" unit="minutes" min={5}
+            hint="Documents are waiting and none has started or finished for this long. A busy queue that's moving never counts."
+            value={s.alert_queue_minutes} onChange={(n) => set({ alert_queue_minutes: n })} />
+          <NumberField id="l-aworker" label="Background worker stopped after" unit="minutes" min={5}
+            hint="The portal's worker hasn't completed a pass (documents, saves, emails) for this long."
+            value={s.alert_worker_minutes} onChange={(n) => set({ alert_worker_minutes: n })} />
+          <NumberField id="l-aengine" label="Engine without workers after" unit="minutes" min={2}
+            hint="The engine reports no workers, or can't be reached, for this long."
+            value={s.alert_engine_minutes} onChange={(n) => set({ alert_engine_minutes: n })} />
+          <NumberField id="l-abackup" label="Backup not finished after" unit="hours" min={2}
+            hint="Only where the cluster runs the nightly backup (BACKUPS=cronjob); never with the hosts' own backups."
+            value={s.alert_backup_hours} onChange={(n) => set({ alert_backup_hours: n })} />
+          <NumberField id="l-lowpct" label="A group's pool is running low below" unit="% of its size" min={0}
+            hint="Or below the number of pages next to it, whichever is larger. Its admins are emailed once when it drops below; Attention shows it."
+            value={s.low_pool_percent} onChange={(n) => set({ low_pool_percent: n })} />
+          <NumberField id="l-lowpages" label="…or below" unit="pages" min={0}
+            value={s.low_pool_pages} onChange={(n) => set({ low_pool_pages: n })} />
+          <NumberField id="l-arepeat" label="Remind every" unit="hours" min={1}
+            hint="While a problem lasts."
+            value={s.alert_repeat_hours} onChange={(n) => set({ alert_repeat_hours: n })} />
+        </div>
+      </Section>
       <Section title="PDF/UA validation (veraPDF)" intro={"veraPDF checks every document before and after remediation, " +
         "and every saved version. The results are the same either way; only the speed and memory differ."}>
         <fieldset className="choices">
@@ -341,7 +368,8 @@ function LimitSettings() {
         <label className="check">
           <input type="checkbox" checked={s.verapdf_ua2} onChange={(e) => set({ verapdf_ua2: e.target.checked })} />
           <span>Also check PDF/UA-2 <span className="muted small">(shown in reports for information; the verdict is
-            PDF/UA-1. Off halves the number of checks)</span></span>
+            PDF/UA-1, except for a PDF 2.0 document, which can only be PDF/UA-2 and is always checked against it. Off
+            halves the number of checks)</span></span>
         </label>
       </Section>
       <ErrorNotice error={error} />

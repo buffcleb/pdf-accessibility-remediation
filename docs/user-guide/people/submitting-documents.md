@@ -7,7 +7,17 @@
 - **PDFs only.** Convert Word, PowerPoint and other files to PDF first, using the application's own "Save as
   PDF" or "Export to PDF". If it has an accessibility option ("tagged PDF", "document structure tags"), turn it
   on: the result starts closer to accessible.
-- **Not password-protected.** Remove the password or restrictions first.
+- **Opens without a password.** A PDF that asks for a password to open can't be read; remove the password first. A PDF
+  that opens freely but restricts printing or editing is fine: the accessible copy keeps the same restrictions, with
+  access for screen readers turned on (PDF/UA requires it).
+- **Signed PDFs wait for you.** Making a file accessible rewrites it, so a signed or certified PDF's accessible copy
+  won't carry a valid signature. It waits on the upload page and its own page until you choose **Send** (sign the
+  copy again afterwards if you need a signature) or **Cancel**. Nothing is charged until you send it. A check only
+  changes nothing, so it isn't held; its report says the PDF is signed.
+- **XFA forms.** Forms made with Adobe LiveCycle Designer (XFA) come in two kinds. A *dynamic* one draws its pages
+  as it opens and has no standard form underneath, so it can't be made accessible and the upload refuses it: open it
+  in Acrobat, save it as a standard PDF form (not XFA), and upload that. A *static* one also holds a standard form,
+  which is kept and made accessible; the XFA part is removed (the report says so).
 - **Size limits.** Your administrators set the largest file, the most pages per document and the most files per
   upload (100 MB, 2,000 pages and 20 files by default). The upload says so if a file is over.
 - **Scans work,** but the clearer the scan the better the result: scan at 300 dpi where you can.
@@ -72,7 +82,13 @@ pages for checks, or to check without AI.
 
 ## More options
 
-Under **More options**, **Review every figure with AI** has the AI checker look at every figure and formula,
+Under **More options**, **Ignore the existing tags** is for a PDF that is already tagged, but badly (headings tagged
+as paragraphs, a jumbled reading order, tables as plain text). Normally a document's own tags are kept and repaired,
+since they're usually its author's; with this ticked they're set aside and the document is tagged afresh from what's
+on the page. The report says the tags were ignored at your request, and the document's page shows "existing tags
+ignored". It changes nothing for **Check only**, and it costs the same.
+
+**Review every figure with AI** has the AI checker look at every figure and formula,
 instead of the ones flagged as doubtful plus a sample. It's slower and uses more AI; use it for documents where
 accuracy matters most. Some AI levels don't offer it.
 
@@ -118,6 +134,8 @@ The message says why, naming the option and where the limit is:
   your group's pool doesn't have. The message links to how to get more (usually your group admin).
 - **Not available to you:** your group keeps documents on its own servers (local-only), or you haven't been
   given that option. Choose another, or ask your group admin.
-- **Too large, too many pages, password-protected, not a PDF:** fix the file and upload it again.
+- **Too large, too many pages, password-protected, not a PDF, a dynamic XFA form:** fix the file and upload it again.
+- **Too many uploads in an hour:** each person has an hourly limit on uploads (and on downloads and report
+  exports), set by the people who run the service. Wait a while and try again.
 
 See [Troubleshooting](troubleshooting.md) for more.

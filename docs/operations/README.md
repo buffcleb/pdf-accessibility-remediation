@@ -15,8 +15,8 @@ Configuring and running the service once it's installed. Installing it is covere
 6. [Monitoring and troubleshooting](monitoring.md): health checks, logs, capacity, common problems
 7. [Limits](limits.md): every limit on a document, a person or a request, its default, where to change it, and
    what happens past it
-8. [CI on your own runners](ci-runners.md): running the tests on a machine of your own, not on GitHub's billed minutes (and why not on the service's cluster); which
-   jobs run for which files
+8. [CI on your own runners](ci-runners.md): running the tests on a machine of your own, not on GitHub's billed
+   minutes (and why not on the service's cluster); which jobs run for which files
 
 ## At a glance
 

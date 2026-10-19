@@ -110,6 +110,9 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     # Separate from status: people waiting for approval (or declined) can sign in, but not submit anything
     approval: Mapped[str] = mapped_column(String(16), nullable=False, default="approved", server_default="approved")
+    # Removed on request (#338): their name and email replaced, their files gone, their records kept without them
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    removed_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
     approval_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approval_by: Mapped[str | None] = mapped_column(String(320), nullable=True)  # the approver's email
     decline_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -385,6 +388,8 @@ class Job(Base):
     external_services: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
     cost: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     full_review: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    # The document's own tags are poor: the engine tags it afresh from the page (#396)
+    ignore_existing: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # An audit with no AI (its level says so): the engine is told to use none
     no_ai: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # "Let AI decide": the kind is picked by the classifier before the document is sent; what it said is kept
@@ -402,6 +407,9 @@ class Job(Base):
     created_at: Mapped[datetime] = _created()
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A super admin's re-run is a new document: the one it re-ran (#323)
+    rerun_of: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True,
+                                                       index=True)
     files_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # "I'm done with it": the files go once the hold (early_removal_hold_hours) ends, not at the end of retention
     removal_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -569,6 +577,26 @@ class TagDraft(Base):
     updated_at: Mapped[datetime] = _created()
 
 
+FINDING_STATUSES = ("checked", "fixed", "not_issue")
+
+
+class FindingMark(Base):
+    """A review item signed off on a document (#366): checked and fine, fixed, or not an issue. Kept per document
+    under the item's key (portal/finding_marks.py), so it stays with the same item in later versions."""
+    __tablename__ = "finding_marks"
+    __table_args__ = (UniqueConstraint("job_id", "key"),
+                      CheckConstraint("status in ('checked', 'fixed', 'not_issue')", name="finding_marks_status"))
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    key: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    set_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    set_by_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    set_at: Mapped[datetime] = _created()
+
+
 HELP_KINDS = ("alt_text", "reading_order", "tables", "headings", "math", "visual", "other", "failed")
 HELP_STATUSES = ("open", "in_progress", "waiting", "resolved", "closed")
 
@@ -707,6 +735,26 @@ class QueuePause(Base):
     paused_by: Mapped[str] = mapped_column(String(320), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     paused_at: Mapped[datetime] = _created()
+
+
+class WorkerBeat(Base):
+    """When a background process last completed a pass (#334): the portal worker writes its own after each one, so
+    the API (and the outside uptime check, through /api/v1/status) can tell a worker that has stopped working."""
+    __tablename__ = "worker_beats"
+
+    name: Mapped[str] = mapped_column(String(40), primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AlertState(Base):
+    """A problem the service has noticed and told super admins about (#334): one row while it lasts. Its email went out
+    when it started and again every few hours (Settings); a "cleared" email goes when the row is removed."""
+    __tablename__ = "alert_states"
+
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # held: waiting for the person's daily summary; combined: went out in one; seen: not sent, they saw it in the portal

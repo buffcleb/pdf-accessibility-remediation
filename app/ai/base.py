@@ -316,6 +316,12 @@ class AIProvider(ABC):
             conf = 0.0
         return {"text": out.replace("[[", "").replace("]]", "")[:1000], "confidence": conf}
 
+    async def name_field(self, png: bytes, page: int, kind: str, context: str) -> str:
+        """A form field's label, from a picture of it and the text around it (#341). Empty if unclear."""
+        data = await self.chat_json(prompts.FIELD_LABEL.format(page=page + 1, kind=kind, context=as_data(context, 600),
+                                                               data=prompts.DATA), [png])
+        return str(data.get("label") or "").strip()[:120]
+
     async def analyze_table(self, png: bytes, page: int, grid: list[list[str]]) -> dict:
         grid_txt = "\n".join(" | ".join(as_data(c, 30) for c in row[:14]) for row in grid[:30])
         data = await self.chat_json(

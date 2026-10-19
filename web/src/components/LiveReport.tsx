@@ -31,9 +31,10 @@ function fmtMoney(v: unknown): string {
 }
 
 const REPORT_GROUPS: { label: string; superLabel?: string; reports: [string, string, boolean][] }[] = [
-  { label: "Documents", reports: [["documents", "Documents", false], ["quality", "Quality", false], ["failures", "Remaining failures", false]] },
+  { label: "Documents", reports: [["documents", "Documents", false], ["quality", "Quality", false], ["failures", "Remaining failures", false],
+    ["limits", "Limits hit", true]] },
   { label: "Usage", superLabel: "Usage and cost", reports: [["usage", "Usage", false], ["ledger", "Page ledger", false], ["ai_usage", "AI usage", false],
-    ["cost", "Cost", true], ["daily", "Daily use", true]] },
+    ["cost", "Cost", true], ["describe", "Describe with AI", true], ["daily", "Daily use", true]] },
   { label: "Activity", reports: [["sign_ins", "Sign-ins", false], ["email", "Email", false], ["help", "Help requests", false], ["audit", "Audit log", false],
     ["report_emails", "Report emails", true]] },
 ];

@@ -125,8 +125,10 @@ def _visible(db: Session, request_id: uuid.UUID, p: Principal, lock: bool = Fals
     return req, role
 
 
-def _seen(db: Session, req: HelpRequest, role: str) -> None:
-    if role == "person":
+def _seen(db: Session, req: HelpRequest, p: Principal) -> None:
+    """Reading a request marks it seen for the person who asked, whatever their role (a super admin asking about their
+    own document is staff on it too)."""
+    if req.user_id == p.user.id:
         req.person_seen_at = helpdesk._now()
         db.commit()
 
@@ -218,7 +220,7 @@ def help_for_job(job_id: uuid.UUID, p: Principal = Depends(current_principal), d
         if job.user_id != p.user.id and not p.is_super_admin and not (job.group_id and p.can_admin_group(job.group_id)):
             raise not_found("Job")
         return None
-    _seen(db, req, role)
+    _seen(db, req, p)
     return _out(db, req, role)
 
 
@@ -234,7 +236,7 @@ def my_requests(p: Principal = Depends(current_principal), db: Session = Depends
 @router.get("/help/{request_id}", response_model=HelpOut)
 def get_request(request_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     req, role = _visible(db, request_id, p)
-    _seen(db, req, role)
+    _seen(db, req, p)
     return _out(db, req, role)
 
 

@@ -12,18 +12,20 @@
     "test": "tsc -p tests && node -e \"require('fs').writeFileSync('.test-build/package.json','{\\\"type\\\":\\\"commonjs\\\"}')\" && node --test .test-build/tests/*.test.js"
   },
   "dependencies": {
-    "dompurify": "^3.4.16",
-    "marked": "^18.0.14",
+    "dompurify": "^3.4.17",
+    "marked": "^18.1.1",
     "pdfjs-dist": "^6.4.299",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.1",
+    "@vitejs/plugin-react": "^6.1.2",
+    "axe-core": "4.14.0",
+    "playwright": "1.64.1",
     "typescript": "^7.0.2",
-    "vite": "^8.3.2"
+    "vite": "^8.3.4"
   }
 }

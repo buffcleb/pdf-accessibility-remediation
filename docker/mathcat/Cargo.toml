@@ -1,0 +1,18 @@
+# A small command-line front end to MathCAT (MIT, https://github.com/daisy/MathCAT) for the engine (#403): MathML in,
+# ClearSpeak speech and Nemeth and UEB braille out. Built in the engine image's first stage (Dockerfile); its rules
+# are compiled in (include-zip), so the image gets one file.
+[package]
+name = "mathcat-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[dependencies]
+mathcat = { version = "=0.7.5", features = ["include-zip"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

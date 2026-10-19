@@ -7,8 +7,8 @@ These are under **Merge and split** in the tag menu, and in the editing panel.
 ## Merging
 
 **Merge** joins neighboring tags into one: useful for a formula, or a sentence, broken into pieces. Select the tags
-(Ctrl-click or Shift-click), then **Merge the N selected tags into one**: they're joined in reading order, and the merged tag
-keeps the type of the first one; change it afterwards if needed.
+(Ctrl-click or Shift-click), then **Merge the N selected tags into one**: they're joined in reading order, and the
+merged tag keeps the type of the first one; change it afterwards if needed.
 
 ## Splitting
 

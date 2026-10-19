@@ -93,6 +93,7 @@ class UserOut(BaseModel):
     approval: str  # pending, approved or declined
     approval_at: datetime | None
     approval_by: str | None
+    removed_at: datetime | None = None  # their data removed on request (#338)
     decline_reason: str | None
     auth_method: str
     roles: list[dict]
@@ -256,6 +257,7 @@ def user_out(u: User, services: list[Service] | None = None) -> UserOut:
     return UserOut(
         id=u.id, email=u.email, name=u.name, group_id=u.group_id, group_name=u.group.name if u.group else None,
         status=u.status, approval=u.approval, approval_at=u.approval_at, approval_by=u.approval_by,
+        removed_at=u.removed_at,
         decline_reason=u.decline_reason, auth_method=u.auth_method,
         roles=[{"role": r.role, "group_id": r.group_id} for r in u.roles],
         cap_pages=std.cap_pages if std else None, effective_cap=effective_cap(u) if u.group else None,

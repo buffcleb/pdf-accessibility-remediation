@@ -256,3 +256,36 @@ def test_a_failed_email_can_be_removed_from_the_list(setup, monkeypatch):
     assert s["c"]["super"].get(f"{Q}/mail/items?state=failed").json()["items"] == [] and _queue(s, "mail")["failed"] == 0
     # Nothing is "in progress" for email
     assert s["c"]["super"].post(f"{Q}/mail/items/{failed[0]['id']}/stop").status_code == 409
+
+
+def test_support_can_restart_a_document_in_progress(setup):
+    """#323: a document stuck at the engine (its worker lost, a deploy cut it off) goes back to the queue: stopped
+    at the engine, its pages still held, nothing charged again, the person not told; it's sent again from there."""
+    s, db = setup, setup["db"]
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("book.pdf", pdf_bytes(5))).json()[0]["job"]["id"]
+    run_worker(db)
+    first = db.get(Job, uuid.UUID(job_id)).engine_job_id
+    item = s["c"]["super"].get(f"{Q}/{STD}/items?state=active").json()["items"][0]
+    assert item["can_restart"] and item["can_stop"]
+    mails = len(get_mailer().outbox)
+    assert s["c"]["admin_a"].post(f"{Q}/{STD}/items/{job_id}/restart").status_code == 403
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/restart").status_code == 204
+    assert s["engine"].stopped == [first]
+    job = s["c"]["user"].get(f"{API}/jobs/{job_id}").json()
+    assert job["status"] == "queued" and job["pages_charged"] == 5
+    assert s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == 5  # held once, not twice
+    ev = db.scalar(select(AuditEvent).where(AuditEvent.action == "job.restarted"))
+    assert ev.actor_email == "root@admin.test" and ev.details["engine_job"] == first
+    run_worker(db)  # sent again: a new engine job; the old one's answer is no longer looked at
+    db.expire_all()
+    second = db.get(Job, uuid.UUID(job_id)).engine_job_id
+    assert second and second != first
+    s["engine"].complete(second)
+    run_worker(db)
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}").json()["status"] == "completed"
+    assert s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == 0
+    assert not any(m.subject.startswith("Stopped") for m in get_mailer().outbox[mails:])
+    # Only what's in progress restarts
+    assert s["c"]["super"].post(f"{Q}/{STD}/items/{job_id}/restart").status_code == 409
+    assert s["c"]["super"].post(f"{Q}/mail/items/{uuid.uuid4()}/restart").status_code in (404, 409)

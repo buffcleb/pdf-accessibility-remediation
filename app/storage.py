@@ -84,6 +84,23 @@ class JobStore:
     def read_error(self) -> dict | None:
         return self._read_json("error.json")
 
+    def count_attempt(self) -> int:
+        """Record that a worker is starting this job; returns which start this is (1 for the first)."""
+        n = int((self._read_json("attempts.json") or {}).get("starts", 0)) + 1
+        self._write_json("attempts.json", {"starts": n, "at": time.time()})
+        return n
+
+    def read_attempts(self) -> dict | None:
+        """{"starts": how many times a worker started this job, "at": when the last start was (epoch seconds)}."""
+        return self._read_json("attempts.json")
+
+    def beat(self) -> None:
+        """The worker running this job is alive (written every HEARTBEAT_S while it runs)."""
+        self._write_json("heartbeat.json", {"at": time.time()})
+
+    def last_beat(self) -> float | None:
+        return (self._read_json("heartbeat.json") or {}).get("at")
+
     # --- outputs ---------------------------------------------------------
     def output_file(self, name: str) -> Path | None:
         """Resolve a download name, refusing anything outside output/."""

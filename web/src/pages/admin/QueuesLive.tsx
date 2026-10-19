@@ -46,9 +46,11 @@ export function QueuesLive({ queues }: { queues: { key: string; label: string }[
     return () => window.clearTimeout(t);
   }, [search]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function act(item: LiveItem, what: "cancel" | "stop" | "process-now") {
+  async function act(item: LiveItem, what: "cancel" | "stop" | "restart" | "process-now") {
     const question = what === "process-now"
       ? `Process "${item.title}" next? It goes ahead of the large-document rules as soon as a slot is free.`
+      : what === "restart"
+        ? `Restart "${item.title}"? The engine stops its copy and it goes back to the queue, keeping its place. Nothing is charged again and nobody is emailed.`
       : what === "stop"
         ? `Stop "${item.title}"? It ends now and frees its place.${item.kind === "documents" ? " The person's pages are given back and they're emailed." : ""}`
         : `Cancel "${item.title}"?${item.kind === "documents" ? " The person's pages are given back and they're emailed." : ""}`;
@@ -57,7 +59,7 @@ export function QueuesLive({ queues }: { queues: { key: string; label: string }[
     setDone("");
     try {
       await post(`/admin/queues/${encodeURIComponent(item.key)}/items/${item.id}/${what}`);
-      setDone(`${{ cancel: "Canceled", stop: "Stopped", "process-now": "Process now" }[what]}: ${item.title}`);
+      setDone(`${{ cancel: "Canceled", stop: "Stopped", restart: "Restarted", "process-now": "Process now" }[what]}: ${item.title}`);
       await live.reload();
     } catch (e) {
       setError(e);
@@ -141,6 +143,8 @@ export function QueuesLive({ queues }: { queues: { key: string; label: string }[
                           Process now<span className="visually-hidden"> {it.title}</span></button>}
                         {it.can_cancel && <button className="btn secondary small" onClick={() => void act(it, "cancel")}>
                           Cancel<span className="visually-hidden"> {it.title}</span></button>}
+                        {it.can_restart && <button className="btn secondary small" onClick={() => void act(it, "restart")}>
+                          Restart<span className="visually-hidden"> {it.title}</span></button>}
                         {it.can_stop && <button className="btn secondary small" onClick={() => void act(it, "stop")}>
                           Stop<span className="visually-hidden"> {it.title}</span></button>}
                       </div></td>

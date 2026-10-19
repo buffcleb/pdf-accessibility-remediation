@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -182,8 +183,14 @@ def test_disabled_user_cut_off_and_shown_message(db, make_client):
     r = admin.patch(f"/api/v1/groups/{g.id}/users/{body['user']['id']}", json={"status": "disabled"})
     assert r.status_code == 200
     assert c.get("/api/v1/me").status_code == 401
+    # The same answer as anyone gets (#359); only the address's owner learns why, by email, and no code is issued
+    sent_before = len(get_mailer().outbox)
     r = make_client().post(CODE, json={"email": "x@a.test"})
-    assert r.status_code == 403 and r.json()["detail"]["error"] == "account_disabled"
+    assert r.status_code == 202 and r.json()["status"] == "code_sent"
+    assert r.json() == make_client().post(CODE, json={"email": "new-person@a.test"}).json()
+    disabled_mail = [m for m in get_mailer().outbox[sent_before:] if m.to == "x@a.test"]
+    assert len(disabled_mail) == 1 and "code" not in disabled_mail[0].subject.lower()
+    assert not re.search(r"\b\d{6}\b", disabled_mail[0].text)
 
 
 def test_tampered_and_foreign_tokens_rejected(db, make_client):
@@ -231,3 +238,22 @@ def test_user_cannot_exist_twice(db):
         db.add(User(email="x@a.test", group_id=g.id))
         db.commit()
     db.rollback()
+
+
+def test_a_super_admin_can_sign_someone_out_everywhere(db, make_client):
+    """#354: a lost device, or an account someone else may be using."""
+    g = make_group(db, "A", "a.test")
+    make_user(db, "root@admin.test", None, role="super_admin")
+    make_user(db, "admin@a.test", g, admin_of=g)
+    sup, admin, c1, c2 = make_client(), make_client(), make_client(), make_client()
+    login(sup, "root@admin.test")
+    login(admin, "admin@a.test")
+    login(c1, "x@a.test")
+    login(c2, "x@a.test")
+    uid = db.scalar(select(User.id).where(User.email == "x@a.test"))
+    assert admin.post(f"/api/v1/admin/users/{uid}/sessions/end").status_code == 403
+    assert sup.post(f"/api/v1/admin/users/{uid}/sessions/end").status_code == 204
+    assert c1.get("/api/v1/me").status_code == 401 and c2.get("/api/v1/me").status_code == 401
+    ev = db.scalar(select(AuditEvent).where(AuditEvent.action == "sessions.ended"))
+    assert ev.details["sessions"] == 2 and ev.actor_email == "root@admin.test"
+    assert sup.get("/api/v1/me").status_code == 200  # nobody else is affected

@@ -12,8 +12,20 @@ Operations:
     {"op": "set_role", "element": 12, "expect_role": "P", "role": "H2"}
     {"op": "set_alt", "element": 30, "expect_role": "Figure", "alt": "Bar chart of ..."}   ("" removes it)
     {"op": "set_actual_text", "element": 31, "expect_role": "Formula", "text": "x squared"}
+    (set_alt and set_actual_text may carry "reading": which of a formula's two readings a person chose, #403;
+    it changes nothing in the file, and the edit job records it in its report)
     {"op": "set_decorative", "element": 30, "expect_role": "Figure"}
+    {"op": "set_decorative", "element": 4, "expect_role": "P", "as": "header"}
+        (any tag and what's under it becomes an artifact: "layout" (the default: a rule, a decoration), or "header",
+        "footer" or "page_number", marked as the page furniture it is)
+    (set_alt on a Link or Annot tag also gives its annotations the text as /Contents, what a screen reader announces
+    for a link; it can't be empty there)
     {"op": "set_lang", "element": 40, "expect_role": "P", "lang": "fr-CA"}                ("" removes it)
+    {"op": "set_field_label", "element": 52, "expect_role": "Form", "label": "Last name"}
+        (the form field's tooltip, what a screen reader announces; a radio button's own, else the field's)
+    {"op": "set_doc_title", "title": "Annual report 2026"}
+    {"op": "set_doc_lang", "lang": "fr-CA"}
+        (the whole document's: its title, announced when it opens, and its language. No element.)
     {"op": "set_cell", "element": 77, "expect_role": "TD", "role": "TH", "scope": "Column"}
     {"op": "move", "element": 15, "expect_role": "P", "target": 9, "position": "before"}
     {"op": "merge", "element": 20, "expect_role": "P", "absorb": [21, 22]}   (21 and 22 join 20, in that order)
@@ -66,6 +78,21 @@ Operations:
     {"op": "link_note", "element": 18, "expect_role": "Reference", "note": 52}
         (the tag points at a note: /Ref names the note, which is given an ID if it has none; "note": null removes what
         the tag points at. For a footnote the rules didn't link: the mark, or the paragraph it's in, and its note.)
+    {"op": "rebuild_table", "element": 70, "expect_role": "Table",
+     "rows": [[{"from": [72], "role": "TH", "scope": "Column", "cols": 2}], [{"from": [74, 75], "role": "TD"},
+              {"from": [], "role": "TD"}]], "caption": 66}
+        (the table editor (#370): the whole table as it should be, row by row. Each cell lists the old cells whose
+        content it takes, in order: one cell is kept as it was, several are merged (a row or column removed joins
+        its neighbour this way), none makes an empty cell. Every old cell has to be somewhere, and the cells with
+        their spans ("rows", "cols") must fill a rectangle. Header cells name their headers by ID when the table
+        needs it, as when it was tagged. "caption": a tag to become the table's caption (null: none; left out:
+        unchanged).)
+    {"op": "build_table", "element": 20, "expect_role": "P", "absorb": [21, 22],
+     "rows": [[{"parts": [{"at": 0}], "role": "TH", "scope": "Column"}, {"parts": [{"at": 1}], "role": "TH",
+               "scope": "Column"}], [{"parts": [{"el": 21, "at": 0}], "role": "TD"}, ...]]}
+        (text tags become a table: each cell takes /K items of the tags (the tag map's parts), every item exactly
+        once; the table takes the first tag's place. A figure can be one of them, a table drawn as a picture; its alt
+        text goes.)
     {"op": "make_toc", "element": 40, "expect_role": "L"}
         (a list becomes a table of contents: L -> TOC, each LI -> TOCI keeping its label, the item's text -> a
         Reference in the entry (a link in it stays inside), and a list nested in an item -> a TOC in that entry)
@@ -82,13 +109,18 @@ import pikepdf
 from pikepdf import Array, ContentStreamInstruction, Dictionary, Name, Operator, String
 
 from app.tagging.content_marker import mcid_of
+from app.tagging.metadata import set_language, set_title
 from app.tagging.role_rules import BLOCKS, check_move, check_role
-from app.tagging.table_headers import headers_named, id_of, table_attrs, write_id_tree
+from app.tagging.table_headers import header_links, headers_named, id_of, is_complex, table_attrs, write_id_tree
 from app.verification.integrity import STANDARD, Elem, IntegrityChecker, _items
 
 OPS = {"set_role", "set_alt", "set_actual_text", "set_decorative", "set_lang", "set_cell", "move", "merge", "split",
        "assign", "tag_artifacts", "delete", "make_list", "indent", "outdent", "build_list", "take_pieces", "cut_area",
-       "make_toc", "set_headers", "link_note"}
+       "make_toc", "set_headers", "link_note", "set_field_label", "set_doc_title", "set_doc_lang", "rebuild_table",
+       "build_table"}
+DOC_OPS = {"set_doc_title", "set_doc_lang"}  # the document's own, naming no element
+MAX_TITLE = 500
+MAX_TABLE_ROWS, MAX_TABLE_COLS = 500, 60
 MAX_HEADERS = 50
 # What a row of build_list can become apart from a list item
 ROW_ROLES = {"P", "H1", "H2", "H3", "H4", "H5", "H6"}
@@ -106,6 +138,9 @@ NEW_AREA_ROLES = {"H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuot
 SCOPES = {"Row", "Column", "Both"}
 MAX_OPS = 5000
 MAX_TEXT = 4000
+# What a tag made an artifact is: the artifact's /Type and /Subtype (#364)
+ARTIFACT_KINDS = {"layout": (Name.Layout, None), "header": (Name.Pagination, Name.Header),
+                  "footer": (Name.Pagination, Name.Footer), "page_number": (Name.Pagination, Name("/PageNum"))}
 _LANG = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$")
 _MARK = Name("/RemediationEditMark")
 
@@ -136,15 +171,31 @@ def validate_ops(ops) -> list[dict]:
     for n, op in enumerate(ops, 1):
         if not isinstance(op, dict) or op.get("op") not in OPS:
             raise EditError(f"Edit {n}: unknown operation.")
+        if op["op"] == "set_doc_title":
+            title = op.get("title")
+            if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE:
+                raise EditError(f"Edit {n}: a title is between 1 and {MAX_TITLE} characters.")
+        if op["op"] == "set_doc_lang" and not _LANG.match(str(op.get("lang") or "")):
+            raise EditError(f"Edit {n}: {op.get('lang')!r} isn't a language code like en-US. "
+                            "A document must have one.")
+        if op["op"] in DOC_OPS:
+            clean.append(op)
+            continue
         if not isinstance(op.get("element"), int) or op["element"] < 0:
             raise EditError(f"Edit {n}: missing element.")
         kind = op["op"]
         if kind == "set_role" and op.get("role") not in STANDARD:
             raise EditError(f"Edit {n}: {op.get('role')!r} isn't a standard PDF tag.")
+        if kind == "set_field_label":
+            label = op.get("label")
+            if not isinstance(label, str) or not label.strip() or len(label) > 300:
+                raise EditError(f"Edit {n}: a field label is between 1 and 300 characters.")
         if kind in ("set_alt", "set_actual_text"):
             text = op.get("alt" if kind == "set_alt" else "text")
             if not isinstance(text, str) or len(text) > MAX_TEXT:
                 raise EditError(f"Edit {n}: text must be at most {MAX_TEXT} characters.")
+        if kind == "set_decorative" and op.get("as", "layout") not in ARTIFACT_KINDS:
+            raise EditError(f"Edit {n}: an artifact is one of {', '.join(ARTIFACT_KINDS)}.")
         if kind == "set_lang" and op.get("lang") and not _LANG.match(str(op["lang"])):
             raise EditError(f"Edit {n}: {op.get('lang')!r} isn't a language code like en-US.")
         if kind == "link_note":
@@ -190,6 +241,8 @@ def validate_ops(ops) -> list[dict]:
                         or ("as" in row and row["as"] not in ROW_ROLES)):
                     raise EditError(f"Edit {n}: each row of a list being built needs where it starts and either a "
                                     f"list level (1 to {MAX_LIST_LEVEL}) or a type ({', '.join(sorted(ROW_ROLES))}).")
+        if kind in ("rebuild_table", "build_table"):
+            _check_table_rows(op, n)
         if kind == "delete" and op.get("children") not in ("lift", "delete"):
             raise EditError(f"Edit {n}: deleting a tag needs to say what happens to what's inside it: "
                             "\"lift\" (keep it, a level up) or \"delete\" (remove it all).")
@@ -234,6 +287,47 @@ def validate_ops(ops) -> list[dict]:
     return clean
 
 
+def _check_table_rows(op: dict, n: int) -> None:
+    """The shape of a table edit's rows, before the PDF is opened."""
+    whole = lambda v, lo=0: isinstance(v, int) and not isinstance(v, bool) and v >= lo  # noqa: E731
+    rows, key = op.get("rows"), "from" if op["op"] == "rebuild_table" else "parts"
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_TABLE_ROWS:
+        raise EditError(f"Edit {n}: a table needs its rows (at most {MAX_TABLE_ROWS}).")
+    seen: set = set()
+    for row in rows:
+        if not isinstance(row, list) or len(row) > MAX_TABLE_COLS:
+            raise EditError(f"Edit {n}: each row of a table is a list of its cells (at most {MAX_TABLE_COLS}).")
+        for cell in row:
+            if (not isinstance(cell, dict) or cell.get("role") not in ("TH", "TD")
+                    or (cell["role"] == "TH" and cell.get("scope", "Column") not in SCOPES)
+                    or not whole(cell.get("rows", 1), 1) or not whole(cell.get("cols", 1), 1)
+                    or cell.get("rows", 1) > MAX_TABLE_ROWS or cell.get("cols", 1) > MAX_TABLE_COLS
+                    or not isinstance(cell.get(key), list)):
+                raise EditError(f"Edit {n}: each cell is a header (TH, with a scope) or data cell (TD), with its "
+                                f"spans and what it holds.")
+            for ref in cell[key]:
+                if key == "from":
+                    if not whole(ref) or ref in seen:
+                        raise EditError(f"Edit {n}: each old cell can go in one new cell only.")
+                    seen.add(ref)
+                else:
+                    others = op.get("absorb") or []
+                    if (not isinstance(ref, dict) or not whole(ref.get("at")) or ("el" in ref and not whole(ref["el"]))
+                            or ("el" in ref and ref["el"] != op["element"] and ref["el"] not in others)):
+                        raise EditError(f"Edit {n}: a cell's pieces are positions in the tags being made a table.")
+                    k = (ref.get("el", op["element"]), ref["at"])
+                    if k in seen:
+                        raise EditError(f"Edit {n}: each piece can go in one cell only.")
+                    seen.add(k)
+    caption = op.get("caption")
+    if caption is not None and not whole(caption):
+        raise EditError(f"Edit {n}: a table's caption is a tag (or none).")
+    absorb = op.get("absorb") or []
+    if not isinstance(absorb, list) or len(absorb) > 500 or op["element"] in absorb or len(set(absorb)) != len(absorb) \
+            or not all(whole(a) for a in absorb):
+        raise EditError(f"Edit {n}: the other tags to make a table of are a list of tags.")
+
+
 def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
     """Apply the edits to src and save dst. Returns one plain-language line per edit."""
     ops = validate_ops(ops)
@@ -247,6 +341,9 @@ def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
         # Resolve every reference first; later moves change pre-order indices but not objects.
         resolved = []
         for n, op in enumerate(ops, 1):
+            if op["op"] in DOC_OPS:
+                resolved.append((op, None, None))
+                continue
             e = _elem(ctx, op["element"], op.get("expect_role"), n)
             if op["op"] == "move":
                 t = _elem(ctx, op["target"], op.get("expect_target_role"), n)
@@ -256,6 +353,11 @@ def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
                 t = [_elem(ctx, h, None, n) for h in op["headers"]]
             elif op["op"] == "link_note" and op.get("note") is not None:
                 t = _elem(ctx, op["note"], None, n)
+            elif op["op"] == "rebuild_table":
+                t = {"cells": [[[_elem(ctx, i, None, n) for i in cell["from"]] for cell in row] for row in op["rows"]],
+                     "caption": _elem(ctx, op["caption"], None, n) if op.get("caption") is not None else None}
+            elif op["op"] == "build_table":
+                t = [_elem(ctx, a, None, n) for a in op.get("absorb") or []]
             else:
                 t = None
             resolved.append((op, e, t))
@@ -278,14 +380,25 @@ def _elem(ctx: _Ctx, index: int, expect_role: str | None, n: int) -> Elem:
     return e
 
 
-def _apply(ctx: _Ctx, op: dict, e: Elem, t: Elem | None, n: int) -> str:
-    kind, obj = op["op"], e.obj
+def _apply(ctx: _Ctx, op: dict, e: Elem | None, t: Elem | None, n: int) -> str:
+    kind = op["op"]
+    if kind == "set_doc_title":
+        set_title(ctx.pdf, op["title"].strip())
+        return f"document title set to \"{op['title'].strip()}\""
+    if kind == "set_doc_lang":
+        set_language(ctx.pdf, op["lang"])
+        return f"document language set to {op['lang']}"
+    obj = e.obj
     if kind == "set_role":
         return _set_role(ctx, e, op["role"], n)
     if kind == "set_alt":
+        if e.role in ("Link", "Annot"):
+            return _set_link_text(e, op["alt"], n)
         return _set_text(obj, "/Alt", op["alt"], e, "alt text")
     if kind == "set_actual_text":
         return _set_text(obj, "/ActualText", op["text"], e, "actual text")
+    if kind == "set_field_label":
+        return _set_field_label(e, op["label"])
     if kind == "set_lang":
         lang = (op.get("lang") or "").strip()
         if lang:
@@ -297,10 +410,14 @@ def _apply(ctx: _Ctx, op: dict, e: Elem, t: Elem | None, n: int) -> str:
         return _set_cell(ctx, e, op["role"], op.get("scope"))
     if kind == "set_headers":
         return _set_headers(ctx, e, t, n)
+    if kind == "rebuild_table":
+        return _rebuild_table(ctx, e, op, t, n)
+    if kind == "build_table":
+        return _build_table(ctx, e, t, op, n)
     if kind == "link_note":
         return _link_note(ctx, e, t, n)
     if kind == "set_decorative":
-        return _make_decorative(ctx, e, n)
+        return _make_decorative(ctx, e, n, op.get("as", "layout"))
     if kind == "move":
         return _move(ctx, e, t, op["position"], n)
     if kind == "merge":
@@ -456,6 +573,36 @@ def _insert_after(ctx: _Ctx, e: Elem, new: list, n: int) -> None:
     if pos is None:
         raise EditError(f"Edit {n}: the tag wasn't found under its parent.")
     parent.K = Array(siblings[:pos + 1] + new + siblings[pos + 1:])
+
+
+def _set_field_label(e: Elem, label: str) -> str:
+    """A Form tag's field gets the label as its tooltip (/TU), what assistive technology announces (#341). A widget
+    with a field of its own (or a radio button that already has its own tooltip) keeps it on itself; otherwise the
+    field the widget belongs to."""
+    if e.role != "Form":
+        raise EditError(f"element {e.index} is a {e.role}: only a form field's tag has a field label")
+    widget = next((it.Obj for it in _items(e.obj.get("/K")) if isinstance(it, Dictionary) and "/Obj" in it
+                   and isinstance(it.Obj, Dictionary)), None)
+    if widget is None:
+        raise EditError(f"element {e.index} holds no form field")
+    parent = widget.get("/Parent")
+    target = widget if ("/T" in widget or "/TU" in widget or not isinstance(parent, Dictionary)) else parent
+    target.TU = String(label.strip())
+    return f"element {e.index} (Form): field label set"
+
+
+def _set_link_text(e: Elem, text: str, n: int) -> str:
+    """A link's description (#364): the tag's /Alt and each of its annotations' /Contents, which is what assistive
+    technology announces for the link (PDF/UA wants it on every link annotation, so it can't be removed)."""
+    text = text.strip()
+    if not text:
+        raise EditError(f"Edit {n}: a link needs a description; change it rather than removing it.")
+    annots = [it.Obj for it in _items(e.obj.get("/K")) if isinstance(it, Dictionary) and "/Obj" in it
+              and isinstance(it.Obj, Dictionary)]
+    e.obj.Alt = String(text)
+    for a in annots:
+        a.Contents = String(text)
+    return f"element {e.index} ({e.role}): description set" + (f" on {len(annots)} annotation(s)" if annots else "")
 
 
 def _set_text(obj: Dictionary, key: str, text: str, e: Elem, label: str) -> str:
@@ -750,7 +897,7 @@ def _move(ctx: _Ctx, e: Elem, t: Elem, position: str, n: int) -> str:
     return f"element {e.index} ({e.role}) moved {position} element {t.index} ({t.role})"
 
 
-def _make_decorative(ctx: _Ctx, e: Elem, n: int) -> str:
+def _make_decorative(ctx: _Ctx, e: Elem, n: int, kind: str = "layout") -> str:
     """Turn an element and everything under it into an artifact: its content's marked-content
     sequences become /Artifact (no MCID), the ParentTree entries are cleared and the tag is removed."""
     if e.parent is None and len(_items(ctx.root.get("/K"))) <= 1:
@@ -758,12 +905,14 @@ def _make_decorative(ctx: _Ctx, e: Elem, n: int) -> str:
     members = _subtree(ctx, e)
     if any(x.objrs for x in members):
         raise EditError(f"Edit {n}: this tag contains a link or form field, which can't be decorative.")
-    changed = _to_artifacts(ctx, {x.index for x in members})
+    changed = _to_artifacts(ctx, {x.index for x in members}, kind)
     _detach(ctx, e)
-    return f"element {e.index} ({e.role}) marked decorative ({changed} content item(s) now artifacts)"
+    what = {"layout": "decorative", "header": "a page header", "footer": "a page footer",
+            "page_number": "a page number"}[kind]
+    return f"element {e.index} ({e.role}) marked {what} ({changed} content item(s) now artifacts)"
 
 
-def _to_artifacts(ctx: _Ctx, member_ids: set[int]) -> int:
+def _to_artifacts(ctx: _Ctx, member_ids: set[int], kind: str = "layout") -> int:
     """The content these tags hold directly becomes /Artifact (no MCID), and leaves the ParentTree."""
     targets: dict[tuple, set[int]] = {}
     for (owner, mcid), users in ctx.checker.index.refs.items():
@@ -779,7 +928,9 @@ def _to_artifacts(ctx: _Ctx, member_ids: set[int]) -> int:
         for i, ins in enumerate(ops):
             if (isinstance(ins, ContentStreamInstruction) and str(ins.operator) == "BDC" and len(ins.operands) == 2
                     and isinstance(ins.operands[1], Dictionary) and mcid_of(ins.operands[1]) in mcids):
-                ops[i] = ContentStreamInstruction([Name.Artifact, Dictionary(Type=Name.Layout)], Operator("BDC"))
+                typ, sub = ARTIFACT_KINDS[kind]
+                props = Dictionary(Type=typ, **({"Subtype": sub} if sub is not None else {}))
+                ops[i] = ContentStreamInstruction([Name.Artifact, props], Operator("BDC"))
                 touched = True
                 changed += 1
         if touched:
@@ -2093,3 +2244,245 @@ def _tag_artifacts(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
     parent.K = Array(kids)
     return (f"page {op['page']}: {len(new_mcids)} artifact section(s) tagged as a new {role}, "
             f"{op['position']} element {anchor.index} ({anchor.role})")
+
+
+# --- the table editor (#370): a table rebuilt from its grid, or built from text tags ---------------------------
+
+@dataclass
+class _Slot:
+    row: int
+    col: int
+    row_span: int
+    col_span: int
+    spec: dict
+
+
+def _layout(rows: list[list[dict]], n: int) -> list[_Slot]:
+    """Where each cell of the rows sits, as HTML lays out a table: the next free column of its row, then its spans.
+    The cells must fill a rectangle: every row as wide as the others, nothing overlapping, no row span past the end."""
+    taken: set[tuple[int, int]] = set()
+    slots = []
+    for r, row in enumerate(rows):
+        c = 0
+        for spec in row:
+            while (r, c) in taken:
+                c += 1
+            rs, cs = spec.get("rows", 1), spec.get("cols", 1)
+            cover = {(r + i, c + j) for i in range(rs) for j in range(cs)}
+            if r + rs > len(rows) or cover & taken:
+                raise EditError(f"Edit {n}: the cells don't fit together: a cell spans past the end of the table or "
+                                "over another cell.")
+            taken |= cover
+            slots.append(_Slot(r, c, rs, cs, spec))
+            c += cs
+    width = 1 + max((c for _, c in taken), default=-1)
+    if not taken or taken != {(r, c) for r in range(len(rows)) for c in range(width)}:
+        raise EditError(f"Edit {n}: the rows don't line up: every row needs cells across the same number of columns.")
+    return slots
+
+
+def _cell_attrs(obj: Dictionary, role: str, scope: str | None, rows: int, cols: int) -> None:
+    """A cell's Table attributes as the editor says: its scope (header cells), spans; its old Headers go (they're
+    written again for the whole table). Other attribute owners stay."""
+    attrs = obj.get("/A")
+    items = [a for a in (list(attrs) if isinstance(attrs, Array) else [attrs] if attrs is not None else [])
+             if not isinstance(a, int)]
+    keep = [a for a in items if not (isinstance(a, Dictionary) and a.get("/O") == Name.Table)]
+    table = Dictionary(O=Name.Table)
+    if role == "TH":
+        table.Scope = Name("/" + (scope or "Column"))
+    if rows > 1:
+        table.RowSpan = rows
+    if cols > 1:
+        table.ColSpan = cols
+    items = keep + ([table] if len(table) > 1 else [])
+    if not items:
+        if "/A" in obj:
+            del obj["/A"]
+    else:
+        obj.A = items[0] if len(items) == 1 else Array(items)
+
+
+def _link_headers(ctx: _Ctx, slots: list[_Slot], objs: list[Dictionary], label: str) -> int:
+    """Headers by name where Scope can't say it (table_headers), as the tagger writes them: the header rows and
+    columns are the leading rows and columns of header cells."""
+    def leading(axis: str) -> int:
+        k = 0
+        while any(getattr(s, axis) == k for s in slots) and all(
+                s.spec["role"] == "TH" for s in slots if getattr(s, axis) <= k):
+            k += 1
+        return k
+    header_rows, header_cols = leading("row"), leading("col")
+    ctx.ids_changed = True  # cells may have gone with their IDs, and header cells may get some
+    if not is_complex(slots, header_rows, header_cols):
+        return 0
+    at = {(s.row, s.col): o for s, o in zip(slots, objs)}
+    links = header_links(slots, header_rows, header_cols)
+    for (r, c), heads in links.items():
+        ids = [_give_id(ctx, at[h], f"{label}-r{h[0]}c{h[1]}") for h in heads]
+        cell = at[(r, c)]
+        a = table_attrs(cell)
+        if a is None:
+            a, old = Dictionary(O=Name.Table), cell.get("/A")
+            cell.A = a if old is None else Array((list(old) if isinstance(old, Array) else [old]) + [a])
+        a.Headers = Array([String(i) for i in ids])
+    return len(links)
+
+
+def _table_rows(ctx: _Ctx, table: Dictionary) -> list[Dictionary]:
+    rows = []
+    for k in _items(table.get("/K")):
+        role = _role_of(ctx, k) if _is_elem_dict(k) else None
+        if role == "TR":
+            rows.append(k)
+        elif role in ("THead", "TBody", "TFoot"):
+            rows += [r for r in _items(k.get("/K")) if _is_elem_dict(r) and _role_of(ctx, r) == "TR"]
+    return rows
+
+
+def _new_elem(ctx: _Ctx, role: str, parent: Dictionary, like: Dictionary | None = None) -> Dictionary:
+    new = ctx.pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name("/" + role), P=parent, K=Array([])))
+    if like is not None and "/Pg" in like:
+        new.Pg = like.Pg
+    return new
+
+
+def _rebuild_table(ctx: _Ctx, e: Elem, op: dict, t: dict, n: int) -> str:
+    if e.role != "Table" or not e.obj.is_indirect:
+        raise EditError(f"Edit {n}: element {e.index} is a {e.role}, not a table.")
+    table = e.obj
+    own = {c.objgen for c in _cells_of(ctx, table)}
+    listed = [x for row in t["cells"] for cell in row for x in cell]
+    if any(x.obj.objgen not in own for x in listed if x.obj.is_indirect) or any(not x.obj.is_indirect for x in listed):
+        raise EditError(f"Edit {n}: a cell named isn't one of this table's cells. Reload and try again.")
+    missing = own - {x.obj.objgen for x in listed}
+    if missing:
+        raise EditError(f"Edit {n}: {len(missing)} of the table's cells aren't in the new table; their content would "
+                        "be lost. Reload and try again.")
+    slots = _layout(op["rows"], n)
+    old_rows = _table_rows(ctx, table)
+    trs, objs, merged = [], [], 0
+    specs = iter(t["cells"])
+    for r, row in enumerate(op["rows"]):
+        tr = old_rows[r] if r < len(old_rows) else _new_elem(ctx, "TR", table, table)
+        tr.P = table
+        kids = []
+        for spec, olds in zip(row, next(specs)):
+            if olds:
+                base = olds[0].obj
+                content = _items(base.get("/K"))
+                for o in olds[1:]:
+                    content += _reparent_items(ctx, o, _items(o.obj.get("/K")), base)
+                    o.obj.K = Array([])
+                    merged += 1
+                base.K = Array(content)
+            else:
+                base = _new_elem(ctx, spec["role"], tr, table)
+            base.S = Name("/" + spec["role"])
+            base.P = tr
+            _cell_attrs(base, spec["role"], spec.get("scope"), spec.get("rows", 1), spec.get("cols", 1))
+            kids.append(base)
+            objs.append(base)
+        tr.K = Array(kids)
+        trs.append(tr)
+    for s, o in zip(slots, objs):
+        a = table_attrs(o)
+        if a is not None and "/Headers" in a:
+            del a["/Headers"]
+    linked = _link_headers(ctx, slots, objs, f"t{e.index}")
+    caption = _table_caption(ctx, e, op, t.get("caption"), n)
+    table.K = Array(([caption] if caption is not None else []) + trs)
+    width = 1 + max(s.col + s.col_span - 1 for s in slots)
+    return (f"element {e.index} (Table): {len(trs)} row(s) by {width} column(s)"
+            + (f", {merged} cell(s) merged into others" if merged else "")
+            + (f"; {linked} cell(s) name their headers" if linked else ""))
+
+
+def _table_caption(ctx: _Ctx, e: Elem, op: dict, chosen: Elem | None, n: int) -> Dictionary | None:
+    """The table's caption after the edit: unchanged when the edit doesn't say; a tag made the caption (moved into
+    the table, first); or none, the old one put back as a paragraph just before the table."""
+    table = e.obj
+    old = next((k for k in _items(table.get("/K")) if _is_elem_dict(k) and _role_of(ctx, k) == "Caption"), None)
+    if "caption" not in op:
+        return old
+    if chosen is not None and old is not None and _same(chosen.obj, old):
+        return old
+    if old is not None:  # out, as a paragraph before the table
+        parent = _parent_obj(ctx, e)
+        old.S, old.P = Name.P, parent
+        siblings = _items(parent.get("/K"))
+        pos = next((i for i, k in enumerate(siblings) if _same(k, table)), len(siblings))
+        parent.K = Array(siblings[:pos] + [old] + siblings[pos:])
+    if chosen is None:
+        return None
+    if chosen.index == e.index or e.index in _ancestors(ctx, chosen) or chosen.role not in LIST_ITEM_FROM | {"Caption"}:
+        raise EditError(f"Edit {n}: a table's caption is a paragraph or heading outside the table.")
+    if not chosen.obj.is_indirect:
+        raise EditError(f"Edit {n}: that tag can't be moved into the table.")
+    _detach(ctx, chosen)
+    chosen.obj.S, chosen.obj.P = Name.Caption, table
+    return chosen.obj
+
+
+def _build_table(ctx: _Ctx, e: Elem, others: list[Elem], op: dict, n: int) -> str:
+    """Text tags made a table: each cell takes the /K items it names; every item goes somewhere. A figure can be one of
+    them, for a table drawn as a picture (a grid of ruled lines): its alt text described the picture, and goes."""
+    tags = [e] + others
+    for x in tags:
+        if not x.obj.is_indirect or x.role not in LIST_ITEM_FROM | {"Figure"}:
+            raise EditError(f"Edit {n}: a {x.role} can't be made into a table. Select paragraphs, headings or a "
+                            "figure.")
+        if x.role == "Figure" and "/Alt" in x.obj:
+            del x.obj["/Alt"]
+        if any(k in x.obj for k in ("/ActualText", "/Alt")):
+            raise EditError(f"Edit {n}: element {x.index} has read-aloud or alt text that stands for all of it. "
+                            "Remove that first.")
+        inside = _ancestors(ctx, x)
+        if any(y.index in inside for y in tags):
+            raise EditError(f"Edit {n}: a tag can't be made into a table with a tag that contains it.")
+    parent = _parent_obj(ctx, e)
+    if not _at_root(ctx, parent):
+        v = check_move("Table", _role_of(ctx, parent), _role_of(ctx, parent), True)
+        if not v.ok:
+            raise EditError(f"Edit {n}: a table can't go here. {v.reason}")
+    items = {(x.index, k): (x, item) for x in tags for k, item in enumerate(_items(x.obj.get("/K")))}
+    named = [(ref.get("el", e.index), ref["at"]) for row in op["rows"] for cell in row for ref in cell["parts"]]
+    if set(named) != set(items) or len(named) != len(items):
+        raise EditError(f"Edit {n}: every piece of the tags has to go in exactly one cell "
+                        f"({len(set(items) - set(named))} left out). Reload and try again.")
+    slots = _layout(op["rows"], n)
+    table = _new_elem(ctx, "Table", parent, e.obj)
+    trs, objs = [], []
+    for row in op["rows"]:
+        tr = _new_elem(ctx, "TR", table, e.obj)
+        kids = []
+        for spec in row:
+            cell = _new_elem(ctx, spec["role"], tr, e.obj)
+            content: list = []
+            for ref in spec["parts"]:
+                owner, item = items[(ref.get("el", e.index), ref["at"])]
+                content += _reparent_items(ctx, owner, [item], cell)
+            cell.K = Array(content)
+            for key in ("/Lang",):
+                if key in e.obj:
+                    cell[key] = e.obj[key]
+            _cell_attrs(cell, spec["role"], spec.get("scope"), spec.get("rows", 1), spec.get("cols", 1))
+            kids.append(cell)
+            objs.append(cell)
+        tr.K = Array(kids)
+        trs.append(tr)
+    table.K = Array(trs)
+    linked = _link_headers(ctx, slots, objs, f"t{e.index}")
+    for x in tags:
+        x.obj.K = Array([])
+    for o in others:
+        _detach(ctx, o)
+    siblings = _items(parent.get("/K"))
+    pos = next((i for i, k in enumerate(siblings) if _same(k, e.obj)), None)
+    if pos is None:
+        raise EditError(f"Edit {n}: the tag wasn't found under its parent.")
+    parent.K = Array(siblings[:pos] + [table] + siblings[pos + 1:])
+    width = 1 + max(s.col + s.col_span - 1 for s in slots)
+    return (f"element {e.index}: made into a table of {len(trs)} row(s) by {width} column(s)"
+            + (f"; {linked} cell(s) name their headers" if linked else ""))
+

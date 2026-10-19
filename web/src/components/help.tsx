@@ -272,8 +272,8 @@ export function HelpPanel({ job }: { job: Job }) {
   useEffect(() => {
     if (asking) ref.current?.scrollIntoView({ block: "start", behavior: "smooth" });
   }, [asking]);
-  // Reading the request marks it seen: refresh the unread count
-  useEffect(() => { if (help.data?.role === "person") void reloadMe(); }, [help.data?.id, help.data?.role, reloadMe]);
+  // Reading the request marks it seen for whoever asked it (a super admin's own request too): refresh the unread count
+  useEffect(() => { if (help.data && own) void reloadMe(); }, [help.data?.id, own, reloadMe]);
 
   if (help.loading && !help.data) return <Loading />;
   const req = help.data;

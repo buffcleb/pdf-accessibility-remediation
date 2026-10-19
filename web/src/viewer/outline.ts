@@ -145,7 +145,7 @@ export type BuiltRow = { role: string; depth: number; text: string; boxes: { pag
 
 type Box = BuiltRow["boxes"][number];
 /** One box per page around all of these. */
-function unite(boxes: Box[]): Box[] {
+export function unite(boxes: Box[]): Box[] {
   const pages = new Map<number, [number, number, number, number]>();
   for (const { page, bbox: b } of boxes) {
     const u = pages.get(page);
@@ -189,6 +189,13 @@ export function builtPreview(map: TagMap, op: Extract<TagEdit, { op: "build_list
 
 /** What a pending build_list makes, in words, for a screen reader on the one row it is read from. */
 export function builtSummary(rows: BuiltRow[]): string {
+  if (rows.some((r) => r.role === "Table")) {
+    // A table made or edited (#370)
+    const trs = rows.filter((r) => r.role === "TR").length;
+    const cells = rows.filter((r) => r.role === "TH" || r.role === "TD");
+    const heads = cells.filter((r) => r.role === "TH").length;
+    return `makes a table of ${trs} row${trs === 1 ? "" : "s"} and ${cells.length} cell${cells.length === 1 ? "" : "s"}${heads ? `, ${heads} of them headers` : ""}`;
+  }
   const items = rows.filter((r) => r.role === "LI");
   const nested = items.filter((r) => r.depth > 1).length;
   const others = rows.filter((r) => r.role !== "LI" && r.role !== "L").length;

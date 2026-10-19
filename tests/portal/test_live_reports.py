@@ -12,7 +12,7 @@ from portal.models import AuditEvent, Job
 from tests.portal.test_jobs import API, fake_engine, pdf_bytes, run_worker, setup, topup, upload  # noqa: F401
 
 REPORTS = ["documents", "usage", "ledger", "sign_ins", "help", "audit", "quality", "failures", "ai_usage"]
-SUPER_ONLY = ["cost", "daily", "report_emails"]
+SUPER_ONLY = ["cost", "daily", "report_emails", "limits", "describe"]
 
 
 def _done(s, client, name, pages):
@@ -144,7 +144,7 @@ def test_quality_pass_rate_by_period_and_option(data):
     chart = body["chart"]
     assert chart["kind"] == "line" and chart["series"] == "option"
     assert round(chart["points"][0]["pass_rate"], 1) == 66.7  # a rate of the sums, not a sum of rates
-    assert {h["label"]: h["value"] for h in body["headline"]}["Pass PDF/UA-1"] == "67%"
+    assert {h["label"]: h["value"] for h in body["headline"]}["Pass PDF/UA"] == "67%"
 
     failures = _get(s, "admin_a", "failures")
     assert failures["rows"][0]["clause"] == "7.1-3" and failures["rows"][0]["documents"] == 1
@@ -191,7 +191,7 @@ def test_cost_and_daily_use(data):
     assert daily["chart"]["ref"] is True and daily["chart"]["points"][0]["_ref"] == 10
 
 
-@pytest.mark.parametrize("name", ["quality", "failures", "cost", "daily", "ai_usage"])
+@pytest.mark.parametrize("name", ["quality", "failures", "cost", "daily", "ai_usage", "limits", "describe"])
 def test_grouped_reports_sort_by_every_column(data, name):
     cols = _get(data, "super", name)["columns"]
     for c in cols:
@@ -302,3 +302,72 @@ def test_documents_on_the_engines_default_ai_are_counted(data):
         [("Engine default AI (no AI level)", "qwen3-vl-8b-instruct", 153)]
     assert _get(s, "super", "ai_usage", level="default")["totals"]["documents"] == 1
     assert "default" in [o["value"] for f in body["filters"] if f["key"] == "level" for o in f["options"]]
+
+
+def test_limits_hit_are_seen_by_document_and_by_limit(data):
+    """#312: which documents reached a limit, and which limits are reached how often and by how much."""
+    s = data
+    db = s["db"]
+
+    def hit(name, *limits, error=None):
+        job = db.scalars(select(Job).where(Job.filename == name)).one()
+        job.result_summary = {**job.result_summary, "metrics": {**(job.result_summary.get("metrics") or {}), "limits_hit": [
+            {"setting": k, "value": v, "wanted": w, "effect": f"{k} effect"} for k, v, w in limits]}}
+        if error:
+            job.status, job.error_code = "failed", error
+        db.commit()
+    hit("annual-report.pdf", ("AI_NOTATION_MAX", 100, 140), ("VERIFY_AI_MAX_ITEMS", 150, 210))
+    hit("syllabus.pdf", ("AI_NOTATION_MAX", 100, 260))
+    hit("minutes.pdf", error="time_limit_exceeded")
+
+    docs = _get(s, "super", "documents", columns="filename,limits", limits="yes")
+    got = {r["filename"]: r["limits"] for r in docs["rows"]}
+    assert got == {"annual-report.pdf": "AI_NOTATION_MAX, VERIFY_AI_MAX_ITEMS", "syllabus.pdf": "AI_NOTATION_MAX",
+                   "minutes.pdf": "TASK_TIME_LIMIT_S"}
+    assert _get(s, "super", "documents", limits="no")["total_rows"] == 0
+
+    rows = {r["setting"]: r for r in _get(s, "super", "limits")["rows"]}
+    assert set(rows) == {"AI_NOTATION_MAX", "VERIFY_AI_MAX_ITEMS"}
+    assert (rows["AI_NOTATION_MAX"]["documents"], rows["AI_NOTATION_MAX"]["wanted"], rows["AI_NOTATION_MAX"]["value"]) \
+        == (2, 260, 100)
+    # The column is super admins' (adjusting limits is theirs)
+    assert "limits" not in [c["key"] for c in _get(s, "admin_a", "documents")["columns"]]
+
+
+def test_the_portal_adds_its_own_review_list_limit():
+    from portal.worker import _limits_hit
+    from portal.config import get_portal_settings
+
+    kept = get_portal_settings().review_findings_max
+    engine = [{"setting": "AI_IMAGES_MAX", "value": 3, "wanted": 5, "effect": "e"}]
+    assert _limits_hit({"limits_hit": engine}, kept) == engine
+    out = _limits_hit({"limits_hit": engine}, kept + 7)
+    assert out[-1]["setting"] == "PORTAL_REVIEW_FINDINGS_MAX" and out[-1]["wanted"] == kept + 7
+    assert _limits_hit({}, 0) == []
+
+
+def test_describe_with_ai_is_counted_per_use_by_person_and_cost(data):
+    """#318: how much Describe with AI is used and what it costs, to size recharging it (#317)."""
+    from datetime import datetime, timezone
+
+    s = data
+    db = s["db"]
+    from portal.models import User
+    jordan = db.scalars(select(User).where(User.email == "user@a.test")).first() or db.scalars(select(User)).first()
+    now = datetime.now(timezone.utc).isoformat()
+    job = db.scalars(select(Job).where(Job.filename == "annual-report.pdf")).one()
+    job.cost = {**(job.cost or {}), "describe_usd": 0.003, "describe_calls": 3, "describe_log": [
+        {"at": now, "user": str(jordan.id), "usd": 0.001, "model": "m", "page": 1} for _ in range(3)]}
+    other = db.scalars(select(Job).where(Job.filename == "minutes.pdf")).one()
+    other.cost = {**(other.cost or {}), "describe_log": None}       # a JSON null: counted as none
+    db.commit()
+    body = _get(s, "super", "describe", by="month")
+    assert body["total_rows"] == 1
+    row = body["rows"][0]
+    assert row["uses"] == 3 and row["documents"] == 1 and abs(row["usd"] - 0.003) < 1e-9 and row["person"] == jordan.email
+    head = {h["label"]: h["value"] for h in body["headline"]}
+    assert head["Uses"] == 3 and head["Cost"] == "$0.00" and head["People"] == 1
+    # ...and the cost report can show it beside the AI cost, for super admins
+    cost = _get(s, "super", "cost", columns="period,describe_usd")
+    assert abs(sum(r.get("describe_usd") or 0 for r in cost["rows"]) - 0.003) < 1e-9
+

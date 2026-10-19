@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import threading
 import traceback
 
 from celery.exceptions import SoftTimeLimitExceeded
 
+from app.pipeline import protection
 from app.pipeline.orchestrator import AIProviderUnavailable, JobOptions, run_remediation
 from app.storage import JobStore, purge_expired_jobs
 from app.validation.verapdf import job_validator
@@ -14,10 +17,59 @@ from app.worker.celery_app import celery_app
 
 log = logging.getLogger(__name__)
 
+# A worker that dies with a job (out of memory, a node drained) leaves it unacknowledged, and the queue hands it out
+# again. One more start is fair (a deploy or a drained node isn't the document's fault); a job that took its worker
+# down twice would only do it again, paying for its AI each time
+MAX_STARTS = 2
+
+
+# While a job runs, its worker says so every HEARTBEAT_S (a thread beside the work): a heartbeat older than
+# HEARTBEAT_STALE_S on an unfinished job means the worker was lost (#315), and the status says so
+HEARTBEAT_S = 30
+HEARTBEAT_STALE_S = 120
+
+
+@contextlib.contextmanager
+def _heartbeat(store: JobStore):
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.is_set():
+            try:
+                store.beat()
+            except OSError:  # a missed beat isn't the job failing
+                pass
+            stop.wait(HEARTBEAT_S)
+    t = threading.Thread(target=beat, name=f"heartbeat-{store.job_id[:8]}", daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
+def _not_again(store: JobStore, job_id: str) -> dict | None:
+    """None when the job should run; else what the task returns without running it: a job handed out again after it
+    finished or was stopped, or one whose worker was lost on every start so far."""
+    if store.read_result() is not None or store.read_error() is not None:
+        log.info("job %s already finished or stopped; not run again", job_id)
+        return {"job_id": job_id, "status": "skipped"}
+    starts = store.count_attempt()
+    if starts > MAX_STARTS:
+        log.error("job %s: its worker was lost on each of %d starts; failed", job_id, starts - 1)
+        store.write_error({"error": "worker_lost", "detail": "The worker processing this job stopped unexpectedly "
+                           f"on each of {starts - 1} tries (often out of memory)."})
+        return {"job_id": job_id, "status": "failed", "error": "worker_lost"}
+    if starts > 1:
+        log.warning("job %s: started again after its worker was lost (start %d of %d)", job_id, starts, MAX_STARTS)
+    return None
+
 
 @celery_app.task(bind=True, name="app.worker.tasks.remediate")
 def remediate(self, job_id: str) -> dict:
     store = JobStore(job_id)
+    if (done := _not_again(store, job_id)) is not None:
+        return done
     meta = store.read_meta() or {}
     options = JobOptions.from_meta(meta)
 
@@ -28,8 +80,10 @@ def remediate(self, job_id: str) -> dict:
             log.debug("progress update failed", exc_info=True)
 
     try:
-        with job_validator(meta.get("flags")):
+        info = protection.inspect(store.input_pdf)
+        with _heartbeat(store), job_validator(meta.get("flags")):
             result = asyncio.run(run_remediation(store, options, progress))
+        protection.finish(store.output_dir, result, info)  # its restrictions back on the outputs (#339)
         store.write_result(result)
         return {"job_id": job_id, "status": "completed"}
     except AIProviderUnavailable as exc:
@@ -66,6 +120,8 @@ def remediate_adobe(self, job_id: str) -> dict:
     from app.pipeline.adobe_job import adobe_error, run_adobe
 
     store = JobStore(job_id)
+    if (done := _not_again(store, job_id)) is not None:
+        return done
     meta = store.read_meta() or {}
     options = JobOptions.from_meta(meta)
 
@@ -76,8 +132,11 @@ def remediate_adobe(self, job_id: str) -> dict:
             log.debug("progress update failed", exc_info=True)
 
     try:
-        with job_validator(meta.get("flags")):
-            store.write_result(asyncio.run(run_adobe(store, options, progress)))
+        info = protection.inspect(store.input_pdf)
+        with _heartbeat(store), job_validator(meta.get("flags")):
+            result = asyncio.run(run_adobe(store, options, progress))
+        protection.finish(store.output_dir, result, info)
+        store.write_result(result)
         return {"job_id": job_id, "status": "completed"}
     except AdobeError as exc:
         log.error("adobe job %s failed: %s", job_id, exc)
@@ -103,6 +162,8 @@ def edit_tags(self, job_id: str) -> dict:
     from app.tagging.editor import EditError
 
     store = JobStore(job_id)
+    if (done := _not_again(store, job_id)) is not None:
+        return done
 
     def progress(stage: str, pct: int) -> None:
         try:
@@ -111,8 +172,11 @@ def edit_tags(self, job_id: str) -> dict:
             log.debug("progress update failed", exc_info=True)
 
     try:
-        with job_validator((store.read_meta() or {}).get("flags")):
-            store.write_result(asyncio.run(run_edit(store, progress)))
+        info = protection.inspect(store.input_pdf)  # a saved version keeps the restrictions it was given
+        with _heartbeat(store), job_validator((store.read_meta() or {}).get("flags")):
+            result = asyncio.run(run_edit(store, progress))
+        protection.finish(store.output_dir, result, info)
+        store.write_result(result)
         return {"job_id": job_id, "status": "completed"}
     except EditError as exc:
         store.write_error({"error": "edit_rejected", "detail": str(exc)})

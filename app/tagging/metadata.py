@@ -12,6 +12,15 @@ def apply_document_metadata(pdf: pikepdf.Pdf, *, title: str, language: str, pdfu
     changes: list[str] = []
     root = pdf.Root
 
+    # An XFA form (Adobe LiveCycle) beside the standard one: the XFA part goes, so readers use the standard form that
+    # was tagged (#360; Matterhorn 25-001). A dynamic XFA form has no standard form and is refused at upload.
+    form = root.get("/AcroForm")
+    if isinstance(form, Dictionary) and "/XFA" in form:
+        del form["/XFA"]
+        changes.append("XFA form data removed (the standard form stays)")
+    if "/NeedsRendering" in root:
+        del root["/NeedsRendering"]
+
     mark = root.get("/MarkInfo")
     if not isinstance(mark, Dictionary):
         root.MarkInfo = mark = Dictionary()
@@ -43,6 +52,8 @@ def apply_document_metadata(pdf: pikepdf.Pdf, *, title: str, language: str, pdfu
                 pass
         meta["dc:title"] = title
         meta["pdfuaid:part"] = str(pdfua_part)
+        if pdfua_part == 2:
+            meta["pdfuaid:rev"] = "2024"  # PDF/UA-2's revision (ISO 14289-2:2024)
         if language:
             meta["dc:language"] = [language]
     changes.append(f"title and PDF/UA-{pdfua_part} identifier written to XMP"
@@ -112,3 +123,36 @@ def _drop_old_style_metadata(pdf: pikepdf.Pdf) -> bool:
     if old:
         del pdf.Root["/Metadata"]
     return old
+
+
+def document_info(pdf: pikepdf.Pdf) -> dict:
+    """The title and language a reader announces: the XMP title (what PDF/UA requires) or the document
+    information's, and the catalog's /Lang. For the tag manager's Document panel (#363)."""
+    title = None
+    try:
+        with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
+            title = meta.get("dc:title")
+    except Exception:  # noqa: BLE001 - unreadable XMP: the document information still says
+        title = None
+    if not title:
+        title = str(pdf.docinfo.get("/Title") or "") or None
+    lang = str(pdf.Root.get("/Lang") or "").strip() or None
+    return {"title": title, "lang": lang}
+
+
+def set_title(pdf: pikepdf.Pdf, title: str) -> None:
+    """A person's title from the tag manager: the document information, the XMP title, and shown in the title bar."""
+    pdf.docinfo[Name.Title] = String(title)
+    with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
+        meta["dc:title"] = title
+    vp = pdf.Root.get("/ViewerPreferences")
+    if not isinstance(vp, Dictionary):
+        pdf.Root.ViewerPreferences = vp = Dictionary()
+    vp.DisplayDocTitle = True
+
+
+def set_language(pdf: pikepdf.Pdf, language: str) -> None:
+    """A person's document language from the tag manager: the catalog's /Lang and the XMP language."""
+    pdf.Root.Lang = String(language)
+    with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
+        meta["dc:language"] = [language]

@@ -5,6 +5,11 @@
 Changes collect under **Unsaved changes (N)…** at the top of the page (and in the panel's tab), where you can undo
 them one by one and save. In the tag tree, tags with unsaved changes are tinted and say what changed.
 
+**Undo** and **Redo** at the top take back your changes in the order you made them, and bring them back:
+**Ctrl+Z** and **Ctrl+Shift+Z** (or **Ctrl+Y**); on a Mac, **⌘Z** and **⇧⌘Z**. Each says what it undid. In a text
+field the keys undo your typing instead, as usual. The history starts again when you save, switch versions or pick
+up kept changes; the last 200 steps are kept.
+
 ![The Changes not saved yet window with one change: a list "made into a table of contents (page 1)", with Undo. Below:
 an optional Note box, the choice "AI review of the saved version" (None now, chosen; Flagged figures plus a sample;
 Every figure), the buttons Save as a new reviewed version and Discard all, and a note that saving re-checks the tags,

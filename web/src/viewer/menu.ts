@@ -7,12 +7,12 @@ import { ROLE_NAMES, absorbedBy, addEdit, listMembers, listPlan, overrides, page
 import { actionNote, checkElementRole, checkMove } from "./roles";
 import { outlineLines } from "./outline";
 
-export type MenuAct = "split-text" | "delete" | "read" | "report" | "show" | "types" | "area-draw" | "area-page" | "area-clear" | "build" | "isolate" | "unisolate" | "edit" | "figure-split";
+export type MenuAct = "split-text" | "delete" | "read" | "report" | "show" | "types" | "area-draw" | "area-page" | "area-clear" | "build" | "isolate" | "unisolate" | "edit" | "figure-split" | "table" | "make-table";
 
 export type MenuItem = {
   id: string;
   label: string;
-  group: "type" | "shape" | "list" | "order" | "note" | "area" | "more";
+  group: "type" | "shape" | "list" | "order" | "note" | "artifact" | "area" | "more";
   note?: string;       // what else choosing it does ("the text is wrapped in a list with one item")
   disabled?: string;   // why it can't be chosen now
   ops?: TagEdit[];     // the unsaved changes as they would be after choosing it
@@ -24,6 +24,16 @@ export const MENU_ROLES = ["P", "H1", "H2", "H3", "H4", "H5", "H6", "L", "Captio
 
 /** Text tags that can become a list item as they are (the engine's LIST_ITEM_FROM). */
 export const LIST_ITEM_FROM = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "Code", "BibEntry"];
+/** Tags that can be made an artifact, with everything in them (#364): text and figures, and the groups that hold
+ * them. A cell, a list's parts or a link would leave the structure around them broken. */
+const ARTIFACT_FROM = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "Code", "Quote", "Span",
+  "Figure", "Formula", "Div", "Sect", "Art", "Part"];
+const ARTIFACT_KINDS: { as: "layout" | "header" | "footer" | "page_number"; label: string; note: string }[] = [
+  { as: "layout", label: "Decoration", note: "A rule, a border, an ornament: screen readers skip it." },
+  { as: "header", label: "Running page header", note: "Repeated at the top of pages: screen readers skip it." },
+  { as: "footer", label: "Running page footer", note: "Repeated at the bottom of pages: screen readers skip it." },
+  { as: "page_number", label: "Page number", note: "Screen readers skip it; their own page count stands in." },
+];
 const BLOCKS = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "L", "Table", "Sect", "Div", "Art", "Part", "BlockQuote", "TOC", "Index", "Document"];
 
 /** Where on a page the menu was asked for, in page units (to split a tag at that place). */
@@ -134,13 +144,43 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
   if (els.every((e) => LIST_ITEM_FROM.includes(e.role) && e.own) && outlineLines(els).length >= 2) {
     const spoken = els.find((e) => e.actual_text || e.alt);
     const blocks = els.find((e) => e.kids.some((k) => BLOCKS.includes(map.elements[k]?.role)));
-    const busy = els.some((e) => absorbed.has(e.i) || members.has(e.i) || ops.some((o) => o.element === e.i && (o.op === "split" || o.op === "merge" || o.op === "set_role")));
+    const busy = els.some((e) => absorbed.has(e.i) || members.has(e.i) || ops.some((o) => "element" in o && o.element === e.i && (o.op === "split" || o.op === "merge" || o.op === "set_role")));
     items.push({ id: "build", group: "list", label: "Build a list from the lines…", act: "build",
       note: "Set each line's level in a window, then apply it as one change.",
       disabled: readOnly ?? (spoken ? `${short(spoken)} has ${spoken.actual_text ? "read-aloud text" : "alt text"} that stands for all of it. Remove that first.`
         : blocks ? `${short(blocks)} holds other blocks.`
         : els.length > 1 && els.some((a) => els.some((b) => a.i !== b.i && isInside(map, a.i, b.i))) ? "A tag can't be built into a list with a tag that contains it."
         : busy ? "One of these has an unsaved change to its type or shape. Save or undo that first." : undefined) });
+  }
+  // Making a table of text tags: their pieces of text laid out in rows and columns by where they sit (#370). A figure
+  // too, for a table drawn as a picture (a grid of ruled lines): its alt text goes with it
+  const pieces = els.reduce((n, e) => n + (e.parts ? e.parts.filter((p) => p.kind === "content").length : 1), 0);
+  if (els.every((e) => (LIST_ITEM_FROM.includes(e.role) || e.role === "Figure") && e.own) && pieces >= 2) {
+    const spoken = els.find((e) => e.actual_text || (e.alt && e.role !== "Figure"));
+    const blocks = els.find((e) => e.kids.length > 0);
+    const busy = els.some((e) => absorbed.has(e.i) || members.has(e.i) || ops.some((o) => "element" in o && o.element === e.i));
+    items.push({ id: "make-table", group: "list", label: "Make a table…", act: "make-table",
+      note: els.some((e) => e.role === "Figure")
+        ? "A table drawn as a picture: its text placed in rows and columns, to correct; the figure's alt text goes."
+        : "Its pieces of text, placed in rows and columns by where they sit; correct them, then apply it as one change.",
+      disabled: readOnly ?? (spoken ? `${short(spoken)} has ${spoken.actual_text ? "read-aloud text" : "alt text"} that stands for all of it. Remove that first.`
+        : blocks ? `${short(blocks)} holds other tags (a link, a span): only plain text can become cells.`
+        : els.length > 1 && els.some((a) => els.some((b) => a.i !== b.i && isInside(map, a.i, b.i))) ? "A tag can't be made into a table with a tag that contains it."
+        : busy ? "One of these has an unsaved change. Save or undo that first." : undefined) });
+  }
+  // The table editor, from the table or anything in it (#370)
+  if (one) {
+    let table: number | null = null;
+    for (let p: number | null = one.i; p !== null && p !== undefined; p = map.elements[p]?.parent ?? null) {
+      if (map.elements[p]?.role === "Table") { table = p; break; }
+    }
+    if (table !== null) {
+      const t = table;
+      const busy = ops.some((o) => o.op !== "rebuild_table" && "element" in o && (o.element === t || isInside(map, o.element, t)));
+      items.push({ id: "table", group: "list", label: "Edit table…", act: "table",
+        note: "Header rows and columns, the caption, cells merged or split, rows and columns added or removed.",
+        disabled: readOnly ?? (busy ? "The table has other unsaved changes. Save or undo those first." : undefined) });
+    }
   }
   {
     // Levels: for list items, tags that are becoming items, and anything selected inside an item (its text)
@@ -167,7 +207,7 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
     // The engine keeps a paragraph or nested list in an item's body; another block has no place in an entry
     const odd = map.elements.filter((e) => e.role === "LBody" && inside(e.i)).flatMap((e) => e.kids.map((k) => map.elements[k]))
       .find((k) => k && BLOCKS.includes(k.role) && k.role !== "P" && k.role !== "L");
-    const busy = ops.some((o) => o.op !== "make_toc" && [o.element, ...("absorb" in o ? o.absorb ?? [] : [])].some(inside)
+    const busy = ops.some((o) => o.op !== "make_toc" && "element" in o && [o.element, ...("absorb" in o ? o.absorb ?? [] : [])].some(inside)
       && ["set_role", "make_list", "build_list", "merge", "split", "delete", "move"].includes(o.op));
     const pending = ops.some((o) => o.op === "make_toc" && o.element === top.i);
     const why = readOnly ?? (odd ? `An item holds ${short(odd)}; an entry can hold only its label, text, paragraphs and nested entries.`
@@ -201,9 +241,17 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
         note: "Choose which drawings and labels become a figure of their own.",
         disabled: readOnly ?? (ops.some((o) => o.op === "take_pieces" && o.element === one.i) ? "It's already being split. Save first, or undo that." : undefined) });
     }
-    if (one.role === "Figure") {
-      items.push({ id: "decorative", group: "shape", label: "Mark as decorative", note: "Screen readers skip it.", disabled: readOnly,
-        ops: addEdit(ops, { op: "set_decorative", element: one.i, expect_role: one.role }) });
+    // Making it an artifact, with everything in it: content that isn't read (#364). A figure's is "decorative".
+    if (ARTIFACT_FROM.includes(one.role) && one.parent !== null) {
+      const inside = (i: number) => i === one.i || isInside(map, i, one.i);
+      const held = map.elements.find((e) => e.annot && inside(e.i));
+      const why = readOnly ?? (held ? `It holds ${short(held)}, a link or form field, which has to stay readable.` : undefined);
+      for (const k of ARTIFACT_KINDS) {
+        const figure = one.role === "Figure" && k.as === "layout";
+        items.push({ id: figure ? "decorative" : `artifact-${k.as}`, group: "artifact", label: figure ? "Decorative" : k.label,
+          note: k.note, disabled: why,
+          ops: addEdit(ops, { op: "set_decorative", element: one.i, expect_role: one.role, ...(k.as !== "layout" ? { as: k.as } : {}) }) });
+      }
     }
 
     // --- reading order ---
@@ -247,7 +295,7 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
   }
 
   // --- the rest ---
-  const mine = ops.filter((o) => ids.includes(o.element) || ((o.op === "make_list" || o.op === "build_list") && o.absorb?.some((i) => ids.includes(i))));
+  const mine = ops.filter((o) => ("element" in o && ids.includes(o.element)) || ((o.op === "make_list" || o.op === "build_list") && o.absorb?.some((i) => ids.includes(i))));
   if (mine.length) {
     items.push({ id: "undo", group: "more", label: many ? "Undo these tags' unsaved changes" : "Undo this tag's unsaved changes",
       ops: withoutEdits(map, ops, ids) });
@@ -288,8 +336,8 @@ export function menuAndTypes(items: MenuItem[]): { menu: MenuItem[]; types: Menu
  * kind with a single choice ("Change type…") and the everyday actions under "More" are on the top level itself. */
 export type MenuEntry = { kind: "item"; item: MenuItem } | { kind: "group"; group: MenuItem["group"]; label: string; items: MenuItem[]; none: boolean };
 
-export const GROUP_NAMES: Record<MenuItem["group"], string> = { type: "Type", shape: "Merge and split", list: "Lists", order: "Reading order", note: "Footnote", area: "Areas", more: "More" };
-const GROUP_ORDER: MenuItem["group"][] = ["type", "shape", "list", "order", "note", "area", "more"];
+export const GROUP_NAMES: Record<MenuItem["group"], string> = { type: "Type", shape: "Merge and split", list: "Lists and tables", order: "Reading order", note: "Footnote", artifact: "Mark as artifact", area: "Areas", more: "More" };
+const GROUP_ORDER: MenuItem["group"][] = ["type", "shape", "list", "order", "note", "artifact", "area", "more"];
 const FLAT: MenuItem["group"][] = ["area", "more"];
 
 export function menuEntries(items: MenuItem[]): MenuEntry[][] {

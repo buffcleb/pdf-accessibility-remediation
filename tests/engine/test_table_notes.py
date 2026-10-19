@@ -69,3 +69,35 @@ def test_how_a_cells_symbols_are_said():
     assert _say_table_marks("500*", {"*": "n"}) == "500 (footnote asterisk)"
     assert _say_table_marks("Dose† and **", {"†": "n"}) == "Dose (footnote dagger) and **"   # ** has no note
     assert _say_table_marks("*", {"*": "n"}) == "footnote asterisk"
+
+
+def test_table_notes_reach_the_documents_own_tags_when_they_are_kept(tmp_path):
+    """#285: a document that arrives tagged with its table note a plain paragraph and nothing pointing at it."""
+    from tests.engine.test_footnotes import _as_a_producer_tags_it
+
+    first, _ = _tagged(tmp_path)
+    src = _as_a_producer_tags_it(first, tmp_path / "producer.pdf")
+    with pikepdf.open(src, allow_overwriting_input=True) as pdf:   # the producer's cell says only what's drawn
+        for obj in pdf.objects:
+            if isinstance(obj, pikepdf.Dictionary) and obj.get("/S") == pikepdf.Name.TD and "/ActualText" in obj:
+                del obj["/ActualText"]
+        pdf.save(src)
+    analysis = prepare_analysis(src)
+    pa = analysis.pages[0]
+    bottom = Y0 + H * len(GRID)
+    cells = [TableCell(row=r, col=c, text=t, bbox=(X0 + W * c, Y0 + H * r, X0 + W * (c + 1), Y0 + H * (r + 1)))
+             for r, row in enumerate(GRID) for c, t in enumerate(row)]
+    pa.blocks = [b for b in pa.blocks if not (Y0 - 2 <= b.bbox[1] < bottom)]
+    pa.tables = [TableRegion(id="p0t0", page=0, bbox=(X0, Y0, X0 + 2 * W, bottom), n_rows=3, n_cols=2, cells=cells)]
+    from app.pipeline.structure import _mark_table_notes
+    _mark_table_notes(analysis)
+    out = tmp_path / "kept.pdf"
+    result = tag_document(src, out, analysis, title="Doses", language="en-US")
+    assert result.existing_tags.get("usable") and result.kept_notes == 1 and result.kept_note_refs == 1
+    with pikepdf.open(out) as pdf:
+        findings, index = check_integrity(pdf)
+        assert [f for f in findings if f.severity == "error"] == []
+        note = next(e for e in index.elements if e.role == "Note")
+        linked = [e for e in index.elements if "/Ref" in e.obj]
+        assert [e.role for e in linked] == ["TD"] and [r.objgen for r in linked[0].obj.Ref] == [note.obj.objgen]
+        assert str(linked[0].obj.ActualText) == "500 (footnote asterisk)"

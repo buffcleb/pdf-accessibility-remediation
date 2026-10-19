@@ -402,14 +402,114 @@ def _spoken_numbers(spoken: str) -> Counter:
     return out
 
 
-def spoken_consistent(extracted: str, spoken: str, rules_reading: str = "") -> tuple[bool, str]:
+DIVISION_NOT_WRITTEN = "the AI's spoken reading has a division that isn't written on the page"
+
+
+def rejection_reason(problem: str) -> str:
+    """A rejection's reason as one kind, for counting: its numbers and quoted parts left out."""
+    return re.sub(r"\s+", " ", re.sub(r"\d+(?:\.\d+)?", "N", re.sub(r"[\"“][^\"”]*[\"”]", "…", problem))).strip()[:100]
+
+
+def drawn_fraction(page, bbox, font_size: float) -> bool:
+    """Whether the page draws a fraction bar in this region (a line, a thin rectangle, or a thin picture): a stacked
+    fraction's "over" is drawn, not a character, so
+    the division check would refuse a right reading of it. Strict, so that a rule between two lines of other text (a
+    name over its tagline, a heading's underline) isn't taken for one: a thin horizontal line no longer than about a
+    dozen characters, with text right above and right below it (within about half a line), both lying within the
+    line's length and roughly centered on it, the wider of them filling at least half of it, and of about the same
+    size; the line standing alone (nothing drawn touching its ends, as an arrowhead, a dimension line's extension lines
+    or a table's vertical rules do, and no line of the same length right above or below, as a table's rules are), and
+    what's below it not wholly in parentheses (a drawing's dimension over the same in millimetres), neither part a phrase (two or more words of
+    three letters or more: "Morgan Homes" over its tagline is shaped like a fraction, but isn't one). page: a PyMuPDF
+    page."""
+    import pymupdf as fitz
+
+    em = max(font_size or 10.0, 4.0)
+    region = fitz.Rect(bbox) + (-em, -em, em, em)
+    # Every horizontal line of the page (x0, x1, y), and every other piece drawn (its box), for the guards below
+    lines: list[tuple[float, float, float]] = []
+    pieces: list[fitz.Rect] = []
+    for d in page.get_drawings():
+        for item in d.get("items", []):
+            if item[0] == "l":
+                a, b = item[1], item[2]
+                box = fitz.Rect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y))
+                if abs(a.y - b.y) <= 0.5:
+                    lines.append((box.x0, box.x1, (a.y + b.y) / 2))
+            elif item[0] == "re":
+                box = fitz.Rect(item[1])
+                if 0 < box.height <= max(1.5, 0.15 * em):
+                    lines.append((box.x0, box.x1, (box.y0 + box.y1) / 2))
+            else:  # curves, quads: the box of their points
+                pts = [pt for pt in item[1:] if hasattr(pt, "x")]
+                box = fitz.Rect(min(p.x for p in pts), min(p.y for p in pts), max(p.x for p in pts),
+                                max(p.y for p in pts)) if pts else None
+            if box is not None:
+                pieces.append(box)
+    # Some TeX converters draw a rule as a picture one pixel tall, stretched (an inline image): on a 531-page book, every
+    # fraction bar was one
+    for info in page.get_image_info():
+        r = fitz.Rect(info["bbox"])
+        if 0 < r.height <= max(1.5, 0.15 * em) and r.width >= 3 * r.height:
+            lines.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+
+    def alone(k: int, x0: float, x1: float, y: float) -> bool:
+        """A fraction bar stands alone: nothing else drawn touches its ends (an arrowhead, a dimension line's
+        extension lines, a table's vertical rules), and no other line of the same length sits right above or below it
+        (a table's rules come in sets)."""
+        ends = (fitz.Rect(x0 - 1, y - 1, x0 + 1, y + 1), fitz.Rect(x1 - 1, y - 1, x1 + 1, y + 1))
+        for box in pieces:
+            if abs(box.x0 - x0) < 0.5 and abs(box.x1 - x1) < 0.5 and abs((box.y0 + box.y1) / 2 - y) < 0.5:
+                continue  # the bar itself
+            if any(not (box.x1 < e.x0 or box.x0 > e.x1 or box.y1 < e.y0 or box.y0 > e.y1) for e in ends):
+                return False
+        return not any(j != k and abs(a - x0) <= 1 and abs(b - x1) <= 1 and 0.5 < abs(yy - y) <= 30 * em
+                       for j, (a, b, yy) in enumerate(lines))
+
+    bars = [(k, x0, x1, y) for k, (x0, x1, y) in enumerate(lines)
+            if region.x0 <= (x0 + x1) / 2 <= region.x1 and region.y0 <= y <= region.y1]
+    if not bars:
+        return False
+    spans = [(fitz.Rect(sp["bbox"]), sp["size"], sp["text"]) for bl in page.get_text("dict", clip=region)["blocks"]
+             for ln in bl.get("lines", []) for sp in ln["spans"] if sp["text"].strip()]
+    for k, x0, x1, y in bars:
+        w = x1 - x0
+        if not 0.3 * em <= w <= 12 * em or not alone(k, x0, x1, y):
+            continue
+        over = [(r, sz, t) for r, sz, t in spans if y - 0.8 * em <= r.y1 <= y + 0.5 and r.x1 > x0 and r.x0 < x1]
+        under = [(r, sz, t) for r, sz, t in spans if y - 0.5 <= r.y0 <= y + 0.8 * em and r.x1 > x0 and r.x0 < x1]
+        if not over or not under:
+            continue
+        ok = True
+        sizes, widths = [], []
+        for part in (over, under):
+            px0, px1 = min(r.x0 for r, _, _ in part), max(r.x1 for r, _, _ in part)
+            pw = px1 - px0
+            if px0 < x0 - 0.5 * em or px1 > x1 + 0.5 * em or abs((px0 + px1) / 2 - (x0 + x1) / 2) > 0.35 * w:
+                ok = False
+            widths.append(pw)
+            if len(re.findall(r"[A-Za-z]{3,}", " ".join(t for _, _, t in part))) >= 2:
+                ok = False  # a phrase, not a numerator or denominator
+            sizes.append(max(sz for _, sz, _ in part))
+        below = re.sub(r"\s+", "", " ".join(t for _, _, t in sorted(under, key=lambda u: u[0].x0)))
+        if re.fullmatch(r"\([^()]*\)", below):
+            ok = False  # a drawing's dimension in other units, "(0.406 – 1.270)": the bar groups a denominator already
+        # The bar is as long as the wider part (a rule across a column is far longer than what's above and below it)
+        if ok and max(widths) >= 0.5 * w and min(sizes) >= 0.7 * max(sizes):
+            return True
+    return False
+
+
+def spoken_consistent(extracted: str, spoken: str, rules_reading: str = "", fraction_drawn: bool = False
+                      ) -> tuple[bool, str]:
     """Whether what will be read aloud still says what the page says. The transcription is compared with the
     page character by character; the spoken form is free text, so this looks at what must never change:
 
     - every number on the page is heard (a dropped list item or answer takes its numbers with it);
     - every dosage unit on the page is heard, as written or by its name (never one unit for another);
     - letters spelled out one by one (a formula read "H O C H 3") don't outnumber the page's;
-    - a division is heard only where one is written.
+    - a division is heard only where one is written (as a character, or as a fraction bar the page draws:
+      fraction_drawn, from drawn_fraction).
 
     There is no tolerance: a reading that fails keeps the layout rules' reading instead."""
     page_numbers, heard = _numbers(extracted), _spoken_numbers(spoken)
@@ -431,8 +531,9 @@ def spoken_consistent(extracted: str, spoken: str, rules_reading: str = "") -> t
         extra = spelled - on_page
         if extra:
             return False, f"the AI's spoken reading spells out {', '.join(sorted(extra.elements())[:5])} more often than the page has it"
-    if _DIVISION_SAID.search(spoken) and not _DIVISION_WRITTEN.search(extracted + " " + (rules_reading or "")):
-        return False, "the AI's spoken reading has a division that isn't written on the page"
+    if _DIVISION_SAID.search(spoken) and not fraction_drawn and \
+            not _DIVISION_WRITTEN.search(extracted + " " + (rules_reading or "")):
+        return False, DIVISION_NOT_WRITTEN
     return True, ""
 
 

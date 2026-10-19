@@ -110,6 +110,25 @@ def test_set_and_remove_alt_and_lang(report, tmp_path):
     assert "lang" not in build_tagmap(dst2)["elements"][p["i"]]
 
 
+def test_the_documents_title_and_language_are_edited_without_an_element(report, tmp_path):
+    """#363: the title a reader announces when the file opens, and the document's language, everywhere it's kept."""
+    assert build_tagmap(report)["document"] == {"title": "T", "lang": "en-US"}
+    dst, log = _edit(report, tmp_path, [{"op": "set_doc_title", "title": "  Quarterly progress report  "},
+                                        {"op": "set_doc_lang", "lang": "fr-CA"}])
+    assert log == ['document title set to "Quarterly progress report"', "document language set to fr-CA"]
+    assert build_tagmap(dst)["document"] == {"title": "Quarterly progress report", "lang": "fr-CA"}
+    with pikepdf.open(dst) as pdf:
+        assert str(pdf.docinfo["/Title"]) == "Quarterly progress report"
+        assert pdf.Root.ViewerPreferences.DisplayDocTitle is True
+        with pdf.open_metadata() as meta:
+            assert meta["dc:title"] == "Quarterly progress report" and set(meta["dc:language"]) == {"fr-CA"}
+            assert meta["pdfuaid:part"] == "1"  # the rest of the XMP stays
+    for bad in ({"op": "set_doc_title", "title": "  "}, {"op": "set_doc_title", "title": "x" * 501},
+                {"op": "set_doc_lang", "lang": ""}, {"op": "set_doc_lang", "lang": "not a language"}):
+        with pytest.raises(EditError):
+            validate_ops([bad])
+
+
 def test_decorative_removes_tag_and_artifacts_content(report, tmp_path):
     tm = build_tagmap(report)
     fig = _first(tm, "Figure")
@@ -1058,3 +1077,173 @@ def test_split_right_after_a_line_break(tmp_path):
     dst, _ = _edit(tagged, tmp_path, [{"op": "split", "element": para["i"], "expect_role": "P", "at": 0, "char": char}])
     assert [e.get("text") for e in build_tagmap(dst)["elements"] if e["role"] == "P"] == [
         para["text"][:char].strip(), para["text"][char:]]
+
+
+def test_a_links_description_goes_on_its_annotation_and_cant_be_emptied(tmp_path):
+    """#364: what a screen reader announces for a link is its annotation's /Contents."""
+    src = _linked(tmp_path)
+    link = _first(build_tagmap(src), "Link")
+    dst, log = _edit(src, tmp_path, [{"op": "set_alt", "element": link["i"], "expect_role": "Link",
+                                      "alt": "  The first site: example.org  "}])
+    assert log == [f"element {link['i']} (Link): description set on 1 annotation(s)"]
+    assert build_tagmap(dst)["elements"][link["i"]]["alt"] == "The first site: example.org"
+    with pikepdf.open(dst) as pdf:
+        contents = [str(a.Contents) for a in pdf.pages[0].Annots if a.get("/Subtype") == pikepdf.Name.Link]
+    assert "The first site: example.org" in contents and len(contents) == 2
+    with pytest.raises(EditError, match="needs a description"):
+        apply_edits(src, tmp_path / "no.pdf", [{"op": "set_alt", "element": link["i"], "expect_role": "Link",
+                                                "alt": " "}])
+
+
+def test_any_tag_can_be_made_an_artifact_of_a_kind(report, tmp_path):
+    """#364: a running header, a footer or a page number left tagged becomes page furniture; anything else, layout."""
+    tm = build_tagmap(report)
+    p = _first(tm, "P")
+    dst, log = _edit(report, tmp_path, [{"op": "set_decorative", "element": p["i"], "expect_role": "P",
+                                         "as": "footer"}])
+    assert "marked a page footer" in log[0]
+    with pikepdf.open(dst) as pdf:
+        marks = [ins.operands[1] for page in pdf.pages for ins in pikepdf.parse_content_stream(page)
+                 if str(ins.operator) == "BDC" and ins.operands[0] == pikepdf.Name.Artifact]
+    assert any(m.get("/Type") == pikepdf.Name.Pagination and m.get("/Subtype") == pikepdf.Name.Footer for m in marks)
+    assert len(build_tagmap(dst)["elements"]) == len(tm["elements"]) - 1  # the paragraph's tag is gone
+    with pytest.raises(EditError, match="an artifact is one of"):
+        validate_ops([{"op": "set_decorative", "element": p["i"], "expect_role": "P", "as": "watermark"}])
+
+
+# --- the table editor (#370) ------------------------------------------------------------------------------------
+
+def _grid_of(tm, table):
+    """The table's rows of cells as (role, text, span), from the tag map."""
+    rows = [tm["elements"][r] for r in tm["elements"][table]["kids"] if tm["elements"][r]["role"] == "TR"]
+    return [[(tm["elements"][c]["role"], tm["elements"][c].get("text"), tm["elements"][c].get("span"))
+             for c in r["kids"]] for r in rows]
+
+
+def _as_is(tm, table):
+    """The rebuild_table rows that leave the table as it is."""
+    rows = [tm["elements"][r] for r in tm["elements"][table]["kids"] if tm["elements"][r]["role"] == "TR"]
+    return [[{"from": [c], "role": tm["elements"][c]["role"],
+              **({"scope": tm["elements"][c]["scope"]} if tm["elements"][c]["role"] == "TH" else {})}
+             for c in r["kids"]] for r in rows]
+
+
+def test_a_table_rebuilt_as_it_was_is_unchanged(table, tmp_path):
+    tm = build_tagmap(table)
+    t = _first(tm, "Table")["i"]
+    dst, log = _edit(table, tmp_path, [{"op": "rebuild_table", "element": t, "expect_role": "Table",
+                                        "rows": _as_is(tm, t)}])
+    assert _grid_of(build_tagmap(dst), t) == _grid_of(tm, t) and "4 row(s) by 3 column(s)" in log[0]
+
+
+def test_cells_merge_rows_go_into_their_neighbours_and_empty_ones_are_added(table, tmp_path):
+    tm = build_tagmap(table)
+    t = _first(tm, "Table")["i"]
+    rows = _as_is(tm, t)
+    q1, q1_docs = rows[1][0], rows[1][1]
+    rows[1] = [{"from": q1["from"] + q1_docs["from"], "role": "TD", "cols": 2}, rows[1][2]]  # Q1 and 120: one cell
+    q3 = rows.pop(3)                                                   # the Q3 row removed: into the row above
+    for cell, gone in zip(rows[2], q3):
+        cell["from"] += gone["from"]
+    for row in rows:                                                   # a new empty column at the end
+        row.append({"from": [], "role": "TH" if row is rows[0] else "TD", "scope": "Column"})
+    dst, log = _edit(table, tmp_path, [{"op": "rebuild_table", "element": t, "expect_role": "Table", "rows": rows}])
+    grid = _grid_of(build_tagmap(dst), t)
+    assert [len(r) for r in grid] == [4, 3, 4]
+    assert grid[1][0][2] == [1, 2] and "Q1" in grid[1][0][1] and "120" in grid[1][0][1]
+    assert "Q2" in grid[2][0][1] and "Q3" in grid[2][0][1]          # nothing lost
+    assert grid[0][3] == ("TH", None, None) and grid[2][3] == ("TD", None, None)
+    assert "4 cell(s) merged into others" in log[0]
+
+
+def test_two_header_rows_name_their_headers_and_a_caption_comes_and_goes(table, tmp_path):
+    tm = build_tagmap(table)
+    t = _first(tm, "Table")["i"]
+    rows = _as_is(tm, t)
+    rows[1] = [{**c, "role": "TH", "scope": "Column"} for c in rows[1]]  # a second header row: needs Headers
+    note = next(e for e in tm["elements"] if e["role"] == "P" and "summarizes" in (e.get("text") or ""))
+    dst, _ = _edit(table, tmp_path, [{"op": "rebuild_table", "element": t, "expect_role": "Table", "rows": rows,
+                                      "caption": note["i"]}])
+    after = build_tagmap(dst)
+    t2 = _first(after, "Table")
+    assert after["elements"][t2["kids"][0]]["role"] == "Caption"
+    assert all(after["elements"][c].get("headers") for c in after["elements"][t2["kids"][3]]["kids"])
+    # The caption taken away again: a paragraph just before the table
+    dst2 = tmp_path / "nocap.pdf"
+    apply_edits(dst, dst2, [{"op": "rebuild_table", "element": t2["i"], "expect_role": "Table",
+                             "rows": _as_is(after, t2["i"]), "caption": None}])
+    assert _errors(dst2) == []
+    again = build_tagmap(dst2)
+    t3 = _first(again, "Table")
+    before = again["elements"][again["elements"][t3["i"]]["parent"]]["kids"]
+    assert again["elements"][before[before.index(t3["i"]) - 1]]["role"] == "P"
+    assert all(again["elements"][k]["role"] == "TR" for k in t3["kids"])
+
+
+def test_a_table_edit_that_loses_content_or_doesnt_fit_is_refused(table, tmp_path):
+    tm = build_tagmap(table)
+    t = _first(tm, "Table")["i"]
+    rows = _as_is(tm, t)
+    with pytest.raises(EditError, match="aren't in the new table"):
+        apply_edits(table, tmp_path / "x.pdf", [{"op": "rebuild_table", "element": t, "expect_role": "Table",
+                                                 "rows": rows[:-1]}])
+    short = _as_is(tm, t)
+    short[2].append({"from": [], "role": "TD"})
+    with pytest.raises(EditError, match="don't line up"):
+        apply_edits(table, tmp_path / "x.pdf", [{"op": "rebuild_table", "element": t, "expect_role": "Table",
+                                                 "rows": short}])
+    with pytest.raises(EditError, match="one new cell only"):
+        validate_ops([{"op": "rebuild_table", "element": t, "rows": [[{"from": [5], "role": "TD"},
+                                                                     {"from": [5], "role": "TD"}]]}])
+
+
+def test_paragraphs_become_a_table_from_their_pieces(tmp_path):
+    from app.pipeline.orchestrator import prepare_analysis
+    from app.tagging.tagger import tag_document
+
+    src = tmp_path / "stacked.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    for n, word in enumerate(["Lot", "Price", "North", "$145", "Library", "$120"]):  # one under the other
+        page.insert_text((72, 120 + n * 30), word, fontsize=11, fontname="helv")
+    doc.save(src)
+    tagged = tmp_path / "stacked_tagged.pdf"
+    tag_document(src, tagged, prepare_analysis(src), title="Stacked", language="en-US")
+    tm = build_tagmap(tagged)
+    tags = [e for e in tm["elements"] if e["role"] in ("P", "H1", "H2", "H3") and e.get("own")]
+    pieces = [(e, p["k"]) for e in tags for p in (e.get("parts") or [{"k": 0, "kind": "content"}])
+              if p["kind"] == "content"]
+    assert len(pieces) == 6, [e.get("text") for e in tags]
+    first = tags[0]
+    ref = lambda e, k: {"at": k} if e["i"] == first["i"] else {"el": e["i"], "at": k}  # noqa: E731
+    rows = [[{"parts": [ref(*pieces[r * 2 + c])], "role": "TH" if r == 0 else "TD", "scope": "Column"}
+             for c in range(2)] for r in range(3)]
+    op = {"op": "build_table", "element": first["i"], "expect_role": first["role"],
+          "absorb": [e["i"] for e in tags[1:]], "rows": rows}
+    dst, log = _edit(tagged, tmp_path, [op])
+    after = build_tagmap(dst)
+    t = _first(after, "Table")["i"]
+    grid = _grid_of(after, t)
+    assert [[c[0] for c in r] for r in grid] == [["TH", "TH"], ["TD", "TD"], ["TD", "TD"]]
+    assert [[c[1] for c in r] for r in grid] == [["Lot", "Price"], ["North", "$145"], ["Library", "$120"]]
+    assert "3 row(s) by 2 column(s)" in log[0]
+    with pytest.raises(EditError, match="exactly one cell"):
+        apply_edits(tagged, tmp_path / "x.pdf", [{**op, "rows": rows[:-1]}])
+
+
+def test_a_figure_that_is_really_a_table_can_be_made_one(report, tmp_path):
+    """A table drawn as a picture (a grid of ruled lines) was tagged as a figure: it can be made a table, and its alt
+    text, which described a picture, goes."""
+    tm = build_tagmap(report)
+    fig = _first(tm, "Figure")
+    assert fig.get("alt")
+    pieces = [p["k"] for p in (fig.get("parts") or [{"k": 0, "kind": "content"}]) if p["kind"] == "content"]
+    rows = [[{"parts": [{"at": k} for k in pieces], "role": "TH", "scope": "Column"}], [{"parts": [], "role": "TD"}]]
+    dst, log = _edit(report, tmp_path, [{"op": "build_table", "element": fig["i"], "expect_role": "Figure",
+                                         "rows": rows}])
+    after = build_tagmap(dst)
+    t = _first(after, "Table")
+    assert [[c[0] for c in r] for r in _grid_of(after, t["i"])] == [["TH"], ["TD"]]
+    figures = lambda m: sum(e["role"] == "Figure" for e in m["elements"])  # noqa: E731
+    assert figures(after) == figures(tm) - 1
+    assert "2 row(s) by 1 column(s)" in log[0]

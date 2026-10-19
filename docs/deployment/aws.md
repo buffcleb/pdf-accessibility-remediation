@@ -42,6 +42,7 @@ flowchart LR
 | Portal API and worker | Two ECS services from `pdfrem-portal` | The ALB routes `/api/*` to the API; the worker needs no inbound traffic |
 | Engine API, workers, scheduler | Three ECS services from `pdfrem-engine` | Internal only. Workers: 2 vCPU / 8 GB each to start; the scheduler exactly one task |
 | AI gateway | ECS service from `ghcr.io/berriai/litellm` | `config/litellm.yaml` from S3 or baked into a small derived image |
+| veraPDF | ECS service from `verapdf/rest`, with `deploy/verapdf/validator.xml` | Internal only; the engine's `VERAPDF_URL`. Without it, each check runs from the command line inside the worker |
 | Databases | RDS for PostgreSQL 16 | Two databases (portal and gateway) on one instance; Multi-AZ for production |
 | Queue and rate limits | ElastiCache for Redis | Engine on db 0, portal on db 1 |
 | Files | S3 | Private bucket, SSE-KMS, versioning off (so deletion is real); a lifecycle rule as a retention backstop |
@@ -54,7 +55,7 @@ flowchart LR
 
 ```
 # portal
-PORTAL_DATABASE_URL=postgresql+psycopg://portal:…@<rds-endpoint>:5432/portal
+PORTAL_DATABASE_URL=postgresql+psycopg://portal_app:…@<rds-endpoint>:5432/portal   # rows only (below)
 PORTAL_REDIS_URL=rediss://<elasticache-endpoint>:6379/1
 PORTAL_S3_ENDPOINT_URL=                     # empty: AWS S3, with the task role's credentials
 PORTAL_S3_BUCKET=<bucket>
@@ -71,7 +72,18 @@ REDIS_URL=rediss://<elasticache-endpoint>:6379/0
 DATA_DIR=/data                              # the EFS mount
 GATEWAY_BASE_URL=http://litellm.<namespace>.local:4000/v1
 SERVICE_API_KEY=…                           # and the same value as PORTAL_ENGINE_API_KEY
+VERAPDF_URL=http://verapdf.<namespace>.local:8080
+AI_GATEWAY_ONLY=true                        # no AI provider but the gateway
 ```
+
+**Two database accounts:** run migrations as the database's owner, and the portal's services as an account that
+can read and write rows but owns no table, as the Kubernetes deployment does (`deploy/k8s/app-role.sql`: run it
+after each migration). That account can't alter a table or drop the triggers that keep the audit log and the page
+ledger append-only.
+
+**The engine's egress:** the engine opens uploaded PDFs, so let its tasks reach only Redis, EFS, veraPDF and the
+gateway (no NAT), and set `AI_GATEWAY_ONLY=true` so every AI call goes through the gateway
+([details](../../deploy/k8s/README.md#network-policies-and-the-redis-password)).
 
 With `PORTAL_S3_ACCESS_KEY` and `PORTAL_S3_SECRET_KEY` empty, the portal's S3 client uses the task role's credentials:
 give the portal tasks' role access to the bucket (and the KMS key).
@@ -94,7 +106,9 @@ it then passes on the address the ALB reports. Without that, the web app reports
    the web app and only the portal reach the engine.
 2. RDS, ElastiCache, the S3 bucket, EFS with an access point, SES domain verification, secrets.
 3. Push the images; create the task definitions and services; the ALB with an ACM certificate.
-4. Run migrations once as a one-off task: `python -m portal.cli migrate` with the portal's settings.
+4. Run migrations as a one-off task, as the database's owner: `python -m portal.cli migrate` with the portal's
+   settings and an owner's `PORTAL_DATABASE_URL`. Then grant the portal's own account the tables
+   (`deploy/k8s/app-role.sql`).
 5. Sign in with a bootstrap super admin and follow [First-time setup](../user-guide/super-admins/first-time-setup.md).
 
 ## Backups

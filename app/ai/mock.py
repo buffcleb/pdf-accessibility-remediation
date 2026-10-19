@@ -40,6 +40,8 @@ class MockProvider(AIProvider):
             out = {"text": (m.group(1) if m else "").replace("[[", "").replace("]]", ""), "confidence": 0.9}
         elif "displayed formula" in prompt:
             out = {"formulas": []}  # tests patch this to place formulas
+        elif "fillable form" in prompt:
+            out = {"label": "Mock field label"}
         elif "shows a table" in prompt:
             out = {"header_rows": 1, "header_cols": 0, "spans": [], "summary": "Test data table.", "is_layout_table": False}
         elif "reading order" in prompt:

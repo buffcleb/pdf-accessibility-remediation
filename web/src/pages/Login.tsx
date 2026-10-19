@@ -90,7 +90,8 @@ export function Login() {
         ) : (
           <form onSubmit={submitCode} className="panel" style={{ border: 0, padding: 0 }} noValidate>
             <Notice kind="info">
-              We sent a code to <strong>{email}</strong>. It expires in 10 minutes.
+              If <strong>{email}</strong> can sign in here, a code is on its way. It expires in 10 minutes; if
+              nothing arrives, check the address, or your spam folder.
             </Notice>
             <div className="field">
               <label htmlFor="code">6-digit code</label>

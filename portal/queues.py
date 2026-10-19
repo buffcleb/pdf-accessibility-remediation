@@ -223,7 +223,8 @@ def items(db: Session, key: str, state: str) -> dict:
                            else j.error_message if state == "failed" else None),
                 "error_code": j.error_code if state == "failed" else None,
                 "can_retry": state == "failed" and j.files_deleted_at is None and any(f.kind == "input" for f in j.files),
-                "can_cancel": state == "waiting", "can_stop": state == "active", "can_remove": state == "failed",
+                "can_cancel": state == "waiting", "can_stop": state == "active",
+                "can_restart": state == "active", "can_remove": state == "failed",
                 "can_process_now": state == "waiting" and 0 < threshold < j.pages and j.expedited_at is None,
             })
     elif d.kind in ("edits", "reviews"):
@@ -257,7 +258,8 @@ def items(db: Session, key: str, state: str) -> dict:
                 "finished_at": v.finished_at if d.kind == "edits" else v.reviewed_at,
                 "detail": detail, "error_code": v.error_code if d.kind == "edits" and state == "failed" else None,
                 "can_retry": state == "failed" and job.files_deleted_at is None,
-                "can_cancel": state == "waiting", "can_stop": state == "active", "can_remove": state == "failed",
+                "can_cancel": state == "waiting", "can_stop": state == "active",
+                "can_restart": state == "active", "can_remove": state == "failed",
             })
     else:
         if state == "active":
@@ -337,7 +339,8 @@ def live(db: Session, *, q: str = "", group_id: uuid.UUID | None = None, queue: 
                 "percent": progress.get("percent") if st == "active" else None,
                 "detail": (_wait_reason(j, pauses, labels, "") if st == "waiting" else j.error_message if st == "failed" else None),
                 "created_at": j.created_at, "started_at": j.submitted_at, "finished_at": j.finished_at,
-                "can_retry": False, "can_cancel": st == "waiting", "can_stop": st == "active", "can_remove": False,
+                "can_retry": False, "can_cancel": st == "waiting", "can_stop": st == "active",
+                "can_restart": st == "active", "can_remove": False,
                 "can_process_now": st == "waiting" and 0 < threshold < j.pages and j.expedited_at is None,
             })
 
@@ -377,7 +380,8 @@ def live(db: Session, *, q: str = "", group_id: uuid.UUID | None = None, queue: 
                 "group": groups.get(job.group_id), "queue": "Saved edit" if kind == "edits" else "AI review of a saved version",
                 "pages": job.pages, "state": st, "stage": None, "percent": None, "detail": detail,
                 "created_at": v.created_at, "started_at": at_start, "finished_at": at_end if st in ("done", "failed") else None,
-                "can_retry": False, "can_cancel": st == "waiting", "can_stop": st == "active", "can_remove": False,
+                "can_retry": False, "can_cancel": st == "waiting", "can_stop": st == "active",
+                "can_restart": st == "active", "can_remove": False,
                 "can_process_now": False,
             })
 
@@ -399,7 +403,8 @@ def live(db: Session, *, q: str = "", group_id: uuid.UUID | None = None, queue: 
                 "detail": (m.last_error if st == "failed" else None if st != "waiting" else "Paused" if MAIL in pauses
                            else f"Trying again after a temporary failure ({m.attempts} so far): {m.last_error}" if m.attempts else None),
                 "created_at": m.created_at, "started_at": None, "finished_at": m.finished_at,
-                "can_retry": False, "can_cancel": st == "waiting", "can_stop": False, "can_remove": False,
+                "can_retry": False, "can_cancel": st == "waiting", "can_stop": False,
+                "can_restart": False, "can_remove": False,
                 "can_process_now": False,
             })
 
@@ -549,6 +554,49 @@ def _stop_at_engine(engine_job_id: str | None) -> str | None:
         return None
     except EngineUnavailable as e:
         return str(e)[:200]
+
+
+def restart(db: Session, request: Request | None, key: str, item_id: str, actor: User) -> None:
+    """Start something in progress over: one that's stuck (its engine worker was lost, a deploy cut it off). The
+    engine is told to stop its copy, and the item goes back to the queue with its place and its pages kept; nothing
+    is charged again and the person isn't told (#323)."""
+    d = _definition(db, key)
+    iid = _uuid(item_id)
+    if d.kind == "documents":
+        job = db.scalar(select(Job).where(Job.id == iid).with_for_update())
+        if job is None or d.service not in job_services(job):
+            raise not_found("Document")
+        if job.status not in ("submitted", "processing"):
+            raise ApiError(409, "not_in_progress", "Only documents in progress can be restarted; this one isn't any more.")
+        unreached, old = _stop_at_engine(job.engine_job_id), job.engine_job_id
+        job.status, job.progress, job.engine_job_id, job.submitted_at, job.submit_attempts = "queued", None, None, None, 0
+        audit.record(db, request, "job.restarted", actor=actor, target_type="job", target_id=job.id,
+                     group_id=job.group_id, details={"queue": d.label, "engine_job": old,
+                                                     **({"engine_not_reached": unreached} if unreached else {})})
+    elif d.kind == "edits":
+        v = db.scalar(select(DocumentVersion).where(DocumentVersion.id == iid).with_for_update())
+        if v is None:
+            raise not_found("Saved edit")
+        if v.status not in ("submitted", "processing"):
+            raise ApiError(409, "not_in_progress", "Only saves in progress can be restarted; this one isn't any more.")
+        unreached = _stop_at_engine(v.engine_job_id)
+        v.status, v.engine_job_id, v.submitted_at = "queued", None, None
+        audit.record(db, request, "version.restarted", actor=actor, target_type="job", target_id=v.job_id,
+                     group_id=v.job.group_id, details={"version": v.number,
+                                                       **({"engine_not_reached": unreached} if unreached else {})})
+    elif d.kind == "reviews":
+        v = db.scalar(select(DocumentVersion).where(DocumentVersion.id == iid).with_for_update())
+        if v is None or v.status != "ready":
+            raise not_found("Review")
+        if v.review_status != "running":
+            raise ApiError(409, "not_in_progress", "Only reviews in progress can be restarted; this one isn't any more.")
+        unreached = _stop_at_engine(v.review_engine_job_id)
+        v.review_status, v.review_engine_job_id, v.review_submitted_at = "queued", None, None
+        audit.record(db, request, "version.review_restarted", actor=actor, target_type="job", target_id=v.job_id,
+                     group_id=v.job.group_id, details={"version": v.number,
+                                                       **({"engine_not_reached": unreached} if unreached else {})})
+    else:
+        raise ApiError(409, "not_restartable", "Emails are sent at once; there's nothing in progress to restart.")
 
 
 def stop(db: Session, request: Request | None, key: str, item_id: str, actor: User) -> None:

@@ -158,6 +158,7 @@ async def correct_lines(ai, pdf_path: str, lines: list[OcrLine], stats) -> None:
     if len(todo) > s.ocr_ai_max_lines:
         # Most uncertain first
         todo.sort(key=lambda t: t[0].mean_confidence or 0.0)
+        stats.limit_hit("OCR_AI_MAX_LINES", s.ocr_ai_max_lines, len(todo), "uncertain OCR lines kept Tesseract's text")
         stats.findings.append(f"{len(todo) - s.ocr_ai_max_lines} uncertain OCR line(s) beyond the limit of "
                               f"{s.ocr_ai_max_lines} kept Tesseract's text")
         todo = todo[:s.ocr_ai_max_lines]

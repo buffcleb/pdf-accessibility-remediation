@@ -19,8 +19,12 @@ Two Compose stacks run side by side on one machine: the **engine** (`docker-comp
 | `adobe-worker` | Adobe Autotag jobs only; idle unless `ADOBE_ENABLED=true` |
 | `beat` | The scheduler that clears old job folders (exactly one) |
 | `redis` | The job queue |
+| `verapdf` | veraPDF kept running for the PDF/UA checks (amd64 only, emulated on Apple silicon) |
 | `litellm`, `litellm-db` | The AI gateway (admin UI on `127.0.0.1:4000/ui`) and its database |
+| `music-reader` | Optional (profile `music`, with `OMR_ENABLED=true` in `.env`): reads the notes of music examples |
 | `fake-adobe` | Testing only (profile `fake-adobe`): a stand-in for Adobe |
+
+The formula reader (#403) isn't in the Compose files; it's a Kubernetes option (`FORMULA_READER`).
 
 **Portal stack** (`docker-compose.portal.yml`):
 

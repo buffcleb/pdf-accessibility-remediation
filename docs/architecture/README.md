@@ -17,8 +17,8 @@ How the service is built: its parts, how a document moves through them, and why 
 
 - **The web portal:** sign-in, groups, services and page quotas, uploads, results, reports, help requests and the
   tag manager and editor. It's the only part people use directly.
-- **The remediation engine:** a headless service that tags a PDF for accessibility (PDF/UA-1), validates it,
-  checks its own work and returns the files with reports. Only the portal can reach it.
+- **The remediation engine:** a headless service that tags a PDF for accessibility (PDF/UA-1, or PDF/UA-2 for a
+  PDF 2.0 file), validates it, checks its own work and returns the files with reports. Only the portal can reach it.
 - **The AI gateway (LiteLLM):** one endpoint in front of every AI model the engine may use, local or cloud, with
   spend tracking and a budget backstop.
 
@@ -62,16 +62,20 @@ flowchart LR
 |---|---|---|
 | Web app | React + Vite, served by nginx | All screens, including the tag manager and editor (pdf.js). nginx also proxies `/api` to the portal API |
 | Portal API | FastAPI, SQLAlchemy 2, Alembic | Accounts, groups, services, quotas, uploads, versions, help requests, reports, audit |
-| Portal worker | Python loop | Sends queued jobs, edits and reviews to the engine, polls them, copies results into storage, settles quotas, sends email, applies retention |
+| Portal worker | Python loop | Sends queued jobs, edits and reviews to the engine, polls them, copies results into storage, settles quotas, sends email, applies retention, raises alerts to super admins |
 | Database | PostgreSQL 16 | Everything the portal knows. The quota ledger is append-only (a trigger refuses updates) |
 | Object store | S3 API (SeaweedFS locally; AWS S3, Cloudflare R2 and so on elsewhere) | Input and output files under `groups/{group}/users/{user}/jobs/{job}/…`, encrypted at rest |
 | Engine API and workers | FastAPI, Celery, Redis | The remediation pipeline, tag edits, re-reviews and the kind-of-document classifier. Never exposed to the internet |
 | AI gateway | LiteLLM + its own PostgreSQL | Routes each call to the model behind an AI level; reports cost per call; budget backstop; admin UI |
-| Validator | veraPDF 1.30, as a service kept running (its REST server) | PDF/UA-1 (and informational PDF/UA-2) before and after. A check that the service doesn't answer runs from the command line in the worker ([details](../operations/configuration.md#verapdf-service)) |
-| Scaling (Kubernetes) | KEDA, the Horizontal Pod Autoscaler | Workers follow the portal's queue; veraPDF and the AI gateway follow their CPU use. Services and AI levels can limit their documents at once ([details](../../deploy/k8s/README.md#scaling-with-the-queue)) |
+| Validator | veraPDF 1.30, as a service kept running (its REST server) | PDF/UA-1 (and informational PDF/UA-2) before and after; PDF/UA-2 for a PDF 2.0 document, which can only be that. A check that the service doesn't answer runs from the command line in the worker ([details](../operations/configuration.md#verapdf-service)) |
+| Scaling (Kubernetes) | KEDA, the Horizontal Pod Autoscaler | Workers follow the portal's queue; the music and formula readers start from nothing when their Redis list has work; veraPDF and the AI gateway follow their CPU use. Services and AI levels can limit their documents at once ([details](../../deploy/k8s/README.md#scaling-with-the-queue)) |
 | OCR | Tesseract 5 | Text of scanned pages, with a confidence per word |
 | Report PDF | WeasyPrint | The accessible PDF report (PDF/UA-1) |
 | Adobe worker | Celery on the `adobe` queue | Adobe Autotag jobs: split, send, poll, merge, then the same checks as every output |
+| Math | latex2mathml, MathCAT (`mathcat-cli` in the engine image) | Each formula as MathML; speech and Nemeth and UEB braille read by rule, to check the AI's reading |
+| Music and formula readers (optional) | Audiveris; RapidLaTeXOCR | Services asked over Redis lists: MusicXML for music examples, a second reading of each formula from its picture |
+| Monitoring (optional) | Prometheus, Grafana, kube-state-metrics, Redis and Postgres exporters | Metrics of every part; alerts reach super admins through the portal; Administration › System shows figures and every workload's pods; Grafana for super admins at `/grafana` |
+| Backups (optional) | A nightly Kubernetes job onto an NFS share | Both databases and the stored files, in the folders `scripts/restore.sh` reads |
 
 ## Where to go next
 

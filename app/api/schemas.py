@@ -15,6 +15,8 @@ class RemediationFlags(BaseModel):
     verify_ai: bool = Field(default=True, description="Run the AI review layer of tag verification")
     notation_ai: bool = Field(default=True, description="Let the AI read specialist notation the layout rules can't")
     ocr_ai: bool = Field(default=True, description="Let the AI correct OCR words Tesseract was unsure of")
+    ignore_existing: bool = Field(default=False, description="Ignore the document's own tags (poor ones) and tag it "
+                                  "afresh from the page")
     validator: Literal["service", "command_line"] | None = Field(
         default=None, description="veraPDF's running service or its command line; default: the service when configured")
     verapdf_ua2: bool = Field(default=True, description="Also check PDF/UA-2 (shown for information)")
@@ -61,6 +63,10 @@ class Reports(BaseModel):
     tag_maps: dict[str, str | None] | None = None  # original / primary / visual_fallback, for the tag manager
     music_files: str | None = None  # a zip of MusicXML: the notation of each music example that was read
     music_score: str | None = None  # sheet music: the whole piece as one MusicXML file
+    math_files: str | None = None  # a zip of MathML: each formula the AI read, and the formula list (#403)
+    math_list: str | None = None  # the formula list: an HTML page with every formula in MathML
+    math_nemeth: str | None = None  # every formula in Nemeth braille (.brf), from MathCAT
+    math_ueb: str | None = None  # every formula in UEB math braille (.brf), from MathCAT
     edits_applied: list[str] | None = None  # edit jobs: one line per tag edit
     adobe_reports: list[str] | None = None  # Adobe's own accessibility report(s) (xlsx), Adobe route only
 

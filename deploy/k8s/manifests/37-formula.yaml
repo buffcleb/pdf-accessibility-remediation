@@ -1,0 +1,45 @@
+# The formula reading service (applied when FORMULA_READER=on in deploy.env, #403): RapidLaTeXOCR (Apache-2.0) and a
+# loop that takes pictures of formulas from the Redis list "formula:requests" and puts their LaTeX back
+# (docker/formula). The engine asks it for a second reading of each formula the AI read, independent of the AI's,
+# to check it against: where they disagree, a person chooses in Edit tag.
+#
+# With scaling on (47-formula-autoscale.yaml) no pod runs until there is something on the list. A pod told to stop
+# finishes the picture it has first (a second or so).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formula-reader
+  namespace: ${NAMESPACE}
+spec:
+  ${FORMULA_REPLICAS}
+  selector:
+    matchLabels: { app: formula-reader }
+  template:
+    metadata:
+      labels: { app: formula-reader }
+      annotations:
+        prometheus.io/scrape: "true"  # busy or idle, pictures read (#397)
+        prometheus.io/port: "9464"
+    spec:
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets: [{ name: pdfrem-ghcr }]
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: formula-reader
+          image: ${REGISTRY}/pdfrem-formula:${FORMULA_TAG}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
+            - { name: HOME, value: /tmp }
+          ports: [{ name: metrics, containerPort: 9464 }]
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 1536Mi, ephemeral-storage: 512Mi }
+          # Nothing is written outside /tmp: the model is read from the image
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }

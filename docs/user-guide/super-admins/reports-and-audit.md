@@ -12,6 +12,13 @@ two differences: you pick **every group or one**, and you get more reports and c
 | **Cost** | AI spend and Adobe pages, by group, service and AI level, over time (with a chart) |
 | **Daily use** | Pages sent per day for each service, against its daily limit (with a chart) |
 | **Report emails** | The scheduled email reports sent: who, which, when |
+| **Describe with AI** (in the Usage group) | How often people use Describe with AI in the tag manager and what it costs, by group, person and AI level, over time; each use counted when it happens. The **Cost** report has a matching optional column, and your email summary a line |
+| **Limits hit** (in the Documents group) | Which limits documents reached, in how many documents, what each is set to and the most a document wanted: whether a limit needs raising |
+
+In the **Documents** report, the **Limits hit** column (under **Columns**) and the **Hit a limit** filter show which
+documents reached a limit, including those that failed for taking too long or running the worker out of memory. A
+document's own report lists the limits it reached too: by setting in the Markdown report, in plain words in the PDF
+report.
 
 The **Usage** group is shown as **Usage and cost** for you. Cost columns (AI spend per document) appear in other
 reports too. What groups are charged is pages, not money, so cost is for super admins only.
@@ -44,7 +51,8 @@ Group admins see their own group's part, including changes super admins made the
 
 All AI calls go through the AI gateway (LiteLLM), which has its own admin UI: models with a playground, spend per
 model and per job, request logs and errors, and virtual keys with budgets. When it's configured, a link appears in the
-Administration menu and on **Services and AI levels**. See [Operations → AI models](../../operations/ai-models.md#the-gateway).
+Administration menu and on **Services and AI levels**. See
+[Operations → AI models](../../operations/ai-models.md#the-gateway).
 
 ## Your own email summary
 

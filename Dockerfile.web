@@ -9,10 +9,17 @@ RUN npm ci --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
 
-FROM nginxinc/nginx-unprivileged:1.29-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:378d0c32f6562f7fd9629170797f57d2b953aa09be983b3daaf4809bb039ca00
+# Packages of the base image with a fixed vulnerability newer than its digest (scripts/build.sh's Trivy scan): libexpat
+# (CVE-2026-77214, fixed in 2.9.0). Drop a package from the list once the pinned base image has the fix.
+USER root
+RUN apk upgrade --no-cache libexpat
+USER 101
 COPY docker/web/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --chmod=755 docker/web/15-trusted-proxies.sh /docker-entrypoint.d/15-trusted-proxies.sh
+COPY --chmod=755 docker/web/16-grafana.sh /docker-entrypoint.d/16-grafana.sh
 COPY --from=build /web/dist /usr/share/nginx/html
 # TRUSTED_PROXIES: proxies in front of this container whose X-Forwarded-For is believed (empty: none)
-ENV PORTAL_API_UPSTREAM=http://portal-api:8080 MAX_UPLOAD_SIZE=512m TRUSTED_PROXIES=""
+# GRAFANA_UPSTREAM: Grafana for super admins at /grafana (MONITORING=on; empty: no /grafana)
+ENV PORTAL_API_UPSTREAM=http://portal-api:8080 MAX_UPLOAD_SIZE=512m TRUSTED_PROXIES="" GRAFANA_UPSTREAM=""
 EXPOSE 8080

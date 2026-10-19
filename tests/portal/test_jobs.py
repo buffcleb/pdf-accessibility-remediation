@@ -65,8 +65,9 @@ class FakeEngine:
         return list(self.models)
 
     def submit(self, filename, fileobj, report_only, ai=None, full_review=False, route="standard", branding=None,
-               no_ai=False, validator=None):
+               no_ai=False, validator=None, ignore_existing=False):
         jid = uuid.uuid4().hex
+        self.ignore_existing = getattr(self, "ignore_existing", []) + [ignore_existing]
         self.validators = getattr(self, "validators", []) + [validator]
         self.submitted.append((filename, report_only))
         self.routes.append(route)
@@ -260,7 +261,8 @@ def test_upload_reserves_and_completion_commits(setup):
     assert job["result"]["compliant_after"] is True and job["result"]["failed_checks_before"] == 120
     assert job["result"]["review"]["findings"][0]["severity"] == "review"  # sorted by severity
     kinds = {f["kind"] for f in job["files"]}
-    assert {"input", "primary", "report_md", "report_json", "verapdf_before", "verapdf_after", "report_pdf"} <= kinds
+    assert {"input", "primary", "report_md", "verapdf_before", "verapdf_after", "report_pdf"} <= kinds
+    assert "report_json" not in kinds  # the engine's JSON report (with the AI's cost) is super admins' (#314)
     assert next(f for f in job["files"] if f["kind"] == "report_pdf")["label"] == "Report (PDF)"
     # The engine is told how to brand the PDF report (and never given a model name for it)
     assert s["engine"].brandings[-1]["service_name"] and "ai_label" not in s["engine"].brandings[-1]
@@ -561,3 +563,256 @@ def test_jobs_at_the_engine_follow_its_running_workers(setup, monkeypatch):
     s["engine"].capacity = lambda: 40
     worker.submit_queued(s["db"])
     assert at_engine() == 7
+
+
+def test_the_engines_own_reports_and_dollar_costs_are_super_admins_only(setup):
+    """#314: re-billing is by pages, so only super admins see the AI's cost in dollars. The engine's JSON report carries
+    it, and neither it nor the Markdown file is a document people need: they have the Report tab and the PDF report."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("doc.pdf", pdf_bytes(2))).json()[0]["job"]["id"]
+    run_worker(s["db"])
+    s["engine"].complete(s["db"].get(Job, uuid.UUID(job_id)).engine_job_id)
+    run_worker(s["db"])
+    job = s["db"].get(Job, uuid.UUID(job_id))
+    job.cost = {**(job.cost or {}), "ai_usd": 0.2767, "ai_calls": 948}
+    s["db"].commit()
+    staff = s["c"]["super"].get(f"{API}/jobs/{job_id}").json()
+    by_kind = {f["kind"]: f["id"] for f in staff["files"]}
+    assert "report_json" in by_kind and staff["cost"]["ai_usd"] == 0.2767
+    for who in ("user", "admin_a"):
+        seen = s["c"][who].get(f"{API}/jobs/{job_id}")
+        assert seen.status_code == 200, who
+        assert "report_json" not in {f["kind"] for f in seen.json()["files"]} and seen.json()["cost"] is None, who
+        assert "0.2767" not in seen.text, who
+        for kind in ("report_json", "report_md"):
+            assert s["c"][who].get(f"{API}/jobs/{job_id}/files/{by_kind[kind]}").status_code == 404, (who, kind)
+        # ...what people use still works: the Report tab's text, the PDF report, veraPDF's XML for the check tab
+        assert s["c"][who].get(f"{API}/jobs/{job_id}/report").status_code == 200, who
+        for kind in ("report_pdf", "verapdf_after"):
+            assert s["c"][who].get(f"{API}/jobs/{job_id}/files/{by_kind[kind]}").status_code == 200, (who, kind)
+    assert s["c"]["super"].get(f"{API}/jobs/{job_id}/files/{by_kind['report_json']}").status_code == 200
+    # The Run details tab's engine side (#313): super admins only
+    assert staff["staff"]["engine_job_id"] == s["db"].get(Job, uuid.UUID(job_id)).engine_job_id and staff["staff"]["submitted_at"]
+    for who in ("user", "admin_a"):
+        assert s["c"][who].get(f"{API}/jobs/{job_id}").json()["staff"] is None, who
+
+
+
+def test_a_nul_in_the_engines_answer_is_dropped_and_one_unsaveable_result_doesnt_stop_the_others(setup, monkeypatch):
+    """A Word-made PDF's alt text ended in a NUL byte, which the tag review quoted in its findings. Postgres can't keep
+    it in JSONB, so saving the finished document failed on every pass and the worker's tick never got past it."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    ids = [r["job"]["id"] for r in upload(s["c"]["user"], ("a.pdf", pdf_bytes(1)), ("b.pdf", pdf_bytes(1))).json()]
+    run_worker(s["db"])
+    jobs = [s["db"].get(Job, uuid.UUID(i)) for i in ids]
+    for j in jobs:
+        s["engine"].complete(j.engine_job_id)
+    s["engine"].jobs[jobs[0].engine_job_id]["reports"]["tag_verification"]["primary"]["findings"] = [
+        {"severity": "warn", "page": 1, "issue": "alt text", "detail": 'alt: "---\x00"'}]
+    run_worker(s["db"])
+    for j in jobs:
+        s["db"].refresh(j)
+    assert [j.status for j in jobs] == ["completed", "completed"]
+    assert "\x00" not in str(jobs[0].result_summary) and '---"' in str(jobs[0].result_summary)
+
+    # Anything else that stops one result being saved fails that document and lets the rest go on
+    ids = [r["job"]["id"] for r in upload(s["c"]["user"], ("c.pdf", pdf_bytes(1)), ("d.pdf", pdf_bytes(1))).json()]
+    run_worker(s["db"])
+    jobs = [s["db"].get(Job, uuid.UUID(i)) for i in ids]
+    for j in jobs:
+        s["engine"].complete(j.engine_job_id)
+    bad, real = jobs[0].engine_job_id, worker.summarize
+
+    def summarize(resp):
+        if bad in str(resp.get("files")):
+            raise ValueError("can't be stored")
+        return real(resp)
+    monkeypatch.setattr(worker, "summarize", summarize)
+    run_worker(s["db"])
+    for j in jobs:
+        s["db"].refresh(j)
+    assert [j.status for j in jobs] == ["failed", "completed"] and jobs[0].error_code == "result_not_saved"
+
+
+def test_super_admins_can_rerun_any_document_as_a_new_one(setup):
+    """#323: a re-run is a new document for the same owner, with the original file and options; the old one stays
+    as it was, and each points to the other. Its pages are charged again only when the super admin asks."""
+    s, db = setup, setup["db"]
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("report.pdf", pdf_bytes(3))).json()[0]["job"]["id"]
+    run_worker(db)
+    s["engine"].complete(db.get(Job, uuid.UUID(job_id)).engine_job_id)
+    run_worker(db)
+    used = s["c"]["user"].get(f"{API}/me").json()
+    assert s["c"]["user"].post(f"{API}/jobs/{job_id}/rerun", json={}).status_code == 403
+    assert s["c"]["admin_a"].post(f"{API}/jobs/{job_id}/rerun", json={}).status_code == 403
+
+    r = s["c"]["super"].post(f"{API}/jobs/{job_id}/rerun", json={"reason": "engine fix deployed"})
+    assert r.status_code == 201, r.text
+    new = r.json()
+    assert new["id"] != job_id and new["status"] == "queued" and new["filename"] == "report.pdf"
+    assert new["rerun_of"] == job_id and new["pages_charged"] == 0 and new["user_id"] == used["id"]
+    assert s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == used["reserved_pages"]
+    old = s["c"]["user"].get(f"{API}/jobs/{job_id}").json()
+    assert old["status"] == "completed" and old["reruns"] == [new["id"]]
+    # The same file goes to the engine, and the re-run finishes like any document, charging nothing
+    db.expire_all()
+    olds, news = (db.get(Job, uuid.UUID(i)) for i in (job_id, new["id"]))
+    o_in, n_in = (next(f for f in j.files if f.kind == "input") for j in (olds, news))
+    assert n_in.s3_key != o_in.s3_key and get_storage().objects[n_in.s3_key] == get_storage().objects[o_in.s3_key]
+    run_worker(db)
+    s["engine"].complete(db.get(Job, uuid.UUID(new["id"])).engine_job_id)
+    run_worker(db)
+    assert s["c"]["user"].get(f"{API}/jobs/{new['id']}").json()["status"] == "completed"
+    after = s["c"]["user"].get(f"{API}/me").json()
+    assert (after["reserved_pages"], after.get("used_pages")) == (used["reserved_pages"], used.get("used_pages"))
+    ev = db.scalar(select(AuditEvent).where(AuditEvent.action == "job.rerun"))
+    assert ev.details["rerun_of"] == job_id and ev.details["charged"] == 0 and ev.details["reason"] == "engine fix deployed"
+
+    # Asked to charge: the owner's pages are held again, as for an upload
+    r = s["c"]["super"].post(f"{API}/jobs/{job_id}/rerun", json={"charge": True})
+    assert r.status_code == 201 and r.json()["pages_charged"] == 3
+    assert s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == used["reserved_pages"] + 3
+    # A document whose file is gone can't be re-run
+    olds.files_deleted_at = olds.finished_at
+    db.commit()
+    assert s["c"]["super"].post(f"{API}/jobs/{job_id}/rerun", json={}).status_code == 410
+
+
+def _signed_pdf(pages=1, certified=False) -> bytes:
+    with pikepdf.open(io.BytesIO(pdf_bytes(pages))) as pdf:
+        sig = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Sig, Filter=pikepdf.Name("/Adobe.PPKLite")))
+        field = pdf.make_indirect(pikepdf.Dictionary(FT=pikepdf.Name.Sig, T=pikepdf.String("Signature1"), V=sig))
+        pdf.Root.AcroForm = pikepdf.Dictionary(Fields=pikepdf.Array([field]))
+        if certified:
+            pdf.Root.Perms = pikepdf.Dictionary(DocMDP=sig)
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+
+def test_a_signed_pdf_is_held_until_its_owner_confirms(setup):
+    """#339: remediating rewrites the file, so a signed PDF's copy carries no valid signature: the person decides
+    first, and nothing is charged until they send it. A check only changes nothing and goes straight on."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    res = upload(s["c"]["user"], ("signed.pdf", _signed_pdf(2)), ("certified.pdf", _signed_pdf(1, certified=True)),
+                 ("plain.pdf", pdf_bytes(1))).json()
+    held = {r["filename"]: r["job"] for r in res}
+    assert [held[n]["status"] for n in ("signed.pdf", "certified.pdf", "plain.pdf")] == ["held", "held", "queued"]
+    assert held["signed.pdf"]["progress"] == {"held": ["signed"]} and held["signed.pdf"]["pages_charged"] == 0
+    assert held["plain.pdf"]["progress"] is None
+    assert s["c"]["user"].get(f"{API}/me").json()["reserved_pages"] == 1  # only the plain one
+    run_worker(s["db"])
+    assert len(s["engine"].submitted) == 1  # nothing signed went to the engine
+    # Confirmed: charged and sent, its reason gone
+    job_id = held["signed.pdf"]["id"]
+    r = s["c"]["user"].post(f"{API}/jobs/{job_id}/confirm")
+    assert r.status_code == 200 and r.json()["status"] == "queued" and r.json()["progress"] is None
+    assert r.json()["pages_charged"] == 2
+    run_worker(s["db"])
+    assert [n for n, _ in s["engine"].submitted] == ["plain.pdf", "signed.pdf"]
+    ev = s["db"].scalar(select(AuditEvent).where(AuditEvent.action == "job.submitted",
+                                                 AuditEvent.target_id == job_id))
+    assert ev.details["signed"] is True and ev.details["held"] is True
+    # Check only: not held
+    (audit,) = upload(s["c"]["user"], ("signed-check.pdf", _signed_pdf(1)), report_only=True).json()
+    assert audit["job"]["status"] == "queued"
+
+
+def test_an_upload_that_cant_be_opened_safely_is_refused_not_the_api(setup, monkeypatch):
+    """#356: the page count runs in a child process with memory, CPU and time limits. A file that hits them fails its
+    own upload with a plain message; the API goes on serving."""
+    from portal.config import get_portal_settings
+
+    s = setup
+    topup(s, s["a"].id, 100)
+    monkeypatch.setattr(get_portal_settings(), "pdfcheck_isolated", True)  # off for the rest of the suite
+    monkeypatch.setattr(get_portal_settings(), "pdfcheck_timeout_s", 0.001)
+    (r,) = upload(s["c"]["user"], ("slow.pdf", pdf_bytes(1))).json()
+    assert not r["accepted"] and r["error"]["error"] == "too_complex"
+    assert s["c"]["user"].get(f"{API}/me").status_code == 200
+    monkeypatch.setattr(get_portal_settings(), "pdfcheck_timeout_s", 60)
+    (r,) = upload(s["c"]["user"], ("locked.pdf", pdf_bytes(1, password="secret"))).json()
+    assert not r["accepted"] and r["error"]["error"] == "encrypted_pdf"
+    (r,) = upload(s["c"]["user"], ("broken.pdf", b"%PDF-1.7\n this is not a pdf")).json()
+    assert not r["accepted"] and r["error"]["error"] == "unreadable_pdf"
+    (r,) = upload(s["c"]["user"], ("fine.pdf", pdf_bytes(2))).json()
+    assert r["accepted"] and r["job"]["pages"] == 2
+
+
+def _xfa_pdf(dynamic: bool) -> bytes:
+    with pikepdf.open(io.BytesIO(pdf_bytes(1))) as pdf:
+        xfa = pdf.make_stream(b"<xdp:xdp xmlns:xdp='http://ns.adobe.com/xdp/'></xdp:xdp>")
+        field = pikepdf.Dictionary(FT=pikepdf.Name.Tx, T=pikepdf.String("Name"))
+        fields = [] if dynamic else [pdf.make_indirect(field)]
+        pdf.Root.AcroForm = pikepdf.Dictionary(Fields=pikepdf.Array(fields), XFA=xfa)
+        if dynamic:
+            pdf.Root.NeedsRendering = True
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_a_dynamic_xfa_form_is_refused_and_a_static_one_accepted(setup, monkeypatch, isolated):
+    """#360: a dynamic XFA form has no standard form to tag, so it's refused with what to do instead; a static one
+    keeps its standard form and goes on (the engine removes the XFA part)."""
+    from portal.config import get_portal_settings
+
+    s = setup
+    topup(s, s["a"].id, 100)
+    monkeypatch.setattr(get_portal_settings(), "pdfcheck_isolated", isolated)
+    dyn, static = upload(s["c"]["user"], ("dynamic.pdf", _xfa_pdf(True)), ("static.pdf", _xfa_pdf(False))).json()
+    assert not dyn["accepted"] and dyn["error"]["error"] == "xfa_dynamic"
+    assert "save it as a standard PDF form" in dyn["error"]["message"]
+    assert static["accepted"] and static["job"]["status"] == "queued"
+
+
+def test_downloads_exports_and_uploads_are_limited_per_person(setup, monkeypatch):
+    """#357: past the hourly limit a person gets a plain 429; others aren't affected."""
+    from portal.config import get_portal_settings
+
+    s = setup
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("doc.pdf", pdf_bytes(1))).json()[0]["job"]["id"]
+    run_worker(s["db"])
+    s["engine"].complete(s["db"].get(Job, uuid.UUID(job_id)).engine_job_id)
+    run_worker(s["db"])
+    file_id = next(f["id"] for f in s["c"]["user"].get(f"{API}/jobs/{job_id}").json()["files"] if f["kind"] == "primary")
+    st = get_portal_settings()
+    monkeypatch.setattr(st, "rate_downloads_per_hour", 2)
+    monkeypatch.setattr(st, "rate_exports_per_hour", 1)
+    monkeypatch.setattr(st, "rate_uploads_per_hour", 1)
+    get = lambda c: s["c"][c].get(f"{API}/jobs/{job_id}/files/{file_id}")  # noqa: E731
+    assert [get("user").status_code for _ in range(3)] == [200, 200, 429]
+    assert "downloads in an hour" in get("user").json()["detail"]["message"]
+    assert get("admin_a").status_code == 200  # someone else's count is their own
+    assert s["c"]["super"].get(f"{API}/reports/documents.csv").status_code == 200
+    assert s["c"]["super"].get(f"{API}/reports/documents.csv").status_code == 429
+    assert s["c"]["user2"].post(f"{API}/jobs", files=[("files", ("a.pdf", pdf_bytes(1), "application/pdf"))]).status_code == 200
+    assert s["c"]["user2"].post(f"{API}/jobs", files=[("files", ("b.pdf", pdf_bytes(1), "application/pdf"))]).status_code == 429
+
+
+def test_existing_tags_can_be_ignored_at_upload_and_on_a_rerun(setup):
+    """#396: a person asks for a badly tagged PDF's own tags to be ignored; the engine is told so. A check only
+    changes no tags, so it doesn't ask. A super admin's re-run keeps the choice, or changes it."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    files = [("files", ("poor.pdf", pdf_bytes(1), "application/pdf"))]
+    (r,) = s["c"]["user"].post(f"{API}/jobs", files=files, data={"ignore_existing": "true"}).json()
+    assert r["job"]["ignore_existing"] is True
+    (audit,) = s["c"]["user"].post(f"{API}/jobs", files=files, data={"ignore_existing": "true",
+                                                                     "report_only": "true"}).json()
+    assert audit["job"]["ignore_existing"] is False
+    run_worker(s["db"])
+    assert s["engine"].ignore_existing == [True, False]
+    job_id = r["job"]["id"]
+    s["engine"].complete(s["db"].get(Job, uuid.UUID(job_id)).engine_job_id)
+    run_worker(s["db"])
+    again = s["c"]["super"].post(f"{API}/jobs/{job_id}/rerun", json={}).json()
+    assert again["ignore_existing"] is True                     # as the original was run
+    off = s["c"]["super"].post(f"{API}/jobs/{job_id}/rerun", json={"ignore_existing": False}).json()
+    assert off["ignore_existing"] is False

@@ -248,7 +248,7 @@ async def get_job(job_id: str, format: str = Query("json", pattern="^(json|markd
         if ended is not None:
             store.write_error(ended)
             return JobResponse(job_id=job_id, status="failed", error=ended)
-        return JobResponse(job_id=job_id, status="processing", progress=_progress(job_id))
+        return JobResponse(job_id=job_id, status="processing", progress=_lost(store) or _progress(job_id))
 
     b64 = bool(meta.get("flags", {}).get("return_base64"))
     ref = lambda name: store.render_file_ref(name, b64)  # noqa: E731
@@ -277,6 +277,10 @@ async def get_job(job_id: str, format: str = Query("json", pattern="^(json|markd
             tag_maps={k: ref(v) for k, v in (reports.get("tag_maps") or {}).items()} or None,
             music_files=ref(reports.get("music_files")),
             music_score=ref(reports.get("music_score")),
+            math_files=ref(reports.get("math_files")),
+            math_list=ref(reports.get("math_list")),
+            math_nemeth=ref(reports.get("math_nemeth")),
+            math_ueb=ref(reports.get("math_ueb")),
             edits_applied=reports.get("edits_applied"),
             adobe_reports=[ref(n) for n in reports.get("adobe_reports") or []] or None,
         ),
@@ -341,6 +345,30 @@ async def stop_job(job_id: str):
     except Exception as exc:  # noqa: BLE001 - the job is marked stopped either way; say the worker wasn't reached
         return {"job_id": job_id, "stopped": True, "worker": f"not reached: {exc}"}
     return {"job_id": job_id, "stopped": True}
+
+
+def _lost(store: JobStore) -> dict | None:
+    """A job whose worker stopped beating (#315): it was killed, and the queue will hand the job out again once its
+    visibility timeout has passed since it was taken (TASK_TIME_LIMIT_S + 15 min), once more at most (MAX_STARTS). Without
+    this, the last progress the worker reported stayed on show, as if it were still working."""
+    import time as _time
+
+    from app.worker.tasks import HEARTBEAT_STALE_S, MAX_STARTS
+
+    beat, attempts = store.last_beat(), store.read_attempts() or {}
+    if beat is None or _time.time() - beat < HEARTBEAT_STALE_S:
+        return None
+    starts = int(attempts.get("starts") or 0)
+    taken = float(attempts.get("at") or beat)
+    retry = taken + get_settings().task_time_limit_s + 900
+    return {"stage": "worker_lost", "lost_at": _iso(beat), "starts": starts,
+            "will_retry": starts < MAX_STARTS, "retry_after": _iso(retry) if starts < MAX_STARTS else None}
+
+
+def _iso(epoch: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
 def _progress(job_id: str) -> dict | None:
@@ -457,6 +485,24 @@ async def describe_area(file: UploadFile = File(...), page: int = Form(..., ge=1
                 "completion_tokens": ai.usage.completion_tokens}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@router.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+    """For the deployment's Prometheus (#397): what's waiting in Redis. Only the portal and Prometheus may reach the
+    engine's API (network policies); nothing here is a document's."""
+    import redis
+    from fastapi.responses import Response
+
+    from app.metrics import CONTENT_TYPE, api_metrics
+    client = redis.Redis.from_url(get_settings().redis_url, socket_timeout=2)
+    return Response(await run_in_threadpool(api_metrics, client), media_type=CONTENT_TYPE)
+
+
+@router.get("/live")
+async def live():
+    """For the liveness probe (#335): the process answers. Redis and veraPDF aren't checked here; /health does."""
+    return {"status": "alive"}
 
 
 @router.get("/health")

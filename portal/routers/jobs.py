@@ -12,12 +12,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.orm import Session, object_session
 
-from portal import approval, audit, quota, removal, services, settings_store
+from portal import approval, audit, finding_marks, quota, removal, services, settings_store
 from portal.db import get_db
 from portal.deps import Principal, current_principal, require_super_admin
 from portal.errors import ApiError, not_found
 from portal.models import HelpRequest, Job, JobFile, User
 from portal.pdfcheck import receive_pdf
+from portal.security.ratelimit import per_person
 from portal.storage import get_storage, job_prefix, safe_name
 
 router = APIRouter(tags=["jobs"])
@@ -37,7 +38,18 @@ FILE_LABELS = {
     "verapdf_after_enhanced": "veraPDF report: improved copy",
     "music_score": "Music: the whole piece (MusicXML)",
     "music_files": "Music: every line, and the whole piece (MusicXML files, zip)",
+    "math_list": "Math: every formula, to read with a screen reader (web page)",
+    "math_files": "Math: every formula (MathML files, zip)",
+    "math_nemeth": "Math in braille: Nemeth (BRF)",
+    "math_ueb": "Math in braille: UEB (BRF)",
 }
+
+
+# The engine's own reports, for the people who run the service: the JSON report carries the AI's cost in dollars and its
+# tokens (re-billing is by pages, so only super admins see dollars), and neither is a document anyone else needs. The
+# web app shows the Markdown report in the Report tab through /jobs/{id}/report, and the PDF report is the one for
+# people; veraPDF's XML stays readable, since the Accessibility check tab draws it.
+STAFF_ONLY_FILES = {"report_json", "report_md"}
 
 
 class JobFileOut(BaseModel):
@@ -68,6 +80,7 @@ class JobOut(BaseModel):
     external_services: list[str]
     needs_confirmation: bool
     full_review: bool
+    ignore_existing: bool  # its own tags ignored, tagged afresh (#396)
     no_ai: bool  # made without AI (an audit, when its AI level is set that way)
     ai_refunded: bool  # the AI tier's pages were given back: every AI call failed, or (ai_unused) none was needed
     ai_unused: bool
@@ -90,6 +103,11 @@ class JobOut(BaseModel):
     deleted_by: str | None = None
     files: list[JobFileOut]
     help: dict | None = None  # the current help request: {id, status, unread}; on the owner's own list
+    # Super admins only (#313): what the Run details tab shows beyond the cost: the engine's job, when it was sent
+    staff: dict | None = None
+    # A super admin's re-run (#323): the document it re-ran, and (on the document's own page) its re-runs
+    rerun_of: uuid.UUID | None = None
+    reruns: list[uuid.UUID] = []
 
 
 def _file_label(job: Job, kind: str) -> str:
@@ -116,6 +134,8 @@ def _ai_label(job: Job) -> str | None:
 
 def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool = False,
             show_cost: bool = False) -> JobOut:
+    """show_cost: the viewer is a super admin. The AI's cost and the engine's own reports (STAFF_ONLY_FILES) are theirs
+    only."""
     hold = runtime.early_removal_hold_hours
     removal_at = removal.remove_at(job, hold)
     expires = None if job.files_deleted_at else job.created_at + timedelta(days=runtime.file_retention_days)
@@ -127,11 +147,15 @@ def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool =
         ai_label=_ai_label(job),
         charged_services=list(job.charged_services or []),
         external_services=list(job.external_services or []), needs_confirmation=job.status == "held",
-        full_review=job.full_review, no_ai=bool(job.no_ai),
+        full_review=job.full_review, ignore_existing=bool(job.ignore_existing), no_ai=bool(job.no_ai),
         ai_refunded=bool((job.cost or {}).get("ai_refunded")),
         ai_unused=bool((job.cost or {}).get("ai_unused")),
         cost=job.cost if show_cost else None,
-        status=job.status, progress=job.progress, result=job.result_summary, error_code=job.error_code,
+        staff={"engine_job_id": job.engine_job_id, "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None}
+        if show_cost else None,
+        rerun_of=job.rerun_of,
+        status=job.status, progress=job.progress,
+        result=finding_marks.summary_with_keys(job.result_summary, "review", "findings"), error_code=job.error_code,
         error_message=job.error_message, created_at=job.created_at, finished_at=job.finished_at,
         files_expire_at=min(expires, removal_at) if expires and removal_at else expires,
         files_deleted=job.files_deleted_at is not None,
@@ -140,7 +164,9 @@ def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool =
         files=[] if job.files_deleted_at else [
             JobFileOut(id=f.id, kind=f.kind, label=_file_label(job, f.kind), name=f.name,
                        size_bytes=f.size_bytes) for f in job.files
-            if not f.kind.startswith(("tagmap_", "reviewed_", "corrected_"))])
+            if not f.kind.startswith(("tagmap_", "reviewed_", "corrected_"))
+            and (show_cost or f.kind != "report_json")])  # (the Markdown report stays listed: the Report tab is shown
+            # when there is one, and reads it through /jobs/{id}/report)
 
 
 class UploadResult(BaseModel):
@@ -329,11 +355,12 @@ def _plan(db: Session, user, chosen, processing: str, report_only: bool, ai_alt_
     return _Plan(tier, None if auto else kind, full_review, keys, charge_keys, hold, external, no_ai, auto)
 
 
-@router.post("/jobs", response_model=list[UploadResult])
+@router.post("/jobs", response_model=list[UploadResult], dependencies=[Depends(per_person("upload"))])
 def upload(request: Request, files: list[UploadFile] = File(...), report_only: bool = Form(False),
            processing: str = Form(services.STANDARD, max_length=64), ai_tier: str | None = Form(None, max_length=64),
            ai_kind: str | None = Form(None, max_length=40),
            confirm: bool = Form(False), full_review: bool = Form(False), ai_alt_text: bool = Form(True),
+           ignore_existing: bool = Form(False),
            per_file: str | None = Form(None, max_length=20_000),
            p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """Submit one or more PDFs. Each file is accepted or refused on its own.
@@ -392,8 +419,11 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                                f"You already have {runtime.max_queued_jobs_per_user} documents waiting or in progress. "
                                "Submit more when some have finished.")
             pl = plan_for(index)
+            # Held for the person's confirmation: a service that asks for it, or a signed PDF whose signature the
+            # remediated copy won't keep (#339; a check only changes nothing, so it isn't held)
+            held = [r for r, on in (("service", pl.hold), ("signed", checked.signed and not report_only)) if on]
             charged = checked.pages if pl.charge_keys else 0
-            if pl.hold:
+            if held:
                 quota.check_access(db, p.user, pl.keys, checked.pages)  # refuse now what can't be confirmed later
                 charged = 0
             elif charged:
@@ -402,8 +432,9 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                       pages_charged=charged, size_bytes=checked.size, sha256=checked.sha256, report_only=report_only,
                       processing=processing, ai_tier=pl.tier, ai_kind=pl.kind,
                       charged_services=pl.charge_keys if charged else [], external_services=pl.external,
-                      status="held" if pl.hold else "queued", full_review=pl.full_review, no_ai=pl.no_ai,
-                      ai_kind_auto=pl.auto)
+                      status="held" if held else "queued", full_review=pl.full_review, no_ai=pl.no_ai,
+                      ignore_existing=ignore_existing and not report_only,  # a check only changes no tags
+                      ai_kind_auto=pl.auto, progress={"held": held} if held else None)
             db.add(job)
             db.flush()
             key = job_prefix(job.group_id, job.user_id, job.id) + "input/" + safe_name(name)
@@ -416,7 +447,8 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                                                          "processing": processing, "ai_tier": pl.tier,
                                                          "ai_kind": services.AUTO if pl.auto else pl.kind,
                                                          "no_ai": pl.no_ai,
-                                                         "external": pl.external, "held": pl.hold})
+                                                         "external": pl.external, "held": bool(held),
+                                                         **({"signed": True} if checked.signed else {})})
             db.commit()
             db.refresh(job)
             results.append(UploadResult(filename=name, accepted=True, job=job_out(job, runtime)))
@@ -541,8 +573,10 @@ def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSett
 def job_detail(job_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
     # Cost is for super admins only: what groups are charged isn't the per-page cost
-    return job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id,
-                   show_cost=p.is_super_admin)
+    out = job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id, show_cost=p.is_super_admin)
+    out.reruns = list(db.scalars(select(Job.id).where(Job.rerun_of == job.id, Job.deleted_at.is_(None))
+                                 .order_by(Job.created_at)))
+    return out
 
 
 @router.post("/jobs/{job_id}/confirm", response_model=JobOut)
@@ -559,7 +593,7 @@ def confirm_job(job_id: uuid.UUID, request: Request, p: Principal = Depends(curr
     quota.reserve(db, p.user, job.pages, job.id, keys)
     job.pages_charged = job.pages
     job.charged_services = keys
-    job.status = "queued"
+    job.status, job.progress = "queued", None
     audit.record(db, request, "job.confirmed", actor=p.user, target_type="job", target_id=job.id,
                  group_id=job.group_id, details={"pages": job.pages, "services": keys})
     db.commit()
@@ -580,6 +614,60 @@ def cancel(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_p
     audit.record(db, request, "job.canceled", actor=p.user, target_type="job", target_id=job.id,
                  group_id=job.group_id)
     db.commit()
+    return job_out(job, settings_store.load(db))
+
+
+# --- re-running (super admins) -----------------------------------------------------------------------
+
+class Rerun(BaseModel):
+    charge: bool = False  # hold the owner's pages again, as a new upload would
+    reason: str | None = Field(None, max_length=500)
+    ignore_existing: bool | None = None  # tag it afresh from the page (#396); left out: as the original was run
+
+
+@router.post("/jobs/{job_id}/rerun", response_model=JobOut, status_code=201)
+def rerun(job_id: uuid.UUID, body: Rerun, request: Request, p: Principal = Depends(require_super_admin),
+          db: Session = Depends(get_db)):
+    """Send a document through again, whatever became of it (#323): a new document for the same owner, with the
+    same options and the original file; the old one, its versions and edits stay as they are. Its pages are
+    charged again only when asked to; otherwise it's support's own re-run and costs the owner nothing."""
+    import tempfile
+
+    from portal.queues import job_services
+
+    old = db.scalar(select(Job).where(Job.id == job_id))
+    if old is None or old.deleted_at is not None:
+        raise not_found("Job")
+    original = next((f for f in old.files if f.kind == "input"), None)
+    if old.files_deleted_at is not None or original is None:
+        raise ApiError(410, "files_deleted", "This document's file has been deleted, so it can't be run again.")
+    owner = old.user
+    new_id = uuid.uuid4()
+    keys = job_services(old) if body.charge and not old.report_only else []
+    if keys:
+        quota.reserve(db, owner, old.pages, new_id, keys)  # refused, as an upload would be, if they have too few
+    job = Job(id=new_id, user_id=owner.id, group_id=old.group_id, filename=old.filename, pages=old.pages,
+              pages_charged=old.pages if keys else 0, size_bytes=old.size_bytes, sha256=old.sha256,
+              report_only=old.report_only, processing=old.processing, ai_tier=old.ai_tier, ai_kind=old.ai_kind,
+              charged_services=keys, external_services=list(old.external_services or []), status="queued",
+              full_review=old.full_review, no_ai=old.no_ai, ai_kind_auto=old.ai_kind_auto, rerun_of=old.id,
+              ignore_existing=(old.ignore_existing if body.ignore_existing is None else body.ignore_existing)
+              and not old.report_only)
+    db.add(job)
+    db.flush()
+    storage = get_storage()
+    key = job_prefix(job.group_id, job.user_id, job.id) + "input/" + safe_name(old.filename)
+    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as tmp:
+        storage.get_to_file(original.s3_key, tmp)
+        tmp.seek(0)
+        storage.put_file(key, tmp, "application/pdf")
+    db.add(JobFile(job_id=job.id, kind="input", name=original.name, s3_key=key, size_bytes=original.size_bytes,
+                   content_type="application/pdf"))
+    audit.record(db, request, "job.rerun", actor=p.user, target_type="job", target_id=job.id, group_id=job.group_id,
+                 details={"rerun_of": str(old.id), "previous_status": old.status, "charged": job.pages_charged,
+                          "reason": body.reason or None, "ignore_existing": job.ignore_existing})
+    db.commit()
+    db.refresh(job)
     return job_out(job, settings_store.load(db))
 
 
@@ -683,11 +771,13 @@ def _record_access(db: Session, request: Request, p: Principal, job: Job, f: Job
         db.commit()
 
 
-@router.get("/jobs/{job_id}/files/{file_id}")
+@router.get("/jobs/{job_id}/files/{file_id}", dependencies=[Depends(per_person("download"))])
 def download(job_id: uuid.UUID, file_id: uuid.UUID, request: Request, reason: str | None = Query(None, max_length=500),
              p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
     f = _file(db, job, file_id)
+    if f.kind in STAFF_ONLY_FILES and not p.is_super_admin:
+        raise not_found("File")
     _record_access(db, request, p, job, f, reason)
     disposition = f"attachment; filename=\"{safe_name(f.name)}\""
     return StreamingResponse(get_storage().get_stream(f.s3_key), media_type=f.content_type,

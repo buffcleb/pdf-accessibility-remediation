@@ -9,9 +9,11 @@ import pikepdf
 
 from app.config import get_settings
 from app.verification.ai_review import FigureItem, OrderItem, ReviewPlan, review
+from app.verification import contrast
 from app.verification.integrity import check_integrity
 from app.verification.model import Finding, VerificationReport
 from app.verification.semantic import SemanticChecker
+from app.tagging.metadata import document_info
 from app.verification.tagmap import annotation_places, artifact_sections, page_sizes, tagmap_from
 
 
@@ -25,8 +27,9 @@ class VerifyOptions:
     only_elements: set[int] | None = None
     tagmap: bool = True  # also build the tag map for the viewer
     judge_model: str | None = None  # the AI tier's review model at the gateway; None = VERIFY_JUDGE_*
-    # Read-aloud text the AI wrote for specialist notation: [(page 0-based, bbox, kind, spoken)]. Each is
-    # flagged for a person to check, and Formula ones go to the AI review.
+    # Read-aloud text the AI wrote for specialist notation: [(page 0-based, bbox, kind, spoken[, two readings])].
+    # Each is flagged for a person to check, and Formula ones go to the AI review. With two readings (#403: the
+    # AI's and MathCAT's, which disagree), the finding carries both for Edit tag to offer.
     ai_read: list = field(default_factory=list)
     # Verdicts shared between the outputs of one job (pass the same dict for each output)
     review_cache: dict | None = None
@@ -42,10 +45,13 @@ _TEXT_ROLES = ("Formula", "P", "LBody", "LI", "TD", "TH", "Caption", "Lbl", "Spa
 def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Finding]:
     """One review finding per block whose read-aloud text the AI wrote, on the element that holds it."""
     out = []
-    for page, bbox, kind, spoken in items:
+    for item in items:
+        page, bbox, kind, spoken = item[:4]
+        readings = item[4] if len(item) > 4 else None
+        roles = _TEXT_ROLES + ("Figure",) if readings else _TEXT_ROLES  # a formula drawn as a picture
         best, best_overlap = None, 0.0
         for e in index.elements:
-            if e.role not in _TEXT_ROLES or checker._page_of(e) != page:
+            if e.role not in roles or checker._page_of(e) != page:
                 continue
             c = checker.subtree(e)
             if c.bbox is None:
@@ -56,6 +62,22 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
             if ov >= 0.5 * area and ov > best_overlap:
                 best, best_overlap = e, ov
         snippet = str(spoken)[:160]
+        if readings:
+            # The readings that say other numbers or letters than the AI's: by rule from its LaTeX, from the picture
+            other = {r["source"]: str(r["text"])[:160] for r in readings["readings"]}
+            pairs = (("rule", "differs", "read by rule from its LaTeX"),
+                     ("picture", "differs_picture", "read from the formula's picture"))
+            said = [f"{how} it's \u201c{other[src]}\u201d" for src, key, how in pairs
+                    if readings.get(key) and src in other]
+            out.append(Finding(
+                layer="ai", severity="review", issue="two readings of a formula disagree",
+                page=page + 1, role=best.role if best else None, element=best.index if best else None,
+                text=snippet,
+                detail=f"the AI reads it as \u201c{snippet}\u201d; " + "; ".join(said)
+                       + (", which say" if len(said) > 1 else ", which says") + " other numbers or letters",
+                action="Choose the reading that matches what's printed in Edit tag, or write your own",
+                extra=readings))
+            continue
         if kind == "ocr-correct":
             issue, detail = "OCR text corrected by AI", f"words OCR was unsure of, corrected by AI: \u201c{snippet}\u201d"
         elif kind == "ocr-transcribe":
@@ -68,6 +90,25 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
             page=page + 1, role=best.role if best else None, element=best.index if best else None,
             detail=detail, action="Check it matches what's printed; correct it in the tag manager if not"))
     return out
+
+
+def _rtl_findings(path: Path, max_pages: int) -> list[Finding]:
+    """Pages mostly in Arabic or Hebrew, read right to left (#368): one finding naming them, to check the order."""
+    import pymupdf as fitz
+
+    from app.pipeline.structure import right_to_left
+
+    with fitz.open(path) as doc:
+        pages = [n + 1 for n, page in enumerate(doc) if n < max_pages and right_to_left(page.get_text())]
+    if not pages:
+        return []
+    named = ", ".join(map(str, pages[:20])) + (f" and {len(pages) - 20} more" if len(pages) > 20 else "")
+    return [Finding(
+        layer="semantic", severity="review", issue="right-to-left reading order", page=pages[0],
+        detail=f"{len(pages)} page(s) mostly in a right-to-left script (Arabic, Hebrew): columns and items side by "
+               f"side are read from the right. Pages {named}",
+        action="Check the reading order on these pages in the tag manager (Reading order view)",
+        extra={"pages": pages})]
 
 
 def _structural(path: Path, opts: VerifyOptions) -> tuple[VerificationReport, ReviewPlan]:
@@ -86,9 +127,12 @@ def _structural(path: Path, opts: VerifyOptions) -> tuple[VerificationReport, Re
         report.findings += checker.run()
         report.skipped += checker.skipped
         report.findings += _ai_read_findings(index, checker, opts.ai_read)
+        if settings.verify_contrast:
+            report.findings += contrast.check(path, settings.verify_max_pages)
+        report.findings += _rtl_findings(path, settings.verify_max_pages)
         if opts.tagmap:
             report.tagmap = tagmap_from(page_sizes(path), index, checker, artifact_sections(path),
-                                        annotation_places(path))
+                                        annotation_places(path), document_info(pdf))
 
         # Build the AI review plan while the PDF is open (alt text lives on the elements).
         flagged_elems = {f.element for f in report.findings if f.element is not None}

@@ -64,6 +64,28 @@ sequenceDiagram
   `Reference` of its own, so nothing is read in a different order. A paragraph in a body stays; any other block
   is refused. `Lbl` may sit in a `TOCI` as well as an `LI` (both rule copies, `role_rules.py` and `roles.ts`). The
   viewer shows the new types before saving (`overrides` given the tag map).
+- **Tables.** The table editor (`TableDialog.tsx`, logic in `tablegrid.ts`, #370) holds a table as a grid: merge and
+  split cells, add and remove rows and columns, choose header rows and columns. A removed row or column joins its
+  neighbour, so nothing on the page goes untagged. It's saved as one edit: `rebuild_table` gives the whole table row
+  by row, each cell naming the old cells whose content it takes (and an optional caption); `build_table` makes text
+  tags into a table, each cell taking `/K` items of the tags, every item once. A figure that is really a drawn table
+  can be one of them; its alt text goes (#395). A pending table edit shows in the tree and on the page as it will be
+  saved (#400).
+- **Splitting a figure.** `take_pieces` makes some of a figure's pieces a new tag read right after it; `cut_area`
+  does the same for what lies inside a box, cutting through drawings that cross it without reordering the page's
+  marked sections. "Describe with AI" writes alt text for an area (the engine's `POST /describe`, one paid call at
+  the document's AI level, where the person is allowed it: `portal/ai_describe.py`).
+- **Artifacts, links and form fields.** `set_decorative` turns any tag and what's under it into an artifact, as
+  layout or as a header, footer or page number (#364). `set_alt` on a `Link` or `Annot` also writes the text to its
+  annotations' `/Contents`, what a screen reader announces for the link. `set_field_label` sets a form field's
+  tooltip (#341).
+- **The document panel.** `set_doc_title` and `set_doc_lang` change the document's title and language; they name no
+  tag (`DocumentPanel.tsx`, #363).
+- **A formula's readings.** Where a formula's readings disagree (#403), Edit tag shows them side by side with the
+  formula drawn from its MathML (`ReadingPicker.tsx`, `readings.ts`); the one picked goes into the read-aloud text,
+  and the edit carries the choice (`reading` on `set_alt` or `set_actual_text`) for the edit job's report.
+- **Undo and redo.** Every change to the pending edits can be undone and redone in order, with Ctrl+Z and
+  Ctrl+Shift+Z or the heading's buttons, up to 200 steps (`history.ts`, #365). Loading a draft or saving starts afresh.
 - **One page, and reading order in the tree's place.** The viewer can show one page at a time (`Pane`'s
   `onlyPage`; the tree is filtered with `tagsOnPage`). The tree pane can list the tags in reading order instead.
   Every view draws from the same pending edits (`pageOrder`, `draftTree`), so a move made in one shows in all;

@@ -14,9 +14,11 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -113,10 +115,36 @@ def job_validator(flags: dict | None):
         _options.reset(token)
 
 
-def flavours() -> list[str]:
-    """The flavours to check: the first gives the verdict; the rest are shown for information, unless turned off."""
+def pdfua_part(path) -> int:
+    """The part of PDF/UA a file can conform to (#409): 2 for a PDF 2.0 file (PDF/UA-1 requires PDF 1.x), else the
+    configured one (1)."""
+    try:
+        import pikepdf
+        with pikepdf.open(path) as pdf:
+            version = str(pdf.pdf_version)
+    except Exception:  # noqa: BLE001 - unreadable here: the header, as veraPDF reads it
+        try:
+            with open(path, "rb") as f:
+                version = f.read(16).decode("latin-1").split("%PDF-", 1)[-1][:3]
+        except OSError:
+            version = "1.7"
+    return 2 if version >= "2.0" else get_settings().pdfua_part
+
+
+def flavours(part: int = 1) -> list[str]:
+    """The flavours to check: the first gives the verdict (PDF/UA-2 for a PDF 2.0 file, #409); the rest are shown for
+    information, unless turned off."""
     fl = get_settings().flavours
+    if part == 2:
+        # PDF/UA-2 gives the verdict; PDF/UA-1 still runs, whatever the setting, because the engine's repairs (fonts,
+        # glyph lists, widths) go by its rules, which check the same things (its header rule fails, and drives none)
+        return ["ua2", "ua1"] + [f for f in fl if f not in ("ua1", "ua2")]
     return fl if _options.get().ua2 else fl[:1]
+
+
+def uses_service() -> bool:
+    """Whether this job's checks go to the veraPDF service (else the command line, in this process's container)."""
+    return _service_url() is not None
 
 
 def _service_url() -> str | None:
@@ -180,17 +208,39 @@ def run_verapdf(pdf_path: Path, xml_out: Path, flavour: str = "ua1") -> VeraResu
                 res.xml_path, res.via = str(xml_out), "service"
                 log.debug("veraPDF service: %s %s in %.2fs", pdf_path.name, flavour, time.monotonic() - started)
                 return res
+            if _OUT_OF_MEMORY.search(res.error):
+                # The command line runs inside the worker, beside the document, with less memory than the service:
+                # on a file the service couldn't hold it can only fail too, and took the worker down with it once
+                log.warning("veraPDF service ran out of memory on %s; not retried on the command line", pdf_path.name)
+                res.error = ("veraPDF ran out of memory on this file (give the veraPDF service more: VERAPDF_HEAP and "
+                             "VERAPDF_MEMORY_LIMIT)")
+                return res
             log.warning("veraPDF service report for %s unusable (%s); using the command line", pdf_path.name, res.error)
     return _run_cli(pdf_path, xml_out, flavour)
 
 
+_OUT_OF_MEMORY = re.compile(r"OutOfMemory|Java heap space", re.I)
+
+
+# The command line is a Java process in the worker's own container: one at a time, whatever runs the checks (the profiles
+# are checked side by side when the service is there, and a failed service sends both here)
+_CLI_TURN = threading.Lock()
+
+
 def _run_cli(pdf_path: Path, xml_out: Path, flavour: str) -> VeraResult:
+    with _CLI_TURN:
+        return _run_cli_now(pdf_path, xml_out, flavour)
+
+
+def _run_cli_now(pdf_path: Path, xml_out: Path, flavour: str) -> VeraResult:
     exe = _binary()
     if not exe:
         return VeraResult(flavour=flavour, available=False, error="veraPDF CLI not found")
     cmd = [exe, "--flavour", flavour, "--format", "xml", "--maxfailuresdisplayed", "200", str(pdf_path)]
+    # A heap of its own size, not Java's default share of the worker's memory (a quarter of it, beside the document)
+    env = {**os.environ, "JAVA_TOOL_OPTIONS": f"-Xmx{get_settings().verapdf_cli_heap} -XX:+UseSerialGC"}
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=get_settings().verapdf_timeout_s)
+        proc = subprocess.run(cmd, capture_output=True, timeout=get_settings().verapdf_timeout_s, env=env)
     except subprocess.TimeoutExpired:
         return VeraResult(flavour=flavour, available=True, error="veraPDF timed out")
     xml = proc.stdout

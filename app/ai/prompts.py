@@ -158,3 +158,13 @@ may introduce content on the next page; both are fine. Only report order problem
 
 JSON schema: {{"acceptable": bool, "out_of_place": [box numbers that are read at the wrong time],
 "explanation": str, "confidence": number between 0 and 1}}"""
+
+FIELD_LABEL = """This image shows part of page {page} of a fillable form. One form field ({kind}) is outlined in red.
+Text near it on the page (may be empty): \"\"\"{context}\"\"\"
+{data}
+
+What does a person enter or choose in the outlined field? Give the short label a screen reader should announce for it,
+as printed on the form where possible ("Last name", "Date of birth", "Payment method: Card"), at most 8 words.
+If you can't tell, give an empty string.
+
+JSON schema: {{"label": str}}"""

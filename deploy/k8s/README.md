@@ -22,6 +22,9 @@ Ingress (class `nginx`) or the optional Cloudflare tunnel, to the web app, which
 | `litellm` (the AI gateway; its admin UI isn't exposed) | Deployment | its database |
 | `verapdf` (PDF/UA checks, kept running), `verapdf-restart` (restarts it every hour) | Deployment + Service, CronJob | – |
 | `engine-worker` scaling, `verapdf` and `litellm` autoscalers (with [scaling on](#scaling-with-the-queue)) | KEDA ScaledObject, HorizontalPodAutoscalers | – |
+| `music-reader` (optional: `MUSIC_READER=on`), `formula-reader` (optional: `FORMULA_READER=on`) | Deployments, KEDA ScaledObjects with scaling on | – |
+| `prometheus`, `grafana`, `kube-state-metrics`, Redis and Postgres exporters (with `MONITORING=on`) | Deployments | `MONITORING_STORAGE_CLASS` |
+| `backup` (optional: `BACKUPS=cronjob`) | CronJob | an NFS share |
 | `postgres` (portal and gateway databases) | StatefulSet | `STORAGE_CLASS` |
 | `redis` (engine queue on db 0, portal on db 1) | StatefulSet | `STORAGE_CLASS` |
 | `seaweedfs` (S3 for stored files) | StatefulSet | `STORAGE_CLASS` |
@@ -35,6 +38,8 @@ Ingress (class `nginx`) or the optional Cloudflare tunnel, to the web app, which
 | `manifests/*.yaml`, `migrate-job.yaml` | yes | The manifests, with `${SETTINGS}` filled in by `deploy.sh` |
 | `deploy.env.example` | yes | Every deployment setting, with comments |
 | `env2secret.py` | yes | Turns env files into a Kubernetes Secret, all keys or a chosen set (quotes and PEM keys handled) |
+| `app-role.sql`, `monitoring-role.sql` | yes | The portal's own database account (`portal_app`, rows only) and the Postgres exporter's (reads no table) |
+| `monitoring/` | yes | Prometheus's config and alert rules (with their tests) and Grafana's dashboards |
 | `deploy.env` | **no** | Your deployment settings (made by `deploy.sh init`) |
 | `engine.env`, `portal.env` | **no** | Secrets for the engine and gateway, and for the portal (made by `deploy.sh init`, mode 600) |
 | `tunnel.env` | **no** | `TUNNEL_TOKEN=…` for the optional Cloudflare tunnel |
@@ -43,20 +48,42 @@ Ingress (class `nginx`) or the optional Cloudflare tunnel, to the web app, which
 
 ### Which pod sees which secret
 
-The two env files are split into five secrets, so a pod holds what it reads and nothing more:
+The two env files are split into five secrets (six with monitoring), so a pod holds what it reads and nothing more:
 
 | Secret | From | Holds | Read by |
 |---|---|---|---|
-| `pdfrem-engine-env` | `engine.env` | Everything but the gateway's keys (`LITELLM_*`, `UI_*`, `LOCAL_*`, `OPENROUTER_*`) and `ADOBE_CLIENT_*` | The engine's API, workers and scheduler; Redis, the music reader and KEDA (`REDIS_PASSWORD`) |
+| `pdfrem-engine-env` | `engine.env` | Everything but the gateway's keys (`LITELLM_*`, `UI_*`, `LOCAL_*`, `OPENROUTER_*`) and `ADOBE_CLIENT_*` | The engine's API, workers and scheduler; Redis, the music and formula readers and KEDA (`REDIS_PASSWORD`) |
 | `pdfrem-gateway-env` | `engine.env` | Everything but the engine's own (`REDIS_PASSWORD`, `SERVICE_API_KEY`, `GATEWAY_API_KEY`, `LOCALAI_*`, `OLLAMA_*`, `ADOBE_*`) | The AI gateway |
 | `pdfrem-adobe-env` | `engine.env` | `ADOBE_CLIENT_ID`, `ADOBE_CLIENT_SECRET` | The Adobe workers only |
 | `pdfrem-db-env` | both | `POSTGRES_ADMIN_PASSWORD`, `PORTAL_DB_PASSWORD`, `LITELLM_DB_PASSWORD` | Postgres; the migration job |
-| `pdfrem-portal-env` | `portal.env` | Everything but `POSTGRES_ADMIN_PASSWORD` | The portal's API and worker; SeaweedFS (the S3 keys) and KEDA (the portal's database password) |
+| `pdfrem-portal-env` | `portal.env` | Everything but `POSTGRES_ADMIN_PASSWORD`, `PORTAL_DB_PASSWORD` and monitoring's three | The portal's API and worker; SeaweedFS (the S3 keys) and KEDA (`PORTAL_APP_DB_PASSWORD`) |
+| `pdfrem-monitoring-env` | `portal.env` | `MONITORING_DB_PASSWORD`, `GRAFANA_ADMIN_PASSWORD`, `GRAFANA_SECRET_KEY` (with `MONITORING=on`) | The Postgres exporter; Grafana |
 
 An engine worker, the part that opens untrusted documents, no longer sees the gateway's master key, the
 OpenRouter key or the Adobe secret. (Its `GATEWAY_API_KEY` is the master key as `init` makes it; a key with
 less reach, made in the gateway's UI, can be put in its place.) The engine's own `OPENROUTER_API_KEY` setting
 is therefore empty on a cluster: cloud models go through the gateway, as the AI levels do.
+
+### `deploy.env` at a glance
+
+`deploy.env.example` says what each setting does. Grouped, with where the longer story is:
+
+| Settings | What they are |
+|---|---|
+| `KUBECONFIG_PATH`, `KUBE_CONTEXT`, `NAMESPACE` | Which cluster, context and namespace (`pdf-remediation`) |
+| `APP_HOST`, `FRONTEND`, `API_ORIGIN_HOST`, `API_ORIGIN_SOURCE_CIDR`, `API_ORIGIN_ALLOWED_SOURCES`, `WORKER_NAME` | The public address, and the [Worker front end](#optional-the-web-app-on-a-cloudflare-worker) |
+| `TRUSTED_PROXY_CIDRS`, `WEB_TRUSTED_PROXIES` | Who may name the caller ([below](#network-policies-and-the-redis-password)) |
+| `REGISTRY`, `ENGINE_TAG`, `PORTAL_TAG`, `WEB_TAG` (and `MUSIC_TAG`, `FORMULA_TAG`) | Where images come from; tags are taken from `.last-build` unless set |
+| `LITELLM_IMAGE`, `VERAPDF_IMAGE`, `CURL_IMAGE`, `CLOUDFLARED_IMAGE` | Outside images, pinned by digest: moving one is a choice |
+| `GATEWAY_ADMIN_URL`, `GATEWAY_SHARED_LOGIN` | The AI gateway's admin UI ([AI models](../../docs/operations/ai-models.md)) |
+| `STORAGE_CLASS`, `SHARED_STORAGE_CLASS`, `DB_SIZE`, `REDIS_SIZE`, `FILES_SIZE`, `JOBDATA_SIZE` | Storage (required) and volume sizes (10, 1, 50 and 50 Gi) |
+| `ENGINE_WORKERS`, `WORKER_CONCURRENCY`, `WORKER_MEMORY_LIMIT`, `ADOBE_WORKERS` | Engine capacity ([sizing](#sizing)); Adobe workers stay at 0 until [Adobe](../../docs/operations/adobe-autotag.md) is set up |
+| `VERAPDF_HEAP`, `VERAPDF_MEMORY_LIMIT`, `VERAPDF_RESTART_SCHEDULE` | The [veraPDF service](../../docs/operations/configuration.md#verapdf-service) |
+| `AUTOSCALE`, `ENGINE_WORKERS_MAX`, `VERAPDF_MAX`, `LITELLM_MAX`, `SCALE_DOWN_SECONDS` | [Scaling with the queue](#scaling-with-the-queue) |
+| `MUSIC_*`, `FORMULA_*` | The optional [music](#music-notation-read-note-by-note) and [formula](#formulas-read-a-second-time-from-their-pictures) readers |
+| `MAX_UPLOAD_SIZE` | Largest upload through the web app and Ingress (`100m`) |
+| `BACKUPS`, `BACKUP_*` | [Nightly backups](../../docs/operations/backups-and-migrations.md#nightly-backups-on-the-cluster) |
+| `MONITORING`, `PROMETHEUS_*`, `GRAFANA_SIZE`, `MONITORING_STORAGE_CLASS` | [Prometheus and Grafana](../../docs/operations/monitoring.md#prometheus-and-grafana) |
 
 ## Before the first deploy (once)
 
@@ -92,10 +119,29 @@ scripts/deploy.sh
 ```
 
 `build.sh` tags the images with the commit and records them in `.last-build` (`--only web` rebuilds one image; the
-others keep their tags). `deploy.sh` asks before changing the cluster (`-y` skips the question), makes the namespace
-and secrets, starts PostgreSQL, Redis and SeaweedFS, **backs up the databases into `./backups` if they already
-exist**, runs the migrations as a Job (stopping if they fail), rolls out the gateway, engine, portal and web app, and
+others keep their tags). Each pushed image is scanned with Trivy (#362): HIGH and CRITICAL vulnerabilities that
+have a fix are listed, and an image with a CRITICAL one is **held**, pushed but not recorded, so `deploy.sh` keeps
+deploying the last one (`build.sh` exits 3 and says which). Rebuild once the base image or package has the fix (a
+Dependabot pull request usually brings it), or record it anyway with `--accept-findings`; a finding judged not to
+apply goes in `.trivyignore` with the reason. `--no-scan` skips the scan.
+
+`build.sh` builds the engine, portal and web images, plus `music` with `MUSIC_READER=on` and `formula` with
+`FORMULA_READER=on` in `deploy.env`. Its other options: `--tag TAG`, `--no-push` (a build check),
+`--platform` (`linux/amd64`), `--allow-dirty` (uncommitted changes, tagged `-dirty`). The engine image includes
+MathCAT (formula speech and braille, #403), compiled from `docker/mathcat` in a Rust build stage, so a build with
+no cache takes a few minutes longer; there's nothing to set for it.
+
+`deploy.sh` asks before changing the cluster (`-y` skips the question), makes the namespace and secrets, starts
+PostgreSQL, Redis and SeaweedFS, **backs up the databases into `./backups` if they already exist** (`--skip-backup`
+doesn't, and isn't recommended), runs the migrations as a Job (stopping if they fail), sets up the portal's own
+database account (below), rolls out the gateway, engine, portal, web app and the optional pieces that are on, and
 checks each one answers.
+
+**The portal's database account** (#337). Migrations run as the database's owner (`portal`, `PORTAL_DB_PASSWORD`);
+the portal's pods and KEDA use `portal_app` (`PORTAL_APP_DB_PASSWORD`, made in `portal.env` by `deploy.sh`), which
+reads and writes rows but owns no table, so it can't alter a table or drop the triggers that keep the audit log and
+the page ledger append-only. `app-role.sql` makes it and grants it the tables on every deploy, after the
+migrations; after restoring a database, run `deploy.sh` once so the restored tables are granted again.
 
 Changing `engine.env`, `portal.env` or `tunnel.env` and rerunning `deploy.sh` restarts the pods that use them (their
 templates carry the file's checksum). `scripts/deploy.sh render` writes the manifests as they'd be applied to
@@ -143,11 +189,24 @@ looking at pods, logs, events, autoscalers and policies are listed with what eac
 ## Network policies and the Redis password
 
 Everything inside the namespace is closed to pods that have no business with it (`manifests/80-network-policies.yaml`):
-Postgres takes connections from the portal, the gateway, the migration job and KEDA; Redis from the engine, the
-portal, the music reader and KEDA; SeaweedFS from the portal, on its S3 port only (its master, filer and volume
-ports check nothing); veraPDF from the engine; the AI gateway from the engine and the portal; the engine's API from
-the portal; the portal's API from the web pod and cloudflared. The workers, the scheduler and the music reader
-answer no one. The web pod and cloudflared keep the cluster's default (open), as the way in. Egress isn't restricted.
+Postgres takes connections from the portal, the gateway, the migration job, the nightly backup and KEDA; Redis
+from the engine, the portal, the music and formula readers and KEDA; SeaweedFS from the portal and the nightly
+backup, on its S3 port only (its master, filer and volume ports check nothing); veraPDF from the engine; the AI
+gateway from the engine and the portal; the engine's API from the portal; the portal's API from the web pod and
+cloudflared. The workers, the scheduler and the two readers answer no one but Prometheus. The web pod and
+cloudflared keep the cluster's default (open), as the way in.
+
+With monitoring on (`MONITORING=on`, `manifests/95-monitoring.yaml`), Prometheus is also let in to the portal's,
+the engine's and the workers' metrics ports, its exporters to Postgres and Redis, the portal and Grafana to
+Prometheus, and only the web pod to Grafana ([monitoring](../../docs/operations/monitoring.md#prometheus-and-grafana)).
+
+Egress is closed for the pods that open uploaded PDFs: the engine's API, workers and scheduler reach only DNS,
+Redis, veraPDF and the AI gateway, and the music and formula readers only DNS and Redis, so an engine taken over
+by a crafted PDF can't send anything out (#361). Their AI calls all go through the gateway (`AI_GATEWAY_ONLY=true` in
+`40-engine.yaml`: a provider named directly, such as the portal's fallback or the default judge, becomes the
+gateway's default or judge model, `GATEWAY_DEFAULT_MODEL` and `GATEWAY_JUDGE_MODEL` in engine.env), and the Jev
+classifier goes through the gateway's `/systemone` route, which adds the OpenRouter key. The gateway, the Adobe
+worker (Adobe's API) and the portal keep their internet access.
 The cluster's network plugin must enforce `NetworkPolicy` (RKE2's Canal does; `kubectl get networkpolicy -n
 <namespace>` lists what is applied).
 
@@ -161,6 +220,16 @@ pods that use it roll with their new address; between the two there can be a min
 (`81-api-origin-policy.yaml`). RKE2's ingress controller runs in the nodes' own network, where its traffic is seen by
 the node's address: set `API_ORIGIN_SOURCE_CIDR` in `deploy.env` to the node network, or the API origin answers no
 one. An ingress controller that runs as a pod in `kube-system` needs nothing more.
+
+**Who may name the caller** (#336). The portal reads the caller's address from a header only on a connection from
+`TRUSTED_PROXY_CIDRS` (the pod range, `10.42.0.0/16` by default on RKE2: cloudflared and the web pod), plus
+`API_ORIGIN_SOURCE_CIDR` with the Worker front end; from anything else it uses the connection's own address. The web
+pod passes Cloudflare's header (`CF-Connecting-IP`) on only from that range too, so someone reaching it through the
+web Ingress on a node's address can't make one up. With `FRONTEND=worker`, `deploy.sh` also requires
+`API_ORIGIN_ALLOWED_SOURCES` (Cloudflare's published ranges, https://www.cloudflare.com/ips/): the API origin's
+Ingress answers only them. An ingress controller that runs as a pod inside the pod range would be trusted as well;
+RKE2's runs on the nodes' network, so it isn't. Putting Cloudflare Access in front of the API origin as well is still
+recommended.
 
 **On first applying this:** watch that the readiness probes keep passing (`scripts/deploy.sh status`); the probes
 come from each node, which Canal lets through, but a different network plugin might not, and then every probed pod
@@ -192,8 +261,9 @@ to take off first.
 
 ## Sizing
 
-Requests add up to about 4.3 GiB, including 768 MiB for the veraPDF service (`VERAPDF_MEMORY_LIMIT`, 1 GiB); each
-engine worker may use up to `WORKER_MEMORY_LIMIT` (4 GiB) on large documents. Worker pods × `WORKER_CONCURRENCY`
+Memory requests add up to about 3.9 GiB (4.6 GiB with monitoring on), including 768 MiB for the veraPDF service
+(`VERAPDF_MEMORY_LIMIT`, 1 GiB); each engine worker may use up to `WORKER_MEMORY_LIMIT` (4 GiB) and 3 CPUs on large
+documents. Worker pods × `WORKER_CONCURRENCY`
 (documents per pod) is how many documents are processed at once. The portal hands the engine as many documents as
 its running workers have places for (at least `PORTAL_ENGINE_MAX_IN_FLIGHT`, 4).
 
@@ -219,7 +289,10 @@ With [KEDA](https://keda.sh/docs/latest/deploy/) and metrics-server on the clust
   at once** (Administration › Services › Pages and cost guards) to what they handle; the rest wait in the queue.
   Cloud and commercial levels scale at the provider; the gateway's `max_budget` (`config/litellm.yaml`) and each
   level's page limits bound the cost.
-- KEDA reads the count with the portal's database user (the password comes from the `pdfrem-portal-env` secret).
+- KEDA reads the count as the portal's rows-only account, `portal_app` (`PORTAL_APP_DB_PASSWORD` in the
+  `pdfrem-portal-env` secret).
+- `WORKER_GRACE_SECONDS` (3900, a little over `TASK_TIME_LIMIT_S`; not in `deploy.env.example`) is how long a
+  stopping worker pod may take to finish.
 - `kubectl -n <namespace> get scaledobject,hpa` shows the current and wanted numbers.
 
 ### Music notation read note by note
@@ -245,3 +318,22 @@ With scaling on, no pod runs until a document has music: KEDA starts one when a 
 `SCALE_DOWN_SECONDS` of quiet. The first reading waits for the pod to start (longer the first time a node pulls
 the image); if nothing answers within `MUSIC_WAIT_SECONDS` (240) the examples are described
 by the AI as before. Without scaling, one pod is always running (768 MiB requested, up to `MUSIC_MEMORY_LIMIT`).
+
+### Formulas read a second time, from their pictures
+
+Optional (`FORMULA_READER=on` in `deploy.env`, #403). Each formula the AI read is also read from its picture by a
+formula reader, [RapidLaTeXOCR](https://github.com/RapidAI/RapidLaTeXOCR) (Apache-2.0; pix2tex's model, MIT, run with
+ONNX Runtime, about a second a formula on a CPU), independent of the AI. The two are compared by rule (MathCAT reads
+both): where they say other numbers or letters, the formula is flagged and Edit tag offers every reading. The
+reader is noisier than the AI, so its equation numbers and padding are taken off, and a reading that shows it
+couldn't read the picture, or says far more or less than the AI's, is set aside rather than flagged. On a real
+textbook chapter (Local AI) it compared 39 of 65 formulas and flagged 4.
+
+1. `scripts/build.sh --only formula` builds and pushes `pdfrem-formula` (about 870 MB; the model is downloaded
+   while building and checked against its SHA-256).
+2. Set `FORMULA_READER=on` and run `scripts/deploy.sh`.
+
+With scaling on, no pod runs until a document has formulas: KEDA starts one when a picture is put on the Redis
+list `formula:requests`, adds another per `FORMULA_PER_POD` (20) waiting up to `FORMULA_MAX` (2), and removes them
+after `SCALE_DOWN_SECONDS` of quiet. If nothing answers within three minutes the formulas are checked as before.
+The reader reaches only Redis and DNS, and only Prometheus reaches it.

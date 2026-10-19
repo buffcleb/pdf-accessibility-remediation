@@ -34,6 +34,8 @@ function fmtX(iso: string, period: string) {
   if (Number.isNaN(d.getTime())) return iso;
   if (period === "month") return d.toLocaleDateString(undefined, { month: "short", year: "numeric", timeZone: "UTC" });
   if (period === "hour") return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", timeZone: "UTC" });
+  // Monitoring's charts (#397): the viewer's own time, to the minute
+  if (period === "time") return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
 }
 
@@ -91,7 +93,8 @@ function useWidth() {
   return [ref, width] as const;
 }
 
-export function ReportChart({ chart, period, title, busy }: { chart: ChartData; period: string; title: string; busy?: boolean }) {
+export function ReportChart({ chart, period, title, busy, note = "The table below has every number." }:
+  { chart: ChartData; period: string; title: string; busy?: boolean; note?: string }) {
   const [measureKey, setMeasureKey] = useState(chart.measures[0]?.key);
   const measure = chart.measures.find((m) => m.key === measureKey) ?? chart.measures[0];
   useEffect(() => { if (!chart.measures.some((m) => m.key === measureKey)) setMeasureKey(chart.measures[0]?.key); }, [chart, measureKey]);
@@ -99,7 +102,7 @@ export function ReportChart({ chart, period, title, busy }: { chart: ChartData; 
   return (
     <figure className={`report-chart${busy ? " busy" : ""}`} aria-label={`${title}: ${measure.label}`}>
       <div className="chart-head">
-        <figcaption><strong>{measure.label}</strong>{chart.kind !== "hbar" && <span className="muted"> by {lowerFirst(chart.x_label)}</span>}</figcaption>
+        <figcaption><strong>{measure.label}</strong>{chart.kind !== "hbar" && chart.x_kind !== "time" && <span className="muted"> by {lowerFirst(chart.x_label)}</span>}</figcaption>
         {chart.measures.length > 1 && (
           <div className="chart-measures" role="group" aria-label="Show">
             {chart.measures.map((m) => (
@@ -112,7 +115,7 @@ export function ReportChart({ chart, period, title, busy }: { chart: ChartData; 
       {chart.kind === "hbar"
         ? <HBars chart={chart} measure={measure} />
         : <Plot chart={chart} measure={measure} period={period} />}
-      <p className="muted small chart-note">The table below has every number.</p>
+      {note && <p className="muted small chart-note">{note}</p>}
     </figure>
   );
 }
@@ -168,7 +171,8 @@ function Plot({ chart, measure, period }: { chart: ChartData; measure: ChartData
   const y = (v: number) => M.top + innerH - (v / yMax) * innerH;
   const band = innerW / Math.max(1, xs.length);
   const xCenter = (i: number) => M.left + band * i + band / 2;
-  const labelEvery = Math.max(1, Math.ceil(xs.length / Math.max(1, Math.floor(innerW / 70))));
+  const labelW = period === "time" ? 110 : 70;  // "Oct 17, 7:15 PM" needs more room than a date
+  const labelEvery = Math.max(1, Math.ceil(xs.length / Math.max(1, Math.floor(innerW / labelW))));
   const barW = Math.min(24, Math.max(3, (band * 0.75 - 2 * (series.length - 1)) / series.length));
   const slot = (name: string) => `var(--series-${(series.indexOf(name) % MAX_SERIES) + 1})`;
 

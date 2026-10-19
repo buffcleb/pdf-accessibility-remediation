@@ -50,3 +50,8 @@ without signing in.
 If you set up scheduled views of the live reports (see the [group admin guide](../group-admins/reports.md)), they're
 listed here: change how often, who gets it and the CSV, email yourself a sample, or delete. Views others send you
 are listed too, with **Stop getting it**.
+
+## Signed-in devices
+
+**Sign out of all devices** signs you out of every browser and device at once, this one too: for a laptop you no
+longer have, or a shared computer you left signed in. You'll need a new code to sign in again.

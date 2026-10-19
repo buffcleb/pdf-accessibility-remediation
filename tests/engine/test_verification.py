@@ -158,8 +158,23 @@ def test_language_mismatch_flagged(tmp_path):
     doc.save(src)
     out = tmp_path / "lang_tagged.pdf"
     tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
-    findings = _semantic(out)
-    lang = [f for f in findings if f.issue.startswith("passage in a different language")]
+    # A sentence or more, the detector very sure: tagged French (#340), so the review has nothing to flag
+    with pikepdf.open(out) as pdf:
+        assert [str(o.Lang) for o in pdf.objects if isinstance(o, pikepdf.Dictionary) and "/Lang" in o
+                and o.get("/Type") == "/StructElem"] == ["fr"]
+    assert not [f for f in _semantic(out) if f.issue.startswith("passage in a different language")]
+    # Shorter than that: left for a person, and flagged
+    short = tmp_path / "short.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_textbox(fitz.Rect(50, 50, 550, 150), "This syllabus describes the course and its weekly schedule "
+                        "of readings, labs and assignments for the semester.", fontsize=11)
+    page.insert_textbox(fitz.Rect(50, 170, 550, 270), "Ce programme est disponible en français sur demande.",
+                        fontsize=11)
+    doc.save(short)
+    out2 = tmp_path / "short_tagged.pdf"
+    tag_document(short, out2, prepare_analysis(short), title="T", language="en-US")
+    lang = [f for f in _semantic(out2) if f.issue.startswith("passage in a different language")]
     assert lang and lang[0].extra["detected_lang"] == "fr"
 
 

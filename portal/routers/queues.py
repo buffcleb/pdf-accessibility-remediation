@@ -48,6 +48,7 @@ class ItemOut(BaseModel):
     can_retry: bool
     can_cancel: bool
     can_stop: bool = False
+    can_restart: bool = False
     can_remove: bool = False
     can_process_now: bool = False
 
@@ -79,6 +80,7 @@ class LiveItemOut(BaseModel):
     can_retry: bool = False
     can_cancel: bool = False
     can_stop: bool = False
+    can_restart: bool = False
     can_remove: bool = False
     can_process_now: bool = False
 
@@ -148,6 +150,14 @@ def stop(key: str, item_id: str, request: Request, p: Principal = Depends(requir
          db: Session = Depends(get_db)):
     """Stop an item that's in progress (the engine is told to stop it too)."""
     queues.stop(db, request, key, item_id, p.user)
+    db.commit()
+
+
+@router.post("/{key}/items/{item_id}/restart", status_code=204)
+def restart(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+            db: Session = Depends(get_db)):
+    """Start an item that's in progress over (it goes back to the queue; nothing is charged again)."""
+    queues.restart(db, request, key, item_id, p.user)
     db.commit()
 
 

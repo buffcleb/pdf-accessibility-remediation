@@ -31,6 +31,9 @@ Open a queue to see its items: **Waiting**, **In progress** and **Failed** (last
 - **Stop** an item that's in progress: a document that's stuck or was sent by mistake, a save being checked, a
   review being run. It ends at once and frees its place in the engine. A stopped document gives the person's pages
   back, and they're emailed; they can send it again.
+- **Restart** an item that's in progress but not moving: its engine worker was lost, or a deploy cut it off. The
+  engine is told to stop its copy, and the item goes back to the queue, keeping its place. A document's pages stay
+  held as they were, so nothing is charged again, and nobody is emailed.
 - **Remove** a failed item from the list once you've dealt with it. Nothing about the item changes (a document
   stays in the person's documents as failed, with its history); it just stops being listed and counted here. If
   it's tried again and fails again, it's listed again.
@@ -57,8 +60,25 @@ document without knowing which queue it is in.
   belongs to no group, so it is left out when a group is chosen.
 - The list **updates every 3 seconds**. **Pause updates** holds it still while you read a row; **Resume updates**
   catches up.
-- **Stop**, **Cancel** and **Process now** work as in a queue's own list. To try a failed item again or take it
-  off the failed list, open its queue under **By queue**.
+- **Stop**, **Restart**, **Cancel** and **Process now** work as in a queue's own list. To try a failed item again or
+  take it off the failed list, open its queue under **By queue**.
 
 Progress is by stage: a long stage (the AI writing, the AI review) stays at one figure until it ends. The view
 takes up to 300 items of each kind; narrow it if it says there is more.
+
+## Re-running a document
+
+Any finished, failed or stopped document has **Re-run** on its page, for super admins. It makes a new document for
+the same owner, with the original file and the same options, and puts it in the queue. The old document, its
+versions and its edits stay as they are, and each links to the other. Use it when an engine fix should be tried on
+a document that already went through.
+
+Pages aren't charged again unless you tick **Charge the owner's pages again**: then they're held on the owner's
+limits as for an upload, and refused if the owner doesn't have enough. The reason you give, if any, goes into the
+audit log with the re-run (`job.rerun`). A document whose files have been deleted can't be re-run.
+
+**Ignore the document's existing tags** re-runs it tagged afresh from the page, its own tags set aside: for a PDF
+whose tags turned out poor. It starts as the original was run, ticked or not.
+
+The document page also has a **Run details** tab for super admins: what the run cost and used, the limits it
+reached, time by stage, and the engine's side (its job ID, route, error and warnings).

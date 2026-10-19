@@ -136,3 +136,43 @@ def download_dir(url: str, directory: Path) -> int:
     if n == 0:
         raise FileNotFoundError(f"nothing found at {url}")
     return n
+
+
+# --- the nightly backup on the cluster (#333) --------------------------------------------------------
+
+def prune_backups(directory: Path, daily: int, weekly: int, dry_run: bool = False) -> list[str]:
+    """Keep the newest `daily` backups, and the newest backup of each of the `weekly` most recent weeks besides;
+    remove the rest (and any partial backup left by a run that failed). Names are backup-YYYYmmdd-HHMMSS, so they
+    sort by time. Returns the names removed."""
+    import shutil
+    from datetime import datetime
+
+    names = sorted((p.name for p in directory.iterdir() if p.is_dir() and p.name.startswith("backup-")
+                    and not p.name.endswith(".partial")), reverse=True)
+    keep = set(names[:daily])
+    weeks: list[tuple[int, int]] = []
+    for n in names:
+        try:
+            week = datetime.strptime(n[7:22], "%Y%m%d-%H%M%S").isocalendar()[:2]
+        except ValueError:
+            keep.add(n)  # not one of ours: leave it alone
+            continue
+        if week not in weeks:
+            weeks.append(week)
+            if len(weeks) <= weekly:
+                keep.add(n)
+    gone = [n for n in names if n not in keep]
+    gone += sorted(p.name for p in directory.iterdir() if p.is_dir() and p.name.endswith(".partial"))
+    if not dry_run:
+        for n in gone:
+            shutil.rmtree(directory / n, ignore_errors=True)
+    return gone
+
+
+def record_backup() -> None:
+    """A nightly backup finished: kept for the "last backup" alert (#334)."""
+    from portal import alerts
+    from portal.db import _sessionmaker
+    with _sessionmaker()() as db:
+        alerts.beat(db, alerts.BACKUP)
+        db.commit()

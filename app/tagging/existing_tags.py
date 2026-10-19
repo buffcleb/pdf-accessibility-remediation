@@ -18,6 +18,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name
 
 from app.tagging.content_marker import mcid_of
+from app.tagging.mathml_tags import in_mathml
 
 STANDARD_TYPES = {
     "Document", "Part", "Art", "Sect", "Div", "BlockQuote", "Caption", "TOC", "TOCI", "Index",
@@ -39,6 +40,7 @@ KNOWN_ROLE_MAP = {
 }
 _TABLE_KIDS = {"TR", "THead", "TBody", "TFoot", "Caption"}
 # The note Office adds to the alt text it writes itself (Word and PowerPoint, older and newer wording)
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 OFFICE_AUTO_ALT = re.compile(r"\s*(Description automatically generated(?: with (?:very high|high|medium|low) confidence)?"
                              r"|AI-generated content may be incorrect)\.?\s*", re.I)
 _ROW_GROUP_KIDS = {"TR"}
@@ -342,6 +344,8 @@ class ExistingTree:
         return referenced
 
     def _repair_element(self, e: ElemInfo, figure_alt_lookup) -> None:
+        if in_mathml(e.obj):
+            return  # a formula's MathML, in its own namespace: it says what it is, and is kept as written (#403)
         # Unknown roles: map them to a standard type via RoleMap.
         if e.role not in STANDARD_TYPES:
             target = KNOWN_ROLE_MAP.get(e.raw_role) or (
@@ -378,6 +382,8 @@ class ExistingTree:
 
         if e.objrefs and e.role not in ("Link", "Annot", "Form"):
             self._wrap_links(e)
+
+        self._strip_controls(e)
 
         if e.role == "Figure" and e.obj.get("/Alt") is not None and OFFICE_AUTO_ALT.search(str(e.obj.Alt)):
             # Office's automatic alt text, marked as such ("Description automatically generated"): use ours if
@@ -836,6 +842,25 @@ class ExistingTree:
             prev = level
 
     # ------------------------------------------------------------------ helpers
+    def _strip_controls(self, e: ElemInfo) -> None:
+        """Control characters out of the text a tag carries: Word's PDFMaker can end alt text with the NUL that ends
+        a C string ("---\\x00"), which a screen reader may read out and Postgres can't store. Tabs and line breaks
+        stay. Alt text that was nothing else is removed, so the figure counts as undescribed."""
+        for key, what in (("/Alt", "alt text"), ("/ActualText", "read-aloud text"), ("/E", "abbreviation expansion"),
+                          ("/T", "title")):
+            v = e.obj.get(key)
+            if not isinstance(v, pikepdf.String):
+                continue
+            text = str(v)
+            cleaned = CONTROL_CHARS.sub("", text)
+            if cleaned == text:
+                continue
+            if cleaned.strip():
+                e.obj[key] = pikepdf.String(cleaned)
+            else:
+                del e.obj[key]
+            self._mark(e, "repaired", f"control characters removed from the {what}")
+
     def _mark(self, e: ElemInfo, decision: str, reason: str) -> None:
         rank = {"retained": 0, "repaired": 1, "removed": 2, "replaced": 2, "artifacted": 2}
         if rank[decision] > rank[e.decision]:

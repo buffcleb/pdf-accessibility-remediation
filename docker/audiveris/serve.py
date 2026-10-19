@@ -7,7 +7,7 @@ piece: {"ok": true, "files": [{"name", "musicxml"}]} (one file, or one per movem
 scaling down never loses a reading.
 
 Settings: REDIS_URL (redis://redis:6379/0), OMR_READ_TIMEOUT_S (120: one picture), OMR_PAGE_TIMEOUT_S (90: each
-page of a whole score), OMR_RESULT_TTL_S (900).
+page of a whole score), OMR_RESULT_TTL_S (900), METRICS_PORT (9464: for Prometheus, #397; 0 turns it off).
 """
 import base64
 import glob
@@ -18,7 +18,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import redis
 
@@ -30,6 +32,38 @@ PAGE_TIMEOUT = int(os.environ.get("OMR_PAGE_TIMEOUT_S", "90"))  # a whole score:
 RESULT_TTL = int(os.environ.get("OMR_RESULT_TTL_S", "900"))
 
 stopping = False
+# For Prometheus (#397): reading now or not, and what's been read, in its text format (the image has no client library)
+stats = {"busy": 0, "read": 0, "not_read": 0}
+
+
+class Metrics(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 - the stdlib's name
+        if self.path != "/metrics":
+            self.send_error(404)
+            return
+        body = ("# HELP music_reader_busy 1 while a picture is being read\n# TYPE music_reader_busy gauge\n"
+                f"music_reader_busy {stats['busy']}\n"
+                "# HELP music_reader_requests_total Pictures read, by result\n"
+                "# TYPE music_reader_requests_total counter\n"
+                f'music_reader_requests_total{{result="read"}} {stats["read"]}\n'
+                f'music_reader_requests_total{{result="not_read"}} {stats["not_read"]}\n').encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # Prometheus asks every 30 seconds: not worth a line each time
+        pass
+
+
+def serve_metrics(port: int) -> None:
+    try:
+        server = HTTPServer(("0.0.0.0", port), Metrics)
+    except OSError as exc:
+        log("metrics not served on port", port, exc)
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 def log(*parts) -> None:
@@ -75,6 +109,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     client = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379/0"))
+    if int(os.environ.get("METRICS_PORT", "9464")):
+        serve_metrics(int(os.environ.get("METRICS_PORT", "9464")))
     log("music reading service: waiting on", QUEUE)
     while not stopping:
         try:
@@ -95,6 +131,7 @@ def main() -> int:
             log(rid, "skipped: nobody is waiting for it any more")
             continue
         started = time.time()
+        stats["busy"] = 1
         try:
             if req.get("pdf"):
                 answer = read(base64.b64decode(req["pdf"]), "pdf", int(req.get("pages") or 1))
@@ -102,6 +139,9 @@ def main() -> int:
                 answer = read(base64.b64decode(req["png"]))
         except Exception as exc:  # noqa: BLE001 - always answer
             answer = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+        finally:
+            stats["busy"] = 0
+        stats["read" if answer.get("ok") else "not_read"] += 1
         key = RESULT.format(id=rid)
         try:
             pipe = client.pipeline()

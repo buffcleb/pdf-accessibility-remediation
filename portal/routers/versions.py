@@ -15,20 +15,21 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, queues, services, tagmarks
+from portal import approval, audit, finding_marks, queues, services, tagmarks
 from portal.db import get_db
 from portal.deps import Principal, current_principal
 from portal.errors import ApiError, not_found
-from portal.models import DocumentVersion, Job, JobFile, TagDraft
+from portal.models import DocumentVersion, FindingMark, Job, JobFile, TagDraft
 from portal.routers.jobs import _file, _record_access, _visible_job
-from portal.security.ratelimit import RateLimiter, get_rate_limiter
+from portal.security.ratelimit import RateLimiter, get_rate_limiter, per_person
 from portal.storage import get_storage, safe_name
 
 router = APIRouter(tags=["versions"])
 
 OPS = {"set_role", "set_alt", "set_actual_text", "set_decorative", "set_lang", "set_cell", "move", "merge", "split",
        "assign", "tag_artifacts", "delete", "make_list", "indent", "outdent", "build_list", "take_pieces", "cut_area", "make_toc",
-       "set_headers", "link_note"}
+       "set_headers", "link_note", "set_field_label", "set_doc_title", "set_doc_lang", "rebuild_table", "build_table"}
+DOC_OPS = {"set_doc_title", "set_doc_lang"}  # the document's title and language: no element (#363)
 MAX_EDITS = 5000
 MAX_EDITS_BYTES = 8 * 1024 * 1024  # all of one save's or draft's edits together, as JSON
 MAX_PENDING_PER_JOB = 3
@@ -92,7 +93,8 @@ def _version_out(db: Session, v: DocumentVersion, numbers: dict[uuid.UUID, int])
     return VersionOut(
         id=v.id, number=v.number, kind=v.kind, label=v.label, status=v.status,
         based_on=numbers.get(v.based_on_id) if v.based_on_id else None, created_by_email=v.created_by_email,
-        note=v.note, edits_count=len(v.edits or []), summary=v.summary, error_message=v.error_message,
+        note=v.note, edits_count=len(v.edits or []), summary=finding_marks.summary_with_keys(v.summary, "findings"),
+        error_message=v.error_message,
         has_tagmap=v.tagmap_file_id is not None, pdf_file_id=v.pdf_file_id, pdf_name=pdf.name if pdf else None,
         pdf_size=pdf.size_bytes if pdf else None, verapdf_file_id=v.verapdf_file_id,
         created_at=v.created_at, finished_at=v.finished_at, review=v.review, review_status=v.review_status,
@@ -158,7 +160,7 @@ def _version_file(db: Session, request: Request, p: Principal, job_id: uuid.UUID
     return f
 
 
-@router.get("/jobs/{job_id}/versions/{number}/pdf")
+@router.get("/jobs/{job_id}/versions/{number}/pdf", dependencies=[Depends(per_person("download"))])
 def version_pdf(job_id: uuid.UUID, number: int, request: Request, reason: str | None = Query(None, max_length=500),
                 p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     f = _version_file(db, request, p, job_id, number, "pdf", reason)
@@ -195,11 +197,13 @@ def _check_edits(edits: list[dict]) -> None:
     """Shape checks; the engine validates each edit against the document itself."""
     total = 0
     for n, op in enumerate(edits, 1):
-        if not isinstance(op, dict) or op.get("op") not in OPS or not isinstance(op.get("element"), int):
+        if (not isinstance(op, dict) or op.get("op") not in OPS
+                or (op["op"] not in DOC_OPS and not isinstance(op.get("element"), int))):
             raise ApiError(422, "invalid_edit", f"Edit {n} isn't a valid tag edit.")
         # An area's list of pieces can be long (a whole page); everything else is small
         size = len(json.dumps(op))
-        if size > (64000 if op["op"] in ("assign", "tag_artifacts", "build_list", "take_pieces") else 8000):
+        big = ("assign", "tag_artifacts", "build_list", "take_pieces", "rebuild_table", "build_table")
+        if size > (64000 if op["op"] in big else 8000):
             raise ApiError(422, "invalid_edit", f"Edit {n} is too large.")
         # Together, too: the per-edit caps alone allow hundreds of megabytes a draft, kept in the database
         total += size
@@ -456,14 +460,19 @@ def describe_area(job_id: uuid.UUID, number: int, body: DescribeRequest, request
             raise ApiError(422, "describe_failed", f"That area couldn't be described: {e}")
     cost = float(out.get("cost_usd") or 0)
     prev = job.cost or {}
+    # Each use, for the Describe with AI report (#318): when, by whom, what it cost (the job's cost is super admins')
+    log = list(prev.get("describe_log") or [])[-999:]
+    log.append({"at": datetime.now(timezone.utc).isoformat(), "user": str(p.user.id), "usd": round(cost, 6),
+                "model": out.get("model"), "page": body.page})
     job.cost = {**prev, "describe_usd": round(float(prev.get("describe_usd") or 0) + cost, 6),
-                "describe_calls": int(prev.get("describe_calls") or 0) + 1}
+                "describe_calls": int(prev.get("describe_calls") or 0) + 1, "describe_log": log}
+    # The cost in dollars is super admins' (#314): the job's cost keeps it for them; the audit log, which group admins
+    # read, and the answer to anyone else don't carry it
     audit.record(db, request, "version.ai_described", actor=p.user, target_type="job", target_id=job.id,
-                 group_id=job.group_id, details={"version": v.number, "page": body.page, "cost_usd": round(cost, 6),
-                                                 "model": out.get("model")})
+                 group_id=job.group_id, details={"version": v.number, "page": body.page, "model": out.get("model")})
     db.commit()
     return {"alt": out.get("alt") or "", "kind": out.get("kind"), "decorative": bool(out.get("decorative")),
-            "cost_usd": round(cost, 6)}
+            **({"cost_usd": round(cost, 6)} if p.is_super_admin else {})}
 
 
 class ReviewRequest(BaseModel):
@@ -503,3 +512,84 @@ def review_version(job_id: uuid.UUID, number: int, request: Request, body: Revie
     db.commit()
     vs = _versions(db, job)
     return _version_out(db, v, {x.id: x.number for x in vs})
+
+
+# --- review items signed off (#366) -------------------------------------------------------------------------------
+
+class MarkOut(BaseModel):
+    key: str
+    status: str
+    note: str | None
+    set_by_email: str
+    set_at: datetime
+
+
+class MarksOut(BaseModel):
+    can_mark: bool
+    marks: list[MarkOut]
+
+
+class MarkSet(BaseModel):
+    status: Literal["checked", "fixed", "not_issue"] | None  # None: back to not looked at
+    note: str | None = Field(None, max_length=1000)
+
+
+_KEY = re.compile(r"^[0-9a-f]{20}$")
+
+
+@router.get("/jobs/{job_id}/finding-marks", response_model=MarksOut)
+def get_marks(job_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The review items signed off on this document, by key; anyone who can see it sees them."""
+    job = _visible_job(db, job_id, p)
+    marks = finding_marks.marks_for(db, job.id).values()
+    return MarksOut(can_mark=can_edit(p, job), marks=[
+        MarkOut(key=m.key, status=m.status, note=m.note, set_by_email=m.set_by_email, set_at=m.set_at)
+        for m in sorted(marks, key=lambda m: m.set_at)])
+
+
+@router.put("/jobs/{job_id}/finding-marks/{key}", response_model=MarkOut | None)
+def set_mark(job_id: uuid.UUID, key: str, body: MarkSet, request: Request, p: Principal = Depends(current_principal),
+             db: Session = Depends(get_db)):
+    """Sign a review item off (checked, fixed, not an issue), or take that back. The people who can edit the
+    document's tags can."""
+    if not _KEY.match(key):
+        raise ApiError(422, "invalid_key", "That isn't a review item.")
+    job = _editable_job(db, job_id, p)
+    mark = db.scalar(select(FindingMark).where(FindingMark.job_id == job.id, FindingMark.key == key))
+    note = (body.note or "").strip() or None
+    if body.status is None:
+        if mark is not None:
+            db.delete(mark)
+    elif mark is None:
+        mark = FindingMark(job_id=job.id, key=key, status=body.status, note=note, set_by_id=p.user.id,
+                           set_by_email=p.user.email, set_at=datetime.now(timezone.utc))
+        db.add(mark)
+    else:
+        mark.status, mark.note, mark.set_by_id, mark.set_by_email = body.status, note, p.user.id, p.user.email
+        mark.set_at = datetime.now(timezone.utc)
+    audit.record(db, request, "finding.marked", actor=p.user, target_type="job", target_id=job.id,
+                 group_id=job.group_id, details={"item": key, "status": body.status})
+    db.commit()
+    if body.status is None:
+        return None
+    return MarkOut(key=mark.key, status=mark.status, note=mark.note, set_by_email=mark.set_by_email,
+                   set_at=mark.set_at)
+
+
+@router.get("/jobs/{job_id}/findings.csv")
+def findings_csv(job_id: uuid.UUID, version: int | None = Query(None, ge=1), p: Principal = Depends(current_principal),
+                 db: Session = Depends(get_db)):
+    """The review items as a spreadsheet, each with its status: the document's own, or a version's."""
+    job = _visible_job(db, job_id, p)
+    if version is None:
+        review = (job.result_summary or {}).get("review") or {}
+        findings, total, label = review.get("findings") or [], review.get("findings_total") or 0, ""
+    else:
+        summary = _version(db, job, version).summary or {}
+        findings, total = summary.get("findings") or [], summary.get("findings_total") or 0
+        label = f"-v{version}"
+    data = finding_marks.findings_csv(findings, finding_marks.marks_for(db, job.id), max(total, len(findings)))
+    name = safe_name(job.filename.rsplit(".", 1)[0], default="document") + f"{label}-review.csv"
+    return Response("\ufeff" + data, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+

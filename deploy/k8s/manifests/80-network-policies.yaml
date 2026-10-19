@@ -6,7 +6,17 @@
 #
 # Probes from the kubelet and traffic between the pods named here are the only flows these services need. The
 # ingress controller reaches only the web pod (60-web.yaml), or the portal API in the Worker front end
-# (81-api-origin-policy.yaml). Egress is not restricted.
+# (81-api-origin-policy.yaml).
+#
+# Egress: the pods that open uploaded PDFs (the engine's API, workers and scheduler, and the music reader) reach only
+# the cluster services they use and DNS, so an engine taken over by a crafted PDF can't send anything out (#361).
+# Their AI calls go through the gateway (AI_GATEWAY_ONLY in 40-engine.yaml). The gateway, the Adobe worker (Adobe's
+# API) and the portal keep their internet access. The job folder is an NFS mount made by the node, not the pod, so
+# it isn't affected.
+#
+# Monitoring (#397, 95-monitoring.yaml): Prometheus reads the metrics of the portal, the engine and the workers on
+# their own ports, and its exporters reach Postgres and Redis. The rules for it are here whether or not it's
+# deployed; with no Prometheus pod they let nothing in.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -21,8 +31,12 @@ spec:
         - podSelector: { matchLabels: { app: portal-worker } }
         - podSelector: { matchLabels: { app: litellm } }
         - podSelector: { matchLabels: { app: portal-migrate } }
+        # The nightly backup's database dumps (90-backup.yaml, BACKUPS=cronjob)
+        - podSelector: { matchLabels: { app: backup } }
         # KEDA reads the queue's length from the portal's database (45-autoscale.yaml)
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: keda } }
+        # Postgres's own statistics, through an account that reads no table (deploy/k8s/monitoring-role.sql)
+        - podSelector: { matchLabels: { app: postgres-exporter } }
       ports: [{ port: 5432 }]
 ---
 apiVersion: networking.k8s.io/v1
@@ -42,8 +56,10 @@ spec:
         - podSelector: { matchLabels: { app: portal-api } }
         - podSelector: { matchLabels: { app: portal-worker } }
         - podSelector: { matchLabels: { app: music-reader } }
-        # KEDA reads the music queue's length (46-music-autoscale.yaml)
+        - podSelector: { matchLabels: { app: formula-reader } }  # the formula reading service (37-formula.yaml)
+        # KEDA reads the music and formula queues' lengths (46-music-autoscale.yaml, 47-formula-autoscale.yaml)
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: keda } }
+        - podSelector: { matchLabels: { app: redis-exporter } }
       ports: [{ port: 6379 }]
 ---
 apiVersion: networking.k8s.io/v1
@@ -59,6 +75,7 @@ spec:
     - from:
         - podSelector: { matchLabels: { app: portal-api } }
         - podSelector: { matchLabels: { app: portal-worker } }
+        - podSelector: { matchLabels: { app: backup } }  # the nightly backup's copy of the stored files
       ports: [{ port: 8333 }]
 ---
 apiVersion: networking.k8s.io/v1
@@ -105,9 +122,10 @@ spec:
     - from:
         - podSelector: { matchLabels: { app: portal-api } }
         - podSelector: { matchLabels: { app: portal-worker } }
+        - podSelector: { matchLabels: { app: prometheus } }  # /api/v1/metrics
       ports: [{ port: 8000 }]
 ---
-# The workers and the scheduler take their work from Redis and answer no one
+# The workers and the scheduler take their work from Redis and answer no one but Prometheus, on their metrics port
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -116,8 +134,12 @@ metadata:
 spec:
   podSelector:
     matchExpressions:
-      - { key: app, operator: In, values: [engine-worker, engine-adobe-worker, engine-beat, portal-worker, music-reader] }
+      - { key: app, operator: In, values: [engine-worker, engine-adobe-worker, engine-beat, portal-worker, music-reader,
+                                           formula-reader] }
   policyTypes: [Ingress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: prometheus } } }]
+      ports: [{ port: 9464 }]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -131,4 +153,44 @@ spec:
     - from:
         - podSelector: { matchLabels: { app: web } }
         - podSelector: { matchLabels: { app: cloudflared } }
+        - podSelector: { matchLabels: { app: prometheus } }  # /metrics
       ports: [{ port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: engine-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [engine-api, engine-worker, engine-beat] }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } },
+             podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ podSelector: { matchLabels: { app: redis } } }]
+      ports: [{ port: 6379 }]
+    - to: [{ podSelector: { matchLabels: { app: verapdf } } }]
+      ports: [{ port: 8080 }]
+    - to: [{ podSelector: { matchLabels: { app: litellm } } }]
+      ports: [{ port: 4000 }]
+---
+# The music reader and the formula reader take their pictures from Redis and answer there
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: music-egress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [music-reader, formula-reader] }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } },
+             podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ podSelector: { matchLabels: { app: redis } } }]
+      ports: [{ port: 6379 }]

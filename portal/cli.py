@@ -9,6 +9,9 @@
                                                      restore files from a tar stream on stdin
     python -m portal.cli upload-backup DIR s3://bucket/prefix      copy a backup folder off the machine
     python -m portal.cli download-backup s3://bucket/prefix/NAME DIR
+    python -m portal.cli prune-backups DIR --daily N --weekly N [--dry-run]
+                                                     keep the newest N backups and one a week for N weeks
+    python -m portal.cli backup-done                 record that the nightly backup finished (for its alert)
 
 The file and backup commands are used by scripts/backup.sh and scripts/restore.sh.
 """
@@ -89,6 +92,18 @@ def _download(args) -> None:
     print(f"downloaded {download_dir(args.url, Path(args.directory))} files", file=sys.stderr)
 
 
+def _prune(args) -> None:
+    from portal.backup_tools import prune_backups
+    gone = prune_backups(Path(args.directory), args.daily, args.weekly, dry_run=args.dry_run)
+    for n in gone:
+        print(f"{'would remove' if args.dry_run else 'removed'} {n}", file=sys.stderr)
+
+
+def _backup_done(_args) -> None:
+    from portal.backup_tools import record_backup
+    record_backup()
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="python -m portal.cli", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -116,6 +131,13 @@ def main(argv: list[str]) -> int:
     p.add_argument("url")
     p.add_argument("directory")
     p.set_defaults(fn=_download)
+    p = sub.add_parser("prune-backups")
+    p.add_argument("directory")
+    p.add_argument("--daily", type=int, required=True)
+    p.add_argument("--weekly", type=int, required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=_prune)
+    sub.add_parser("backup-done").set_defaults(fn=_backup_done)
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
         ap.print_help()

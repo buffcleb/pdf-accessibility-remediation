@@ -22,10 +22,13 @@ A badge on **Administration** counts what's waiting for you, such as people wait
 The first page: what needs action, most serious first, each with what to do about it.
 
 - **People waiting for approval.**
-- **Pools that are empty or running low.** With an empty pool, everyone sees 0 pages left, whatever their own
-  limit.
+- **Pools that are empty or running low.** You're also emailed once when one drops below the service's threshold
+  (10% of the pool or 20 pages, whichever is larger, unless your administrators set otherwise), so you can request
+  more in time. With an empty pool, everyone sees 0 pages left, whatever their own limit.
 - **Personal limits larger than what's left in the pool**, which can't actually be used.
 - **Documents** held for confirmation, waiting for a daily limit, stuck or failing.
+- **Documents whose engine worker was lost** partway through (it ran out of memory or its pod restarted). The
+  document's page says when the engine will try it again, or that it won't.
 - **Documents where the AI wasn't available.**
 - **Waiting for a paused service:** support has paused an option your group's documents use.
 

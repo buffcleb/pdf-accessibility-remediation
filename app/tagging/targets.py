@@ -29,7 +29,7 @@ class _T:
 
 
 # Blocks whose footnote marks are tagged as References inside them (others say "footnote 1" in their read-aloud text)
-MARK_ROLES = {"P", "H1", "H2", "H3", "H4", "H5", "H6"}
+MARK_ROLES = {"P", "H1", "H2", "H3", "H4", "H5", "H6", "LI"}
 
 
 def mark_key(block_id: str, n: int) -> str:
@@ -47,7 +47,7 @@ class PageResolver:
                 self.text.append(_T("artifact:" + (b.artifact_type or "Pagination"), "Artifact", b.bbox))
             else:
                 self.text.append(_T(b.id, _MC_TAG.get(b.role, b.role), b.bbox))
-        # A footnote's mark in a paragraph or heading is a target of its own (the smallest box it lies in), so its
+        # A footnote's mark in a paragraph, heading or list item is a target of its own (the smallest box it lies in), so its
         # glyphs are marked apart and can be tagged as a Reference to the note (struct_tree, mark_key)
         for b in page.blocks:
             if b.role in MARK_ROLES:

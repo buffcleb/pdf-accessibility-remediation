@@ -2,7 +2,8 @@
 
 Terms used in the portal and these guides, in alphabetical order.
 
-**Accessibility check.** The PDF/UA-1 check made with veraPDF, before and after remediation. A document
+**Accessibility check.** The PDF/UA-1 check (PDF/UA-2 for a PDF 2.0 file) made with veraPDF, before and after
+remediation. A document
 "passes" when no machine-checkable rule fails. It can't judge whether alt text is accurate or headings are the
 right ones, which is why there's also a review list.
 
@@ -14,7 +15,7 @@ model behind a level.
 image. The AI writes a first draft for every figure; charts and diagrams are worth checking.
 
 **Artifact.** Content that's decoration rather than meaning (page numbers, running headers, borders, a scanned
-page's background). Screen readers skip it.
+page's background). Screen readers skip it. In the tag manager, **Mark as artifact** makes a tag's content one.
 
 **Audit (Check only).** A check of a document without changing it: the accessibility check and the review list,
 but no remediated file.
@@ -37,7 +38,9 @@ The service adds an invisible text layer so the scanned text can be read aloud, 
 **Pages (allowance).** Each page of each document counts against your allowance for each processing option and
 AI level it uses. Your group has a pool; you may also have your own limit.
 
-**PDF/UA.** The ISO standard for accessible PDF (ISO 14289). PDF/UA-1 is the version this service aims at.
+**PDF/UA.** The ISO standard for accessible PDF (ISO 14289). PDF/UA-1 is the version this service aims at. A PDF 2.0
+file (as LaTeX's tagging and other recent tools write them) can only be PDF/UA-2, so it's checked and labelled as
+PDF/UA-2 instead.
 
 **Processing option (service).** How documents are tagged: *Standard* (this service's own engine) or, if your
 administrators offer it, *Adobe Autotag* (Adobe PDF Services).

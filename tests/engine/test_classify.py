@@ -91,6 +91,24 @@ def test_jev_needs_a_key_and_errors_are_ai_errors(math_pdf, monkeypatch):
         asyncio.run(cl.classify(math_pdf, KINDS, "jev"))
 
 
+def test_on_the_cluster_jev_goes_through_the_gateway(math_pdf, monkeypatch):
+    """#361: the engine has no internet access there and no OpenRouter key; the gateway's /systemone route adds it."""
+    cfg = get_settings()
+    monkeypatch.setattr(cfg, "ai_gateway_only", True)
+    monkeypatch.setattr(cfg, "openrouter_api_key", "")
+    monkeypatch.setattr(cfg, "gateway_base_url", "http://litellm:4000/v1")
+    monkeypatch.setattr(cfg, "gateway_api_key", "sk-gateway")
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"], seen["auth"] = str(request.url), request.headers["authorization"]
+        return httpx.Response(200, json={"answers": {"kind": {"choice": "forms", "confidence": 0.9}}})
+
+    _mock_client(monkeypatch, handler)
+    r = asyncio.run(cl.classify(math_pdf, KINDS, "jev"))
+    assert seen == {"url": "http://litellm:4000/systemone", "auth": "Bearer sk-gateway"} and r["kind"] == "forms"
+
+
 def test_the_gateway_model_is_asked_for_json(math_pdf, monkeypatch):
     prompts = []
 

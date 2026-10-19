@@ -31,10 +31,19 @@ spec:
             - { name: PORTAL_API_UPSTREAM, value: "http://portal-api:8080" }
             - { name: MAX_UPLOAD_SIZE, value: "${MAX_UPLOAD_SIZE}" }
             - { name: TRUSTED_PROXIES, value: "${WEB_TRUSTED_PROXIES}" }
+            # cloudflared's range: only from there is Cloudflare's caller header passed on (#336)
+            - { name: TUNNEL_PROXIES, value: "${TRUSTED_PROXY_CIDRS}" }
+            # Grafana at /grafana for super admins (#397, docker/web/16-grafana.sh); empty with MONITORING=off
+            - { name: GRAFANA_UPSTREAM, value: "${GRAFANA_UPSTREAM}" }
           ports: [{ containerPort: 8080 }]
           readinessProbe:
             httpGet: { path: /, port: 8080 }
             periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 8080 }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests: { cpu: 20m, memory: 32Mi }
             limits: { cpu: 500m, memory: 128Mi, ephemeral-storage: 1536Mi }

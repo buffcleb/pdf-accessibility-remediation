@@ -67,13 +67,30 @@ class PortalSettings(BaseSettings):
     rate_otp_per_email: int = 5
     rate_otp_per_ip: int = 30
     rate_verify_per_ip: int = 50
+    # Per person, per hour (#357; 0 turns one off): files downloaded, reports and person data exported, upload requests
+    rate_downloads_per_hour: int = 600
+    rate_exports_per_hour: int = 120
+    rate_uploads_per_hour: int = 200
     # Cloudflare Turnstile bot check on "Email me a code" (off unless both keys are set; see security/botcheck.py)
     turnstile_site_key: str = ""
     turnstile_secret_key: str = ""
     turnstile_fail_open: bool = True  # Cloudflare unreachable: allow (the rate limits still apply) rather than refuse
 
     # Trust X-Forwarded-For from a proxy in front of the API (Cloudflare, ALB, nginx)
+    # Set by the deploy when the cluster runs the nightly backup (#333, BACKUPS=cronjob): only then is a backup that
+    # hasn't finished for a while alerted. Off where backups are taken another way (the hosts' own, or none).
+    backup_expected: bool = False
+    # An upload's pages are counted in a child process with these limits (#356); past them the upload is refused
+    pdfcheck_isolated: bool = True  # off only in tests
+    pdfcheck_memory_mb: int = 1024
+    pdfcheck_cpu_s: int = 30
+    pdfcheck_timeout_s: float = 60
     trust_proxy_headers: bool = False
+    # With trusted proxy headers: the addresses (CIDRs, comma-separated) of the proxies in front of the API, such as
+    # cloudflared, the web pod and an ingress controller. The headers count only on a connection from one of them;
+    # anyone else is known by their own address, so they can't pick a fresh rate-limit bucket by setting a header
+    # (#336, security review M10). Empty: every connection's headers count (a local stack behind its own proxy).
+    trusted_proxies: str = ""
     # With trusted proxy headers: the header holding the caller's address. Cloudflare sets cf-connecting-ip; behind
     # the Cloudflare Worker front end (which forwards /api/ to the cluster) the Worker passes it as x-client-ip.
     client_ip_header: str = "cf-connecting-ip"
@@ -95,6 +112,12 @@ class PortalSettings(BaseSettings):
     engine_url: str = "http://localhost:8000"
     engine_api_key: str = ""
     engine_ai_provider: str = "localai"
+    metrics_enabled: bool = True  # /metrics for the deployment's Prometheus (#397)
+    worker_metrics_port: int = 9464  # the portal worker's own metrics (it serves no requests)
+    # MONITORING=on (#397): Grafana's address in the web app (e.g. /grafana/), and Prometheus's inside the cluster for
+    # the System page and its alerts. Empty: not part of this deployment.
+    grafana_url: str = ""
+    prometheus_url: str = ""
     engine_ai_model: str = ""
     # Jobs the portal keeps at the engine at once: at least this many, and as many as the engine's running workers
     # process at once when that's more (workers scaled with the queue), up to the ceiling

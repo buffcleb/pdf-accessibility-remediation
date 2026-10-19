@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TagEdit, TagElement, TagMap } from "../src/api";
-import { draftTree, editMarks, jumpQuestion, pageOrder, tagPages, tagsOnPage, undoMoves } from "../src/viewer/draft";
+import { addEdit, describe, documentDraft, draftTree, editMarks, jumpQuestion, overrides, pageOrder, tagPages, tagsOnPage, undoMoves, withoutEdits } from "../src/viewer/draft";
 
 type Spec = Partial<TagElement> & { i: number; role: string; parent: number | null };
 
@@ -107,4 +107,35 @@ test("one-page view asks before turning the page for a tag that spans pages", ()
   const top = map.elements[0];
   assert.deepEqual(jumpQuestion({ ...top, boxes: [{ page: 3, bbox: [0, 0, 1, 1] }, { page: 5, bbox: [0, 0, 1, 1] }] }, 4),
     { first: 3, last: 5, pages: 2, here: false });
+});
+
+test("a form field's label is one pending change per field, shown and described", () => {
+  const map = doc([
+    { i: 0, role: "Document", parent: null },
+    { i: 1, role: "P", parent: 0, own: true, text: "Last name" },
+    { i: 2, role: "Form", parent: 0, own: true, name: "Text1" },
+  ]);
+  const edit = (label: string): TagEdit => ({ op: "set_field_label", element: 2, expect_role: "Form", label });
+  const ops = addEdit(addEdit([], edit("Surname")), edit("Last name"));  // the second replaces the first
+  assert.equal(ops.length, 1);
+  assert.equal(overrides(ops, map).get(2)?.fieldLabel, "Last name");
+  assert.ok(/^Field label for .*→ “Last name”/.test(describe(ops[0], map)));
+  assert.deepEqual(editMarks(map, ops).get(2), ["field label"]);
+});
+
+test("the document's title and language are one pending change each, kept when a tag's changes are undone", () => {
+  const map = { ...sample(), document: { title: "Old title", lang: "en-US" } };
+  assert.deepEqual(documentDraft([], map), { title: "Old title", lang: "en-US" });
+  let ops = addEdit([], { op: "set_doc_title", title: "First try" });
+  ops = addEdit(ops, { op: "set_doc_title", title: "Annual report" });  // replaces the first
+  ops = addEdit(ops, { op: "set_doc_lang", lang: "fr-CA" });
+  ops = addEdit(ops, { op: "set_alt", element: 3, expect_role: "P", alt: "x" });
+  assert.equal(ops.length, 3);
+  assert.deepEqual(documentDraft(ops, map), { title: "Annual report", lang: "fr-CA" });
+  assert.equal(describe(ops[0], map), "Document title → “Annual report”");
+  assert.equal(describe(ops[1], map), "Document language → fr-CA");
+  assert.deepEqual(withoutEdits(map, ops, [3]).map((o) => o.op), ["set_doc_title", "set_doc_lang"]);
+  assert.equal(editMarks(map, ops).size, 1);  // nothing marked on a tag for the document's own changes
+  // A tag map from before the Document panel says neither
+  assert.deepEqual(documentDraft([], sample()), { title: "", lang: "" });
 });

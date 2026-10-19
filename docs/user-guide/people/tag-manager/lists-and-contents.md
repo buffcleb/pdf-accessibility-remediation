@@ -3,7 +3,7 @@
 [The tag manager](README.md) › Lists and tables of contents
 
 A list tagged as a list tells a screen reader how many items there are and where it ends. These tools are under
-**Lists** in the tag menu.
+**Lists and tables** in the tag menu.
 
 ## Building a list from an outline
 
@@ -30,9 +30,9 @@ of it.
 ## Making one list from several tags
 
 **Make one list from the N selected tags** turns each selected paragraph or heading into one item of a single list, in
-reading order. A list among the selected tags gives its items, so this also joins two lists (**Join the N selected lists into one** when they're all lists). (Choosing **List** under
-**Change type** is different: it makes a separate one-item list of each tag.) Figures and formulas can't become list
-items; they would lose their description.
+reading order. A list among the selected tags gives its items, so this also joins two lists (**Join the N selected
+lists into one** when they're all lists). (Choosing **List** under **Change type** is different: it makes a separate
+one-item list of each tag.) Figures and formulas can't become list items; they would lose their description.
 
 ## Nesting items
 

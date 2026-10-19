@@ -74,8 +74,14 @@ def _and(items) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def _ua1(snap: dict | None) -> dict:
-    return ((snap or {}).get("verapdf") or {}).get("ua1") or {}
+def _part(snap: dict | None) -> int:
+    """Which PDF/UA the verdict is by: 2 for a PDF 2.0 file, else 1 (#409)."""
+    return 2 if (snap or {}).get("pdfua_part") == 2 else 1
+
+
+def _ua(snap: dict | None) -> dict:
+    """The check the verdict is by, rule by rule."""
+    return ((snap or {}).get("verapdf") or {}).get(f"ua{_part(snap)}") or {}
 
 
 def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
@@ -107,11 +113,13 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
     fb, fa = before.get("failed_checks"), (after or {}).get("failed_checks")
     if audit_only:
         s.append(f'<p class="verdict">The document <strong>{"passes" if before.get("compliant") else "does not pass"}'
-                 f"</strong> the PDF/UA-1 accessibility check{f' ({fb:,} failed checks)' if isinstance(fb, int) else ''}. "
+                 f"</strong> the PDF/UA-{_part(before)} accessibility check"
+                 f"{f' ({fb:,} failed checks)' if isinstance(fb, int) else ''}. "
                  "It was checked only; nothing was changed.</p>")
     else:
         verdict = "passes" if after.get("compliant") else "does not yet fully pass"
-        s.append(f'<p class="verdict">The remediated document <strong>{verdict}</strong> the PDF/UA-1 accessibility check'
+        s.append(f'<p class="verdict">The remediated document <strong>{verdict}</strong> the PDF/UA-{_part(after)} '
+                 'accessibility check'
                  + (f": failed checks went from {fb:,} to {fa:,}." if isinstance(fb, int) and isinstance(fa, int) else ".")
                  + "</p>")
         if files.get("remediated_visual_fallback"):
@@ -140,9 +148,9 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
         if rows:
             s.append("<h2>What changed</h2>" + _table("Before and after remediation", ["", "Before", "After"], rows, {1, 2}))
 
-    # --- the PDF/UA-1 check, rule by rule -----------------------------------------------------------------
-    ub, ua = _ua1(before), _ua1(after) if after else {}
-    s.append("<h2>Accessibility check (PDF/UA-1)</h2>")
+    # --- the PDF/UA check, rule by rule (PDF/UA-2 for a PDF 2.0 file) -----------------------------------
+    ub, ua = _ua(before), _ua(after) if after else {}
+    s.append(f"<h2>Accessibility check (PDF/UA-{_part(after or before)})</h2>")
     def _rules(n) -> str:
         n = n or 0
         return f"{n} rule{'s' if n != 1 else ''} failed"
@@ -181,7 +189,7 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
                      + "".join(f"<li><strong>{_e(k)}</strong>: {_e(r['description'])} ({r['after']:,} "
                                f"check{'s' if r['after'] != 1 else ''})</li>" for k, r in still) + "</ul>")
         else:
-            s.append("<p>Nothing. Every PDF/UA-1 rule passes.</p>")
+            s.append(f"<p>Nothing. Every PDF/UA-{_part(after)} rule passes.</p>")
 
     # --- for review ----------------------------------------------------------------------------------------
     s.append("<h2>For review</h2>")
@@ -225,6 +233,12 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
     warnings = result.get("warnings") or []
     if warnings:
         s.append("<h3>Notes</h3><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings[:20]) + "</ul>")
+    hits = [x for x in (result.get("metrics") or {}).get("limits_hit") or [] if isinstance(x, dict)]
+    if hits:
+        from app.pipeline.limits import describe
+        # Limits cut this run short somewhere: said plainly, so a capped result isn't taken for a complete one
+        s.append("<h3>Limits reached</h3><ul>" + "".join(f"<li>{_e(describe(x, with_setting=False))}</li>"
+                                                        for x in hits) + "</ul>")
 
     css = f"""
     @page {{ size: A4; margin: 18mm 16mm 18mm 16mm;

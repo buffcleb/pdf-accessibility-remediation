@@ -18,3 +18,4 @@ web/dist
 .pytest_cache
 .pytest_data
 deploy/cloudflare-worker
+docker/mathcat/target

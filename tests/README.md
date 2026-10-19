@@ -1,12 +1,15 @@
 # Tests
 
-Two suites, one per service. GitHub Actions runs both, plus the web app's type-check and build, on every pull
-request (`.github/workflows/ci.yml`).
+Two Python suites, one per service, plus the web app's own tests (`web/tests`). GitHub Actions
+(`.github/workflows/ci.yml`) runs them on pull requests and pushes to `main`, each only when files it tests have
+changed: the engine and portal suites, the web app's type-check, build and tests, and checks of the shell scripts
+(shellcheck), the SQL (bandit) and the dependencies (pip-audit).
 
 | Folder | What it covers | Needs |
 |---|---|---|
 | [`engine/`](engine) | The remediation engine (`app/`): layout analysis, tagging, existing tags, OCR, specialist notation, verification, the AI gateway and adapters (with HTTP mocked), veraPDF parsing, the API, the Adobe route (against the fake Adobe), the PDF report | Python only. A few tests also need Tesseract, Java and veraPDF, or Pango (for WeasyPrint); they're skipped when those aren't installed |
-| [`portal/`](portal) | The portal (`portal/`): sign-in, roles, groups, services and pages, uploads and jobs, versions, help requests, reports, email, backups | A PostgreSQL database on port 55432 |
+| [`portal/`](portal) | The portal (`portal/`): sign-in, roles, groups, services and pages, uploads and jobs, versions, help requests, reports, email, backups | A PostgreSQL database on port 55432; without one the tests are skipped |
+| [`a11y/`](a11y) | Not tests: `serve.py` runs the portal API with invented people and documents for `scripts/a11y.sh` | See below |
 
 No test calls a real AI model or a real Adobe account.
 
@@ -32,10 +35,23 @@ docker run -d --rm --name portal-test-db -e POSTGRES_USER=portal -e POSTGRES_PAS
 .venv/bin/python -m pytest -q tests/portal
 ```
 
-Use another database with `PORTAL_TEST_DATABASE_URL`. **Never point it at a real one:** the tests truncate its
-tables.
+Use another database with `PORTAL_TEST_DATABASE_URL`. **Never point it at a real one:** the tests drop and recreate
+its schema. With no database the portal tests are skipped; set `PORTAL_TEST_DATABASE_REQUIRED=1` (as CI does) to
+make that a failure instead.
 
 **Everything:** `.venv/bin/python -m pytest -q` (the database is still needed).
+
+**Web app:** in `web/`, `npm ci`, then `npm run build` (type-check and build) and `npm test` (the tests in
+`web/tests`, with Node's own test runner).
+
+**Accessibility:** `scripts/a11y.sh` checks the web app's main pages with axe-core in a headless browser (WCAG 2.2 A
+and AA, light and dark, as each role). It needs the `.venv`, `web/`'s packages and a Playwright browser
+(`npx --prefix web playwright install chromium`); it uses `PORTAL_TEST_DATABASE_URL` if set, or else starts a
+throwaway PostgreSQL container. `A11Y_ONLY=admin` checks only the pages whose name contains "admin". CI runs it only
+when started by hand (`.github/workflows/a11y.yml`).
+
+**Regression documents:** `scripts/regression.sh` runs real documents that once broke something through the code
+as it stands, in the engine's image; see [harness/README.md](../harness/README.md#regression-documents).
 
 ### The tests that need system tools
 

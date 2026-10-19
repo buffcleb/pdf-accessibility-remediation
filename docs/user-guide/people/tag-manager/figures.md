@@ -9,7 +9,7 @@ tag](editing-a-tag.md#what-can-be-changed)). AI-written alt text is a draft: rea
 what the image is *for*? A chart's description should give the trend or the key values, not just "a bar chart".
 
 **Decorative** marks a figure that needs no description (a border, a flourish): screen readers skip it, because the
-tag is removed and its content becomes an artifact. **Mark as decorative** in the tag menu does the same.
+tag is removed and its content becomes an artifact. **Mark as artifact → Decorative** in the tag menu does the same.
 
 ## Splitting a figure
 

@@ -31,6 +31,7 @@ jobs:
       web: ${{ steps.filter.outputs.web }}
       scripts: ${{ steps.filter.outputs.scripts }}
       deps: ${{ steps.filter.outputs.deps }}
+      python: ${{ steps.filter.outputs.python }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -59,8 +60,13 @@ jobs:
             scripts:
               - '.github/workflows/**'
               - 'scripts/**'
+            python:
+              - '.github/workflows/**'
+              - 'app/**'
+              - 'portal/**'
             deps:
               - '.github/workflows/**'
+              - 'scripts/audit-deps.sh'
               - 'requirements*.txt'
               - 'portal/requirements.txt'
               - 'web/package-lock.json'
@@ -189,6 +195,22 @@ jobs:
         run: command -v shellcheck || { sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck; }
       - run: shellcheck scripts/*.sh docker/web/*.sh
 
+  sql:
+    name: SQL built from strings
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install bandit==1.9.4
+      # Only Bandit's SQL check (B608): a query built by formatting a string fails the run. Values go to SQLAlchemy
+      # as bound parameters; a line that really must build SQL text from constants says why and ends # nosec B608.
+      - run: bandit -r app portal -t B608 -q
+
   deps:
     name: Dependency audit
     needs: changes
@@ -201,13 +223,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pip-audit
-      # The known advisories against what the three requirements files resolve to. One is left out on purpose:
-      # PYSEC-2026-3412 (CVE-2026-49452) is CSS injection through presentational attributes of untrusted HTML,
-      # and the only HTML WeasyPrint sees here is the report the engine builds itself from escaped text
-      # (app/reports/pdf.py); no fix version exists. Remove the exception when one does.
-      - run: pip-audit -r requirements.txt -r portal/requirements.txt -r requirements-dev.txt --progress-spinner off --ignore-vuln PYSEC-2026-3412 --ignore-vuln CVE-2026-49452
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - run: npm audit --audit-level=high
-        working-directory: web
+      # The same audit runs every week (audit.yml), so an advisory published later is found without a change here
+      - run: scripts/audit-deps.sh

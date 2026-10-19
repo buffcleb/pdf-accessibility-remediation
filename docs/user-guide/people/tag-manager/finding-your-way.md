@@ -3,8 +3,9 @@
 [The tag manager](README.md) › Finding your way around
 
 The viewing controls sit in the header row of each side, beside its version picker: **View** and **Show** on the
-left, the zoom and **Scroll together** on the right. **Actions**, **Panel**, **Read aloud** and **Report a problem**
-are at the top of the page, on the right.
+left, the zoom and **Scroll together** on the right. At the top of the page, on the right: **Actions** (with a tag
+selected), **Undo** and **Redo**, **Unsaved changes…**, **Document…**, **Panel**, **Read aloud** and, on your own
+documents, **Report a problem**.
 
 ## The two sides
 

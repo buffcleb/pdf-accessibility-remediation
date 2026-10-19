@@ -135,6 +135,18 @@ class RuntimeSettings(BaseModel):
     classifier_local_model: str = Field("", max_length=200)
     classifier_threshold: float = Field(0.6, ge=0, le=1)
     classifier_pages: int = Field(3, ge=1, le=10)
+    # Alerts (#334): emailed to super admins and shown on Attention. The queue counts as stuck when documents wait and
+    # none has started or finished for this long (a busy queue that's moving never is); the worker as stopped when it
+    # hasn't completed a pass for this long; the engine as without workers after this long. Reminders go this often.
+    alert_queue_minutes: int = Field(60, ge=5, le=1440)
+    alert_worker_minutes: int = Field(15, ge=5, le=1440)
+    alert_engine_minutes: int = Field(10, ge=2, le=1440)
+    alert_repeat_hours: int = Field(4, ge=1, le=168)
+    alert_backup_hours: int = Field(26, ge=2, le=720)  # only when the cluster runs the nightly backup
+    # A pool is "running low" below this share of its size or this many pages, whichever is larger: shown on
+    # Attention, and its group's admins are emailed once when it drops below (#358)
+    low_pool_percent: int = Field(10, ge=0, le=100)
+    low_pool_pages: int = Field(20, ge=0, le=1_000_000)
 
     # PDF/UA validation (veraPDF): its running service (fast; the engine falls back to the command line when the
     # service doesn't answer) or the command line in the engine (Java started for every check); and whether to
@@ -219,6 +231,13 @@ class RuntimeSettingsUpdate(BaseModel):
     classifier_local_model: str | None = Field(None, max_length=200)
     classifier_threshold: float | None = Field(None, ge=0, le=1)
     classifier_pages: int | None = Field(None, ge=1, le=10)
+    alert_queue_minutes: int | None = Field(None, ge=5, le=1440)
+    alert_worker_minutes: int | None = Field(None, ge=5, le=1440)
+    alert_engine_minutes: int | None = Field(None, ge=2, le=1440)
+    alert_repeat_hours: int | None = Field(None, ge=1, le=168)
+    alert_backup_hours: int | None = Field(None, ge=2, le=720)
+    low_pool_percent: int | None = Field(None, ge=0, le=100)
+    low_pool_pages: int | None = Field(None, ge=0, le=1_000_000)
     verapdf_mode: str | None = Field(None, pattern="^(service|command_line)$")
     verapdf_ua2: bool | None = None
     help_on_failure: bool | None = None

@@ -41,6 +41,11 @@ flowchart TD
 ## The steps
 
 1. **Validate the original.** veraPDF and an internal audit record the "before" state.
+   Its protection is read too (`app/pipeline/protection.py`): restrictions are put back on the outputs, a signature
+   is noted, and an XFA form is told apart. A static one's XFA part (and `/NeedsRendering`) is removed and its
+   standard form tagged, with a note in the report; a dynamic one has no standard form, so the portal refuses it at
+   upload; sent to the engine's API directly, it's run with a note in the report that it can't be made accessible
+   (#360).
 2. **Fix font Unicode maps.** Fonts whose glyphs have no Unicode value (common in LaTeX output) get their map
    completed from glyph names. Rendering is unchanged.
 3. **Analyze layout** (PyMuPDF), in visual page space, character by character:
@@ -75,7 +80,9 @@ flowchart TD
      under a title or a row of buttons narrower than the page, and a column can hold columns. What lines up row
      by row either side of a gap (labels beside values, a grid of exercise items) is read across instead. A
      heading that starts below where the other column ends, near the end of its own, is read after both, and so is
-     anything that sits across the bottom of the columns (the next section, a barcode).
+     anything that sits across the bottom of the columns (the next section, a barcode). On a page mostly in Arabic or
+     Hebrew, columns are read right to left, and items side by side from the right (#368); the review lists such
+     pages to check.
 4. **AI enrichment.** One alt-text call per unique image, table structure for detected tables, reading order for
    complex pages, and readings of notation the rules can't read, through the gateway models of the job's AI level
    (or kind). Every call is validated; a failure falls back to heuristics and is reported.
@@ -93,6 +100,13 @@ flowchart TD
 **Where the time goes.** Each job records the seconds spent in every stage (`metrics.stage_seconds`, from one
 progress mark to the next), with the time spent waiting for the validator and on music counted inside them
 (`of_which`). The report has a "Time by stage" table, and the worker logs one line per job with the same numbers.
+
+**Large documents on several cores** (#124, `app/pipeline/page_pool.py`). Two kinds of per-page work depend on each
+page alone: the layout analysis, and the checks' reading of each page's content. For a document of
+`PAGE_WORKERS_MIN_PAGES` (50) pages or more, they're shared out over `PAGE_WORKERS` (3) processes, each opening the
+PDF itself and taking every nth page (interleaved, so heavy chapters are spread out); the results are put back in
+page order, so the output is what one process would have made. A worker that fails, runs out of memory or runs too
+long makes the step run in one process as before. `PAGE_WORKERS=1` turns it off.
 
 ## Non-destructive tagging
 
@@ -115,20 +129,21 @@ It produces:
 - footnotes (`structure.py`, `_mark_footnotes`): small print (at most 0.9 of the body size) in the lower 45% of a
   page, at least four words and mostly letters, starting with a mark (up to three digits, or `*`, `†`, `‡`, `§`, `¶`)
   that is raised after a word, not after a digit (a power), in larger text above it on the same page (`marks` and
-  `lead_mark`, recorded by the analyzer). It becomes a `Note` with an `ID`. In a paragraph or heading, each mark
-  that has a footnote is a resolver target of its own (`targets.mark_key`, from the mark's box), so the content
+  `lead_mark`, recorded by the analyzer). It becomes a `Note` with an `ID`. In a paragraph, heading or list item,
+  each mark that has a footnote is a resolver target of its own (`targets.mark_key`, from the mark's box), so the content
   marker draws its glyphs in a marked section apart (same operators, same positions), and the builder tags it as a
-  `Reference` inside the paragraph, in drawing order, naming the note in `/Ref` (PDF 2.0). The Reference says
-  "footnote 1" (`ActualText`) when the paragraph needs no read-aloud text of its own; otherwise the paragraph's
-  text says it ("soils (footnote 1)"), as it does for list items and wherever a mark couldn't be drawn apart (then
-  the paragraph names the note). Every `Note` in the tree, a kept
+  `Reference` inside the paragraph (a list item's `LBody`, or the `Span` holding its own text beside a nested list),
+  in drawing order, naming the note in `/Ref` (PDF 2.0). The Reference says "footnote 1" (`ActualText`) when the
+  text needs no read-aloud text of its own; otherwise the text says it ("soils (footnote 1)"), as it does wherever a
+  mark couldn't be drawn apart (then the paragraph names the note). Every `Note` in the tree, a kept
   document's own included, gets an `ID` if it has none (PDF/UA-1 7.9). Notes under a table
   (`_mark_table_notes`): a block within about 120 points below a table, across its width, that starts with a symbol
   (`*`, `†`, `‡`, `§`, `¶`) the table's cells carry, whatever its size (on a 332-page guideline fewer than half were
   smaller). It becomes a `Note`; each cell with the symbol says it ("500 (footnote asterisk)") and names the note in
   `/Ref`. Letters (a, b) aren't taken. On a document whose own tags are kept, the notes and cells are its tags, and
-  only the ones the engine adds are changed. PDF/UA-2 has no `Note` (it would be `FENote`);
-  the engine declares part 1;
+  only the ones the engine adds are changed. PDF/UA-2 has no `Note` (it would be `FENote`); the engine declares
+  part 1 for PDF 1.x files (a PDF 2.0 file is declared part 2, #409, and its notes haven't been checked against
+  PDF/UA-2 yet);
 - captions ("Figure 1: …", "Table 2 …") tagged with what they describe, when they sit right next to it and are read
   next to it: a table's `Caption` is its first or last child; a figure and its `Caption` are grouped in a `Sect`.
   The caption stays outside the `Figure`, because screen readers read a figure's alt text in place of everything
@@ -138,7 +153,16 @@ It produces:
 - `Link`, `Form` and `Annot` elements for annotations, with `OBJR`, `StructParent` and `Contents`/`TU`.
 
 The ParentTree is always regenerated. The document also gets `MarkInfo`, `Lang`, a title with `DisplayDocTitle`, the
-XMP `pdfuaid:part` and `/Tabs /S`.
+XMP `pdfuaid:part` and `/Tabs /S`. The part is 1 for a PDF 1.x file (`PDFUA_PART`, which refuses anything else),
+and 2 for a PDF 2.0 file, with `pdfuaid:rev` 2024 (#409): PDF/UA-1 requires PDF 1.x, so a PDF 2.0 file is
+labelled and judged by PDF/UA-2, with PDF/UA-1 still run for the font repairs.
+
+**Language** (`app/pipeline/language.py`, #340): the job's, if given; else the file's own `/Lang` unless the text is
+very clearly another (99 % sure over 1,500 letters or more: a template's "English" over Spanish text); else the
+text's, when the detector (py3langid) is 95 % sure over 300 letters or more; else `DEFAULT_LANGUAGE`. The report says
+when the text decided it. A paragraph, heading, note or caption clearly in another language than the document's
+(99 % sure, 12 words or more, mostly letters, a common language) gets its own `Lang`; anything less certain, and list
+items and table cells, stays a review finding ("passage in a different language from its tag").
 
 Bookmarks (`app/tagging/bookmarks.py`) are made from the headings once each output's tag map exists, so the text of
 a long document isn't read again for them: H1–H6 nest by level, and each item is a GoTo action with the page and
@@ -159,7 +183,9 @@ When the input already has a structure tree, each element is audited:
   malformed table, for example, is rebuilt from the detected grid.
 
 Content that's already validly marked is never re-wrapped. If the tree is unusable overall (most references dangling,
-or empty), it's discarded and rebuilt, and the report says why.
+or empty), it's discarded and rebuilt, and the report says why. A person can ask for the same when the tags are
+valid but poor (**Ignore the existing tags** on upload, or on a super admin's re-run; the engine's `ignore_existing`
+flag, #396): the report then says they were "ignored at your request".
 
 Producers' tags often need more than repairs, especially slides:
 
@@ -177,8 +203,15 @@ Producers' tags often need more than repairs, especially slides:
 - **Page furniture drawn by shared forms** (crop marks, a "DO NOT STAPLE" box on every page) is an artifact: a form
   that only draws lines and fills, with any text in it already marked as an artifact, is placed by what it
   draws, not by its nominal box (often the whole page).
+- **Form field names** (`app/pipeline/field_labels.py`, #341): a field with no tooltip, or one that's only an internal
+  name ("Text1", "fill_12", an XFA path), is named from the page before tagging: a text field or list by the words
+  just left of it on its row, else the line just above; a checkbox or radio button by the words to its right, with
+  the group's question in front ("Payment method: Card"; a radio group's own tooltip is the question). What the
+  page doesn't label goes to the document's AI level, with a picture of the field (`AI_FIELD_LABELS_MAX`, 200). A
+  tooltip that reads like words is never touched; the tag review flags fields still left with an internal name.
 - **Where added tags go:** what the engine adds to kept tags (content they left out, untagged form fields and links)
   is put beside the kept tag it follows on its page, not after the producer's content (`app/tagging/placement.py`).
+  In a newly built tree the same is done for its form fields, which would otherwise come after the page's text.
   Content goes by its place in the page's reading order. A field goes by where its rectangle sits: a checkbox just
   before the words to its right, any other field right after the nearest text (its label). Each goes as high up the
   tree as it takes to be valid, and never into an aside or a quotation. Added blocks that only look like headings
@@ -208,6 +241,16 @@ sent to the AI reviewer:
 - what will be spoken still says what the page says: every number is heard, every dosage unit is heard as itself or
   by its name, letters spelled out don't outnumber the page's, and a division is heard only where one is written.
   Numbers and units get no tolerance.
+- A stacked fraction's "over" is drawn, not a character: `notation.drawn_fraction` accepts the division when the
+  region draws a fraction bar (a line, a thin rectangle, or a picture one pixel tall, as some TeX converters draw
+  rules). Strict, to keep other lines out: short (about a dozen characters at most), standing alone (nothing drawn
+  touching its ends, as an arrowhead, a dimension line or a table's vertical rules do; no line of the same length
+  just above or below, as a table's rules are), with text tight above and below, within its length and centered,
+  of about the same size, neither part a phrase, and the lower part not wholly in parentheses (a drawing's
+  dimension in millimetres). On every text block of the 30 quick-set documents it answered yes only on real
+  fractions; on a 531-page math book it kept 53 of 58 right readings it would have refused.
+- Each job counts its rejections by reason (`metrics.notation_ai_rejected_by_reason`): the findings list stops at
+  100, the counts don't.
 
 What goes to the AI, and what doesn't:
 - **A formula inside a sentence** is read by itself (a whole reaction is one piece), once per document however often
@@ -244,7 +287,75 @@ content: the tag and the block must cover each other, the tag must be a text tag
 (no Alt, ActualText or expansion), and anything inside it must be plain Spans. A reading with no such tag is left
 out, and the report says how many were. Content the kept tags don't hold is tagged afresh, reading included.
 
-Not covered yet: equations on scanned pages are barely found (#183).
+Footnotes reach kept tags the same way (`_footnotes_onto_kept_tags`). The kept paragraph that holds a footnote the
+analysis found becomes a `Note` (one already a `Note` stays as it is, and every `Note` gets its `ID`). The kept tag
+that holds the text with its mark, or a table cell with a table note's symbol, names the note in `/Ref`, and says the
+mark as a footnote ("soils (footnote 1)") when it has nothing of its own to say. A tag that already names a note is
+left as it is, and marks aren't cut out as References of their own, which would rewrite the producer's content. A
+cell's kept tag is found by lying inside the cell, since its box is only its glyphs.
+
+**Formulas as MathML** (#403, `app/pipeline/mathml.py`). Each formula the AI read with LaTeX, in the text or as a
+figure described as a formula, is also converted to MathML (`latex2mathml`). The MathML has to parse, use only
+MathML's presentation elements, and give each fraction, root and script the parts it needs; LaTeX that fails (a
+brace left open) gets none, and the formula keeps its spoken reading as before. Text from the document is escaped,
+and attributes such as links and styles are dropped, so the files are inert. The LaTeX is kept inside each one
+(`<semantics>` with an `application/x-tex` annotation). A document with such formulas gets two downloads:
+`*_formulas.html` (`reports.math_list`), every formula by page in MathML with its spoken reading, which browsers draw
+and screen readers let a person move through part by part; and `*_math.zip` (`reports.math_files`), one `.mml` per
+formula named by page and place (`page-003_formula-2.mml`), the formula list and a note. The full JSON report keeps
+each formula's MathML (`reports.math`, and `mathml` on each `ai_notation` reading). Both routes do this; on the
+Adobe route only the readings put onto Adobe's tags. Readings made by rule (doses) have no LaTeX, so no MathML.
+
+**Read by rule, and checked** (#403, `app/pipeline/mathspeak.py`). Right after the AI step, each formula's MathML goes
+to MathCAT (MIT; `mathcat-cli`, a small program built from `docker/mathcat` into the engine image, its crates locked
+and its rules compiled in), one process per document: ClearSpeak speech, and Nemeth and UEB braille. The speech is
+compared with the AI's spoken reading: both must say the same numbers and the same letters (variables, Greek
+letters), each as often; words may differ ("over" or "divided by"; "x squared" and "x to the second power" agree).
+MathCAT reads the AI's own LaTeX, so a disagreement means the AI's spoken reading and its transcription don't say the
+same thing. Nothing is settled automatically: the PDF keeps the AI's reading (the one checked against the page's
+own text), the formula is flagged "two readings of a formula disagree" with both readings and the MathML in the
+finding (`extra`), so Edit tag can offer the choice, and each disagreement is listed in the full JSON report
+(`reports.math_disagreements`: both readings, what differs, `in_pdf`, `chosen`). A saved edit that picks a reading
+carries it (`reading` on `set_alt` or `set_actual_text`), and the edit job's report lists those choices
+(`reports.math_choices`). The braille becomes two more downloads, `*_math_nemeth.brf` and `*_math_ueb.brf`
+(braille ASCII, 40 cells to a line, 25 lines to a page, each formula under its page and number), and is in the zip
+too. Without `mathcat-cli` (a run outside the image) none of this happens and the formulas keep the AI's reading
+only.
+
+**A document's own MathML** (#403, `app/tagging/mathml_tags.py`). LaTeX's tagging (tagpdf with luamml) and other PDF
+2.0 producers put a formula's MathML on its Formula tag: as an associated file (`/AF`, an embedded MathML file,
+`/AFRelationship /Supplement`, often with the formula's LaTeX beside it as `/Source`), and optionally as structure
+elements in the MathML namespace (`math`, `mi`, `mfrac`… with `/NS`) under the Formula. When the document's tags are
+kept, both are kept as written: MathML elements say what they are through their namespace, so they aren't role-mapped
+or repaired like unknown roles, and the tag check accepts them. A Formula carrying MathML is never released as a
+wrapper around tagged text (which used to make a LaTeX formula a Div). A Formula with no read-aloud text whose MathML
+is an associated file gets its Alt from that MathML, read by rule (MathCAT): the formula as its author wrote it,
+with no AI. Its MathML (cleaned as ours is, with the LaTeX source as its annotation), reading and braille join the
+math downloads (`page-003_tagged-1.mml`), and an AI reading of the same place gives way to it. Not yet: reading a
+formula whose MathML is only structure elements (it's kept, and described as before), and a document whose tags
+aren't kept (its MathML goes with them).
+
+**MathML inside the PDF** (#403, `app/tagging/mathml_embed.py`). In a PDF 2.0 file (PDF/UA-2, #409), each
+formula's MathML is attached to the tag carrying its reading, as LaTeX's tagging does: an embedded file on the tag
+(`/AF`, `/AFRelationship /Supplement`, subtype `application/mathml+xml`, named `mathml-1.xml` and so on), beside its
+read-aloud text, which stays. That's done to each output file before veraPDF checks it, so the verdict covers it.
+The tag is found by place, as the review's findings find the tag a reading is on: a Formula, a Figure (a formula
+drawn as a picture), or a paragraph or span with read-aloud text (a reading the AI put on a kept tag); a sentence
+around a formula, with no read-aloud text of its own, never gets it. A tag that already has MathML (the
+document's own) is left as it is. A PDF 1.x file gets none: associated files are PDF 2.0's, and PDF/UA-1 has no
+place for them.
+
+**A second reading, from the picture** (#403, `app/pipeline/formula_ocr.py`, `docker/formula`). With the formula
+reading service (`FORMULA_OCR_ENABLED`, set by `FORMULA_READER=on`), each formula the AI read is pictured from its
+place on the page (200 dpi, a 3-point margin) and read by RapidLaTeXOCR over a Redis queue, like the music reader.
+Its LaTeX is cleaned (`picture_latex`: the equation number and padding taken off; set aside when it shows the
+reader couldn't read the picture, such as an array of empty cells or long runs of spacing), made MathML and read
+by MathCAT, and compared with the AI's LaTeX read the same way, so wording plays no part. Readings that say far
+more or less than each other aren't compared. A difference flags the formula with every reading (the finding's
+`extra` adds the picture's reading and MathML; `reports.math_disagreements` adds `differs_picture` and
+`picture_latex`), and Edit tag draws both formulas. Without an answer within `FORMULA_OCR_TIMEOUT_S` (180) the
+formulas are checked as before. `FORMULA_OCR_MAX` (200) caps the formulas read this way in one document.
+
 `AI_NOTATION_ENABLED` and `AI_NOTATION_MAX` (100 regions per document by default) control it, as do the `notation_ai`
 job flag and a switch per AI level.
 

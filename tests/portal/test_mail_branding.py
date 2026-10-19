@@ -1,6 +1,8 @@
 """Email providers (#6) and branding (#5). Nothing is sent anywhere: every provider is faked."""
 from __future__ import annotations
 
+from sqlalchemy import select
+
 import io
 import json
 import smtplib
@@ -147,7 +149,9 @@ def test_ses_sends_through_the_api(backend, monkeypatch):
     stub.assert_no_pending_responses()
 
 
-def test_sign_in_says_when_the_code_couldnt_be_sent(setup, backend, monkeypatch):
+def test_a_code_that_couldnt_be_sent_is_logged_for_support(setup, backend, monkeypatch):
+    """The answer can't depend on the email (#359: the same answer for every address), so a failure is audited and in
+    the email log, where super admins see it; the person tries again."""
     from portal.mail import Mailer
 
     def broken(self, mail, from_name=None, attempts=None):
@@ -156,9 +160,12 @@ def test_sign_in_says_when_the_code_couldnt_be_sent(setup, backend, monkeypatch)
     monkeypatch.setattr(Mailer, "deliver", broken)
     c = setup["c"]["user"]
     r = c.post(f"{API}/auth/code", json={"email": "user@a.test"})
-    assert r.status_code == 503 and r.json()["detail"]["error"] == "mail_failed"
+    assert r.status_code == 202
     log = setup["c"]["super"].get(f"{API}/admin/audit", params={"action": "login.code_not_sent"}).json()
     assert log and log[0]["outcome"] == "failure"
+    from portal.models import MailOutbox
+    failed = setup["db"].scalars(select(MailOutbox).where(MailOutbox.kind == "sign_in", MailOutbox.status == "failed")).all()
+    assert failed and failed[-1].to_addr == "user@a.test"
 
 
 def test_super_admin_sends_a_test_email(setup):

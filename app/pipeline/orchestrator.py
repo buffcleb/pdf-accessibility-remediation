@@ -36,7 +36,9 @@ from app.pipeline.enrichment import EnrichmentStats, enrich, render_slots
 from app.pipeline.models import DocumentAnalysis
 from app.pipeline.ocr import block_confidence, ocr_lines, tesseract_available, tesseract_cli, write_ocr_layer
 from app.pipeline.ocr_ai import correct_lines
-from app.pipeline import music, scan_figures
+from app.pipeline import field_labels, limits, mathml, music, protection, scan_figures
+from app.tagging import mathml_embed
+from app.pipeline.language import document_language
 from app.pipeline.structure import assign_roles, detect_columns, heuristic_reading_order
 from app.pipeline.transfer import transfer_enrichment
 from app.storage import JobStore
@@ -50,6 +52,7 @@ from app.tagging.tagger import TagResult, apply_written_alts, tag_document, writ
 from app.validation.audit import audit_pdf
 from app.validation.verapdf import VeraResult, run_verapdf
 from app.validation.verapdf import flavours as verapdf_flavours
+from app.validation.verapdf import pdfua_part
 from app.verification.model import IntegrityError
 from app.verification.tagmap import build_tagmap
 from app.verification.verify import VerifyOptions, verify_output
@@ -81,6 +84,7 @@ class JobOptions:
     route: str = "standard"  # standard | adobe
     notation_ai: bool = True  # the AI reads specialist notation the layout rules can't
     ocr_ai: bool = True  # the AI corrects OCR words Tesseract was unsure of
+    ignore_existing: bool = False  # the document's own tags are poor: tag it afresh from the page (#396)
 
     @classmethod
     def from_meta(cls, meta: dict) -> "JobOptions":
@@ -102,6 +106,7 @@ class JobOptions:
             route=meta.get("route") or "standard",
             notation_ai=flags.get("notation_ai", True) is not False,
             ocr_ai=flags.get("ocr_ai", True) is not False,
+            ignore_existing=bool(flags.get("ignore_existing")),
         )
 
 
@@ -163,10 +168,26 @@ _clock: contextvars.ContextVar[StageClock | None] = contextvars.ContextVar("stag
 
 
 def _validate(pdf: Path, out_dir: Path, label: str, stem: str) -> dict[str, VeraResult]:
-    results = {}
+    """Each profile (PDF/UA-1, and PDF/UA-2 for information) checked, at the same time when the veraPDF service is
+    there (it runs several copies; each check waits on it, not on this process): about a minute and a half less on a
+    500-page document, which is checked six to eight times."""
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.validation.verapdf import uses_service
+
+    flavours = verapdf_flavours(pdfua_part(pdf))  # the verdict by the part the file can conform to (#409)
     started = time.monotonic()
-    for fl in verapdf_flavours():
-        results[fl] = run_verapdf(pdf, out_dir / f"{stem}_verapdf_{label}_{fl}.xml", fl)
+
+    def one(fl: str) -> VeraResult:
+        return run_verapdf(pdf, out_dir / f"{stem}_verapdf_{label}_{fl}.xml", fl)
+    if len(flavours) > 1 and uses_service():
+        # Each in a copy of this job's context: its validator choices (job_validator) live there
+        with ThreadPoolExecutor(max_workers=len(flavours)) as pool:
+            futures = [pool.submit(contextvars.copy_context().run, one, fl) for fl in flavours]
+            results = {fl: f.result() for fl, f in zip(flavours, futures)}
+    else:
+        results = {fl: one(fl) for fl in flavours}
     if (clock := _clock.get()) is not None:
         clock.add("validator", time.monotonic() - started)
     return results
@@ -175,6 +196,8 @@ def _validate(pdf: Path, out_dir: Path, label: str, stem: str) -> dict[str, Vera
 def _snapshot(audit: dict, vera: dict[str, VeraResult]) -> dict:
     primary = next(iter(vera.values()), None)
     snap = {
+        # Which PDF/UA the verdict is by: 2 for a PDF 2.0 file, else 1 (#409)
+        "pdfua_part": 2 if next(iter(vera), None) == "ua2" else 1,
         "compliant": primary.compliant if primary and primary.available else None,
         "failed_rules": primary.failed_rules if primary else None,
         "failed_checks": primary.failed_checks if primary else None,
@@ -227,17 +250,89 @@ def _pick_title(opts: JobOptions, analysis: DocumentAnalysis) -> str:
     return opts.stem.replace("_", " ")
 
 
-def _pick_language(opts: JobOptions, analysis: DocumentAnalysis, default: str) -> str:
-    """The job's language, else the file's own when it is a well-formed tag, else the default."""
-    for candidate in (opts.language, analysis.language):
-        if candidate and _LANGUAGE_TAG.match(candidate.strip()):
-            return candidate.strip()
-    return default
+def _pick_language(opts: JobOptions, analysis: DocumentAnalysis, default: str) -> tuple[str, str | None]:
+    """The job's language; else the file's own when it is a well-formed tag and the text doesn't clearly say
+    otherwise; else the text's, when the detector is sure; else the default (#340). With a note for the report when
+    the text decided it."""
+    if opts.language and _LANGUAGE_TAG.match(opts.language.strip()):
+        return opts.language.strip(), None
+    own = analysis.language.strip() if analysis.language and _LANGUAGE_TAG.match(analysis.language.strip()) else None
+    text = " ".join(b.text for p in analysis.pages for b in p.blocks if b.text)
+    return document_language(own, text, default)
+
+
+def _rules(v: dict[str, VeraResult] | None) -> VeraResult | None:
+    """The result the repairs go by: PDF/UA-1's, whose rule numbers they know (for a PDF 2.0 file the verdict is
+    PDF/UA-2's, #409), else the verdict's."""
+    r = (v or {}).get("ua1")
+    return r if r and r.available and not r.error else _primary(v or {})
 
 
 def _primary(v: dict[str, VeraResult]) -> VeraResult | None:
     r = next(iter(v.values()), None)
     return r if r and r.available and not r.error else None
+
+
+async def _read_formulas(enrichment, images, pdf: Path | None = None) -> None:
+    """The formulas the AI read, as MathML and read by rule (#403), and, with the formula reading service, from
+    their pictures in `pdf` too; a problem here only means fewer readings."""
+    try:
+        enrichment.formulas = await asyncio.to_thread(mathml.collect, enrichment.notation, images)
+        enrichment.math_disagree = await asyncio.to_thread(mathml.read_by_rule, enrichment.formulas)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("formulas not read as MathML: %s", exc)
+        enrichment.formulas = []
+    if pdf is not None and get_settings().formula_ocr_enabled and enrichment.formulas:
+        try:
+            enrichment.math_picture_disagree = await asyncio.to_thread(mathml.read_from_pictures, enrichment.formulas,
+                                                                       pdf)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("formulas not read from their pictures: %s", exc)
+    for f in enrichment.formulas:
+        if f.get("disagreement"):
+            enrichment.findings.append(f"page {f['page'] + 1}: the AI's reading of a formula and the reading by "
+                                       "rule from its LaTeX say different numbers or letters; choose one in Edit tag")
+        if f.get("picture_disagreement"):
+            enrichment.findings.append(f"page {f['page'] + 1}: the formula read from its picture says different "
+                                       "numbers or letters from the AI's transcription; choose a reading in Edit tag")
+
+
+async def _embed_math(path: Path, enrichment) -> None:
+    """Each formula's MathML attached to its tag, in a PDF 2.0 file (#403); before the file is checked, so the
+    check covers it. A problem here only means no MathML in the file."""
+    if not enrichment.formulas:
+        return
+    try:
+        enrichment.math_embedded = await asyncio.to_thread(mathml_embed.embed, path, enrichment.formulas)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("MathML not attached to the formulas in %s: %s", path.name, exc)
+
+
+def _ai_read(enrichment) -> list:
+    """The AI's readings for the tag check, each flagged for a person: (page, bbox, kind, spoken[, two readings]).
+    A formula whose AI reading and rule reading disagree carries both, so Edit tag can offer the choice."""
+    differs = {(f["page"], tuple(f["bbox"] or ())): f for f in enrichment.formulas if mathml.flagged(f)}
+    out = []
+    for n in enrichment.notation:
+        if n.get("by_rule"):
+            continue
+        f = differs.pop((n["page"], tuple(n.get("bbox") or ())), None)
+        out.append((n["page"], n["bbox"], n["kind"], n["spoken"]) + ((mathml.finding_extra(f),) if f else ()))
+    # Formulas drawn as pictures (a figure's alt text), where the two readings disagree
+    out += [(f["page"], f["bbox"], "formula", f["spoken"], mathml.finding_extra(f)) for f in differs.values()]
+    return out
+
+
+async def _math_outputs(out, stem: str, enrichment) -> tuple[list[dict], dict[str, str]]:
+    """The formulas' downloads (#403); a problem here only means no math files."""
+    try:
+        formulas, files = await asyncio.to_thread(mathml.outputs, out, stem, enrichment.notation,
+                                                  formulas=enrichment.formulas)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("formulas not saved as MathML: %s", exc)
+        return [], {}
+    enrichment.math_formulas = sum(1 for f in formulas if f["mathml"])
+    return formulas, files
 
 
 # --------------------------------------------------------------------------- main
@@ -250,7 +345,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
     src = store.input_pdf
-    warnings: list[str] = []
+    warnings: list[str] = protection.notes(protection.inspect(src), opts.report_only)  # signed, restricted (#339)
     # The viewer's tag map of the original needs nothing the pipeline produces and costs about as much as a
     # verification pass (it reads every page back through pdfplumber). Built on its own thread from the start, it
     # runs while the job waits on the validator and on the AI instead of adding its time at the end.
@@ -343,7 +438,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     try:
         music_started = time.monotonic()
         music_count = await asyncio.to_thread(music.apply, base, analysis, enrichment.music, music_files, music_score,
-                                              enrichment.findings)
+                                              enrichment.findings, enrichment)
         if music_count:
             clock.add("music", time.monotonic() - music_started)
         for m in enrichment.music:
@@ -362,6 +457,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         music_score_file = f"{stem}_music.{music_score[0][0].rsplit('.', 1)[-1]}"
         (out / music_score_file).write_bytes(music_score[0][1])
 
+    # Form fields named from their printed labels (#341); the AI names the rest below
+    fields_named, fields_unlabeled = await asyncio.to_thread(field_labels.find, base)
+
     # 3. AI ---------------------------------------------------------------------------------
     progress("ai_enrichment", 30)
     if ai is not None:
@@ -372,6 +470,16 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                 raise AIProviderUnavailable(f"AI provider '{opts.provider}' is not usable: {exc}") from exc
             enrichment = await enrich(ai, base, analysis, dpi=min(settings.raster_dpi, 150), notation=opts.notation_ai,
                                       stats=enrichment)
+            await field_labels.ask_ai(ai, base, fields_unlabeled, fields_named, settings.ai_field_labels_max, enrichment)
+    else:
+        fields_named.unnamed += sorted({f.name for f in fields_unlabeled})
+    if fields_named.from_page or fields_named.from_ai or fields_named.unnamed:
+        warnings.append(
+            f"Form fields: {fields_named.from_page} named from their printed labels"
+            + (f", {fields_named.from_ai} by the AI (check them)" if fields_named.from_ai else "")
+            + (f"; {len(fields_named.unnamed)} still have only an internal name (set them in the tag manager)"
+               if fields_named.unnamed else "") + ".")
+    if ai is not None:
         if ai.failures and not ai.calls:
             warnings.append(f"every AI call failed ({ai.failures}); alt text, tables and reading order fell back to "
                             "heuristics. See ai_findings for the error")
@@ -380,6 +488,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     else:
         if any(not i.decorative for p in analysis.pages for i in p.images):
             warnings.append("ai_provider 'none': figures are tagged without alt text")
+    # Formulas as MathML, and read by rule (MathCAT) to check the AI's reading of them (#403): before the tags are
+    # checked, so a formula whose two readings disagree is flagged there
+    await _read_formulas(enrichment, [i for p in analysis.pages for i in p.images], base)
     if opts.debug:
         (work / "analysis.json").write_text(json.dumps(analysis.to_dict(), indent=1, default=str))
 
@@ -398,6 +509,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         "notation_read_by_ai": sum(1 for n in enrichment.notation if not n.get("by_rule")),
         "notation_by_rule": sum(1 for n in enrichment.notation if n.get("by_rule")) + enrichment.dose_cells,
         "notation_ai_rejected": enrichment.notation_rejected,
+        "notation_ai_rejected_by_reason": dict(sorted(enrichment.notation_rejected_by.items(), key=lambda kv: -kv[1])),
         "tables_analyzed": enrichment.tables_analyzed,
         "reading_order_pages_ai": enrichment.reading_order_pages,
         "ocr_pages": len(scanned) if ocr_count else 0,
@@ -420,6 +532,8 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         tag_maps = {"original": await original_map}
         metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
         metrics["stage_seconds"] = clock.seconds()
+        metrics["limits_hit"] = limits.collect(enrichment.limits_hit, verification, enrichment.findings,
+                                               metrics.get("pages_processed"))
         result = {
             "files": {"remediated_primary": None, "remediated_visual_fallback": None},
             "metrics": metrics,
@@ -441,12 +555,18 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     # 4. visual (non-destructive) ----------------------------------------------------------
     progress("tagging", 55)
     title = _pick_title(opts, analysis)
-    language = _pick_language(opts, analysis, settings.default_language)
+    language, language_note = _pick_language(opts, analysis, settings.default_language)
+    if language_note:
+        warnings.append(language_note)
     visual = work / "visual.pdf"
     visual_region_alts: list = []
     tag_visual = await asyncio.to_thread(
-        tag_document, base, visual, analysis, title=title, language=language,
+        tag_document, base, visual, analysis, title=title, language=language, field_labels=fields_named,
+        ignore_existing=opts.ignore_existing,
         pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables)
+    if tag_visual.passages_lang:
+        warnings.append(f"Language: {tag_visual.passages_lang} passage(s) in another language than the document's were "
+                        "tagged with their own.")
     if tag_visual.figures_needing_alt and ai is not None:
         # Existing Figure tags over vector art or equations: describe the rendered region, re-tag.
         progress("ai_existing_figures", 62)
@@ -461,7 +581,8 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             # A figure judged decorative loses its tag and its content becomes an artifact: that takes the content
             # marker, so the document is tagged again with every verdict
             tag_visual = await asyncio.to_thread(
-                tag_document, base, visual, analysis, title=title, language=language,
+                tag_document, base, visual, analysis, title=title, language=language, field_labels=fields_named,
+                ignore_existing=opts.ignore_existing,
                 pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables, region_alts=region_alts)
         elif region_alts:
             # Descriptions alone go straight onto the tags they describe; nothing else about the file changes
@@ -470,6 +591,11 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             apply_written_alts(tag_visual, written)
         if region_alts:
             visual_region_alts = region_alts
+    # The document's own formulas (MathML its kept tags carry, #403): with the others, in place of any AI reading of
+    # them
+    if tag_visual.document_formulas:
+        mathml.add_document_formulas(enrichment.formulas, enrichment.notation, tag_visual.document_formulas)
+    await _embed_math(visual, enrichment)
     progress("validating_output", 70)
     vera_visual = await asyncio.to_thread(_validate, visual, work, "after_visual", stem)
     # Width corrections are exact on paper, but many of them can shift glyphs by a fraction of a
@@ -504,10 +630,11 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     vera_modified: dict[str, VeraResult] | None = None
     destructive_pages: list[int] = []
     fonts_embedded: list[str] = []
-    pv = _primary(vera_visual)
+    pv = _primary(vera_visual)  # the verdict
+    rv = _rules(vera_visual)  # what the repairs go by
     needs_fix = widths_subpixel is not None or not (pv and pv.compliant) and (
-        (pv is not None and bool(pv.failed_clauses_with(DESTRUCTIVE_CLAUSES)))
-        or (pv is None and any(p.font_issues for p in analysis.pages)))
+        (rv is not None and bool(rv.failed_clauses_with(DESTRUCTIVE_CLAUSES)))
+        or (rv is None and any(p.font_issues for p in analysis.pages)))
     if needs_fix:
         progress("destructive_fixes", 78)
         stage_src = base
@@ -524,8 +651,10 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             stage_src = emb
             fonts_candidate = work / "modified_fonts.pdf"
             tag_modified = await asyncio.to_thread(
-                tag_document, stage_src, fonts_candidate, analysis, title=title, language=language,
+                tag_document, stage_src, fonts_candidate, analysis, title=title, language=language, field_labels=fields_named,
+                ignore_existing=opts.ignore_existing,
                 pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables, region_alts=visual_region_alts)
+            await _embed_math(fonts_candidate, enrichment)
             vera_modified = await asyncio.to_thread(_validate, fonts_candidate, work, "after_modified_fonts", stem)
             vera_modified, _ = await asyncio.to_thread(_fix_glyph_lists, fonts_candidate, vera_modified, work,
                                                        "after_modified_fonts", stem)
@@ -537,7 +666,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             stage_src = base  # flattening re-tags from the untagged base; widths are re-fixed afterwards
         pm = _primary(vera_modified) if vera_modified else pv
         if not (pm and pm.compliant):
-            destructive_pages = await asyncio.to_thread(_destructive_candidates, pm, analysis, stage_src)
+            destructive_pages = await asyncio.to_thread(_destructive_candidates,
+                                                        _rules(vera_modified) if vera_modified else rv, analysis,
+                                                        stage_src)
         if destructive_pages:
             progress("flattening", 84)
             flat = work / "flattened.pdf"
@@ -550,8 +681,10 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             layout_mod = transfer_enrichment(analysis, analysis_mod, set(destructive_pages), enrichment.layout_tables,
                                              notation=enrichment.notation)
             tag_modified = await asyncio.to_thread(
-                tag_document, flat, candidate, analysis_mod, title=title, language=language,
+                tag_document, flat, candidate, analysis_mod, title=title, language=language, field_labels=fields_named,
+                ignore_existing=opts.ignore_existing,
                 pdfua_part=settings.pdfua_part, layout_tables=layout_mod, region_alts=visual_region_alts)
+            await _embed_math(candidate, enrichment)
             vera_modified = await asyncio.to_thread(_validate, candidate, work, "after_modified", stem)
             vera_modified, _ = await asyncio.to_thread(_fix_glyph_lists, candidate, vera_modified, work,
                                                        "after_modified", stem)
@@ -600,8 +733,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         verification = {}
         vopts = VerifyOptions(ai=opts.verify_ai, full_review=opts.full_review, seed=opts.job_id,
                               kinds=_kinds(analysis), judge_model=opts.judge_model,
-                              ai_read=[(n["page"], n["bbox"], n["kind"], n["spoken"]) for n in enrichment.notation
-                                       if not n.get("by_rule")]
+                              ai_read=_ai_read(enrichment)
                               + [(o["page"], o["bbox"], f"ocr-{o['mode']}", o["after"]) for o in enrichment.ocr],
                               review_cache={})  # one verdict per figure across both output files
         outputs = [("primary", out / files["remediated_primary"])]
@@ -648,8 +780,14 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         comparison["destructive_pages"] = [p + 1 for p in destructive_pages]
         comparison["fonts_embedded"] = fonts_embedded
 
+    # Formulas as MathML (#403): the structured form of each one the AI read, as music has MusicXML. Before the
+    # summary, which counts them
+    math_formulas, math_files = await _math_outputs(out, stem, enrichment)
+
     metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
     metrics["stage_seconds"] = clock.seconds()
+    metrics["limits_hit"] = limits.collect(enrichment.limits_hit, verification, enrichment.findings,
+                                           metrics.get("pages_processed"))
     summary = _summary(analysis, tag_visual, tag_modified, enrichment, before_snapshot, after_snapshot,
                        comparison, destructive_pages, warnings, title, language)
     result = {
@@ -674,6 +812,11 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             "music_files": music_archive,
             # Sheet music: the whole piece as one MusicXML file (several movements: they're in the zip)
             "music_score": music_score_file,
+            # Formulas the AI read (page 1-based, region, read-aloud text, LaTeX, MathML) and their downloads (#403)
+            "math": [{**f, "page": f["page"] + 1} for f in math_formulas][:300] or None,
+            # Formulas whose AI reading and rule reading disagree: both readings, and the person's choice once made
+            "math_disagreements": mathml.disagreements(math_formulas) or None,
+            **{k: math_files.get(k) for k in ("math_files", "math_list", "math_nemeth", "math_ueb")},
         },
         "warnings": warnings,
     }
@@ -748,6 +891,8 @@ async def _describe_regions(ai, pdf_path: Path, regions: list, enrichment: Enric
     finally:
         doc.close()
     if len(regions) > limit:
+        enrichment.limit_hit("AI_EXISTING_FIGURES_MAX", limit, len(regions),
+                             "figures the document arrived with weren't described and have no alt text")
         enrichment.findings.append(f"{len(regions) - limit} figure tag(s) the document arrived with, beyond the limit of "
                                    f"{limit} (AI_EXISTING_FIGURES_MAX), weren't described and have no alt text "
                                    f"(from page {regions[limit][0] + 1} on)")
@@ -783,7 +928,7 @@ def _fix_glyph_lists(pdf: Path, vera: dict[str, VeraResult], work: Path, label: 
     re-validate. Rendering is unchanged: nothing draws with these lists."""
     from app.tagging.font_descriptors import CLAUSE, remove_incomplete_glyph_lists
 
-    pv = _primary(vera)
+    pv = _rules(vera)
     if pv is None or CLAUSE not in pv.failed_clauses:
         return vera, []
     tmp = work / f"glyphlists_{pdf.name}"
@@ -800,7 +945,7 @@ def _fix_widths(pdf: Path, vera: dict[str, VeraResult], work: Path, label: str, 
     because veraPDF lists a limited number of failed checks per rule."""
     total = 0
     for _ in range(3):
-        pv = _primary(vera)
+        pv = _rules(vera)
         if pv is None or not pv.width_mismatches:
             break
         tmp = work / f"widthfix_{pdf.name}"
@@ -1008,6 +1153,26 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
     if by_rule or enr.dose_cells:
         lines.append(f"Dosage notation: {by_rule} block(s) and {enr.dose_cells} table cell(s) put in words by rule (units "
                      "by name, prescription shorthand in full); no AI was used for these.")
+    if enr.math_embedded:
+        lines.append(f"Formulas: MathML attached to {enr.math_embedded} formula tag(s) in the PDF (a PDF 2.0 file, as "
+                     "PDF/UA-2 allows), beside their read-aloud text.")
+    if tv.formulas_read_from_mathml:
+        lines.append(f"Formulas: {tv.formulas_read_from_mathml} of the document's own, which carry their MathML, given "
+                     "read-aloud text from it by rule (MathCAT), with no AI.")
+    if enr.math_formulas:
+        read = sum(1 for f in enr.formulas if f.get("rule"))
+        lines.append(f"Formulas: {enr.math_formulas} saved as MathML as well, in the math files and the formula list "
+                     "(a web page a screen reader can move through part by part)"
+                     + (f"; {read} also in Nemeth and UEB braille, and read by rule to check the AI's reading" if read
+                        else "")
+                     + (f": {enr.math_disagree} disagree and are flagged to choose between the two readings"
+                        if enr.math_disagree else "") + ".")
+        pictured = sum(1 for f in enr.formulas if f.get("picture"))
+        if pictured:
+            lines.append(f"Formulas read again from their pictures by the formula reader: {pictured}"
+                         + (f", of which {enr.math_picture_disagree} say other numbers or letters than the AI's "
+                            "transcription and are flagged to choose a reading" if enr.math_picture_disagree
+                            else ", all agreeing with the AI's transcription") + ".")
     if enr.reading_order_pages:
         lines.append(f"Reading order: determined by AI on {enr.reading_order_pages} page(s).")
     lines.append(f"Document: title \"{title}\", language {language}, PDF/UA identifier set.")

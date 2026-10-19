@@ -4,7 +4,8 @@
 
 ## Reporting a problem
 
-**Report a problem**, at the top right, opens the help form about the document, with the version and page filled in.
+**Report a problem**, at the top right of your own documents, opens the help form about the document, with the
+version and page filled in.
 With a tag selected it reads **Report a problem here** and fills in the tag as well. **Report a problem with this
 tag** in the tag menu does the same. See [Getting help](../getting-help.md).
 
@@ -19,6 +20,9 @@ tag** in the tag menu does the same. See [Getting help](../getting-help.md).
 - **Lists and tables:** a list read as one paragraph, or a table read as text, can be rebuilt. See [Lists and tables
   of contents](lists-and-contents.md) and [Tables](tables.md).
 - **Math and notation:** read the read-aloud text of formulas marked as written by AI; the AI can confuse similar
-  symbols.
+  symbols. Where two readings disagree, pick the right one in **Edit tag…**
+  ([how](editing-a-tag.md#what-can-be-changed)).
+- **Right-to-left pages:** on pages in Arabic or Hebrew, check that columns and items side by side are read from the
+  right. See [Reading order](reading-order.md).
 - **Listen:** [Read aloud](read-aloud.md) catches order and alt-text problems quickly, but check with a real screen
   reader before you finish.

@@ -1,7 +1,8 @@
 // Pending tag edits: the list sent to the server, and how the right pane shows them before saving.
 import type { TagEdit, TagElement, TagMap } from "../api";
 
-export type Overrides = { role?: string; alt?: string; actual?: string; lang?: string; scope?: string; decorative?: boolean };
+export type Overrides = { role?: string; alt?: string; actual?: string; lang?: string; scope?: string; decorative?: boolean;
+  fieldLabel?: string };
 
 /** One pending edit per element and property; moves accumulate in order. */
 function key(op: TagEdit): string | null {
@@ -37,7 +38,27 @@ function key(op: TagEdit): string | null {
       return `headers:${op.element}`;
     case "link_note":
       return `note:${op.element}`;
+    case "set_field_label":
+      return `fieldlabel:${op.element}`;
+    case "set_doc_title":
+      return "doc:title";
+    case "set_doc_lang":
+      return "doc:lang";
+    case "rebuild_table":
+      return `table:${op.element}`;  // the editor's grid replaces what it said before
+    case "build_table":
+      return null;
   }
+}
+
+/** The document's own title and language once pending edits are applied (#363): what the Document panel shows. */
+export function documentDraft(ops: TagEdit[], map?: TagMap | null): { title: string; lang: string } {
+  let title = map?.document?.title ?? "", lang = map?.document?.lang ?? "";
+  for (const op of ops) {
+    if (op.op === "set_doc_title") title = op.title;
+    else if (op.op === "set_doc_lang") lang = op.lang;
+  }
+  return { title, lang };
 }
 
 /** Tags merged into another by pending edits: absorbed element -> the tag that now holds its content. */
@@ -98,6 +119,7 @@ export function overrides(ops: TagEdit[], map?: TagMap | null): Map<number, Over
     else if (op.op === "set_actual_text") at(op.element).actual = op.text;
     else if (op.op === "set_lang") at(op.element).lang = op.lang;
     else if (op.op === "set_decorative") at(op.element).decorative = true;
+    else if (op.op === "set_field_label") at(op.element).fieldLabel = op.label;
   }
   return out;
 }
@@ -125,7 +147,12 @@ export function deletedTags(map: TagMap, ops: TagEdit[]): Set<number> {
   return ops.some((o) => o.op === "delete") ? draftTree(map, ops).deleted : new Set();
 }
 
+const ARTIFACT_WORDS: Record<string, string> = { layout: "decorative", header: "a running page header",
+  footer: "a running page footer", page_number: "a page number" };
+
 export function describe(op: TagEdit, map: TagMap): string {
+  if (op.op === "set_doc_title") return `Document title → “${op.title.slice(0, 60)}”`;
+  if (op.op === "set_doc_lang") return `Document language → ${op.lang}`;
   const el = map.elements[op.element];
   const what = el ? `${el.role}${el.text ? ` “${el.text.slice(0, 40)}${el.text.length > 40 ? "…" : ""}”` : ""}` : `element ${op.element}`;
   const page = el?.page ? ` (page ${el.page})` : "";
@@ -139,7 +166,7 @@ export function describe(op: TagEdit, map: TagMap): string {
     case "set_actual_text":
       return op.text.trim() ? `Read-aloud text for ${what}${page}` : `Read-aloud text removed from ${what}${page}`;
     case "set_decorative":
-      return `${what} marked decorative${page}`;
+      return `${what} marked ${ARTIFACT_WORDS[op.as ?? "layout"]}${page}`;
     case "set_lang":
       return op.lang ? `${what} language → ${op.lang}${page}` : `Language removed from ${what}${page}`;
     case "move": {
@@ -174,6 +201,16 @@ export function describe(op: TagEdit, map: TagMap): string {
       return `${what} moved one level out of its nested list${page}`;
     case "make_toc":
       return `${what} made into a table of contents${page}`;
+    case "set_field_label":
+      return `Field label for ${what} → “${op.label.slice(0, 40)}”${page}`;
+    case "rebuild_table": {
+      const width = Math.max(0, ...op.rows.map((r) => r.reduce((n, c) => n + (c.cols ?? 1), 0)));
+      return `${what} edited: ${op.rows.length} row${op.rows.length === 1 ? "" : "s"} by ${width} column${width === 1 ? "" : "s"}${op.caption === null ? ", caption removed" : op.caption !== undefined ? ", with a caption" : ""}${page}`;
+    }
+    case "build_table": {
+      const width = Math.max(0, ...op.rows.map((r) => r.reduce((n, c) => n + (c.cols ?? 1), 0)));
+      return `${what}${op.absorb?.length ? ` and ${op.absorb.length} more` : ""} made into a table of ${op.rows.length} row${op.rows.length === 1 ? "" : "s"} by ${width} column${width === 1 ? "" : "s"}${page}`;
+    }
     case "link_note":
       return op.note === null ? `${what} no longer points at a footnote${page}`
         : `${what} points at the footnote “${(map.elements[op.note]?.text ?? `element ${op.note}`).slice(0, 30)}”${page}`;
@@ -346,6 +383,9 @@ export function editMarks(map: TagMap, ops: TagEdit[]): Map<number, string[]> {
       case "make_toc": add(op.element, "table of contents"); break;
       case "set_headers": add(op.element, "headers"); break;
       case "link_note": add(op.element, op.note === null ? "footnote link removed" : "points at a footnote"); break;
+      case "set_field_label": add(op.element, "field label"); break;
+      case "rebuild_table": add(op.element, "table edited"); break;
+      case "build_table": for (const i of [op.element, ...(op.absorb ?? [])]) add(i, "made into a table"); break;
       case "indent": case "outdent": {
         const level = (levels ??= listPlan(map, ops)).level(op.element);
         add(op.element, level ? `list level ${level}` : op.op === "indent" ? "one level in" : "one level out");
@@ -480,7 +520,7 @@ export function withoutEdits(map: TagMap, ops: TagEdit[], ids: number[]): TagEdi
       if (absorb.length) next.push(absorb.length === op.absorb.length ? op : { ...op, absorb });
     } else if (op.op === "build_list" && op.absorb?.some((i) => ids.includes(i))) {
       continue; // its rows are cut from every tag it took: without one of them the rest don't stand
-    } else if (!ids.includes(op.element)) next.push(op);
+    } else if (!("element" in op) || !ids.includes(op.element)) next.push(op); // the document's own edits stay
   }
   for (let bad = listPlan(map, next).bad; bad.size; bad = listPlan(map, next).bad) {
     const first = Math.min(...bad.keys());

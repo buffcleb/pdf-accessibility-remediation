@@ -104,6 +104,8 @@ generate systemd units with `podman generate systemd` / Quadlet (Podman).
 
 ## Scaling on one server
 
-Raise `WORKER_CONCURRENCY` (documents processed at once by the engine worker) and the portal's
-`PORTAL_ENGINE_MAX_IN_FLIGHT` together, within the server's memory. Beyond one server, use [Kubernetes](kubernetes.md)
-or [AWS](aws.md).
+Raise `WORKER_CONCURRENCY` (documents processed at once by the engine worker, 2 by default) within the server's
+memory and CPUs: each document keeps about one CPU busy and can use a few GB. The portal asks the engine how many
+places its workers have, so `PORTAL_ENGINE_MAX_IN_FLIGHT` (4) only needs raising past that if the engine can't be
+asked. A long document's per-page work is also shared over `PAGE_WORKERS` processes (3, from
+`PAGE_WORKERS_MIN_PAGES`, 50 pages). Beyond one server, use [Kubernetes](kubernetes.md) or [AWS](aws.md).

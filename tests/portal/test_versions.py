@@ -111,7 +111,12 @@ def test_edit_requests_are_checked(setup):
     assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": []}).status_code == 422
     bad = [{"op": "rm -rf", "element": 1}]
     assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": bad}).status_code == 422
-    for _ in range(3):
+    # Every other edit names a tag; the document's title and language don't (#363)
+    no_tag = [{"op": "set_alt"}]
+    assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": no_tag}).status_code == 422
+    doc = [{"op": "set_doc_title", "title": "Annual report"}, {"op": "set_doc_lang", "lang": "fr-CA"}]
+    assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": doc}).status_code == 201
+    for _ in range(2):
         assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS}).status_code == 201
     r = u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS})
     assert r.status_code == 429
@@ -458,13 +463,20 @@ def test_describe_an_area_writes_alt_text_and_records_its_cost(setup):
     s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": True})
     r = s["c"]["user"].post(url, json=body)
     assert r.status_code == 200, r.text
-    assert r.json()["alt"] == "Two rings joined by a bond" and r.json()["cost_usd"] == 0.0012
+    assert r.json()["alt"] == "Two rings joined by a bond"
+    assert "cost_usd" not in r.json()        # dollars are super admins' (#314): the job's cost keeps it for them
     name, page, bbox, model, long, size = s["engine"].described[-1]
     assert (page, bbox, model, long) == (1, [100, 100, 300, 260], "local-vision", True) and size > 0
     s["c"]["user"].post(url, json=body)
     s["db"].expire_all()
     cost = s["db"].get(Job, uuid.UUID(job_id)).cost
     assert cost["describe_calls"] == 2 and abs(cost["describe_usd"] - 0.0024) < 1e-9
+    # ...each use in the log the Describe with AI report reads (#318)
+    assert [(u["user"], u["usd"], u["page"]) for u in cost["describe_log"]] == [(uid, 0.0012, 1)] * 2
+    # ...and the audit log, which group admins read, doesn't carry it
+    from portal.models import AuditEvent
+    events = [e for e in s["db"].scalars(select(AuditEvent)) if e.action == "version.ai_described"]
+    assert events and not any("cost_usd" in (e.details or {}) for e in events)
     # someone else in the group can't, even when allowed, and nor can anyone without a box
     s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}", json={"ai_describe": True})
     assert s["c"]["user2"].post(url, json=body).status_code in (403, 404)

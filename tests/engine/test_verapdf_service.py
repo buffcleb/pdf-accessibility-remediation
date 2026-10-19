@@ -120,3 +120,69 @@ def test_worker_capacity_adds_up_the_running_workers(monkeypatch):
     assert routes.worker_capacity() == {"workers": 0, "documents_at_once": None}
     monkeypatch.setattr(celery_app.control, "inspect", lambda timeout=1.0: Inspect(ConnectionError("no queue")))
     assert routes.worker_capacity() == {"workers": None, "documents_at_once": None}
+
+
+OOM_REPORT = (b"<report><jobs><job><taskResult><exceptionMessage>Exception: OutOfMemory caught when validating item "
+              b"caused by exception: Java heap space</exceptionMessage></taskResult></job></jobs></report>")
+
+
+def test_the_service_running_out_of_memory_isnt_retried_inside_the_worker(monkeypatch, tmp_path):
+    """The command line runs in the worker beside the document, with less memory than the service: retried there on a
+    300-page file, it took the worker down with it (production, 2026-10-16)."""
+    monkeypatch.setattr(get_settings(), "verapdf_url", "http://verapdf.test")
+    monkeypatch.setattr(verapdf, "_run_service", lambda url, p, f: OOM_REPORT)
+    called = []
+    monkeypatch.setattr(verapdf, "_run_cli", lambda p, x, f: called.append(f))
+    res = verapdf.run_verapdf(tmp_path / "big.pdf", tmp_path / "big.xml", "ua1")
+    assert called == [] and res.compliant is None
+    assert "ran out of memory" in res.error and "VERAPDF_HEAP" in res.error
+    # Any other unusable report still goes to the command line
+    monkeypatch.setattr(verapdf, "_run_service", lambda url, p, f: b"<report/>")
+    verapdf.run_verapdf(tmp_path / "big.pdf", tmp_path / "big.xml", "ua1")
+    assert called == ["ua1"]
+
+
+def test_the_command_line_gets_a_heap_of_its_own_size(monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.setattr(verapdf, "_binary", lambda: "/usr/bin/verapdf")
+    monkeypatch.setattr(get_settings(), "verapdf_cli_heap", "768m")
+    seen = {}
+
+    def run(cmd, **kw):
+        seen.update(kw.get("env") or {})
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+    monkeypatch.setattr(verapdf.subprocess, "run", run)
+    verapdf._run_cli(tmp_path / "a.pdf", tmp_path / "a.xml", "ua1")
+    assert seen["JAVA_TOOL_OPTIONS"].startswith("-Xmx768m") and "PATH" in seen
+
+
+def test_the_profiles_are_checked_side_by_side_through_the_service(monkeypatch, tmp_path):
+    """Each check waits on the service, not on the worker: the two profiles at once save a minute and a half on a
+    500-page document. The job's own validator choices (a context variable) reach both; the command line stays one
+    at a time."""
+    import threading
+    import time
+
+    from app.pipeline import orchestrator
+
+    monkeypatch.setattr(get_settings(), "verapdf_flavours", "ua1,ua2")
+    seen = []
+
+    def check(pdf, xml, fl):
+        seen.append((fl, threading.get_ident(), verapdf._options.get().service))
+        time.sleep(0.4)
+        return verapdf.VeraResult(flavour=fl, available=True, compliant=True)
+    monkeypatch.setattr(orchestrator, "run_verapdf", check)
+    monkeypatch.setattr(verapdf, "uses_service", lambda: True)
+    started = time.monotonic()
+    with verapdf.job_validator({"validator": "service"}):
+        results = orchestrator._validate(tmp_path / "a.pdf", tmp_path, "after", "a")
+    assert time.monotonic() - started < 0.7                         # side by side, not 0.8 s one after the other
+    assert list(results) == ["ua1", "ua2"] and {s[2] for s in seen} == {True}
+    assert len({s[1] for s in seen}) == 2
+
+    seen.clear()
+    monkeypatch.setattr(verapdf, "uses_service", lambda: False)    # the command line: one after the other
+    orchestrator._validate(tmp_path / "a.pdf", tmp_path, "after", "a")
+    assert len({s[1] for s in seen}) == 1

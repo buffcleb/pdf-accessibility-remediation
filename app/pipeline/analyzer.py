@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -824,11 +825,18 @@ def _merge_paragraph_lines(blocks: list[TextBlock]) -> list[TextBlock]:
 
 # --------------------------------------------------------------------------- tables
 def _extract_tables(page: fitz.Page, page_no: int) -> list[TableRegion]:
+    # find_tables turns PyMuPDF's process-wide "small glyph heights" on while it works, and on a rotated page that
+    # throws early it never turns it off: every page after it, in this document and the next, then had shorter text
+    # boxes. Put back as it was, so a page's analysis doesn't depend on the pages before it (#124: pages are shared
+    # out over processes, each starting fresh)
+    small = fitz.TOOLS.set_small_glyph_heights()
     try:
         found = page.find_tables()
     except Exception as exc:  # noqa: BLE001 - table finder is heuristic and occasionally throws
         log.warning("table detection failed on page %s: %s", page_no, exc)
         return []
+    finally:
+        fitz.TOOLS.set_small_glyph_heights(small)
     tables: list[TableRegion] = []
     for t_idx, tab in enumerate(found.tables):
         if tab.row_count < 2 or tab.col_count < 2:
@@ -1177,7 +1185,19 @@ def _cell_at(table: TableRegion, b: TextBlock) -> TableCell | None:
                 None)
 
 
+# One page analyzed at a time in a process: table detection switches a PyMuPDF setting for the whole process while
+# it works (see _extract_tables), so a page read in another thread meanwhile came out different, and two at once
+# could leave it switched. Nothing is lost: PyMuPDF holds the interpreter lock, so threads never ran pages in
+# parallel; more than one core is page_pool's processes (#124)
+_PAGE_LOCK = threading.Lock()
+
+
 def analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[dict]]:
+    with _PAGE_LOCK:
+        return _analyze_page(doc, page_no)
+
+
+def _analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[dict]]:
     page = doc[page_no]
     # Everything is analyzed in *visual* page space (what a reader sees, after /Rotate), so layout
     # heuristics like "top of page" and "left column" hold for rotated pages too. PyMuPDF extracts
@@ -1252,12 +1272,23 @@ def analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[d
     return pa, issues
 
 
+def analyze_pages(path: Path | str, numbers: list[int]) -> dict[int, tuple[PageAnalysis, list[dict]]]:
+    """The pages numbered, each analyzed as analyze_document does (one page_pool worker's share, #124)."""
+    with fitz.open(path) as doc:
+        return {n: analyze_page(doc, n) for n in numbers}
+
+
 def analyze_document(path: Path | str) -> DocumentAnalysis:
+    from app.pipeline import page_pool
+
     doc = fitz.open(path)
     try:
         pages, font_issues = [], []
+        workers = page_pool.workers_for(doc.page_count)
+        done = page_pool.run("app.pipeline.analyzer:analyze_pages", path, doc.page_count, workers) \
+            if workers > 1 else None
         for n in range(doc.page_count):
-            pa, issues = analyze_page(doc, n)
+            pa, issues = done[n] if done is not None else analyze_page(doc, n)
             pages.append(pa)
             font_issues.extend(issues)
 

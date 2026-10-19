@@ -41,3 +41,11 @@ def test_a_writer_and_the_reviewer_suggested_for_it_are_from_different_families(
                           ("commercial-small-vision", "open-judge"), ("commercial-medium-vision", "commercial-judge"),
                           ("commercial-large-vision", "commercial-judge")):
         assert family(writer) != family(judge), (writer, judge)
+
+
+def test_the_jev_route_adds_the_openrouter_key_from_the_environment():
+    """#361: the engine reaches Jev only through the gateway, which holds the key; the file never does."""
+    (route,) = CONFIG["general_settings"]["pass_through_endpoints"]
+    assert route["path"] == "/systemone" and route["target"] == "https://openrouter.ai/api/v1/systemone"
+    assert route["headers"]["Authorization"] == "Bearer os.environ/OPENROUTER_API_KEY"
+    assert route["forward_headers"] is False  # the engine's gateway key isn't passed on to OpenRouter

@@ -18,6 +18,7 @@ import pikepdf
 import pymupdf as fitz
 from pikepdf import Dictionary, Name
 
+from app.pipeline import page_pool
 from app.verification.integrity import TagIndex, _items
 from app.verification.model import Finding
 
@@ -70,6 +71,9 @@ def _patch_pdfplumber_marked_content() -> None:
 
 _patch_pdfplumber_marked_content()
 
+
+# The glyph fields the checks use (text, its size and font, where it is, which marked content it is in)
+_CHAR_KEYS = ("text", "size", "fontname", "x0", "x1", "top", "bottom", "mcid", "tag")
 
 _ALT_LONG = 300
 _ALT_LONG_DRAWING = 1000  # above what a labeled figure's description is cut at (ALT_LIMIT_LONG, app/ai/base.py)
@@ -233,6 +237,137 @@ def _image_clips(page: pikepdf.Page) -> dict[int | None, list[fitz.Rect | None]]
     return out
 
 
+@dataclass
+class PageContent:
+    """What one page holds, for SemanticChecker: by tag (element index), by marked-content item, and its artifacts."""
+    page_size: tuple = (0.0, 0.0)
+    own: dict = field(default_factory=dict)  # element index -> Content, in the order first seen
+    by_mcid: dict = field(default_factory=dict)  # (page, mcid) -> Content
+    artifact: Content | None = None  # None: nothing on the page asked for it
+    tables: list = field(default_factory=list)
+
+
+def _each_page(path, numbers, by_page_mcid: dict, pdf: pikepdf.Pdf | None = None):
+    """(page number, PageContent) for each page numbered, in order."""
+    own_pdf = pdf is None
+    if own_pdf:
+        pdf = pikepdf.open(path)
+    try:
+        with fitz.open(path) as doc, pdfplumber.open(path) as plumb:
+            for i in numbers:
+                page = plumb.pages[i]
+                yield i, _collect_page(i, page, doc[i], pdf.pages[i], by_page_mcid)
+                page.close()  # its parsed objects are cached until then: on a long document, every page's
+                # would stay in memory to the end
+    finally:
+        if own_pdf:
+            pdf.close()
+
+
+def collect_pages(path, numbers: list[int], by_page_mcid: dict) -> dict[int, PageContent]:
+    """One page_pool worker's share of SemanticChecker._collect (#124)."""
+    return dict(_each_page(path, numbers, by_page_mcid))
+
+
+def _collect_page(i: int, page, fpage: fitz.Page, pkpage, by_page_mcid: dict) -> PageContent:
+    out = PageContent()
+
+    def artifact() -> Content:
+        if out.artifact is None:
+            out.artifact = Content()
+        return out.artifact
+
+    rot = fpage.rotation_matrix if fpage.rotation else None
+    vis = fpage.rect
+    out.page_size = (vis.width, vis.height)
+    top0 = float(page.bbox[1])
+    x00 = float(page.bbox[0])
+
+    def vbox(o):
+        r = fitz.Rect(o["x0"] - x00, o["top"] - top0, o["x1"] - x00, o["bottom"] - top0)
+        if rot is not None:
+            r = r * rot
+        return (r.x0, r.y0, r.x1, r.y1)
+
+    def bucket(o) -> Content:
+        mcid = o.get("mcid")
+        if mcid is None or o.get("tag") == "Artifact":
+            return artifact()
+        idx = by_page_mcid.get((i, mcid))
+        if idx is None:
+            return artifact()
+        return out.own.setdefault(idx, Content())
+
+    def piece(o) -> Content | None:
+        """The content of the one marked-content item o belongs to (for the tag manager)."""
+        mcid = o.get("mcid")
+        if mcid is None or o.get("tag") == "Artifact" or (i, mcid) not in by_page_mcid:
+            return None
+        return out.by_mcid.setdefault((i, mcid), Content())
+
+    for c in page.chars:
+        b = vbox(c)
+        # Only what the checks read: pdfplumber's own dict has some 25 fields per glyph, which on a
+        # 332-page document came to gigabytes (the worker was killed for memory, 2026-10-16)
+        c = {k: c.get(k) for k in _CHAR_KEYS} | {"vbox": b}
+        dest = bucket(c)
+        dest.chars.append(c)
+        dest.boxes.append(b)
+        dest.page_boxes.append((i, b))
+        if (pc := piece(c)) is not None:
+            pc.chars.append(c)
+            pc.boxes.append(b)
+    # Images drawn under a clip show only inside it (see _image_clips); matched to pdfplumber's
+    # images per marked-content id, in order, when the two agree on how many there are
+    try:
+        clips = _image_clips(pkpage)
+    except Exception:  # noqa: BLE001 - unreadable content: use the images' full placement
+        clips = {}
+    counts = Counter(im.get("mcid") for im in page.images)
+    seen: Counter = Counter()
+    to_page = fpage.transformation_matrix * (rot if rot is not None else fitz.Identity)
+    for im in page.images:
+        b = vbox(im)
+        mcid = im.get("mcid")
+        listed = clips.get(mcid, [])
+        k = seen[mcid]
+        seen[mcid] += 1
+        if len(listed) == counts[mcid] and listed[k] is not None:
+            shown = fitz.Rect(listed[k]) * to_page
+            cut = fitz.Rect(b) & shown
+            b = tuple(cut) if not cut.is_empty else tuple(shown)
+        try:
+            raw = im["stream"].get_rawdata() or b""
+            digest = hashlib.sha1(raw[:65536]).hexdigest()
+        except Exception:  # noqa: BLE001 - unreadable image data: fall back to geometry
+            digest = f"{im.get('srcsize')}"
+        area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        dest = bucket(im)
+        dest.images.append((b, digest, area))
+        dest.boxes.append(b)
+        dest.page_boxes.append((i, b))
+        if (pc := piece(im)) is not None:
+            pc.images.append((b, digest, area))
+            pc.boxes.append(b)
+    for g in page.rects + page.curves + page.lines:
+        dest = bucket(g)
+        dest.graphics += 1
+        if dest is not artifact():
+            gb = vbox(g)
+            dest.boxes.append(gb)
+            dest.page_boxes.append((i, gb))
+            if (pc := piece(g)) is not None:
+                pc.graphics += 1
+                pc.boxes.append(gb)
+    try:
+        out.tables = [(t.bbox, t.extract(), vbox({"x0": t.bbox[0], "top": t.bbox[1], "x1": t.bbox[2],
+                                                  "bottom": t.bbox[3]}))
+                      for t in page.find_tables()]
+    except Exception:  # noqa: BLE001 - table finder is heuristic
+        out.tables = []
+    return out
+
+
 class SemanticChecker:
     def __init__(self, path, pdf: pikepdf.Pdf, index: TagIndex, max_pages: int = 400):
         self.path = path
@@ -264,101 +399,30 @@ class SemanticChecker:
             page = self.index.page_of_owner.get(owner)
             if page is not None and owner == owner_for_page.get(page):
                 by_page_mcid[(page, mcid)] = users[0]
-        doc = fitz.open(self.path)
-        try:
-            with pdfplumber.open(self.path) as plumb:
-                for i, page in enumerate(plumb.pages):
-                    if i >= self.max_pages:
-                        self.skipped.append(f"semantic checks limited to the first {self.max_pages} pages")
-                        break
-                    rot = doc[i].rotation_matrix if doc[i].rotation else None
-                    vis = doc[i].rect
-                    self.page_size[i] = (vis.width, vis.height)
-                    top0 = float(page.bbox[1])
-                    x00 = float(page.bbox[0])
+        count = len(self.pdf.pages)
+        pages = min(count, self.max_pages)
+        # A long document's pages read by several processes (#124), each page on its own, put back in page order
+        workers = page_pool.workers_for(pages)
+        done = page_pool.run("app.verification.semantic:collect_pages", self.path, pages, workers, arg=by_page_mcid) \
+            if workers > 1 else None
+        if done is not None:
+            for i in range(pages):
+                self._merge(i, done[i])
+                done[i] = None  # merged: not held twice
+        else:
+            for i, part in _each_page(self.path, range(pages), by_page_mcid, self.pdf):
+                self._merge(i, part)
+        if count > self.max_pages:
+            self.skipped.append(f"semantic checks limited to the first {self.max_pages} pages")
 
-                    def vbox(o):
-                        r = fitz.Rect(o["x0"] - x00, o["top"] - top0, o["x1"] - x00, o["bottom"] - top0)
-                        if rot is not None:
-                            r = r * rot
-                        return (r.x0, r.y0, r.x1, r.y1)
-
-                    def bucket(o) -> Content:
-                        mcid = o.get("mcid")
-                        if mcid is None or o.get("tag") == "Artifact":
-                            return self.artifact[i]
-                        idx = by_page_mcid.get((i, mcid))
-                        if idx is None:
-                            return self.artifact[i]
-                        return self.own.setdefault(idx, Content())
-
-                    def piece(o) -> Content | None:
-                        """The content of the one marked-content item o belongs to (for the tag manager)."""
-                        mcid = o.get("mcid")
-                        if mcid is None or o.get("tag") == "Artifact" or (i, mcid) not in by_page_mcid:
-                            return None
-                        return self.by_mcid.setdefault((i, mcid), Content())
-
-                    for c in page.chars:
-                        b = vbox(c)
-                        c = dict(c, vbox=b)
-                        dest = bucket(c)
-                        dest.chars.append(c)
-                        dest.boxes.append(b)
-                        dest.page_boxes.append((i, b))
-                        if (pc := piece(c)) is not None:
-                            pc.chars.append(c)
-                            pc.boxes.append(b)
-                    # Images drawn under a clip show only inside it (see _image_clips); matched to pdfplumber's
-                    # images per marked-content id, in order, when the two agree on how many there are
-                    try:
-                        clips = _image_clips(self.pdf.pages[i])
-                    except Exception:  # noqa: BLE001 - unreadable content: use the images' full placement
-                        clips = {}
-                    counts = Counter(im.get("mcid") for im in page.images)
-                    seen: Counter = Counter()
-                    to_page = doc[i].transformation_matrix * (rot if rot is not None else fitz.Identity)
-                    for im in page.images:
-                        b = vbox(im)
-                        mcid = im.get("mcid")
-                        listed = clips.get(mcid, [])
-                        k = seen[mcid]
-                        seen[mcid] += 1
-                        if len(listed) == counts[mcid] and listed[k] is not None:
-                            shown = fitz.Rect(listed[k]) * to_page
-                            cut = fitz.Rect(b) & shown
-                            b = tuple(cut) if not cut.is_empty else tuple(shown)
-                        try:
-                            raw = im["stream"].get_rawdata() or b""
-                            digest = hashlib.sha1(raw[:65536]).hexdigest()
-                        except Exception:  # noqa: BLE001 - unreadable image data: fall back to geometry
-                            digest = f"{im.get('srcsize')}"
-                        area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-                        dest = bucket(im)
-                        dest.images.append((b, digest, area))
-                        dest.boxes.append(b)
-                        dest.page_boxes.append((i, b))
-                        if (pc := piece(im)) is not None:
-                            pc.images.append((b, digest, area))
-                            pc.boxes.append(b)
-                    for g in page.rects + page.curves + page.lines:
-                        dest = bucket(g)
-                        dest.graphics += 1
-                        if dest is not self.artifact[i]:
-                            gb = vbox(g)
-                            dest.boxes.append(gb)
-                            dest.page_boxes.append((i, gb))
-                            if (pc := piece(g)) is not None:
-                                pc.graphics += 1
-                                pc.boxes.append(gb)
-                    try:
-                        self.tables[i] = [(t.bbox, t.extract(), vbox({"x0": t.bbox[0], "top": t.bbox[1],
-                                                                       "x1": t.bbox[2], "bottom": t.bbox[3]}))
-                                          for t in page.find_tables()]
-                    except Exception:  # noqa: BLE001 - table finder is heuristic
-                        self.tables[i] = []
-        finally:
-            doc.close()
+    def _merge(self, i: int, part: "PageContent") -> None:
+        self.page_size[i] = part.page_size
+        if part.artifact is not None:
+            self.artifact[i] = part.artifact
+        for idx, c in part.own.items():
+            self.own.setdefault(idx, Content()).add(c)
+        self.by_mcid.update(part.by_mcid)
+        self.tables[i] = part.tables
 
     def _page_of(self, e) -> int | None:
         """Page of an element, or of its first descendant that has one (containers often lack /Pg)."""
@@ -395,6 +459,7 @@ class SemanticChecker:
         self._tables(els)
         self._lists(els)
         self._links(els)
+        self._fields(els)
         self._reading_order(els)
         self._language(els)
         self._cut_off()
@@ -670,6 +735,24 @@ class SemanticChecker:
             if text and _GENERIC_LINK.match(text):
                 self.add("suggest", "link text is generic", e, text=text, action="make the link text descriptive",
                          confidence=0.7)
+
+    def _fields(self, els) -> None:
+        """A form field whose tooltip (what a screen reader announces) is missing or only an internal name (#341)."""
+        from app.pipeline.field_labels import looks_internal
+
+        for e in els:
+            if e.role != "Form":
+                continue
+            for item in _items(e.obj.get("/K")):
+                if isinstance(item, Dictionary) and "/Obj" in item:
+                    w = item.Obj
+                    tu = w.get("/TU") or (w.get("/Parent").get("/TU") if w.get("/Parent") is not None else None)
+                    name = w.get("/T") or (w.get("/Parent").get("/T") if w.get("/Parent") is not None else None)
+                    if looks_internal(str(tu or "")):
+                        self.add("review", "form field has no name a person would understand", e,
+                                 detail=f'announced as "{tu or name or "(nothing)"}"',
+                                 action="give it a label in the tag manager (what a person fills in here)",
+                                 confidence=0.8)
 
     def _reading_order(self, els) -> None:
         per_page: dict[int, list[tuple[int, tuple]]] = defaultdict(list)

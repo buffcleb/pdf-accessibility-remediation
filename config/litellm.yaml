@@ -86,3 +86,13 @@ litellm_settings:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/LITELLM_DATABASE_URL
+  # The Jev classifier (OpenRouter's System One API, not a chat model): the engine calls /systemone here with its
+  # gateway key, and the gateway adds the OpenRouter key, so the engine needs neither the key nor the internet
+  # (#361). Unused unless a super admin picks Jev for "Let AI decide".
+  pass_through_endpoints:
+    - path: /systemone
+      target: https://openrouter.ai/api/v1/systemone
+      headers:
+        Authorization: "Bearer os.environ/OPENROUTER_API_KEY"
+        X-Title: PDF Accessibility Remediation
+      forward_headers: false

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import pikepdf
 from pikepdf import Array, ContentStreamInstruction, Dictionary, Name
 
+from app.tagging.mathml_tags import in_mathml as _in_mathml
 from app.verification.model import Finding
 
 STANDARD = {
@@ -211,7 +212,7 @@ class IntegrityChecker:
             elems.append(e)
             if parent_idx is not None:
                 elems[parent_idx].kids.append(e.index)
-            if role not in STANDARD:
+            if role not in STANDARD and not _in_mathml(obj):  # MathML says what it is by its namespace (#403)
                 self.err("structure type is not standard and not role-mapped", role=raw, element=e.index,
                          page=(e.page + 1) if e.page is not None else None)
             p = obj.get("/P")

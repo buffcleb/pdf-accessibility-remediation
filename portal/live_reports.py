@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import Float, Integer, Numeric, Select, String, Text, and_, case, cast, distinct, func, or_, select
+from sqlalchemy import DateTime, Float, Integer, Numeric, Select, String, Text, and_, case, cast, distinct, func, or_, select
 from sqlalchemy import column, literal_column
 from sqlalchemy import true as sa_true
 from sqlalchemy.dialects.postgresql import JSONB
@@ -133,6 +133,23 @@ def _kind_expr() -> ColumnElement:
 
 
 _summary = Job.result_summary
+# The limits a document reached (#312): the engine's and the portal's (result_summary.metrics.limits_hit), and a
+# failure for taking too long or running the worker out of memory
+_limits_raw = _summary["metrics"]["limits_hit"]
+# (a list, or an empty one: older summaries have none, or a JSON null)
+_limits_json = case((func.jsonb_typeof(_limits_raw) == "array", _limits_raw), else_=func.jsonb_build_array())
+_FAILED_LIMITS = {"time_limit_exceeded": "TASK_TIME_LIMIT_S", "worker_lost": "worker memory (lost worker)"}
+_hit_any = or_(func.jsonb_array_length(_limits_json) > 0, Job.error_code.in_(list(_FAILED_LIMITS)))
+
+
+def _limits_named() -> ColumnElement:
+    """The settings a document reached, by name: "AI_NOTATION_MAX, VERIFY_AI_MAX_ITEMS"."""
+    each = func.jsonb_array_elements(_limits_json).table_valued(column("value", JSONB)).alias("hit")
+    names = select(func.string_agg(each.c.value["setting"].astext, ", ")).select_from(each).scalar_subquery()
+    failed = case(*[(Job.error_code == code, name) for code, name in _FAILED_LIMITS.items()], else_=None)
+    return func.nullif(func.concat_ws(", ", names, failed), "")
+
+
 _doc_compliant = _summary["compliant_after"].as_boolean()
 _doc_findings = cast(_summary["review"]["findings_total"].as_string(), Integer)
 
@@ -146,7 +163,8 @@ def _doc_headline(db: Session, sub) -> list[dict]:
     )).one()
     rate = round(100 * row[3] / row[2]) if row[2] else None
     return [{"label": "Documents", "value": row[0]}, {"label": "Pages charged", "value": int(row[1])},
-            {"label": "Pass PDF/UA-1", "value": f"{rate}%" if rate is not None else "–", "hint": "of finished, remediated documents"},
+            {"label": "Pass PDF/UA", "value": f"{rate}%" if rate is not None else "–",
+             "hint": "of finished, remediated documents (PDF/UA-1; PDF/UA-2 for PDF 2.0 documents)"},
             {"label": "With review findings", "value": row[4]}]
 
 
@@ -165,7 +183,7 @@ DOCUMENTS = Report(
         Col("status", "Status", Job.status),
         Col("pages", "Pages", Job.pages, "num", total=True, default=False),
         Col("pages_charged", "Pages charged", Job.pages_charged, "num", total=True),
-        Col("compliant", "Passes PDF/UA-1", _doc_compliant, "bool"),
+        Col("compliant", "Passes PDF/UA", _doc_compliant, "bool"),
         Col("failed_checks", "Failed checks after", cast(_summary["failed_checks_after"].as_string(), Integer), "num", default=False),
         Col("findings", "Review findings", _doc_findings, "num", total=True),
         Col("seconds", "Time to process (s)", func.round(cast(func.extract("epoch", Job.finished_at - Job.submitted_at), Float)),
@@ -173,6 +191,7 @@ DOCUMENTS = Report(
         Col("external", "Sent elsewhere", func.jsonb_array_length(Job.external_services) > 0, "bool", default=False),
         Col("ai_usd", "AI cost ($)", cast(Job.cost["ai_usd"].as_string(), Float), "money", total=True, super_only=True,
             default=False),
+        Col("limits", "Limits hit", _limits_named(), super_only=True, default=False),
     ],
     group_col=Job.group_id, date_col=Job.created_at,
     search=[Job.filename, User.email, User.name],
@@ -183,10 +202,11 @@ DOCUMENTS = Report(
         Filter("service", "Service or AI level", lambda st, v: st.where(or_(Job.processing == v, Job.ai_tier == v)), _services),
         Filter("outcome", "Result", lambda st, v: st.where(
             _doc_compliant.is_(True) if v == "pass" else _doc_compliant.is_(False) if v == "fail" else _doc_findings > 0),
-            [("pass", "Passes PDF/UA-1"), ("fail", "Doesn't pass"), ("flagged", "Has review findings")]),
+            [("pass", "Passes PDF/UA"), ("fail", "Doesn't pass"), ("flagged", "Has review findings")]),
         Filter("report_only", "Audit only", _yes_no(Job.report_only), YES_NO),
         Filter("external", "Sent elsewhere", lambda st, v: st.where(
             (func.jsonb_array_length(Job.external_services) > 0) if v == "yes" else (func.jsonb_array_length(Job.external_services) == 0)), YES_NO),
+        Filter("limits", "Hit a limit", lambda st, v: st.where(_hit_any if v == "yes" else ~_hit_any), YES_NO),
     ],
     sort="-created_at", links={"job_id": Job.id, "group_id": Job.group_id, "user_id": Job.user_id},
     search_hint="document or person",
@@ -508,7 +528,7 @@ def _quality_cols(ctx: Ctx) -> list[Col]:
         Col("period", "Period", _period(ctx, Job.finished_at), "period"),
         Col("option", "Service and AI level", _option_expr()),
         Col("documents", "Documents", docs, "num", total=True),
-        Col("passed", "Pass PDF/UA-1", passed, "num", total=True),
+        Col("passed", "Pass PDF/UA", passed, "num", total=True),
         Col("pass_rate", "Pass rate", func.round(cast(100.0 * passed / func.nullif(docs, 0), Numeric), 1), "pct"),
         Col("flagged", "With review findings", func.count().filter(_doc_findings > 0), "num", total=True),
         Col("avg_failed", "Failed checks left (average, failing documents)",
@@ -521,12 +541,14 @@ def _quality_headline(db: Session, sub) -> list[dict]:
     row = db.execute(select(func.coalesce(func.sum(sub.c.documents), 0), func.coalesce(func.sum(sub.c.passed), 0),
                             func.coalesce(func.sum(sub.c.flagged), 0))).one()
     rate = f"{100 * row[1] / row[0]:.0f}%" if row[0] else "–"
-    return [{"label": "Pass PDF/UA-1", "value": rate}, {"label": "Remediated documents", "value": int(row[0])},
+    return [{"label": "Pass PDF/UA", "value": rate}, {"label": "Remediated documents", "value": int(row[0])},
             {"label": "With review findings", "value": int(row[2])}]
 
 
 QUALITY = Report(
-    name="quality", label="Quality", description="How often remediated documents pass PDF/UA-1, by service and AI level, over time.",
+    name="quality", label="Quality",
+    description="How often remediated documents pass PDF/UA (PDF/UA-1; PDF/UA-2 for PDF 2.0 documents), by service "
+                "and AI level, over time.",
     base=lambda ctx: _with_options(select().select_from(Job)).where(_remediated, Job.finished_at.is_not(None)),
     cols=[], cols_fn=_quality_cols, group_by=["period", "option"],
     group_col=Job.group_id, date_col=Job.finished_at, search=[],
@@ -541,7 +563,7 @@ QUALITY = Report(
 
 # --- remaining failures: what's left after remediation ---------------------------------------------
 
-_failure = func.jsonb_array_elements(func.coalesce(Job.result_summary["remaining_failures"], cast("[]", JSONB))) \
+_failure = func.jsonb_array_elements(func.coalesce(Job.result_summary["remaining_failures"], func.jsonb_build_array())) \
     .table_valued(column("value", JSONB)).lateral("failure")
 
 
@@ -554,7 +576,7 @@ def _failure_headline(db: Session, sub) -> list[dict]:
 
 FAILURES = Report(
     name="failures", label="Remaining failures",
-    description="The PDF/UA-1 rules remediated documents still fail, most common first: where the engine falls short.",
+    description="The PDF/UA rules remediated documents still fail, most common first: where the engine falls short.",
     base=lambda ctx: select().select_from(Job).join(_failure, sa_true()).where(_remediated),
     cols=[
         Col("clause", "Rule (veraPDF clause)", _failure.c.value["clause"].astext),
@@ -587,6 +609,9 @@ def _cost_cols(ctx: Ctx) -> list[Col]:
         Col("ai_usd", "AI cost ($)", func.coalesce(func.sum(_ai_usd), 0), "money", total=True),
         Col("adobe_pages", "Adobe pages", func.coalesce(func.sum(Job.pages_charged).filter(_ProcService.c.engine_route == "adobe"), 0),
             "num", total=True),
+        # Describe with AI's cost, by the documents' period (the Describe with AI report counts each use when it happens)
+        Col("describe_usd", "Describe with AI ($)", func.coalesce(func.sum(cast(Job.cost["describe_usd"].as_string(), Float)), 0),
+            "money", total=True, default=False),
     ]
 
 
@@ -784,8 +809,92 @@ REPORT_EMAILS = Report(
     sort="-created_at", links={"group_id": User.group_id}, super_only=True, search_hint="email address",
 )
 
+# --- limits hit (super admins): which limits documents reach, and by how much ------------------------
+
+_limit = func.jsonb_array_elements(_limits_json).table_valued(column("value", JSONB)).lateral("limit")
+
+
+def _limits_headline(db: Session, sub) -> list[dict]:
+    top = db.execute(select(sub.c.setting, sub.c.documents).order_by(sub.c.documents.desc()).limit(1)).first()
+    n = db.scalar(select(func.count()).select_from(sub)) or 0
+    return [{"label": "Limits reached", "value": n},
+            {"label": "Most often", "value": top[0] if top else "–", "hint": f"{top[1]} documents" if top else None}]
+
+
+LIMITS = Report(
+    name="limits", label="Limits hit",
+    description="Which limits documents reached, how often, and how far past them they would have gone: whether a "
+                "limit needs raising. Documents that failed for time or memory are in the Documents report "
+                "(filter: Hit a limit).",
+    base=lambda ctx: select().select_from(Job).join(_limit, sa_true()),
+    cols=[
+        Col("setting", "Limit (setting)", _limit.c.value["setting"].astext),
+        Col("effect", "What happens past it", func.max(_limit.c.value["effect"].astext)),
+        Col("value", "Set to", func.max(cast(_limit.c.value["value"].astext, Integer)), "num"),
+        Col("documents", "Documents", func.count(distinct(Job.id)), "num", total=True),
+        Col("wanted", "Most wanted", func.max(cast(_limit.c.value["wanted"].astext, Integer)), "num"),
+        Col("last", "Last", func.max(Job.finished_at), "date"),
+    ],
+    group_by=["setting"],
+    group_col=Job.group_id, date_col=Job.finished_at,
+    search=[_limit.c.value["setting"].astext],
+    filters=[Filter("service", "Service or AI level",
+                    lambda st, v: st.where(or_(Job.processing == v, Job.ai_tier == v)), _services)],
+    sort="-documents", headline=_limits_headline, search_hint="setting", super_only=True,
+    chart=Chart(x="setting", kind="hbar", measures=[Measure("documents", "Documents", "", num="documents")]),
+)
+
+
+# --- Describe with AI (super admins): how much it's used and what it costs, to size recharging (#318) ------
+
+_describe_raw = Job.cost["describe_log"]
+_describe = func.jsonb_array_elements(
+    case((func.jsonb_typeof(_describe_raw) == "array", _describe_raw), else_=func.jsonb_build_array())) \
+    .table_valued(column("value", JSONB)).lateral("described")
+_described_at = cast(_describe.c.value["at"].astext, DateTime(timezone=True))
+_DescribedBy = User.__table__.alias("described_by")
+
+
+def _describe_cols(ctx: Ctx) -> list[Col]:
+    return [
+        Col("period", "Period", _period(ctx, _described_at), "period"),
+        Col("group", "Group", Group.name),
+        Col("person", "Person", _DescribedBy.c.email),
+        Col("level", "AI level", _level_expr()),
+        Col("uses", "Uses", func.count(), "num", total=True),
+        Col("documents", "Documents", func.count(distinct(Job.id)), "num", total=True),
+        Col("usd", "Cost ($)", func.coalesce(func.sum(cast(_describe.c.value["usd"].astext, Float)), 0), "money",
+            total=True),
+    ]
+
+
+def _describe_headline(db: Session, sub) -> list[dict]:
+    row = db.execute(select(func.coalesce(func.sum(sub.c.uses), 0), func.coalesce(func.sum(sub.c.usd), 0),
+                            func.count(distinct(sub.c.person)))).one()
+    per = float(row[1]) / int(row[0]) if row[0] else 0
+    return [{"label": "Uses", "value": int(row[0])}, {"label": "Cost", "value": f"${float(row[1]):,.2f}"},
+            {"label": "People", "value": int(row[2])}, {"label": "Per use", "value": f"${per:,.4f}"}]
+
+
+DESCRIBE = Report(
+    name="describe", label="Describe with AI",
+    description="How often people use Describe with AI in the tag manager, and what it costs, by group, person and AI "
+                "level, over time: to size recharging it. Each use is counted when it happens.",
+    base=lambda ctx: (_with_options(select().select_from(Job).join(_describe, sa_true())
+                                    .outerjoin(Group, Group.id == Job.group_id)
+                                    .outerjoin(_DescribedBy, cast(_DescribedBy.c.id, String) == _describe.c.value["user"].astext))),
+    cols=[], cols_fn=_describe_cols, group_by=["period", "group", "person", "level"],
+    group_col=Job.group_id, date_col=_described_at, search=[_DescribedBy.c.email],
+    filters=[PERIOD_FILTER, Filter("service", "AI level", lambda st, v: st.where(Job.ai_tier == v), _ai_levels)],
+    sort="-period", headline=_describe_headline, super_only=True, search_hint="person",
+    chart=Chart(x="period", kind="bar", measures=[Measure("uses", "Uses", "", num="uses"),
+                                                  Measure("usd", "Cost", "$", num="usd")]),
+)
+
+
 REPORTS: dict[str, Report] = {r.name: r for r in (DOCUMENTS, USAGE, LEDGER, SIGN_INS, EMAIL, HELP, AUDIT,
-                                                    QUALITY, FAILURES, COST, AI_USAGE, DAILY, REPORT_EMAILS)}
+                                                    QUALITY, FAILURES, COST, AI_USAGE, DAILY, REPORT_EMAILS, LIMITS,
+                                                    DESCRIBE)}
 
 
 # --- running a report ------------------------------------------------------------------------------

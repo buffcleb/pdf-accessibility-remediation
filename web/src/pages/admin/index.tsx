@@ -12,6 +12,7 @@ import { PeopleAll } from "./People";
 import { QueuesPage } from "./Queues";
 import { ServiceDetail, ServicesList } from "./Services";
 import { SettingsArea } from "./Settings";
+import { SystemPage } from "./System";
 import { OfferService } from "./Setup";
 import { GatewayLink } from "./shared";
 
@@ -47,6 +48,7 @@ export function Admin() {
               <NavLink to="/admin/services">Services and AI levels</NavLink>
               <NavLink to="/admin/people">People (all groups)</NavLink>
               <NavLink to="/admin/queues">Queues</NavLink>
+              <NavLink to="/admin/system">System</NavLink>
               <NavLink to="/admin/reports">Reports</NavLink>
               <NavLink to="/admin/settings">Settings</NavLink>
             </>
@@ -70,6 +72,7 @@ export function Admin() {
               <Route path="services/:key" element={<ServiceDetail />} />
               <Route path="people" element={<PeopleAll />} />
               <Route path="queues" element={<QueuesPage />} />
+              <Route path="system" element={<SystemPage />} />
               <Route path="users" element={<Navigate to="/admin/people" replace />} />
               <Route path="reports" element={<><h1>Reports</h1><LiveReports />
                 <details className="panel">

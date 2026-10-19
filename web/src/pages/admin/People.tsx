@@ -1,6 +1,6 @@
-import { Fragment, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { del, get, patch, post, type Group, type User } from "../../api";
+import { del, download, get, patch, post, type Group, type User } from "../../api";
 import { useAuth } from "../../auth";
 import { ErrorNotice, Loading, Notice, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
@@ -53,7 +53,8 @@ export function PeopleAll() {
                 return (
                   <Fragment key={u.id}>
                     <tr className={open === u.id ? "row-open" : undefined}>
-                      <td>{u.email}{u.status !== "active" && <> <span className="pill muted">Disabled</span></>}
+                      <td>{u.email}{u.removed_at ? <> <span className="pill muted">Data removed</span></>
+                        : u.status !== "active" && <> <span className="pill muted">Disabled</span></>}
                         {u.approval === "pending" && <> <span className="pill warn">Waiting for approval</span></>}
                         {u.approval === "declined" && <> <span className="pill warn">Declined</span></>}
                         {isSuper && <> <span className="pill info">Super admin</span></>}</td>
@@ -80,9 +81,13 @@ export function PeopleAll() {
                               </div>
                             </Notice>
                           )}
-                          <MoveGroup user={u} groups={groups.data ?? []} onMove={(id) => act(() => patch(`/admin/users/${u.id}`, { group_id: id }))} />
-                          {u.group_id && <UserPages user={u} onChange={(x) => users.setData((users.data ?? []).map((y) => (y.id === x.id ? x : y)))} />}
-                          {u.id !== me?.id && (
+                          {u.removed_at && <p className="small muted">Their data was removed on {fmtDate(u.removed_at)}. The
+                            records stay, without them; nothing else can be changed here.</p>}
+                          {!u.removed_at && <MoveGroup user={u} groups={groups.data ?? []} onMove={(id) => act(() => patch(`/admin/users/${u.id}`, { group_id: id }))} />}
+                          {u.group_id && !u.removed_at && <UserPages user={u} onChange={(x) => users.setData((users.data ?? []).map((y) => (y.id === x.id ? x : y)))} />}
+                          {!u.removed_at && <PersonalData user={u} self={u.id === me?.id} onError={setError}
+                            onRemoved={() => void users.reload()} />}
+                          {u.id !== me?.id && !u.removed_at && (
                             <div className="person-section">
                               <h3>Account</h3>
                               <div className="actions">
@@ -93,6 +98,11 @@ export function PeopleAll() {
                                 <button className="btn secondary small" onClick={() => void act(() => isSuper ? del(`/admin/users/${u.id}/super-admin`) : post(`/admin/users/${u.id}/super-admin`))}>
                                   {isSuper ? "Remove super admin" : "Make super admin"}
                                 </button>
+                                <button className="btn secondary small" onClick={() => {
+                                  if (window.confirm(`Sign ${u.email} out of every browser and device? They'll need a new code to sign in.`)) {
+                                    void act(() => post(`/admin/users/${u.id}/sessions/end`));
+                                  }
+                                }}>Sign out everywhere</button>
                               </div>
                             </div>
                           )}
@@ -107,6 +117,84 @@ export function PeopleAll() {
         </div>
       )}
     </>
+  );
+}
+
+/** A person's data on request (#338): exported for a records request, or removed. Removing keeps the service's
+ * records (counts, pages, the audit trail) without their name, email or files, and can't be undone. */
+function PersonalData({ user, self, onError, onRemoved }: {
+  user: User; self: boolean; onError: (e: unknown) => void; onRemoved: () => void;
+}) {
+  const [asking, setAsking] = useState(false);
+  async function exportData(files: boolean) {
+    onError(null);
+    try {
+      await download(`/admin/users/${user.id}/export${files ? "?files=true" : ""}`, files ? "person.zip" : "person.json");
+    } catch (e) {
+      onError(e);
+    }
+  }
+  return (
+    <div className="person-section">
+      <h3>Personal data</h3>
+      <p className="small muted">For a records request. Exports and removals are recorded in the audit log.</p>
+      <div className="actions">
+        <button className="btn secondary small" onClick={() => void exportData(false)}>Export records</button>
+        <button className="btn secondary small" onClick={() => void exportData(true)}>Export records and files</button>
+        {!self && <button className="btn small danger" onClick={() => setAsking(true)}>Remove this person's data…</button>}
+      </div>
+      {asking && <RemoveDialog user={user} onClose={() => setAsking(false)} onError={onError}
+        onDone={() => { setAsking(false); onRemoved(); }} />}
+    </div>
+  );
+}
+
+function RemoveDialog({ user, onClose, onError, onDone }: {
+  user: User; onClose: () => void; onError: (e: unknown) => void; onDone: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const [typed, setTyped] = useState("");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const d = ref.current;
+    if (d && !d.open) d.showModal();
+  }, []);
+  const ready = typed.trim().toLowerCase() === user.email.toLowerCase() && reason.trim().length >= 3;
+  async function remove() {
+    setBusy(true);
+    onError(null);
+    try {
+      await post(`/admin/users/${user.id}/remove`, { confirm_email: typed.trim(), reason: reason.trim() });
+      onDone();
+    } catch (e) {
+      onError(e);
+      onClose();
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <dialog ref={ref} className="confirm-dialog" aria-labelledby="rm-h" aria-describedby="rm-d"
+      onCancel={(e) => { e.preventDefault(); onClose(); }}>
+      <h2 id="rm-h">Remove {user.email}'s data?</h2>
+      <p id="rm-d">Their documents' files and help attachments are deleted, their name and email are replaced in every
+        record, and their account is closed. The records themselves (documents, pages, the audit log) stay, without
+        them, so reports still add up. This can't be undone; export their data first if they asked for a copy.</p>
+      <div>
+        <label htmlFor="rm-reason">Reason (kept in the audit log)</label>
+        <input id="rm-reason" type="text" maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} />
+      </div>
+      <div>
+        <label htmlFor="rm-email">Type their email address to confirm</label>
+        <input id="rm-email" type="email" autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} />
+      </div>
+      <div className="actions">
+        <button className="btn danger" type="button" disabled={!ready || busy} onClick={() => void remove()}>
+          {busy ? "Removing…" : "Remove their data"}</button>
+        <button className="btn secondary" type="button" autoFocus onClick={onClose}>Cancel</button>
+      </div>
+    </dialog>
   );
 }
 

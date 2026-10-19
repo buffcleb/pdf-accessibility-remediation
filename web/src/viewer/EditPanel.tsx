@@ -4,11 +4,13 @@ import { keptHolders, ROLE_GROUPS, ROLE_NAMES, absorbedBy, addEdit, describe, dr
 import { CONTENT_ROLES, NEW_AREA_ROLES, actionNote, checkElementRole, checkMove } from "./roles";
 import { splitPieces } from "./pieces";
 import { headerChoices, headersOf } from "./cells";
+import { ReadingPicker } from "./ReadingPicker";
+import { choiceFor, readingsOf, type Readings } from "./readings";
 
 type Props = {
   map: TagMap;
   element: TagElement | null;
-  findings: (Finding & { extra?: { suggested_alt?: string } })[];
+  findings: (Finding & { extra?: { suggested_alt?: string } & Partial<Readings> })[];
   page: number;
   ops: TagEdit[];
   setOps: (ops: TagEdit[]) => void;
@@ -230,6 +232,14 @@ export function TagForm({ map, element, findings, ops, setOps, canEdit, onSelect
   const [lang, setLang] = useState(o.lang ?? element.lang ?? "");
   const [scope, setScope] = useState(o.scope ?? element.scope ?? "Column");
   const [decorative, setDecorative] = useState(!!o.decorative);
+  // A form field's label: its tooltip, what a screen reader announces for it (#341)
+  const isForm = element.role === "Form";
+  const fieldLabel0 = o.fieldLabel ?? element.name ?? "";
+  // A link's description: what a screen reader announces for it, kept on its annotation too (#364)
+  const isLink = element.role === "Link" || element.role === "Annot";
+  const linkText0 = o.alt ?? element.alt ?? element.name ?? "";
+  const [linkText, setLinkText] = useState(linkText0);
+  const [fieldLabel, setFieldLabel] = useState(fieldLabel0);
   // A cell's headers: the header cells of its table it's read with
   const named0 = headersOf(map, ops, element.i);
   const [named, setNamed] = useState(named0);
@@ -238,6 +248,9 @@ export function TagForm({ map, element, findings, ops, setOps, canEdit, onSelect
   const isFigure = [role, role0, element.role].some((r) => r === "Figure" || r === "Formula");
   const isCell = ["TH", "TD"].includes(role) || ["TH", "TD"].includes(element.role);
   const suggested = findings.map((f) => f.extra?.suggested_alt).find(Boolean);
+  // A formula whose two readings disagree (#403): both offered, and the choice goes with the edit
+  const readings = readingsOf(findings);
+  const [picked, setPicked] = useState(false);
   // Text a screen reader reads: the read-aloud text (ActualText) when there is one, otherwise the drawn text
   const readable = element.own && !isFigure;
   const base = { element: element.i, expect_role: element.role };
@@ -260,9 +273,22 @@ export function TagForm({ map, element, findings, ops, setOps, canEdit, onSelect
       const chosen = choices.filter((h) => named.includes(h.i)).map((h) => h.i);  // in table order
       if (chosen.join() !== named0.join()) next = addEdit(next, { op: "set_headers", ...base, headers: chosen });
     }
-    if (isFigure && alt !== (o.alt ?? element.alt ?? "")) next = addEdit(next, { op: "set_alt", ...base, alt });
-    if (!isFigure && readable && actual !== actual0) next = addEdit(next, { op: "set_actual_text", ...base, text: actual });
+    // A chosen reading is saved even when it's the one the tag already has: the choice settles the finding
+    const reading = readings && (picked || (isFigure ? alt !== (o.alt ?? element.alt ?? "") : actual !== actual0))
+      ? { reading: choiceFor(isFigure ? alt : actual, readings) } : {};
+    if (isFigure && (alt !== (o.alt ?? element.alt ?? "") || (readings && picked))) {
+      next = addEdit(next, { op: "set_alt", ...base, alt, ...reading });
+    }
+    if (!isFigure && readable && (actual !== actual0 || (readings && picked))) {
+      next = addEdit(next, { op: "set_actual_text", ...base, text: actual, ...reading });
+    }
     if (lang !== (o.lang ?? element.lang ?? "")) next = addEdit(next, { op: "set_lang", ...base, lang: lang.trim() });
+    if (isLink && linkText.trim() && linkText.trim() !== linkText0.trim()) {
+      next = addEdit(next, { op: "set_alt", ...base, alt: linkText.trim() });
+    }
+    if (isForm && fieldLabel.trim() && fieldLabel.trim() !== fieldLabel0.trim()) {
+      next = addEdit(next, { op: "set_field_label", ...base, label: fieldLabel.trim() });
+    }
     setOps(next);
     onDone?.();
   }
@@ -290,6 +316,10 @@ export function TagForm({ map, element, findings, ops, setOps, canEdit, onSelect
         </div>
       ))}
       <fieldset disabled={!canEdit || decorative} className="pv-fields">
+        {readings && (isFigure || readable) && (
+          <ReadingPicker readings={readings} prefix={prefix} value={isFigure ? alt : actual}
+            onPick={(text) => { if (isFigure) setAlt(text); else setActual(text); setPicked(true); }} />
+        )}
         <div className="field">
           <label htmlFor={`${prefix}-role`}>Tag type</label>
           <select id={`${prefix}-role`} value={role} onChange={(e) => setRole(e.target.value)}>
@@ -335,6 +365,23 @@ export function TagForm({ map, element, findings, ops, setOps, canEdit, onSelect
               </label>
             ))}
           </fieldset>
+        )}
+        {isLink && (
+          <div className="field">
+            <label htmlFor={`${prefix}-ltext`}>Link description <span className="hint">(what a screen reader says for
+              this link, e.g. "Annual report, PDF")</span></label>
+            <input id={`${prefix}-ltext`} type="text" value={linkText} maxLength={4000}
+              onChange={(e) => setLinkText(e.target.value)} />
+            <span className="hint">Say where it goes, not "click here". It can be changed but not left empty.</span>
+          </div>
+        )}
+        {isForm && (
+          <div className="field">
+            <label htmlFor={`${prefix}-flabel`}>Field label <span className="hint">(what a screen reader announces for
+              this field, e.g. "Last name")</span></label>
+            <input id={`${prefix}-flabel`} type="text" value={fieldLabel} maxLength={300}
+              onChange={(e) => setFieldLabel(e.target.value)} />
+          </div>
         )}
         {isFigure && (
           <div className="field">

@@ -10,7 +10,7 @@ export type DocumentsPage = { items: Job[]; total: number; page: number; page_si
 
 const STATUSES: [string, string][] = [["", "All statuses"], ["held", "Waiting for you to confirm"], ["waiting", "Waiting"],
   ["in_progress", "In progress"], ["done", "Done"], ["failed", "Couldn't be processed"], ["canceled", "Canceled"]];
-const RESULTS: [string, string][] = [["", "Any result"], ["passes", "Passes PDF/UA-1"], ["needs_work", "Needs work"],
+const RESULTS: [string, string][] = [["", "Any result"], ["passes", "Passes PDF/UA"], ["needs_work", "Needs work"],
   ["review", "Has items to review"], ["help", "Open help request"]];
 const AUDIT: [string, string][] = [["", "Both"], ["false", "Remediated"], ["true", "Audit only"]];
 const SIZES = [25, 50, 100, 200];

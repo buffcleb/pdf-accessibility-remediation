@@ -13,7 +13,8 @@ import { useConfirmLeave, useUnsavedChanges } from "../components/unsaved";
 import type { Area } from "./draft";
 import { DeleteTag, EditPanel, ReviewStatus, SaveChanges } from "./EditPanel";
 import { Reader } from "./Reader";
-import { LONG_DOCUMENT_PAGES, addEdit, draftTree, jumpQuestion, undoMoves } from "./draft";
+import { LONG_DOCUMENT_PAGES, addEdit, describe, draftTree, jumpQuestion, undoMoves } from "./draft";
+import { fresh, historyKey, push, redo, undo, type History } from "./history";
 import { PAGE_TOP, Pane, TREE, VersionPicker, type OverlayMode, type PaneLayout } from "./Pane";
 import { TreePane } from "./TreePane";
 import { TagMenu } from "./TagMenu";
@@ -27,6 +28,8 @@ import { FigureSplit } from "./FigureSplit";
 import { SplitDialog } from "./SplitDialog";
 import { AreaDialog } from "./AreaDialog";
 import { HeadingDialog } from "./ChangesDialog";
+import { DocumentPanel } from "./DocumentPanel";
+import { TableDialog } from "./TableDialog";
 import { clearVersionCache, type PaneData } from "./pdf";
 
 // 1 = fit the page to the pane's width; larger values scroll sideways
@@ -74,7 +77,11 @@ export function TagViewer() {
   const [also, setAlso] = useState<{ of: number; ids: number[] }>(ALONE);
   const [menu, setMenu] = useState<{ x: number; y: number; ids: number[]; at: MenuPoint | null; page?: number } | null>(null);
   const navigate = useNavigate();
-  const [ops, setOps] = useState<TagEdit[]>([]);
+  // The unsaved changes, with their history for undo and redo (#365). Loading a draft or saving starts afresh.
+  const [history, setHistory] = useState<History<TagEdit[]>>(() => fresh([]));
+  const ops = history.present;
+  const setOps = useCallback((next: TagEdit[]) => setHistory((h) => push(h, next)), []);
+  const resetOps = useCallback((next: TagEdit[]) => setHistory(fresh(next)), []);
   const [rightData, setRightData] = useState<PaneData | null>(null);
   const [rightPage, setRightPage] = useState(1);
   const [saving, setSaving] = useState(false);
@@ -170,7 +177,7 @@ export function TagViewer() {
         if (usable.some((v) => v.number === d.mine!.based_on && v.kind !== "original")) {
           lastKept.current = JSON.stringify([d.mine.based_on, d.mine.edits]);
           setRight(d.mine.based_on);
-          setOps(d.mine.edits);
+          resetOps(d.mine.edits);
           setRestored({ at: d.mine.updated_at, count: d.mine.edits.length });
         } else setLostDraft(d.mine);
       } else if (d.others.length) setOtherDraft(d.others[0]);
@@ -199,7 +206,7 @@ export function TagViewer() {
       const d = await get<TagDraft>(`/jobs/${id}/tag-draft/${other.user_id}`);
       if (!usable.some((v) => v.number === d.based_on && v.kind !== "original")) throw new Error("The version those changes were made on is no longer available.");
       setRight(d.based_on);
-      setOps(d.edits);
+      resetOps(d.edits);
       setRestored({ at: d.updated_at, count: d.edits.length, from: d.user_email });
     } catch (e) { setSaveError(e); }
   }
@@ -394,11 +401,13 @@ export function TagViewer() {
   };
   const [isolated, setIsolated] = useState<number | null>(null); // a tag of the right-hand version, everything else veiled
   const [buildFrom, setBuildFrom] = useState<number[] | null>(null); // the tags whose lines the list builder has open
+  // The table editor (#370): a table, or text tags being made one
+  const [tableFor, setTableFor] = useState<{ table?: number; tags?: number[] } | null>(null);
   const [typesFor, setTypesFor] = useState<number[] | null>(null);
   const [editFor, setEditFor] = useState<number | null>(null); // the tag open in the "Edit tag" dialog
   const [splitFor, setSplitFor] = useState<number | null>(null); // the tag open in the "Split" dialog
   const [areaOpen, setAreaOpen] = useState(false); // the chosen area's contents, in a dialog
-  const [headingDialog, setHeadingDialog] = useState<"changes" | "review" | null>(null); // opened from the heading's buttons
+  const [headingDialog, setHeadingDialog] = useState<"changes" | "review" | "document" | null>(null); // opened from the heading's buttons
   const [deleteFor, setDeleteFor] = useState<number | null>(null);
   const [figureFor, setFigureFor] = useState<{ i: number; keys?: string[] } | null>(null); // the figure being split, and pieces chosen already // the tag the "remove or delete" question is about
   // The editing panel: hidden unless asked for, since the menu and its dialogs do its work (remembered per browser)
@@ -413,6 +422,12 @@ export function TagViewer() {
     if (item.act === "edit" && menu?.ids.length) setEditFor(menu.ids[0]);
     if (item.act === "figure-split" && menu?.ids.length) setFigureFor({ i: menu.ids[0] });
     if (item.act === "build" && menu) setBuildFrom(menu.ids);
+    if (item.act === "make-table" && menu) setTableFor({ tags: menu.ids });
+    if (item.act === "table" && menu?.ids.length && rightData) {
+      let t: number | null = menu.ids[0];
+      while (t !== null && rightData.tagmap.elements[t]?.role !== "Table") t = rightData.tagmap.elements[t]?.parent ?? null;
+      if (t !== null) setTableFor({ table: t });
+    }
     if (item.act === "isolate" && menu?.ids.length) { setIsolated(menu.ids[0]); setAnnounce("Tag isolated: the rest is veiled. Show everything again from the menu or the button at the top."); return setMenu(null); }
     if (item.act === "unisolate") { setIsolated(null); setAnnounce("Showing everything."); return setMenu(null); }
     setMenu(null);
@@ -491,6 +506,27 @@ export function TagViewer() {
   const allowFullReview = !job.data?.ai_tier || (tierChoice?.allow_full_review ?? true);
   const leftVersion = list.find((v) => v.number === left);
   const editable = !!versions.data?.can_edit && !!rightVersion && rightVersion.kind !== "original" && !readOnlyFor && !lostDraft;
+  // Undo and redo, saying what was undone or redone: the edit one list has and the other doesn't
+  const stepHistory = useCallback((way: "undo" | "redo") => {
+    const next = way === "undo" ? undo(history) : redo(history);
+    if (next === history) return;
+    const [more, fewer] = next.present.length >= history.present.length ? [next.present, history.present] : [history.present, next.present];
+    const op = more.find((o) => !fewer.includes(o)) ?? next.present.find((o, n) => o !== history.present[n]);
+    const what = op && rightData ? `: ${describe(op, rightData.tagmap)}` : "";
+    setHistory(next);
+    setAnnounce(`${way === "undo" ? "Undone" : "Redone"}${what}. ${next.present.length} unsaved change${next.present.length === 1 ? "" : "s"}.`);
+  }, [history, rightData]);
+  useEffect(() => {
+    if (!editable) return;
+    const key = (e: KeyboardEvent) => {
+      const way = historyKey(e, e.target);
+      if (!way || document.querySelector("dialog[open]")) return;  // a window open has its own fields and buttons
+      e.preventDefault();
+      stepHistory(way);
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [editable, stepHistory]);
   const selectedEl = selected?.side === "right" && rightData ? rightData.tagmap.elements[selected.i] ?? null : null;
   const selectedFindings = useMemo(
     () => (rightVersion?.summary?.findings ?? []).filter((f) => selectedEl && f.element === selectedEl.i),
@@ -500,7 +536,7 @@ export function TagViewer() {
   async function changeRight(n: number) {
     if (ops.length && !(await confirmLeave())) return;
     setIsolated(null); // its number means a tag of this version
-    setOps([]);
+    resetOps([]);
     setSelected(null);
     setArea(null);
     setAreaMode(false);
@@ -530,7 +566,7 @@ export function TagViewer() {
       const v = await post<DocVersion>(`/jobs/${id}/versions`, {
         based_on: rightVersion.number, edits: ops, note: note || null, review: aiReview, replace,
       });
-      setOps([]);
+      resetOps([]);
       // The draft became this version (the server removed it)
       hasDraft.current = false;
       lastKept.current = "";
@@ -637,8 +673,20 @@ export function TagViewer() {
               setMenu({ x: box.left, y: box.bottom + 4, ids: chosen, at: null });
             }}>Actions{chosen.length > 1 ? ` (${chosen.length})` : ""}<span aria-hidden="true"> ▾</span></button>
           )}
+          {editable && (history.past.length > 0 || history.future.length > 0) && (
+            <span className="pv-history" role="group" aria-label="Undo and redo">
+              <button className="btn secondary small" disabled={!history.past.length} onClick={() => stepHistory("undo")}
+                aria-keyshortcuts="Control+Z Meta+Z" title="Undo the last change (Ctrl+Z, ⌘Z on a Mac)">Undo</button>
+              <button className="btn secondary small" disabled={!history.future.length} onClick={() => stepHistory("redo")}
+                aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z Control+Y" title="Redo (Ctrl+Shift+Z, ⇧⌘Z on a Mac)">Redo</button>
+            </span>
+          )}
           {editable && ops.length > 0 && rightVersion && (
             <button className="btn small" aria-haspopup="dialog" onClick={() => setHeadingDialog("changes")}>Unsaved changes ({ops.length})…</button>
+          )}
+          {rightData && rightVersion && (
+            <button className="btn secondary small" aria-haspopup="dialog" onClick={() => setHeadingDialog("document")}
+              title="The document's title and language">Document…</button>
           )}
           {rightVersion && (rightVersion.kind === "reviewed" || rightVersion.kind === "corrected") && (
             <button className="btn secondary small" aria-haspopup="dialog" onClick={() => setHeadingDialog("review")}>
@@ -785,6 +833,10 @@ export function TagViewer() {
                   isolateItem(isolated, menu.ids[0] ?? null)]}
               onChoose={choose} onClose={() => setMenu(null)} />
           )}
+          {tableFor && rightData && (
+            <TableDialog map={rightData.tagmap} ops={ops} table={tableFor.table} tags={tableFor.tags} onClose={() => setTableFor(null)}
+              onApply={(op) => { setOps(addEdit(ops, op)); setTableFor(null); setAlso(ALONE); setAnnounce(`${tableFor.table !== undefined ? "Table edited" : "Table made"}. Not in the file until you save.`); }} />
+          )}
           {buildFrom && rightData && (
             <ListBuilder els={inReadingOrder(rightData.tagmap, buildFrom)} onClose={() => setBuildFrom(null)}
               onApply={(op) => { setOps([...ops, op]); setAlso(ALONE); setAnnounce("List built. Not in the file until you save."); }} />
@@ -819,6 +871,12 @@ export function TagViewer() {
               <SaveChanges map={rightData.tagmap} ops={ops} setOps={setOps} version={rightVersion} baseLabel={rightVersion.label} saving={saving}
                 allowFullReview={allowFullReview} prefix="savedlg"
                 onSave={(n, r, into) => { setHeadingDialog(null); void save(n, r, into); }} />
+            </HeadingDialog>
+          )}
+          {headingDialog === "document" && rightData && (
+            <HeadingDialog title="Document" className="pv-docdlg" onClose={() => setHeadingDialog(null)}>
+              <DocumentPanel map={rightData.tagmap} ops={ops} setOps={setOps} canEdit={editable}
+                onDone={() => { setHeadingDialog(null); setAnnounce("Added to the unsaved changes."); }} />
             </HeadingDialog>
           )}
           {headingDialog === "review" && rightVersion && (

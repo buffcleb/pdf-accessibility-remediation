@@ -16,7 +16,7 @@ from portal.db import get_db
 from portal.deps import Principal, current_principal
 from portal.errors import ApiError, forbidden, too_many, unauthorized
 from portal.identity import eligibility, normalize_email, provision
-from portal.mail import MailError, get_mailer, sign_in_code_mail
+from portal.mail import Mail, MailError, get_mailer, sign_in_code_mail
 from portal.models import AuthSession, OtpChallenge, User
 from portal.schemas import MeOut, me_out
 from portal.security import botcheck
@@ -125,32 +125,46 @@ def request_code(body: CodeRequest, request: Request, background: BackgroundTask
         audit.record(db, request, "login.code_requested", actor_email=email, outcome="not_provisioned")
         db.commit()
         raise ApiError(403, "not_provisioned", runtime.not_provisioned_message)
+    # Every address the service would take gets the same answer, at the same speed (#359): the email (a code, or why
+    # the account can't sign in) goes out after answering, so neither the reply nor its timing says whether an account
+    # exists or is disabled. Only the owner of the address learns which.
+    answer = {"status": "code_sent", "expires_in": s.otp_minutes * 60}
     if elig.user is not None and (msg := _blocked_message(db, elig.user)):
         audit.record(db, request, "login.code_requested", actor=elig.user, outcome="disabled",
                      group_id=elig.user.group_id)
         db.commit()
-        raise ApiError(403, "account_disabled", msg)
+        mail = Mail(to=email, subject=f"Signing in to {runtime.service_name}",
+                    text=f"Someone (probably you) asked to sign in to {runtime.service_name} with this address.\n\n"
+                         f"{msg}\n\nIf it wasn't you, there's nothing to do.\n\n{runtime.service_name}\n")
+        background.add_task(_send, mail, runtime.mail_from_name, "account", email, elig.user.id)
+        return answer
 
     code = issue_code(db, email, audit.client_ip(request))
     audit.record(db, request, "login.code_requested", actor=elig.user, actor_email=email,
                  group_id=elig.user.group_id if elig.user else (elig.group.id if elig.group else None),
                  details={"bot_check": "unavailable (allowed)"} if bot.outcome == "unavailable" else None)
     db.commit()
-    # Sent before answering, so a mail problem is reported to the person instead of a code that never arrives
-    mail = sign_in_code_mail(email, code, s.otp_minutes, runtime.service_name)
-    try:
-        get_mailer().deliver(mail, from_name=runtime.mail_from_name)
-    except MailError as e:
-        log.error("sign-in code to %s not sent: %s", email, e)
-        audit.record(db, request, "login.code_not_sent", actor=elig.user, actor_email=email, outcome="failure",
-                     details={"error": str(e)[:300]})
-        outbox.record(db, mail, "sign_in", error=str(e))
+    background.add_task(_send, sign_in_code_mail(email, code, s.otp_minutes, runtime.service_name),
+                        runtime.mail_from_name, "sign_in", email, elig.user.id if elig.user else None)
+    return answer
+
+
+def _send(mail: Mail, from_name: str | None, kind: str, email: str, user_id) -> None:
+    """After answering: send it, and keep it in the email log (never a code). A failure is logged, audited and in the
+    email log, where super admins see it; the person tries again."""
+    from portal.db import _sessionmaker
+
+    with _sessionmaker()() as db:
+        try:
+            get_mailer().deliver(mail, from_name=from_name)
+        except MailError as e:
+            log.error("%s email to %s not sent: %s", kind, email, e)
+            audit.record(db, None, "login.code_not_sent", actor_email=email, outcome="failure",
+                         details={"error": str(e)[:300], **({"user": str(user_id)} if user_id else {})})
+            outbox.record(db, mail, kind, error=str(e))
+        else:
+            outbox.record(db, mail, kind)
         db.commit()
-        raise ApiError(503, "mail_failed", "We couldn't send your sign-in code just now. Try again in a few minutes; "
-                                           "if it keeps happening, contact the people who run this service.")
-    outbox.record(db, mail, "sign_in")  # the email log: when it went, and its message ID (never the code)
-    db.commit()
-    return {"status": "code_sent", "expires_in": s.otp_minutes * 60}
 
 
 @router.post("/code/verify", response_model=TokenOut)

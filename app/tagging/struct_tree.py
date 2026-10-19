@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import pikepdf
 from pikepdf import Array, Dictionary, Name, String
 
+from app.pipeline.language import passage_language
 from app.pipeline.lists import fix_row_order, label_order, nest
 from app.pipeline.models import DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, TextBlock, bbox_intersection
 from app.pipeline.structure import caption_pairs, footnote_words, row_top
@@ -43,6 +44,7 @@ class BuildStats:
     annotations: int = 0
     contents_added: int = 0
     unmatched_paragraphs: int = 0
+    passages_lang: int = 0  # text tags given their own language (#340)
     headings_renumbered: int = 0
     leftover_content: int = 0
 
@@ -78,7 +80,9 @@ def _list_numbering(label: str | None) -> str:
 
 
 class StructTreeBuilder:
-    def __init__(self, pdf: pikepdf.Pdf, analysis: DocumentAnalysis, layout_tables: set[str]):
+    def __init__(self, pdf: pikepdf.Pdf, analysis: DocumentAnalysis, layout_tables: set[str],
+                 language: str | None = None):
+        self.language = language  # the document's: a passage clearly in another gets its own (#340)
         self.pdf = pdf
         self.analysis = analysis
         self.layout_tables = layout_tables
@@ -368,6 +372,8 @@ class StructTreeBuilder:
                     e.Alt = String(el.actual_text or el.text)
                 elif el.actual_text:
                     e.ActualText = String(el.actual_text)
+                if role != "Formula":
+                    self._own_language(e, el.text)
                 if self._attach_text(e, el, page.number):
                     out.append(e)
                     if role == "Note":  # PDF/UA: a note has an ID, for what points at it
@@ -393,7 +399,14 @@ class StructTreeBuilder:
         e = self._elem(role, parent, page_no)
         if block.actual_text:
             e.ActualText = String(block.actual_text)
+        self._own_language(e, block.text)
         return e if self._attach_refs(e, block.id, page_no) else None
+
+    def _own_language(self, e: pikepdf.Object, text: str | None) -> None:
+        """A passage clearly in another language than the document's gets its own (#340)."""
+        if self.language and (lang := passage_language(text or "", self.language)):
+            e.Lang = String(lang)
+            self.stats.passages_lang += 1
 
     def _captioned(self, elems: list[pikepdf.Object], region: ImageRegion | TableRegion, page: PageAnalysis,
                    caption_of: dict[str, str], order: dict[str, int], doc) -> list[pikepdf.Object]:
@@ -438,13 +451,13 @@ class StructTreeBuilder:
                 # ActualText stands for everything inside its element: on the LBody it would hide the nested
                 # list from screen readers, so it goes on a Span around the item's own text
                 own = self._elem("Span", body, page_no, ActualText=String(el.actual_text))
-                has_text = self._attach_refs(own, el.id, page_no)
+                has_text = self._attach_text(own, el, page_no)
                 if has_text:
                     body.K.append(own)
             else:
                 if el.actual_text:
                     body.ActualText = String(el.actual_text)
-                has_text = self._attach_refs(body, el.id, page_no)
+                has_text = self._attach_text(body, el, page_no)  # its footnote marks become References
             for child in children:
                 sub = self._list(child, body, page_no)
                 if sub is not None:

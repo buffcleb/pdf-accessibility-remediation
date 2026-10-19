@@ -519,3 +519,32 @@ def test_number_badges_are_decorative_backgrounds(tmp_path):
     assert sorted(e["text"] for e in els if e["role"] == "P" and e.get("text", "").isdigit()) == list("12345")
     with pikepdf.open(out) as pdf:
         assert not [f for f in check_integrity(pdf)[0] if f.severity == "error"]
+
+
+def test_control_characters_are_removed_from_kept_tag_text(samples, tmp_path):
+    """Word's PDFMaker can end alt text with the NUL that ends a C string: it goes, and the rest stays. Alt text that
+    was nothing but control characters counts as none."""
+    def build(pdf, pg, doc):
+        fig = next(k for k in doc.K if str(k.S) == "/Figure")
+        fig.Alt = pikepdf.String("---\x00")
+        fig.ActualText = pikepdf.String("Line one\nline\x07 two\x00")
+
+    src = _tagged_with(tmp_path, samples, build)
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert _figure_alts(out) == ["---"]
+    with pikepdf.open(out) as pdf:
+        figs = [o for o in pdf.objects if isinstance(o, pikepdf.Dictionary) and str(o.get("/S")) == "/Figure"]
+        assert [str(f.ActualText) for f in figs if "/ActualText" in f] == ["Line one\nline two"]
+        assert not any(b"\x00" in bytes(f[k]) for f in figs for k in ("/Alt", "/ActualText") if k in f)
+    reasons = " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+    assert "control characters removed from the alt text" in reasons and "from the read-aloud text" in reasons
+
+    def only_nul(pdf, pg, doc):
+        next(k for k in doc.K if str(k.S) == "/Figure").Alt = pikepdf.String("\x00")
+
+    src = _tagged_with(tmp_path, samples, only_nul)
+    out = tmp_path / "o2.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert _figure_alts(out) in ([], [None])  # undescribed: no figure, or one without alt text
+    assert "missing Alt" in " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])

@@ -669,10 +669,23 @@ def _reads_across(boxes: list[BBox], gutter: float) -> bool:
     return min(partnered(left, right), partnered(right, left)) >= 0.6
 
 
-def _by_rows(items: list[tuple[str, BBox]]) -> list[tuple[str, BBox]]:
-    """Top to bottom, and left to right within a row. Items whose tops are within a few points of the
-    row's first item share the row: sorting on the exact top would let a point's difference put the
-    right-hand item of a row first."""
+_RTL_RANGES = ((0x0590, 0x08FF), (0xFB1D, 0xFDFF), (0xFE70, 0xFEFF))  # Hebrew, Arabic, Syriac, Thaana; their forms
+
+
+def right_to_left(text: str) -> bool:
+    """Most of the letters are Arabic or Hebrew (or another right-to-left script): the page is read from the right
+    (#368). A handful of letters decides nothing."""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 20:
+        return False
+    rtl = sum(1 for c in letters if any(lo <= ord(c) <= hi for lo, hi in _RTL_RANGES))
+    return rtl > len(letters) / 2
+
+
+def _by_rows(items: list[tuple[str, BBox]], rtl: bool = False) -> list[tuple[str, BBox]]:
+    """Top to bottom, and left to right within a row (right to left on a right-to-left page). Items whose tops are
+    within a few points of the row's first item share the row: sorting on the exact top would let a point's
+    difference put the right-hand item of a row first."""
     rest = sorted(items, key=lambda it: (it[1][1], it[1][0]))
     out: list[tuple[str, BBox]] = []
     while rest:
@@ -680,16 +693,18 @@ def _by_rows(items: list[tuple[str, BBox]]) -> list[tuple[str, BBox]]:
         h = max(1.0, first[1][3] - first[1][1])
         tol = min(3.0, 0.35 * h)
         row = [it for it in rest if it[1][1] - first[1][1] <= tol]
-        out += sorted(row, key=lambda it: it[1][0])
+        out += sorted(row, key=lambda it: -it[1][2]) if rtl else sorted(row, key=lambda it: it[1][0])
         rest = [it for it in rest if it not in row]
     return out
 
 
 def heuristic_reading_order(page: PageAnalysis) -> list[str]:
-    """Top-to-bottom bands separated by full-width elements; columns left-to-right inside a band."""
+    """Top-to-bottom bands separated by full-width elements; columns left-to-right inside a band (right to left on a
+    page in Arabic or Hebrew, #368)."""
     items = sorted(_elements(page), key=lambda it: (round(it[1][1], 0), it[1][0]))
     if not items:
         return []
+    rtl = right_to_left(" ".join(b.text for b in page.blocks))
     full = page.width * 0.6
     order: list[str] = []
     band: list[tuple[str, BBox]] = []
@@ -698,18 +713,18 @@ def heuristic_reading_order(page: PageAnalysis) -> list[str]:
         """Columns left to right, each read on its own (it may hold columns too: a logo beside a page that then
         splits in two); otherwise what's above any columns by rows, then those columns."""
         if depth > 3 or len(items) < 2:
-            return [i for i, _ in _by_rows(items)]
+            return [i for i, _ in _by_rows(items, rtl)]
         gutters = _gutters([b for _, b in items], page.width)
         if gutters and depth and _reads_across([b for _, b in items], gutters[0]):
-            return [i for i, _ in _by_rows(items)]  # inside a column: labels beside their values, not more columns
+            return [i for i, _ in _by_rows(items, rtl)]  # inside a column: labels beside their values, not more columns
         below: list[tuple[str, BBox]] = []
         if gutters:
             head, cols = [], items
         else:
             head, cols, gutters, below = _columns_below(items, page.width)
             if not cols:
-                return [i for i, _ in _by_rows(items)]
-        out = [i for i, _ in _by_rows(head)]
+                return [i for i, _ in _by_rows(items, rtl)]
+        out = [i for i, _ in _by_rows(head, rtl)]
         edges = [float("-inf"), *gutters, float("inf")]
         columns = [[it for it in cols if lo <= (it[1][0] + it[1][2]) / 2 < hi] for lo, hi in zip(edges, edges[1:])]
         # A heading that starts below where every other column has ended, near the end of its own, opens what comes
@@ -732,9 +747,9 @@ def heuristic_reading_order(page: PageAnalysis) -> list[str]:
                     break
             if tail:
                 break
-        for col in columns:
+        for col in (reversed(columns) if rtl else columns):
             out += ordered(col, depth + 1)
-        return out + [i for i, _ in _by_rows(tail)] + ordered(below, depth + 1)
+        return out + [i for i, _ in _by_rows(tail, rtl)] + ordered(below, depth + 1)
 
     def flush() -> None:
         order.extend(ordered(band))

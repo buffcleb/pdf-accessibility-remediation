@@ -1,0 +1,29 @@
+name: Weekly dependency audit
+
+# Known vulnerabilities published since the dependencies last changed (#362): the same audit as CI's "Dependency
+# audit" job (scripts/audit-deps.sh), every Monday, on the runner CI_RUNNER names (docs/operations/ci-runners.md).
+# A failed run is emailed to the repository's watchers like any other failed workflow.
+
+on:
+  schedule:
+    - cron: "17 11 * * 1"  # Mondays, 11:17 UTC (early morning US Eastern)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - run: scripts/audit-deps.sh

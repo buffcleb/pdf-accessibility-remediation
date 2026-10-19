@@ -5,7 +5,7 @@ export type LiveItem = {
   who: string; group_id: string | null; group: string | null; queue: string; pages: number | null;
   state: "active" | "waiting" | "done" | "failed" | "canceled"; stage: string | null; percent: number | null;
   detail: string | null; created_at: string; started_at: string | null; finished_at: string | null;
-  can_retry: boolean; can_cancel: boolean; can_stop: boolean; can_remove: boolean; can_process_now: boolean;
+  can_retry: boolean; can_cancel: boolean; can_stop: boolean; can_restart?: boolean; can_remove: boolean; can_process_now: boolean;
 };
 export type Live = { items: LiveItem[]; counts: Record<string, number>; more: boolean; recent_minutes: number };
 
@@ -22,6 +22,7 @@ const STAGES: Record<string, string> = {
   validating_output: "Checking the result", destructive_fixes: "Fixing what the check found",
   flattening: "Flattening pages", reporting: "Writing the report", verifying_tags: "AI: reviewing the tags",
   adobe_sending: "Sending to Adobe", adobe_tagging: "Adobe is tagging", adobe_merging: "Putting Adobe's parts together",
+  worker_lost: "Worker lost: waiting to be retried",
 };
 
 export function stageLabel(item: Pick<LiveItem, "state" | "stage" | "kind">): string {

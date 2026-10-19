@@ -1,0 +1,49 @@
+# Dependency updates (#362). Security updates come as soon as an advisory is published, one pull request each
+# (switched on in the repository's settings: Code security > Dependabot security updates). Everything else comes
+# once a week, one pull request per ecosystem with every update in it, so CI runs a few times a week, not per
+# package. Each pull request runs CI like any other; merge it as usual, then build and deploy.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directories: ["/", "/portal"]  # requirements.txt and requirements-dev.txt; portal/requirements.txt
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: America/New_York }
+    groups:
+      python: { patterns: ["*"], update-types: [minor, patch] }
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: America/New_York }
+    groups:
+      npm: { patterns: ["*"], update-types: [minor, patch] }
+    open-pull-requests-limit: 3
+
+  # MathCAT's command-line front end (docker/mathcat, #403): its crates, MathCAT itself held at the version it pins
+  - package-ecosystem: cargo
+    directory: /docker/mathcat
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: America/New_York }
+    groups:
+      cargo: { patterns: ["*"], update-types: [minor, patch] }
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker  # Dockerfile, Dockerfile.portal, Dockerfile.web, docker/audiveris/Dockerfile
+    directories: ["/", "/docker/audiveris"]
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: America/New_York }
+    groups:
+      docker: { patterns: ["*"] }
+    # A new digest of the same tag (the base image's security fixes) comes every week. A new Python, Node or Ubuntu
+    # release is a change of its own, made by hand and tested on the regression set.
+    ignore:
+      - { dependency-name: python, update-types: ["version-update:semver-major", "version-update:semver-minor"] }
+      - { dependency-name: node, update-types: ["version-update:semver-major"] }
+      - { dependency-name: ubuntu, update-types: ["version-update:semver-major", "version-update:semver-minor"] }
+      # Rust for MathCAT's build stage: a new release is a change of its own
+      - { dependency-name: rust, update-types: ["version-update:semver-major", "version-update:semver-minor"] }
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: America/New_York }
+    groups:
+      actions: { patterns: ["*"] }
+    open-pull-requests-limit: 3

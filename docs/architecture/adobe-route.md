@@ -18,7 +18,8 @@ Adobe's file:
   ActualText on a text tag, or as the alt text of a Formula (as the standard route writes formulas, and as PDF/UA asks).
   Only a tag with nothing of its own to say takes one: no Alt or ActualText, no link or field, only plain Spans inside
   (a list item: its label and body). A reading whose text Adobe divided differently stays out, and the report says how
-  many. The AI's readings are listed for review on the improved copy.
+  many. The AI's readings are listed for review on the improved copy. Readings with LaTeX get their MathML, MathCAT's
+  check and the math downloads, as on the standard route (#403).
 - **Font fixes that never change rendering:** missing ToUnicode maps, incomplete glyph lists in font descriptors
   (7.21.4.2), and glyph width mismatches (7.21.5, only if the pages stay pixel-identical). These are the same fixes
   the standard route applies to its visually exact file.
@@ -66,6 +67,10 @@ sequenceDiagram
   the same tags and rendering as tagging the whole file at once.
 - **What's checked:** the same checks as every output, plus Adobe's own report (an Excel file). Problems in Adobe's
   tags are reported, not fatal: the file is Adobe's.
+- **Signed and restricted PDFs** are handled as on the standard route (#339): a restricted file's restrictions are put
+  back on every output after veraPDF has checked it, and the report notes a signature the copy no longer carries.
+- **Egress.** Unlike the engine's other pods, the Adobe worker keeps its internet access, for Adobe's API;
+  its AI calls still go through the gateway.
 - **Cost guards** are the portal's, as for any service: off until switched on, most pages per document, most pages
   per day, and confirm before sending (on by default for Adobe).
 - **Testing without Adobe.** `app/adobe/fake.py` speaks Adobe's REST protocol and tags with this engine's own tagger

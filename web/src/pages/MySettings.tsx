@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
-  del, get, patch, post, put, type EmailReportChoice, type EmailReports, type NotificationChoice, type Notifications as NotificationsData,
-  type NotifyChoice, type ReportView,
+  del, get, patch, post, put, signOut, type EmailReportChoice, type EmailReports, type NotificationChoice,
+  type Notifications as NotificationsData, type NotifyChoice, type ReportView,
 } from "../api";
 import { useAuth } from "../auth";
 import { VIEW_FREQUENCIES } from "../components/ScheduleView";
 import { ErrorNotice, Loading, Notice, useLoad, useTitle } from "../components/ui";
+import { useConfirmLeave } from "../components/unsaved";
 
 const NOTIFY: [NotifyChoice, string][] = [["each", "As they happen"], ["daily", "Once a day"], ["off", "Off"]];
 const REPORT_FREQUENCIES: [EmailReportChoice["frequency"], string][] = [
@@ -27,12 +28,36 @@ export function MySettings() {
           <a href="#notifications">Email notifications</a>
           <a href="#reports">Email reports</a>
           {isAdmin && <a href="#views">Scheduled report views</a>}
+          <a href="#devices">Signed-in devices</a>
         </nav>
       </header>
       <Notifications />
       <EmailReportsCard />
       <ReportViews isAdmin={isAdmin} />
+      <Devices />
     </div>
+  );
+}
+
+/** Sign out everywhere (#354): every browser and device this account is signed in on, this one included. For a lost
+ * laptop, or a shared computer left signed in. */
+function Devices() {
+  const navigate = useNavigate();
+  const confirmLeave = useConfirmLeave();
+  const [busy, setBusy] = useState(false);
+  async function everywhere() {
+    if (!(await confirmLeave())) return;
+    setBusy(true);
+    await signOut(true);
+    navigate("/login", { replace: true, state: null });
+  }
+  return (
+    <Card id="devices" title="Signed-in devices"
+      intro="Signed in on a computer you no longer have, or one other people use? Sign out everywhere: every browser and device, this one too. You'll need a new code to sign in again.">
+      <div className="actions">
+        <button className="btn secondary" disabled={busy} onClick={() => void everywhere()}>Sign out of all devices</button>
+      </div>
+    </Card>
   );
 }
 

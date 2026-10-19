@@ -20,6 +20,7 @@ Adobe doesn't publish its limits, so take them from your contract.
 | `ADOBE_MAX_RETRIES` | 4 | For "too many requests" and server errors. Running out of transactions (Adobe codes 429001/429002) is never retried |
 | `ADOBE_POLL_SECONDS`, `ADOBE_TIMEOUT_MINUTES` | 3, 20 | Status polling, and the limit per part |
 | `ADOBE_GENERATE_REPORT` | true | Keep Adobe's own accessibility report (an Excel file) with the job |
+| `ADOBE_SHIFT_HEADINGS` | false | Passed to Adobe as `shiftHeadings` (Adobe's option to renumber heading levels) |
 
 ## Before the first real document
 

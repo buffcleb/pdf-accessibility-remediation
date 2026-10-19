@@ -26,7 +26,7 @@ One row per service:
 | **For the group** | On or off for your group. A service a super admin hasn't switched on can't be turned on here |
 | **Who has it** | Everyone in the group, or only the people you choose |
 | **Group's pages** | The pool: used, in progress and left. An empty pool is highlighted, because everyone then sees 0 left, whatever their limit |
-| **Default limit** | The limit for people without their own |
+| **Default per person** | The limit for people without their own |
 | **Own limits** | How many people have a limit of their own |
 
 **Edit** on a row changes:

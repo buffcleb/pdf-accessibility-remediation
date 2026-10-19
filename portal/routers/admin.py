@@ -18,6 +18,7 @@ from portal.identity import Eligibility, domain_of, lookup_email, normalize_doma
 from portal.models import AuditEvent, AuthSession, Group, GroupDomain, GroupEmail, RoleAssignment, Service, User
 from portal.routers.common import AuditOut, LedgerOut, audit_query
 from portal.schemas import GroupOut, UserOut, group_out, user_out
+from portal.security.ratelimit import per_person
 
 router = APIRouter(prefix="/admin", tags=["super admin"])
 
@@ -388,6 +389,66 @@ def grant_super_admin(user_id: uuid.UUID, request: Request, p: Principal = Depen
         db.commit()
         db.refresh(user)
     return user_out(user)
+
+
+@router.post("/users/{user_id}/sessions/end", status_code=204)
+def end_sessions(user_id: uuid.UUID, request: Request, p: Principal = Depends(require_super_admin),
+                 db: Session = Depends(get_db)):
+    """Sign a person out everywhere (#354): a lost device, or an account someone else may be using."""
+    user = db.get(User, user_id)
+    if user is None:
+        raise not_found("User")
+    count = revoke_sessions(db, [user.id], "ended_by_admin")
+    audit.record(db, request, "sessions.ended", actor=p.user, target_type="user", target_id=user.id,
+                 group_id=user.group_id, details={"sessions": count})
+    db.commit()
+
+
+# --- a person's data (#338) ---------------------------------------------------------------------------
+
+class RemovePerson(BaseModel):
+    confirm_email: str = Field(..., max_length=320)  # typed by the super admin: removing is final
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+@router.post("/users/{user_id}/remove", response_model=UserOut)
+def remove_person(user_id: uuid.UUID, body: RemovePerson, request: Request, p: Principal = Depends(require_super_admin),
+                  db: Session = Depends(get_db)):
+    """Remove a person's data on their request: their files deleted, their name and email gone from every record,
+    the records themselves kept. Final."""
+    from portal import privacy
+
+    user = db.scalar(select(User).where(User.id == user_id).with_for_update())
+    if user is None:
+        raise not_found("User")
+    if body.confirm_email.strip().lower() != user.email.lower():
+        raise ApiError(422, "confirm_email", "Type the person's email address to confirm.")
+    counts = privacy.remove_person(db, request, user, p.user)
+    audit.record(db, request, "person.removal_reason", actor=p.user, target_type="user", target_id=user.id,
+                 group_id=user.group_id, details={"reason": body.reason.strip(), **counts})
+    db.commit()
+    db.refresh(user)
+    return user_out(user)
+
+
+@router.get("/users/{user_id}/export", dependencies=[Depends(per_person("export"))])
+def export_person(user_id: uuid.UUID, request: Request, files: bool = False,
+                  p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Everything held about a person, for a records request: JSON, or with files=true a zip that also has their
+    documents' files that still exist. Audited."""
+    from fastapi.responses import Response
+
+    from portal import privacy
+
+    user = db.get(User, user_id)
+    if user is None:
+        raise not_found("User")
+    content, media, name = privacy.export_person(db, user, files)
+    audit.record(db, request, "person.exported", actor=p.user, target_type="user", target_id=user.id,
+                 group_id=user.group_id, details={"files": files, "bytes": len(content)})
+    db.commit()
+    return Response(content, media_type=media, headers={"Content-Disposition": f'attachment; filename="{name}"',
+                                                        "Cache-Control": "no-store"})
 
 
 @router.delete("/users/{user_id}/super-admin", response_model=UserOut)

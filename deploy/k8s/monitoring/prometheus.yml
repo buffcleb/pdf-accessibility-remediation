@@ -1,0 +1,95 @@
+# Prometheus for the service (#397, MONITORING=on): what it reads, every 30 seconds. Rendered by scripts/deploy.sh
+# (${NAMESPACE}) into the prometheus-config ConfigMap, with rules.yml.
+#
+# - This namespace's pods that ask to be read (the prometheus.io/* annotations on their templates): the portal's API
+#   and worker, the engine's API and workers, the music reader, and the exporters for Postgres, Redis and the
+#   cluster's view of the pods (kube-state-metrics).
+# - Each node's kubelet, for the CPU, memory and volume use of this namespace's containers and their probes' results
+#   only; everything else on the nodes is dropped as it's read.
+#
+# There is no Alertmanager: the portal's worker reads the firing alerts and tells super admins (portal/alerts.py).
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels: { namespace: ${NAMESPACE} }
+
+rule_files: [/etc/prometheus/rules.yml]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs: [{ targets: ["localhost:9090"] }]
+
+  - job_name: pods
+    # A pod's own labels (kube-state-metrics' pod, namespace) win over the ones added here
+    honor_labels: true
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces: { names: [${NAMESPACE}] }
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        regex: "true"
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_phase]
+        regex: Running
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        regex: (.+)
+        target_label: __metrics_path__
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        regex: (.+);(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: app
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+
+  # Containers' CPU, memory and network (the kubelet's cAdvisor), this namespace's only
+  - job_name: cadvisor
+    scheme: https
+    metrics_path: /metrics/cadvisor
+    authorization: { credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token }
+    tls_config: { insecure_skip_verify: true }  # the kubelets' serving certificates are their own, self-signed
+    kubernetes_sd_configs: [{ role: node }]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+    metric_relabel_configs:
+      - source_labels: [namespace]
+        regex: ${NAMESPACE}
+        action: keep
+      - source_labels: [__name__]
+        regex: container_(cpu_usage_seconds_total|cpu_cfs_.+|memory_working_set_bytes|network_.+_bytes_total|oom_events_total)
+        action: keep
+      # CPU and memory by container, not the pod's totals or its pause container (network is only counted by pod)
+      - source_labels: [__name__, container]
+        regex: container_(cpu|memory|oom)_.+;(|POD)
+        action: drop
+
+  # Liveness and readiness probes, each result counted (Administration > System's pods, #398)
+  - job_name: probes
+    scheme: https
+    metrics_path: /metrics/probes
+    authorization: { credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token }
+    tls_config: { insecure_skip_verify: true }
+    kubernetes_sd_configs: [{ role: node }]
+    metric_relabel_configs:
+      - source_labels: [__name__, namespace]
+        regex: prober_probe_total;${NAMESPACE}
+        action: keep
+
+  # The volumes' use (the job folder, the database's, the file store's, Prometheus's own)
+  - job_name: kubelet
+    scheme: https
+    authorization: { credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token }
+    tls_config: { insecure_skip_verify: true }
+    kubernetes_sd_configs: [{ role: node }]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+    metric_relabel_configs:
+      - source_labels: [__name__, namespace]
+        regex: kubelet_volume_stats_(available|capacity|used)_bytes;${NAMESPACE}
+        action: keep

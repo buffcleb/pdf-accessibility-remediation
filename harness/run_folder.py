@@ -44,10 +44,12 @@ def main() -> int:
         try:
             result = asyncio.run(run_remediation(store, JobOptions(stem="doc", job_id=jid, provider=args.provider,
                                                                    model=args.model)))
-            xml = next(store.output_dir.glob("*verapdf_after_ua1.xml")).read_text()
+            # The verdict's own report: PDF/UA-1, or PDF/UA-2 for a PDF 2.0 file (#409)
+            part = (result["reports"]["comparison"].get("after") or {}).get("pdfua_part") or 1
+            xml = next(store.output_dir.glob(f"*verapdf_after_ua{part}.xml")).read_text()
             ok = re.search(r'isCompliant="(\w+)"', xml).group(1) == "true"
             cost = result["metrics"].get("ai_cost_usd") or 0
-            note = "passes" if ok else "FAILS PDF/UA-1"
+            note = "passes" if ok else f"FAILS PDF/UA-{part}"
             print(f"{f.name[:56]:56} {note:15} {time.monotonic() - t:5.0f} s" + (f"  ${cost:.4f}" if cost else ""), flush=True)
         except Exception as exc:  # noqa: BLE001 - one document's failure is a result, not the end of the run
             ok = False

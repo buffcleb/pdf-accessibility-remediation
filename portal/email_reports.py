@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Request
 from sqlalchemy import Float, cast, func, select
+from sqlalchemy import true as sa_true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -202,7 +203,7 @@ def _finished(where, start, end):
 
 
 def _quality(db: Session, where: list) -> tuple[int, int]:
-    """(documents finished, of which pass PDF/UA-1)."""
+    """(documents finished, of which pass PDF/UA: PDF/UA-1, or PDF/UA-2 for a PDF 2.0 document)."""
     total = db.scalar(select(func.count()).select_from(Job).where(*where, Job.status == "completed")) or 0
     passed = db.scalar(select(func.count()).select_from(Job).where(
         *where, Job.status == "completed", Job.result_summary["compliant_after"].as_boolean().is_(True))) or 0
@@ -228,7 +229,7 @@ def my_month(db: Session, user: User, start: datetime, end: datetime) -> Section
     sec = Section("Your documents", link=("See your documents", _url("/")))
     sec.lines.append(f"Documents processed: {_n(total)}" + (f" ({_n(failed)} more couldn't be processed)" if failed else ""))
     if total:
-        sec.lines.append(f"Pass the PDF/UA-1 accessibility check: {_n(passed)} of {_n(total)} ({_pct(passed, total)})")
+        sec.lines.append(f"Pass the PDF/UA accessibility check: {_n(passed)} of {_n(total)} ({_pct(passed, total)})")
     rows = []
     for s in svc.all_services(db):
         if not svc.access(db, user, s.key).ok and not used.get(s.key):
@@ -247,6 +248,7 @@ def my_month(db: Session, user: User, start: datetime, end: datetime) -> Section
 def group_summary(db: Session, user: User, start: datetime, end: datetime) -> list[Section]:
     group_ids = [r.group_id for r in user.roles if r.role == "group_admin" and r.group_id]
     labels = {s.key: s for s in svc.all_services(db)}
+    rs = settings_store.load(db)
     out = []
     for g in db.scalars(select(Group).where(Group.id.in_(group_ids)).order_by(Group.name)):
         sec = Section(g.name if len(group_ids) > 1 else f"Your group: {g.name}",
@@ -265,7 +267,7 @@ def group_summary(db: Session, user: User, start: datetime, end: datetime) -> li
             rows.append([s.label, _n(used.get(s.key)), _n(gs.pool_pages), _n(max(0, left))])
             if left <= 0:
                 sec.warnings.append(f"{s.label}: the group's pages have run out.")
-            elif _low(left, gs.pool_pages):
+            elif _low(left, gs.pool_pages, rs):
                 sec.warnings.append(f"{s.label}: only {_n(left)} of {_n(gs.pool_pages)} pages left.")
         if rows:
             sec.tables.append(Table("Pages", ["Processing option", "Used in this period", "Pool", "Left now"], rows,
@@ -278,7 +280,7 @@ def group_summary(db: Session, user: User, start: datetime, end: datetime) -> li
             sec.tables.append(Table("Most active people", ["Person", "Pages"], [[e, _n(p)] for e, p in people], {1}))
         total, passed = _quality(db, _finished([Job.group_id == g.id], start, end))
         sec.lines.append(f"Documents processed: {_n(total)}" +
-                         (f"; {_n(passed)} pass PDF/UA-1 ({_pct(passed, total)})" if total else ""))
+                         (f"; {_n(passed)} pass PDF/UA ({_pct(passed, total)})" if total else ""))
         open_help = db.scalar(select(func.count()).select_from(HelpRequest).where(
             HelpRequest.group_id == g.id, HelpRequest.status.in_(("open", "in_progress", "waiting")))) or 0
         sec.lines.append(f"Open help requests: {_n(open_help)}")
@@ -311,6 +313,13 @@ def service_summary(db: Session, start: datetime, end: datetime) -> list[Section
     adobe = db.scalar(select(func.coalesce(func.sum(Job.pages), 0)).where(
         *done, Job.status == "completed", Job.processing.in_(adobe_keys))) if adobe_keys else 0
     cost.lines.append(f"AI cost: ${float(ai):,.2f}")
+    # Describe with AI in the tag manager, counted when used (#318)
+    from portal.live_reports import _describe, _described_at
+    uses, usd = db.execute(select(func.count(), func.coalesce(func.sum(cast(_describe.c.value["usd"].astext, Float)), 0))
+                           .select_from(Job).join(_describe, sa_true())
+                           .where(_described_at >= start, _described_at < end)).one()
+    if uses:
+        cost.lines.append(f"Describe with AI: {int(uses):,} use(s), ${float(usd):,.2f}")
     cost.lines.append(f"Pages sent to Adobe: {_n(adobe)}")
     # Days a service reached its daily limit (pages sent that day, by the day they were sent, UTC)
     capped = {k: s.daily_cap_pages for k, s in services.items() if s.daily_cap_pages}
@@ -328,7 +337,7 @@ def service_summary(db: Session, start: datetime, end: datetime) -> list[Section
     quality = Section("Quality", link=("Open the quality report", _url("/admin/reports?report=quality")))
     total, passed = _quality(db, done)
     quality.lines.append(f"Documents processed: {_n(total)}" +
-                         (f"; {_n(passed)} pass PDF/UA-1 ({_pct(passed, total)})" if total else ""))
+                         (f"; {_n(passed)} pass PDF/UA ({_pct(passed, total)})" if total else ""))
     clauses: Counter = Counter()
     names: dict[str, str] = {}
     for (summary,) in db.execute(select(Job.result_summary).where(*done, Job.status == "completed")):

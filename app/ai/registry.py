@@ -6,6 +6,9 @@ from app.ai.base import AIProvider
 from app.config import get_settings
 
 
+DIRECT = ("openrouter", "ollama", "localai")  # providers the engine calls itself, not through the gateway
+
+
 def available_providers() -> list[str]:
     names = ["none", "gateway", "openrouter", "ollama", "localai"]
     if get_settings().allow_mock_provider:
@@ -18,6 +21,8 @@ def get_provider(name: str, model: str | None = None, log_path: Path | None = No
     name = (name or "none").lower()
     if name == "none":
         return None
+    if name in DIRECT and get_settings().ai_gateway_only:
+        name, model = "gateway", None  # the gateway's default model (#361)
     if name == "gateway":
         from app.ai.gateway import GatewayProvider
         return GatewayProvider(model, log_path=log_path)

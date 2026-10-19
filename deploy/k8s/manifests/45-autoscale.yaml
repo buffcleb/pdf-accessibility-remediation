@@ -14,7 +14,7 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   secretTargetRef:
-    - { parameter: password, name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD }
+    - { parameter: password, name: pdfrem-portal-env, key: PORTAL_APP_DB_PASSWORD }  # rows only (#337)
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -41,7 +41,7 @@ spec:
       metadata:
         host: postgres.${NAMESPACE}.svc.cluster.local
         port: "5432"
-        userName: portal
+        userName: portal_app
         dbName: portal
         sslmode: disable
         targetQueryValue: "${WORKER_CONCURRENCY}"

@@ -7,10 +7,11 @@ through the engine's API with checks on every result, and measuring OCR accuracy
 |---|---|
 | [`make_samples.py`](make_samples.py) | Generates the synthetic sample PDFs (untagged, partly tagged with broken tags, scanned, two-column, tables, unembedded fonts…). The engine's tests use the same samples |
 | [`run_harness.py`](run_harness.py) | Submits every PDF in a folder to the engine, waits for each, checks the results, and writes a report |
+| [`run_folder.py`](run_folder.py) | Runs every PDF in a folder through the pipeline in its own process (no engine API, no queue) and says whether each passes; used by `scripts/regression.sh` |
 | [`ocr_eval.py`](ocr_eval.py) | Damages pages of a text PDF like a poor scan, OCRs them (optionally with AI correction), and measures word accuracy |
 
-All three need the engine's Python dependencies (`pip install -r requirements.txt`); `run_harness.py` only needs
-`httpx` and a running engine.
+All but `run_harness.py` need the engine's Python dependencies (`pip install -r requirements.txt`);
+`run_harness.py` only needs `httpx` and a running engine.
 
 ## Sample documents
 
@@ -42,7 +43,7 @@ python harness/run_harness.py path/to/folder --provider gateway --model local-vi
 | `--provider`, `--model` | `none` | The AI provider (`gateway`, `none`, `mock`, …) and model |
 | `--route` | `standard` | `adobe` tags with Adobe Autotag (use the fake Adobe for testing) |
 | `--report-only` | | Check only, change nothing |
-| `--expect-compliant` | | Fail unless each primary output passes veraPDF PDF/UA-1 |
+| `--expect-compliant` | | Fail unless each primary output passes veraPDF (PDF/UA-1, or PDF/UA-2 for a PDF 2.0 file) |
 | `--markdown` | | Save each job's Markdown report and a combined `harness_report.md` |
 | `--base64` | | Ask for files inline instead of as links |
 | `--debug` | | Keep the engine's working files and AI logs |
@@ -52,9 +53,10 @@ python harness/run_harness.py path/to/folder --provider gateway --model local-vi
 For every document it checks that the job completed (a tag integrity failure fails the job), that the reports and
 metrics are complete, that the output is tagged and has no more failed checks than the original, that the visually
 exact file is pixel-identical to the original, that every file downloads, that no AI calls failed, and (with
-`--expect-compliant`) that the primary output passes. It prints a line per file and exits 0 only if every check
-passed. `harness_output/<run>/harness_report.md` summarizes the run and links
-each document's report.
+`--expect-compliant`) that the primary output passes. On the Adobe route, more failed checks and pages that render
+differently are printed as notes about Adobe's output, not counted as failures. It prints a line per file and exits 0
+only if every check passed. `harness_output/<run>/harness_report.md` summarizes the run and links each document's
+report.
 
 ## Regression documents
 
@@ -69,9 +71,10 @@ python harness/run_harness.py samples/regression/full --provider mock --expect-c
 ```
 
 `scripts/regression.sh` does the same without a running engine: it runs the quick set through the working tree's
-code in a throwaway container (the full set every fifth run, or with `--full`), prints a line per document, and
-exits non-zero if any fails. `--provider` and `--model` run it with real AI; those runs are never made longer than
-asked.
+code in the engine's image (`harness/run_folder.py`; the full set every fifth run, or with `--full`; `--quick` and
+`--every N` change that), prints a line per document, and exits non-zero if any fails. `--provider` and `--model` run
+it with real AI; those runs are never made longer than asked. The set is git-ignored, so a worktree has none: set
+`REGRESSION_SAMPLES` to the folder in the checkout that has it. `REGRESSION_IMAGE` names another image to run in.
 
 A cut-down copy must show the old problem on the code from before the fix and pass now. A document whose own tags
 are kept can't be cut without changing what is tested, so its quick copy covers only what doesn't depend on them.

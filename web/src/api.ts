@@ -1,5 +1,6 @@
 // API client. The access token lives only in memory; the refresh token is an HttpOnly cookie the
 // page never sees. A 401 triggers one refresh attempt, then the user is sent to sign in.
+import type { ReadingChoice, Readings } from "./viewer/readings";
 
 export type Role = { role: "super_admin" | "group_admin"; group_id: string | null };
 
@@ -7,6 +8,7 @@ export type User = {
   id: string;
   email: string;
   name: string | null;
+  removed_at?: string | null; // their data removed on request (#338)
   group_id: string | null;
   group_name: string | null;
   status: "active" | "disabled";
@@ -248,9 +250,17 @@ export type Finding = {
   action?: string;
   confidence?: number;
   suggested_alt?: string;
+  key?: string; // what the item is about, for its status (#366); missing on findings a client made itself
 };
 
+/** A review item signed off on a document (#366), kept by the item's key so it stays with it in later versions. */
+export type MarkStatus = "checked" | "fixed" | "not_issue";
+export type FindingMark = { key: string; status: MarkStatus; note: string | null; set_by_email: string; set_at: string };
+export type FindingMarks = { can_mark: boolean; marks: FindingMark[] };
+export const MARK_LABELS: Record<MarkStatus, string> = { checked: "Checked", fixed: "Fixed", not_issue: "Not an issue" };
+
 export type JobResult = {
+  pdfua_part?: 1 | 2;  // which PDF/UA the verdicts are by: 2 for a PDF 2.0 document (#409)
   compliant_before: boolean | null;
   compliant_after: boolean | null;
   failed_checks_before: number | null;
@@ -307,14 +317,21 @@ export type Job = {
   external_services: string[];
   needs_confirmation: boolean;
   full_review: boolean;
+  ignore_existing: boolean; // its own tags were ignored and it was tagged afresh (#396)
   /** Made without AI (an audit, when its AI level is set that way). */
   no_ai: boolean;
   ai_refunded: boolean;
   ai_unused: boolean;
+  /** Super admins only: what the AI cost and did (writer and review split, tokens, models, refunds...). */
   cost: {
     ai_usd?: number; ai_calls?: number; ai_tier?: string | null;
     adobe?: { pages_sent?: number; parts?: number; requests?: number; retries?: number; seconds?: number };
+    [key: string]: unknown;
   } | null;
+  /** Super admins only (#313): the engine's job id, and when the document was sent to the engine. */
+  staff?: { engine_job_id: string | null; submitted_at: string | null } | null;
+  rerun_of?: string | null;  // a super admin's re-run (#323): the document it re-ran
+  reruns?: string[];  // and, on the document's own page, its re-runs
   status: "held" | "queued" | "submitted" | "processing" | "completed" | "failed" | "canceled";
   progress: Record<string, unknown> | null;
   result: JobResult | null;
@@ -425,6 +442,13 @@ export type RuntimeSettings = {
   classifier_threshold: number;
   /** Pages read: the first ones and some spread through the document. */
   classifier_pages: number;
+  alert_queue_minutes: number;
+  alert_worker_minutes: number;
+  alert_engine_minutes: number;
+  alert_repeat_hours: number;
+  alert_backup_hours: number;
+  low_pool_percent: number;
+  low_pool_pages: number;
   /** veraPDF: its running service (falls back to the command line), or the command line in the engine. */
   verapdf_mode: "service" | "command_line";
   /** Also check PDF/UA-2, shown for information. */
@@ -621,7 +645,7 @@ export async function del<T>(path: string): Promise<T | undefined> {
 
 export async function uploadFiles(files: File[], reportOnly: boolean, processing = "standard",
   confirm = false, aiTier: string | null = null, fullReview = false, aiAltText = true,
-  aiKind: string | null = null, perFile: Record<number, FileChoice> = {}): Promise<UploadResult[]> {
+  aiKind: string | null = null, perFile: Record<number, FileChoice> = {}, ignoreExisting = false): Promise<UploadResult[]> {
   const form = new FormData();
   files.forEach((f) => form.append("files", f, f.name));
   form.append("report_only", String(reportOnly));
@@ -631,6 +655,7 @@ export async function uploadFiles(files: File[], reportOnly: boolean, processing
   if (aiTier) form.append("ai_tier", aiTier);
   if (aiTier && aiKind && aiKind !== "general") form.append("ai_kind", aiKind);
   if (fullReview) form.append("full_review", "true");
+  if (ignoreExisting) form.append("ignore_existing", "true");
   if (Object.keys(perFile).length) form.append("per_file", JSON.stringify(perFile));
   const r = await send("/jobs", { method: "POST", body: form });
   return r.json();
@@ -684,6 +709,7 @@ export type TagElement = {
   lang?: string;
   scope?: string;
   refs?: number[]; // what the tag points at (/Ref): a footnote mark's note
+  span?: [number, number]; // a table cell's rows and columns, when more than one (#370)
   headers?: number[]; // a table cell's headers, as it names them (Headers): the header cells it's read with, in order
   text?: string;
   orig?: boolean; // the tag was in the document as it was uploaded (only set when its tags were kept)
@@ -705,13 +731,15 @@ export type TagArtifact = { page: number; seq: number; bbox: [number, number, nu
 export type TagMap = {
   schema: number; pages: { w: number; h: number }[]; elements: TagElement[];
   pieces?: TagPiece[]; artifacts?: TagArtifact[]; // missing from tag maps made before area editing
+  document?: { title: string | null; lang: string | null }; // missing from tag maps made before #363
 };
 
 export type VersionSummary = {
+  pdfua_part?: 1 | 2;
   compliant: boolean | null;
   failed_checks: number | null;
   failed_rules: number | null;
-  findings: (Finding & { element?: number; extra?: { suggested_alt?: string } })[];
+  findings: (Finding & { element?: number; extra?: { suggested_alt?: string } & Partial<Readings> })[];
   findings_total: number;
   edits_applied?: string[];
   visual_identical?: boolean;
@@ -751,9 +779,10 @@ export type Versions = { can_edit: boolean; versions: DocVersion[] };
 
 export type TagEdit =
   | { op: "set_role"; element: number; expect_role: string; role: string }
-  | { op: "set_alt"; element: number; expect_role: string; alt: string }
-  | { op: "set_actual_text"; element: number; expect_role: string; text: string }
-  | { op: "set_decorative"; element: number; expect_role: string }
+  // reading: which of a formula's two readings a person chose (#403); recorded in the engine's report
+  | { op: "set_alt"; element: number; expect_role: string; alt: string; reading?: ReadingChoice }
+  | { op: "set_actual_text"; element: number; expect_role: string; text: string; reading?: ReadingChoice }
+  | { op: "set_decorative"; element: number; expect_role: string; as?: "layout" | "header" | "footer" | "page_number" }
   | { op: "set_lang"; element: number; expect_role: string; lang: string }
   | { op: "set_cell"; element: number; expect_role: string; role: "TH" | "TD"; scope?: string }
   | { op: "move"; element: number; expect_role: string; target: number; expect_target_role: string; position: "before" | "after" }
@@ -768,9 +797,21 @@ export type TagEdit =
   | { op: "make_toc"; element: number; expect_role: string }
   | { op: "set_headers"; element: number; expect_role: string; headers: number[] }
   | { op: "link_note"; element: number; expect_role: string; note: number | null }
+  | { op: "set_field_label"; element: number; expect_role: string; label: string }
+  // The whole document's, naming no tag (#363)
+  | { op: "set_doc_title"; title: string }
+  | { op: "set_doc_lang"; lang: string }
   | { op: "build_list"; element: number; expect_role: string; absorb?: number[]; rows: ListRow[] }
   | { op: "take_pieces"; element: number; expect_role: string; pieces: { page: number; mcid: number }[]; role: string; alt?: string }
-  | { op: "cut_area"; element: number; expect_role: string; page: number; bbox: [number, number, number, number]; role: string; alt?: string };
+  | { op: "cut_area"; element: number; expect_role: string; page: number; bbox: [number, number, number, number]; role: string; alt?: string }
+  // The table editor (#370): a table as it should be, or text tags made a table
+  | { op: "rebuild_table"; element: number; expect_role: string; rows: TableCellSpec[][]; caption?: number | null }
+  | { op: "build_table"; element: number; expect_role: string; absorb?: number[]; rows: BuildCellSpec[][] };
+
+/** A cell of the table editor's grid, as the engine takes it: header or data, its spans, and the old cells whose
+ * content it takes (a table being edited) or the pieces of text it holds (text tags being made a table). */
+export type TableCellSpec = { from: number[]; role: "TH" | "TD"; scope?: "Row" | "Column" | "Both"; rows?: number; cols?: number };
+export type BuildCellSpec = { parts: { el?: number; at: number }[]; role: "TH" | "TD"; scope?: "Row" | "Column" | "Both"; rows?: number; cols?: number };
 
 /** One row of a list being built from a tag's content: where it starts (item `at` of tag `el`, the edit's own tag
  * when left out) and what it becomes: a list item at a level, or a tag of a type. */
@@ -821,3 +862,9 @@ export type AccessCheck = {
 export interface TagDraft { user_id: string; user_email: string; based_on: number; edits: TagEdit[]; updated_at: string }
 export interface TagDraftInfo { user_id: string; user_email: string; based_on: number; edits_count: number; updated_at: string }
 export interface TagDrafts { mine: TagDraft | null; others: TagDraftInfo[] }
+
+/** Why a document waits for its owner's confirmation (#339): a service that asks for it, a signed PDF, or both. */
+export function heldFor(j: Job): string[] {
+  const why = j.progress?.held;
+  return Array.isArray(why) ? (why as string[]) : ["service"];
+}

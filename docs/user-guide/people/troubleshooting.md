@@ -9,7 +9,8 @@
 | No code arrives | It may be in junk, or delayed | Wait a minute, check junk, then **Send a new code**. If codes never arrive, contact your administrators: they can issue one another way |
 | "Your email address isn't set up for this service" | Neither your address nor your email's domain is linked to a group | Contact the people who run the service for your organization; they can add your domain, or just your address |
 | "That code is wrong or has expired" | Codes last 10 minutes, and only the newest works | Request a new code and use that one |
-| "Your account has been disabled" | An administrator disabled it | Contact your group's administrator |
+| "Too many attempts" | Too many codes asked for, or tried, in a short time | Wait a few minutes and try again |
+| An email saying your account can't sign in, instead of a code | An administrator disabled your account (the sign-in page doesn't say, so it can't tell anyone else) | Contact your group's administrator |
 | "Waiting for approval" on My documents | Your group approves new people first | Wait for the email; **Check again** refreshes |
 
 ## Uploading
@@ -20,8 +21,12 @@
 | The option is refused as not available to you | Your group keeps documents on its own servers (local-only), or you haven't been given that option | Choose another option, or ask your group admin |
 | "Files can be at most … MB" / "Documents can have at most … pages" | Over the limits your administrators set | Split the document, or ask an administrator |
 | "This PDF is password-protected" | The PDF is encrypted | Save a copy without the password, and upload that |
+| "This is a dynamic XFA form…" | A LiveCycle form that draws its pages as it opens, with no standard form to tag | Open it in Acrobat, save it as a standard PDF form (not XFA), and upload that |
 | "This file isn't a PDF" / "This PDF is damaged and can't be read" | The file isn't a readable PDF | Export it to PDF again from the original application |
 | "Letting AI decide the kind isn't available here" | That choice was switched off since the page loaded | Reload the page and choose a kind |
+| "This PDF has no pages" / "This PDF couldn't be checked…" | The file is empty, damaged, or too large or complex to open safely | Export it to PDF again, or split it |
+| "That's a lot of uploads in an hour" (or downloads, or exports) | Each person has an hourly limit on these | Wait a while and try again, or ask your administrator |
+| A signed PDF waits with **Send** and **Cancel** | Making it accessible removes the signature's validity | Choose **Send** (and sign the copy again), or **Cancel** |
 
 ## Waiting and processing
 
@@ -39,7 +44,7 @@
 
 | What you see | What it means | What to do |
 |---|---|---|
-| "Doesn't yet pass PDF/UA-1" | Some rules still fail | See **Still failing** in the report. Font problems are usually solved in the modified file, if there is one |
+| "Doesn't fully pass yet" (or **Needs work** in the list) | Some rules still fail | See **Still failing** in the report. Font problems are usually solved in the modified file, if there is one |
 | Two files | The document can't pass without a visible change | See [Which file to use](your-results.md#which-file-to-use) |
 | A long review list | Many things a machine couldn't be sure about | Start with **High**; suggestions are optional |
 | Alt text that's wrong | AI-written descriptions are drafts | Fix it in the [tag manager](tag-manager/figures.md), or ask for help |

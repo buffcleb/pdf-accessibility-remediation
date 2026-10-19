@@ -131,7 +131,7 @@ def render_job_markdown(job_id: str, meta: dict, status: str, result: dict | Non
         out.append("Report only: no changes were applied.")
     else:
         verdict = "passes" if after.get("compliant") else "does not yet pass" if after.get("compliant") is False else "was not validated against"
-        out.append(f"The remediated document **{verdict} PDF/UA-1**"
+        out.append(f"The remediated document **{verdict} PDF/UA-{2 if after.get('pdfua_part') == 2 else 1}**"
                    + (f" ({before.get('failed_checks')} → {after.get('failed_checks')} failed checks)."
                       if isinstance(before.get("failed_checks"), int) and isinstance(after.get("failed_checks"), int) else "."))
         if files.get("remediated_visual_fallback"):
@@ -260,6 +260,12 @@ def render_job_markdown(job_id: str, meta: dict, status: str, result: dict | Non
         out += [f"- ⚠️ {_esc(w)}" for w in warnings] + [f"- {_esc(f)}" for f in findings] + [""]
 
     m = result.get("metrics") or {}
+    hits = [x for x in m.get("limits_hit") or [] if isinstance(x, dict)]
+    if hits:
+        from app.pipeline.limits import describe
+        out += ["## Limits reached", "", "| Setting | Set to | This document | What happened |", "|---|---|---|---|"]
+        out += [f"| {_esc(x.get('setting'))} | {x.get('value')} | {x.get('wanted')}{' pages' if x.get('count') else ''} | "
+                f"{_esc(describe(x, with_setting=False))} |" for x in hits] + [""]
     tok = m.get("ai_tokens_used") or {}
     out += ["## Metrics", "", "| Metric | Value |", "|---|---|",
             f"| Pages processed | {m.get('pages_processed')} |",

@@ -95,14 +95,19 @@ INSTRUCTIONS = ("Which kind of document is this? The answer picks the AI best su
 
 async def by_jev(s: dict, kinds: list[dict], model: str | None = None) -> dict:
     cfg = get_settings()
-    if not cfg.openrouter_api_key:
+    if cfg.ai_gateway_only:
+        # Through the gateway's pass-through route, which adds the OpenRouter key (config/litellm.yaml; #361)
+        url = re.sub(r"/v1/?$", "", cfg.gateway_base_url.rstrip("/")) + "/systemone"
+        key = cfg.gateway_api_key
+    elif not cfg.openrouter_api_key:
         raise AIError("OPENROUTER_API_KEY is not configured")
+    else:
+        url, key = cfg.openrouter_base_url.rstrip("/") + "/systemone", cfg.openrouter_api_key
     body = {"model": model or cfg.classifier_jev_model, "state": _state(s),
             "questions": {"kind": {"type": "choice", "instructions": INSTRUCTIONS, "criteria": _options(kinds)}}}
-    url = cfg.openrouter_base_url.rstrip("/") + "/systemone"
     try:
         async with httpx.AsyncClient(timeout=cfg.ai_timeout_s) as client:
-            r = await client.post(url, json=body, headers={"Authorization": f"Bearer {cfg.openrouter_api_key}",
+            r = await client.post(url, json=body, headers={"Authorization": f"Bearer {key}",
                                                            "X-Title": "PDF Accessibility Remediation"})
     except httpx.TransportError as exc:
         raise AIError(f"cannot reach the classifier: {exc}") from exc

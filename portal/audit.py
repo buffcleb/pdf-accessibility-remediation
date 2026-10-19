@@ -21,10 +21,28 @@ def _valid_ip(value: str | None) -> str | None:
         return None
 
 
+def _from_trusted_proxy(peer: str | None, trusted: str) -> bool:
+    if not trusted.strip():
+        return True
+    try:
+        addr = ipaddress.ip_address((peer or "").strip())
+    except ValueError:
+        return False
+    for net in trusted.split(","):
+        try:
+            if net.strip() and addr in ipaddress.ip_network(net.strip(), strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def client_ip(request: Request) -> str | None:
-    """The caller's IP address, or None if it isn't a valid address (headers are untrusted input)."""
+    """The caller's IP address, or None if it isn't a valid address (headers are untrusted input). The proxy headers
+    are read only on a connection from a trusted proxy (PORTAL_TRUSTED_PROXIES)."""
     s = get_portal_settings()
-    if s.trust_proxy_headers:
+    peer = request.client.host if request.client else None
+    if s.trust_proxy_headers and _from_trusted_proxy(peer, s.trusted_proxies):
         name = (s.client_ip_header or "cf-connecting-ip").lower()
         if name != "x-forwarded-for":
             own = request.headers.get(name)
@@ -36,7 +54,7 @@ def client_ip(request: Request) -> str | None:
         if hops:
             back = max(1, getattr(s, "trusted_proxy_hops", 1))
             return _valid_ip(hops[-back] if len(hops) >= back else hops[0])
-    return _valid_ip(request.client.host if request.client else None)
+    return _valid_ip(peer)
 
 
 def user_agent(request: Request) -> str | None:

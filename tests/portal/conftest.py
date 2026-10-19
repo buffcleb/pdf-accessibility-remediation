@@ -19,6 +19,9 @@ ORIGIN = "http://app.test"
 from portal.security.tokens import generate_private_key_pem  # noqa: E402  (no settings needed)
 
 os.environ.update({
+    # Uploads are page-counted in-process in tests (a child process per upload doubles the suite's time); the
+    # isolation itself is tested in test_jobs.py with it turned on
+    "PORTAL_PDFCHECK_ISOLATED": "false",
     "PORTAL_DATABASE_URL": TEST_DB,
     "PORTAL_JWT_PRIVATE_KEYS": generate_private_key_pem(),
     "PORTAL_SECRET_KEY": "test-secret-" + "x" * 40,
@@ -45,7 +48,7 @@ from portal.security.ratelimit import RateLimiter, get_rate_limiter  # noqa: E40
 
 email_validator.TEST_ENVIRONMENT = True  # allow the reserved .test domain
 
-TABLES = "user_presence, report_sends, saved_reports, report_subscriptions, mail_outbox, queue_pauses, document_versions, quota_ledger, job_files, jobs, audit_events, sessions, otp_challenges, role_assignments, users, group_emails, group_domains, groups, settings"
+TABLES = "worker_beats, alert_states, user_presence, report_sends, saved_reports, report_subscriptions, mail_outbox, queue_pauses, document_versions, quota_ledger, job_files, jobs, audit_events, sessions, otp_challenges, role_assignments, users, group_emails, group_domains, groups, settings"
 
 
 @pytest.fixture(scope="session")

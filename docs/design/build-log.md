@@ -37,6 +37,23 @@ migrations, edge cases, checks). Issue and pull request numbers refer to the pro
 - [Document page, part 2: the report as an accessible PDF (#49, #53): done](#document-page-part-2-the-report-as-an-accessible-pdf-49-53-done)
 - [Upload form (#47): done](#upload-form-47-done)
 - [Kind-of-document classifier (#43): done](#kind-of-document-classifier-43-done)
+- [Kubernetes deployment (#62): done](#kubernetes-deployment-62-done)
+- [Portal additions, 8 to 11 October: done](#portal-additions-8-to-11-october-done)
+- [Tag viewer, 9 to 14 October: done](#tag-viewer-9-to-14-october-done)
+- [Music notation (#134): done](#music-notation-134-done)
+- [Reviews of 12 October, and their fixes: done](#reviews-of-12-october-and-their-fixes-done)
+- [Portal, 13 October: done](#portal-13-october-done)
+- [Engine: notation, structure and footnotes, 12 to 15 October: done](#engine-notation-structure-and-footnotes-12-to-15-october-done)
+- [Long documents in production, 15 and 16 October: done](#long-documents-in-production-15-and-16-october-done)
+- [Super admins: cost, limits and re-runs (#312 to #327): done](#super-admins-cost-limits-and-re-runs-312-to-327-done)
+- [Operations and hardening, 17 October: done](#operations-and-hardening-17-october-done)
+- [People and sign-in, 17 October: done](#people-and-sign-in-17-october-done)
+- [Engine: documents of every kind, 17 October: done](#engine-documents-of-every-kind-17-october-done)
+- [Tag manager, 17 and 18 October: done](#tag-manager-17-and-18-october-done)
+- [Monitoring (#397, #398): done](#monitoring-397-398-done)
+- [Math as MathML (#403): done](#math-as-mathml-403-done)
+- [PDF/UA-2 for PDF 2.0 documents (#409): done](#pdfua-2-for-pdf-20-documents-409-done)
+- [Large documents on more than one core (#124): done](#large-documents-on-more-than-one-core-124-done)
 
 ## Phase 1: done (portal API foundation)
 Code is in `portal/`, tests in `tests/portal/`, and the image is `Dockerfile.portal`. The demo stack
@@ -143,16 +160,18 @@ Tests: 51 portal tests, including a 10-thread race against the pool, failure ref
 the records purge, CSV injection and file-access scoping. With the 68 engine tests that makes 119.
 
 ## Known gaps (next)
-- **SAML** (phase 5).
+- **SAML** (phase 5). On hold.
 - **Engine changes:** the spec's engine-reads-S3 and signed-webhook design isn't built yet. The
   worker currently polls the engine and copies files over HTTP, which works but moves each file
   twice.
 - **Hardening** (phase 6):
   - Postgres row-level security
-  - a separate, non-owner database role for the app, so it can't disable the append-only triggers
-  - counting pages in a sandboxed process rather than in the API process
+  - ~~a separate, non-owner database role for the app, so it can't disable the append-only triggers~~: done on
+    the cluster (#337)
+  - ~~counting pages in a sandboxed process rather than in the API process~~: done as a limited child process (#356)
   - SeaweedFS filer and IAM authentication (the demo relies on the private Docker network)
-  - scans in CI
+  - ~~scans in CI~~: done as dependency audits, Bandit's SQL check, Dependabot, and Trivy in `scripts/build.sh`
+    (#228, #326, #362)
 - ~~Per-group AI policy~~: done as **local-only groups** plus **AI tiers** (see below). Jobs without a tier
   still use `PORTAL_ENGINE_AI_PROVIDER`.
 
@@ -708,3 +727,184 @@ queue and talk it over with them.
 - Comparison on the 30 sample documents: Jev 30/30, `local-vision` 29/30, total Jev cost $0.0016.
 - Migration 0027 (`jobs.ai_kind_auto`, `jobs.ai_kind_pick`).
 
+## Kubernetes deployment (#62): done
+- `scripts/build.sh` builds the engine, portal and web images for linux/amd64 and pushes them, tagged with the
+  commit. `scripts/deploy.sh` makes the settings and secret files (with new keys), then applies the secrets,
+  Postgres, Redis and SeaweedFS, a migration Job and the rollout. Manifests are in `deploy/k8s/manifests`.
+- Follow-ups: pods restart when their settings file changes (#66); the job folder check fixed (#65); a setting to
+  turn off the AI gateway's shared admin login (#118); the gateway link hidden unless an address is set (#115).
+- **Scaling with the queue** (#112): engine workers follow the portal's queue through KEDA's PostgreSQL scaler;
+  veraPDF and the AI gateway get CPU autoscalers; each service can cap documents at once (migration 0032).
+- **veraPDF as a service** (#64): kept running instead of started per check, after a comparison of validators
+  ([report](../evaluation/test-reports/2026-10-09-lighter-validators.md)).
+
+## Portal additions, 8 to 11 October: done
+- **Mail:** Date and Message-ID always set, which fixed DKIM failures (#67); the sign-in code kept out of the
+  subject (#70); Cloudflare's backend sends attachments (#63). **Email log** (#69, migration 0031): every email
+  recorded, sign-in codes and test emails without their body, under Reports › Activity.
+- **Break-glass sign-in code** from the command line (#71), audited.
+- **Groups allow single addresses** (#95, migration 0030): a listed address joins the group without its domain,
+  and comes before a domain match.
+- **Turnstile bot check** on "Email me a code" (#68), off unless its keys are set.
+- **The caller's address** behind any proxy, not only Cloudflare (#84).
+- **AI usage report** per AI level and model (#80): tokens, cost and failed calls for writing and review.
+- **Early removal** (#75, migration 0029): people mark a document done and its files go after a hold (24 hours);
+  super admins remove files or delete documents at once.
+- **Queues:** stop items in progress and remove failed ones; a job whose worker was killed is reported as failed
+  (#126, migration 0033).
+- **Failed documents get a help request** of their own, opened by the service (#147, migration 0034).
+- **Time by stage:** each job records where its time went, shown in the report and the report PDF (#138, #148).
+- **Limits:** one reference page, [limits](../operations/limits.md), and the report says when a document reaches
+  one (#157); figures described per document became a setting, 1,000 by default (#159).
+- **Public snapshots** (#86): `scripts/publish.sh` exports a ref and refuses to publish on gitleaks findings,
+  private addresses or private-looking files.
+
+## Tag viewer, 9 to 14 October: done
+- **Viewing:** one page at a time, with the reading order in the tree's place (#119); read the tags aloud in
+  reading order with the browser's voices (#105); tags from the uploaded document marked original (#129); long
+  documents open a page at a time (#150). Many layout changes followed (#245 to #275): resizable panes, a tag
+  menu, isolate a tag, select several.
+- **Editing:** drag tags in the tree, only where valid (#108); change the area a tag covers and tag untagged
+  content (#93); delete a tag, choosing what happens to what's inside (#130, #146); several tags made one list,
+  or a list built from a paragraph's lines (#250, #253); a list made a table of contents (#276); a figure split
+  by choosing its pieces on a picture (#270 to #272); "Describe with AI" for a part of a figure (#273, migration
+  0037); a table cell's headers seen and changed (#278).
+- **Saving:** unsaved changes kept on the server between sessions (#151, `tag_drafts`, migration 0035); save into
+  the same reviewed version, with undo for a day (#152, migration 0036).
+- Renamed **Tag manager** (#294), with its guide in its own folder (#296).
+
+## Music notation (#134): done
+- Each example of music is one figure. Staves are found on a low-resolution rendering, and an optional
+  Audiveris service, started on demand through a Redis list and KEDA, reads them note by note.
+- One figure per line of music, then per measure; readings stop at a whole measure; the whole piece as one
+  MusicXML file; the summary says how the music was tagged (#153 to #158).
+
+## Reviews of 12 October, and their fixes: done
+- Two internal reviews, of the tagging process (#187) and of security (#188).
+- **Hostile files** (#189 to #207): a form that draws itself, a looping page tree, CID font widths, absurd page
+  sizes, deep or broken tag trees, bad marked-content ids and table spans no longer hang or fail a job.
+- **Speed on large files** (#195 to #215): pictures for the AI rendered right before their call, the original's tag
+  map built while the validator and AI are waited for, and layout comparisons limited to neighbours.
+- **Security fixes** (#201 to #228): LIKE wildcards in audit filters taken literally; bounds on a save's edits,
+  on request size and on the file's title and language; an engine page cap (`MAX_PAGES`); document text sent to
+  the AI as data, with control characters stripped; network policies, a Redis password and one secret per pod;
+  pods bounded (seccomp, no capabilities, read-only root filesystems); every image pinned to a digest; a
+  dependency audit whenever dependencies change.
+
+## Portal, 13 October: done
+- An AI level can be deleted when it's off and unused; its models are chosen from a list (#231).
+- Gateway model names say family, size and role (#234); a small and a large commercial writer added (#230).
+- A group's documents listed a page at a time, with search, filters and sorting (#235).
+- **Live queues** (#236): every queue's items in one list, with search and filters, updated every three seconds.
+- Three built-in caps became settings, for documents towards a thousand pages: `AI_TABLES_MAX`,
+  `AI_ORDER_PAGES_MAX` and `PORTAL_REVIEW_FINDINGS_MAX` (#237).
+
+## Engine: notation, structure and footnotes, 12 to 15 October: done
+- **Notation:** doses put in words by rule with no AI call; one chemistry style; only the formula inside a
+  sentence goes to the AI; what will be spoken checked against the page (#179 to #186). A drawn chemical structure
+  or reaction scheme is one figure with its atom labels (#238 to #244). Formulas on scanned pages found and read
+  (#183). On the Adobe route, notation readings go onto Adobe's tags (#20, part 3).
+- **Bookmarks** from the headings (#277). **Complex tables** link each cell to its headers (#278).
+- **Footnotes** tagged as notes and linked from their marks (#279), then marks said as footnotes, made
+  References of their own, linkable by hand, linked from table cells, and kept on the kept-tags route (#285).
+- **OCR:** a scanned page with values typed onto it is read (#292).
+- **Tag text** gets a space where a line ends (#298); a heading comes before the text under it, whatever the AI
+  says (#297).
+- CI's actions run on Node.js 24 (#169).
+
+## Long documents in production, 15 and 16 October: done
+- A document no longer gets a second copy or endless reruns, and veraPDF can't take the worker down (#308).
+- The checker keeps only what it reads, and worker processes don't carry a long document over (#309).
+- Both veraPDF profiles are checked side by side through the service (#310).
+- A drawn fraction bar counts as a division (#311).
+- A lost worker is reported to the portal, with when it's tried again (#315).
+- A NUL in the engine's answer no longer stops the portal worker (#324); the engine strips control characters
+  from kept tags' text (#325).
+
+## Super admins: cost, limits and re-runs (#312 to #327): done
+- **Dollar costs** and the engine's own JSON report are for super admins only (#314).
+- **Limits hit** are recorded with each document and reported (#312). A **Run details** tab for super admins: AI
+  cost, calls and models, pages and limits (#313). Describe with AI's use and cost logged per use (#318).
+- **Re-run** any document as a new one, charging the owner only when asked, and **Restart** a stuck item from
+  Queues (#323, migration 0038).
+- **Security tests:** attack strings through every search, sort and filter, with Bandit's SQL check in CI
+  (#326); a document whose text carries SQL, HTML, a formula, a NUL and an AI instruction (#327).
+- An internal feature assessment of 16 October (#332).
+
+## Operations and hardening, 17 October: done
+- **Liveness probes** (#335): a stuck engine worker, portal worker or API is restarted. The APIs answer
+  `GET /api/v1/live`.
+- **Alerts** (#334, migration 0039): the queue not moving, the portal worker stopping, or the engine without
+  workers is emailed to super admins, with reminders and a cleared note, and shown on Attention.
+- **Nightly backups** (#333, #346): `BACKUPS=cronjob` runs a CronJob onto an NFS share, with pruning and an alert.
+- **Proxy headers** count only from the proxies in front of the portal (`PORTAL_TRUSTED_PROXIES`, #336).
+- **Database account** (#337): the portal connects as `portal_app`, which owns no table. Row-level security is
+  #350.
+- **Uploads:** pages counted in a child process with memory, CPU and time limits (#356).
+- **Rate limits per person** on downloads, exports and uploads (#357).
+- **Egress** (#361): the engine reaches the internet only through the AI gateway.
+- **Dependencies** (#362): Dependabot weekly per ecosystem, a weekly audit, and Trivy in `scripts/build.sh`;
+  the libraries Trivy flagged in the music and web images replaced (#393).
+
+## People and sign-in, 17 October: done
+- **A person's data** (#338, migration 0040): super admins export it, or remove it on request; the records stay
+  with the name and email replaced.
+- **Sign out of all devices** (#354): a button in Settings, and for super admins on anyone.
+- **Sign-in** gives the same answer for every address the service would take, at the same speed (#359).
+- **Low pools:** group admins emailed once when their pool runs low (#358).
+- **Accessibility of the app:** keyboard focus shown on the upload buttons (#353); `scripts/a11y.sh` runs axe over
+  the main pages, locally and in CI on demand (#369).
+
+## Engine: documents of every kind, 17 October: done
+- **Signed and permission-protected PDFs** (#339): signed ones held for the owner's confirmation; restricted ones
+  keep their restrictions, with access for assistive technology.
+- **Language** detected from the text, a template's wrong one replaced, passages in another language tagged
+  (#340).
+- **Form fields** named from their printed labels, with the AI for the rest (#341).
+- **XFA forms** (#360): a dynamic one refused at upload, a static one's XFA part removed.
+- **Low contrast** text listed per page for review (#367).
+- **Right-to-left pages** (Arabic, Hebrew) read from the right, and listed to check (#368).
+- `PDFUA_PART` other than 1 is refused (#355); PDF 2.0 files were handled later (#409).
+
+## Tag manager, 17 and 18 October: done
+- The document's title and language edited in a Document panel (#363).
+- Link descriptions, and any text or figure tag marked as an artifact (header, footer, page number) (#364).
+- Undo and redo of the unsaved changes, with Ctrl+Z and Ctrl+Shift+Z (#365).
+- **Review items signed off** (#366, `finding_marks`, migration 0041): checked, fixed or not an issue, kept with
+  the same item in later versions, with a filter and a CSV.
+- **Tables:** a table editor, text tags made into a table (#370), a figure that is a drawn table made a table
+  (#395), and a pending table edit shown as it will be saved (#400).
+- **Ignore the existing tags** at upload, to tag a document afresh (#396, migration 0042).
+
+## Monitoring (#397, #398): done
+- `MONITORING=on` (the default) deploys Prometheus, Grafana at `/grafana` for super admins (signed in through the
+  portal), kube-state-metrics and the Redis and Postgres exporters. The portal, its worker and the engine serve
+  metrics.
+- Prometheus's alert rules (`deploy/k8s/monitoring/rules.yml`, with tests) reach super admins like the portal's
+  own alerts.
+- **Administration › System:** figures and charts over 6 hours, a day or a week, and every workload's pods with
+  their state and details, all from Prometheus, so the portal needs no access to the Kubernetes API.
+- Details in [monitoring](../operations/monitoring.md).
+
+## Math as MathML (#403): done
+- **Part 1:** the LaTeX that comes with the AI's reading of a formula is converted to MathML and checked. A
+  document with formulas gets a formula list (a web page) and a zip of MathML files.
+- **Part 2:** MathCAT, built into the engine image, reads each formula by rule (ClearSpeak speech, Nemeth and UEB
+  braille). Where its speech and the AI's reading disagree, the formula is flagged and the tag manager offers both.
+  Two more downloads: the formulas in Nemeth and in UEB braille.
+- **Part 3:** a document's own MathML (from LaTeX's tagging and other PDF 2.0 producers) is kept, read by rule and
+  joins the math downloads.
+- **Part 4:** in a PDF 2.0 file, each formula's MathML is attached to its tag as an associated file.
+- **Part 5:** an optional formula reader (`FORMULA_READER=on`, RapidLaTeXOCR, on demand like the music reader)
+  reads each formula from its picture; a difference from the AI's reading flags it.
+
+## PDF/UA-2 for PDF 2.0 documents (#409): done
+- A PDF 2.0 file can only be PDF/UA-2. Its verdict comes from veraPDF's UA-2 profile (UA-1 for the rest), and its
+  output is labelled PDF/UA-2 with the root tag in the PDF 2.0 namespace. PDF 1.x is unchanged.
+- The portal keeps the part, and the badge, verdicts, reports, email and file names follow it.
+
+## Large documents on more than one core (#124): done
+- **Part 1:** a document of 50 pages or more has its layout analysis split over `PAGE_WORKERS` processes (3 by
+  default); the pages are put back in order, so the result is the one a single process makes.
+- **Part 2:** the checks' reading of each page is shared out the same way.
+- If a process fails, the work is done in one process as before.

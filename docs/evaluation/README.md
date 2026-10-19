@@ -1,7 +1,8 @@
 # Evaluation
 
 How the proof of concept was tested, what it achieved, and what it costs to run. Individual experiments are written
-up in [test reports](test-reports/README.md).
+up in [test reports](test-reports/README.md), and reviews of the code in [reviews](#reports-and-reviews). Each report
+is a record of its day; later changes are noted in it only as "fixed since".
 
 ## Contents
 
@@ -12,6 +13,7 @@ up in [test reports](test-reports/README.md).
 - [Known limitations](#known-limitations)
 - [Comparing with another remediation service](#comparing-with-another-remediation-service)
 - [Cost model](#cost-model)
+- [Reports and reviews](#reports-and-reviews)
 
 ## Test method
 
@@ -101,11 +103,13 @@ and a human review list. The same applies to any other remediation tool's output
 - **Specialist notation:** tested on 19 real chemistry, medical and engineering documents
   ([report](test-reports/2026-10-11-notation-real-documents.md)). `AI_NOTATION_MAX` (100 regions by default) takes the
   first regions in page order, so a very math-heavy document keeps the layout rules' readings on later pages unless it's
-  raised, as the [long-document settings](../operations/limits.md) do. MathML isn't added yet.
-- **PDF/UA-2** is validated for information only. Passing it needs PDF 2.0 output and the PDF 2.0 structure namespace,
-  which aren't implemented. veraPDF has no standalone WCAG profile; WCAG and Section 508 conformance rest on PDF/UA-1
-  plus the AI-written alt text, tables and reading order, and a person should still review the results.
-- **Forms** are only partly handled: field tooltips are added, but form-specific rules aren't fully covered.
+  raised, as the [long-document settings](../operations/limits.md) do. Formulas get MathML since #403.
+- **PDF/UA-2** is the verdict only for PDF 2.0 files, which keep PDF 2.0 and are labelled PDF/UA-2 (#409); for
+  every other file it is checked for information only, as PDF 1.x files are written as PDF/UA-1. veraPDF has no
+  standalone WCAG profile; WCAG and Section 508 conformance rest on PDF/UA and the AI-written alt text, tables and
+  reading order, and a person should still review the results.
+- **Forms** are only partly handled: fields are named from their printed labels (#341), but form-specific rules
+  aren't fully covered.
 - **Retained tags:** when existing tags are kept, their order is changed only on slide-like (landscape) pages, where
   it's put in the page's reading order if it clearly disagrees. On portrait pages newly tagged content is placed after
   the kept elements of the same page, and a reading-order mismatch is reported, not reordered. Hidden text is
@@ -120,8 +124,8 @@ and a human review list. The same applies to any other remediation tool's output
   check still flags suspicious order.
 - **The engine's job store** is a shared folder. Spreading the engine over several hosts needs a shared
   (ReadWriteMany) volume, or an object-storage backend behind `app/storage.py`.
-- **Not built yet:** SAML sign-in (designed), bounce handling for email, a classifier for AI levels (not just kinds),
-  and further fixes on top of Adobe's tags beyond alt text, notation and fonts.
+- **Not built yet:** SAML sign-in (designed, on hold), bounce handling for email, a classifier for AI levels (not
+  just kinds), and further fixes on top of Adobe's tags beyond alt text, notation and fonts.
 
 ## Comparing with another remediation service
 
@@ -203,3 +207,22 @@ full.
 **Not included:** the engineering time to make it production-ready and maintain it, hardware for local models, and
 staff time for the human review list (which any tool's output needs in practice). At these volumes, those, not the
 per-page cost, decide the business case.
+
+## Reports and reviews
+
+### Test reports
+
+| Date | Report |
+|---|---|
+| 2026-10-07 | [Specialist notation read by AI: Local, Cloud and Commercial on a research paper](test-reports/2026-10-07-notation-ai-tiers.md) |
+| 2026-10-07 | [AI-assisted OCR correction on damaged scans](test-reports/2026-10-07-ocr-ai-correction.md) |
+| 2026-10-09 | [Lighter PDF/UA checkers compared with veraPDF](test-reports/2026-10-09-lighter-validators.md) |
+| 2026-10-11 | [Chemistry, medical and engineering notation on real documents (Local AI)](test-reports/2026-10-11-notation-real-documents.md) |
+
+The [test reports index](test-reports/README.md) has a summary of each, and how to write one.
+
+### Reviews
+
+Internal reviews of the tagging process and of security (12 October 2026), and a feature assessment (16 October
+2026), are kept with the private working copy: they name weaknesses before they're fixed, so they aren't part of
+the public snapshot. What they led to is in the [build log](../design/build-log.md).

@@ -1,6 +1,6 @@
 import { useId, useRef, useState, type DragEvent } from "react";
 import {
-  get, post, uploadFiles, type FileChoice, type Job, type ServiceChoice, type UploadOptions, type UploadResult,
+  get, heldFor, post, uploadFiles, type FileChoice, type Job, type ServiceChoice, type UploadOptions, type UploadResult,
 } from "../api";
 import { ErrorNotice, LiveRegion, Notice, fmtBytes, fmtNum, useLoad } from "./ui";
 
@@ -22,6 +22,7 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   const [changing, setChanging] = useState(false);
   const [altText, setAltText] = useState(true);
   const [fullReview, setFullReview] = useState(false);
+  const [ignoreTags, setIgnoreTags] = useState(false);  // #396: the documents' own tags are poor
   const [held, setHeld] = useState<Job[]>([]);
   const ids = useId();
 
@@ -85,7 +86,7 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
       if (!fixed) files.forEach((f, i) => { if (f.choice) perFile[i] = f.choice; });
       const res = await uploadFiles(files.map((f) => f.file), check, chosen?.key ?? "standard", false,
         fixed ? null : base.ai_tier, fullReview && fullAllowed && usesAi && !check,
-        !altTextOnly || altText, base.ai_kind, perFile);
+        !altTextOnly || altText, base.ai_kind, perFile, ignoreTags && !check);
       setResults(res);
       setHeld(res.filter((r) => r.job?.status === "held").map((r) => r.job!));
       const ok = res.filter((r) => r.accepted).length;
@@ -210,18 +211,31 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
       {chosen?.notice && <Notice kind="warn" title={`About ${chosen.label}`}>{chosen.notice}</Notice>}
       {usesAi && level?.notice && <Notice kind="warn" title={`About ${level.label}`}>{level.notice}</Notice>}
 
-      {usesAi && fullAllowed && (
-        <details className="upload-more">
-          <summary>More options{fullReview ? " (1 on)" : ""}</summary>
-          <label className="check">
-            <input type="checkbox" checked={fullReview} onChange={(e) => setFullReview(e.target.checked)} />
-            <span>
-              Review every figure with AI. <span className="muted">Normally the AI checks flagged figures plus a
-              sample; this checks them all. Slower, and uses more AI. Not used for Check only.</span>
-            </span>
-          </label>
-        </details>
-      )}
+      {(() => {
+        const on = (fullReview && usesAi && fullAllowed ? 1 : 0) + (ignoreTags ? 1 : 0);
+        return (
+          <details className="upload-more">
+            <summary>More options{on ? ` (${on} on)` : ""}</summary>
+            <label className="check">
+              <input type="checkbox" checked={ignoreTags} onChange={(e) => setIgnoreTags(e.target.checked)} />
+              <span>
+                Ignore the existing tags. <span className="muted">For a PDF that is tagged, but badly: its own tags are
+                set aside and it's tagged afresh from the page. Normally good tags are kept and repaired. Not used for
+                Check only.</span>
+              </span>
+            </label>
+            {usesAi && fullAllowed && (
+              <label className="check">
+                <input type="checkbox" checked={fullReview} onChange={(e) => setFullReview(e.target.checked)} />
+                <span>
+                  Review every figure with AI. <span className="muted">Normally the AI checks flagged figures plus a
+                  sample; this checks them all. Slower, and uses more AI. Not used for Check only.</span>
+                </span>
+              </label>
+            )}
+          </details>
+        );
+      })()}
 
       <div className="actions upload-actions">
         <button className="btn" disabled={!!busy || files.length === 0} onClick={() => void submit(false)}>
@@ -239,12 +253,18 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
 
       <ErrorNotice error={error} />
       {held.length > 0 && (
-        <Notice kind="warn" title={`Confirm before sending to ${chosen?.label ?? "this service"}`}>
+        <Notice kind="warn" title={held.some((j) => heldFor(j).includes("service"))
+          ? `Confirm before sending to ${chosen?.label ?? "this service"}`
+          : `Confirm before sending ${held.length === 1 ? "this signed PDF" : "these signed PDFs"}`}>
           <span>Nothing is sent, and no pages are used, until you confirm each document.</span>
+          {held.some((j) => heldFor(j).includes("signed")) && (
+            <span>A signed PDF's accessible copy won't carry a valid signature: sign it again afterwards if one is
+              needed.</span>
+          )}
           <ul className="held-list">
             {held.map((j) => (
               <li key={j.id} className="actions">
-                <span>{j.filename}: {fmtNum(j.pages)} page{j.pages === 1 ? "" : "s"}</span>
+                <span>{j.filename}: {fmtNum(j.pages)} page{j.pages === 1 ? "" : "s"}{heldFor(j).includes("signed") ? " (signed)" : ""}</span>
                 <button className="btn small" onClick={() => void decide(j, true)}>
                   Send<span className="visually-hidden"> {j.filename}</span>
                 </button>

@@ -23,11 +23,13 @@ from app.adobe import chunks
 from app.adobe.client import AdobeClient, AdobeError
 from app.ai.base import AIError
 from app.ai.registry import get_provider
+from app.pipeline import limits, mathml, protection
 from app.pipeline.enrichment import EnrichmentStats
 from app.config import get_settings
 from app.pipeline.orchestrator import (
-    JobOptions, Progress, _bookmarks, _delta, _describe_regions, _move_xml, _primary, _snapshot, _tagmap_file,
-    _validate, _verdict_line, _visual_fidelity, _write_json_report, _xml_name,
+    JobOptions, Progress, _ai_read, _bookmarks, _delta, _describe_regions, _math_outputs, _move_xml, _primary,
+    _read_formulas, _snapshot, _tagmap_file, _validate, _verdict_line, _visual_fidelity, _write_json_report,
+    _xml_name,
 )
 from app.storage import JobStore
 from app.validation.audit import audit_pdf
@@ -46,7 +48,7 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
     src = store.input_pdf
-    warnings: list[str] = []
+    warnings: list[str] = protection.notes(protection.inspect(src), opts.report_only)  # signed, restricted (#339)
 
     progress("validating_original", 5)
     before_audit = await asyncio.to_thread(audit_pdf, src)
@@ -137,6 +139,8 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
                 improvements["decorative"] = sum(1 for e in edits if e["op"] == "set_decorative")
                 improvements["notation"] = sum(1 for e in edits if e["op"] == "set_actual_text"
                                                or (e["op"] == "set_alt" and e["expect_role"] == "Formula"))
+    # The readings that reached Adobe's tags, as MathML and read by rule (#403), before the copy is checked
+    await _read_formulas(enrichment, (), src)
     progress("font_fixes", 86)
     improvements.update(await asyncio.to_thread(_font_fixes, primary, candidate, work, stem, warnings))
     vera_candidate = improvements.pop("vera")
@@ -160,8 +164,7 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
                 ai=opts.verify_ai and improvements["alt_text"] > 0, full_review=opts.full_review, seed=opts.job_id,
                 judge_model=opts.judge_model,
                 # the AI's readings are listed for a person to check, as on the standard route
-                ai_read=[(n["page"], n["bbox"], n["kind"], n["spoken"]) for n in enrichment.notation
-                         if not n.get("by_rule")]))
+                ai_read=_ai_read(enrichment)))
             verification["enhanced"] = rep.to_dict()
             tag_maps["enhanced"] = await _tagmap_file(out, stem, "enhanced", enhanced, rep.tagmap)
             if rep.ai.get("error"):
@@ -201,6 +204,9 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
         "notation_read_by_ai": sum(1 for n in enrichment.notation if not n.get("by_rule")),
         "notation_by_rule": sum(1 for n in enrichment.notation if n.get("by_rule")),
         "notation_ai_rejected": enrichment.notation_rejected,
+        "notation_ai_rejected_by_reason": dict(sorted(enrichment.notation_rejected_by.items(), key=lambda kv: -kv[1])),
+        "limits_hit": limits.collect(enrichment.limits_hit, verification, enrichment.findings,
+                                     before_audit.get("pages") or pages),
         "route": "adobe",
         "adobe": adobe,
     }
@@ -219,6 +225,11 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
     vf = comparison["visual_fidelity"]
     summary.append(f"Visual fidelity: {vf.get('pages_identical')}/{vf.get('pages_compared')} pages pixel-identical "
                    "to the original.")
+    # Formulas read onto Adobe's tags, as MathML too (#403)
+    math_formulas, math_files = await _math_outputs(out, stem, enrichment)
+    if enrichment.math_formulas:
+        summary.append(f"Formulas: {enrichment.math_formulas} saved as MathML as well, in the math files and the "
+                       "formula list.")
     summary += [f"Warning: {w}" for w in warnings]
     result = {
         "files": {"remediated_primary": primary_name, "remediated_visual_fallback": None,
@@ -238,6 +249,9 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
             # Specialist notation read onto Adobe's tags (page 1-based, region, kind, read-aloud text, LaTeX,
             # confidence)
             "ai_notation": [{**n, "page": n["page"] + 1} for n in enrichment.notation][:300] or None,
+            "math": [{**f, "page": f["page"] + 1} for f in math_formulas][:300] or None,
+            "math_disagreements": mathml.disagreements(math_formulas) or None,
+            **{k: math_files.get(k) for k in ("math_files", "math_list", "math_nemeth", "math_ueb")},
         },
         "warnings": warnings,
     }
@@ -311,6 +325,8 @@ async def _ai_edits(ai, opts: JobOptions, pdf, original, tagmap_path, tagmap: di
                if e.get("role") == "Figure" and not (e.get("alt") or "").strip() and e.get("boxes")]
     limit = get_settings().ai_existing_figures_max
     if len(figures) > limit:
+        enrichment.limit_hit("AI_EXISTING_FIGURES_MAX", limit, len(figures),
+                             "figures weren't described by the AI and have no alt text")
         enrichment.findings.append(f"{len(figures) - limit} figure(s) beyond the limit of {limit} "
                                    "(AI_EXISTING_FIGURES_MAX) weren't described by the AI and have no alt text")
     figures = figures[:limit]

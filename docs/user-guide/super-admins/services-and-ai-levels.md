@@ -49,7 +49,9 @@ levels start switched off. On its **Model** tab:
 
 On its **Pages and cost guards** tab, **Audits** sets what **Check only** uses with this level:
 
-- **Use AI, free** (the default): the AI review runs and no pages are counted.
+- **Use AI, free** (the default): the AI writes alt text and reads tables, reading order and notation for the
+  report, as in a remediation, and no pages are counted. Nothing limits what checks cost you, so prefer one of the
+  other two for a paid level.
 - **Use AI and count its pages:** each page counts against this level's pages (not the processing pages).
 - **No AI:** checks are made without AI and use no pages.
 

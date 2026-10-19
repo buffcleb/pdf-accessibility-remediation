@@ -3,8 +3,10 @@
 [Operations](README.md) › Limits
 
 Every limit on what one document, one person or one request can do: its default, where to change it, and what
-happens past it. A limit that cuts a result short says so in the document's report (under **Findings and
-warnings**), so a capped result isn't mistaken for a complete one.
+happens past it. A limit that cuts a result short says so in the document's report (under **Limits reached**, and
+in **Findings and warnings**), so a capped result isn't mistaken for a complete one. Each one is also recorded with
+the document (`metrics.limits_hit`: the setting, its value, what the document wanted), and Administration › Reports ›
+**Limits hit** counts them across documents, so you can tell when a limit needs raising.
 
 **Where to change**
 - **Settings:** Administration › Settings in the portal (super admins). Takes effect at once.
@@ -22,6 +24,7 @@ warnings**), so a capped result isn't mistaken for a complete one.
 - [Queues and time](#queues-and-time)
 - [What the AI is asked](#what-the-ai-is-asked)
 - [Music](#music)
+- [Formula reader](#formula-reader)
 - [Checking the result](#checking-the-result)
 - [Adobe Autotag](#adobe-autotag)
 - [Tag manager and editing](#tag-manager-and-editing)
@@ -37,7 +40,7 @@ on a hosted model, these go up together; raising one alone moves the cut to the 
 |---|---|---|---|
 | `TASK_TIME_LIMIT_S` | 3600 | 14400 | More AI work takes longer than an hour |
 | `AI_CONCURRENCY` | 4 | 8 | Four suits one GPU; a hosted model takes more at once |
-| `VERIFY_MAX_PAGES` | 400 | 1200 | Later pages otherwise get the structure checks only |
+| `VERIFY_MAX_PAGES` | 400 | 1200 | Later pages otherwise get the structure checks only (and no contrast check) |
 | `VERIFY_AI_MAX_ITEMS` | 150 | 1000 | What the reviewer looks at, per file |
 | `PORTAL_REVIEW_FINDINGS_MAX` | 300 | 1000 | Or part of what was reviewed isn't listed in the app |
 | `AI_NOTATION_MAX` | 100 | 1000 | A math or chemistry text passes 100 in a few chapters |
@@ -61,6 +64,9 @@ reasoning, not measured on a 1,000-page document.
 | Size the engine accepts | 200 MB | Engine: `MAX_UPLOAD_MB` | The engine refuses the file; keep it at or above the portal's |
 | Pages the engine accepts | 2,000 | Engine: `MAX_PAGES` (0: no limit) | The engine refuses the document; keep it at or above the portal's, so the portal's own message is the one people see |
 | Pages a person or group may process | Their allowance | Groups and allowances | The document waits, or is refused, as the group is set up |
+| Opening a file to count its pages | 1,024 MB, 30 s of CPU, 60 s in all | Portal: `PORTAL_PDFCHECK_MEMORY_MB`, `PORTAL_PDFCHECK_CPU_S`, `PORTAL_PDFCHECK_TIMEOUT_S` | The upload is refused as too large or complex to open safely (it's opened in a child process, so the API isn't affected) |
+| Size of an upload through the cluster's web app and Ingress | 100 MB | Deploy: `MAX_UPLOAD_SIZE` | The upload is refused; keep it at or below Cloudflare's limit when behind Cloudflare |
+| Upload requests by one person | 200 an hour | Portal: `PORTAL_RATE_UPLOADS_PER_HOUR` (0: off) | A plain 429; it clears within the hour |
 
 ## Queues and time
 
@@ -71,7 +77,9 @@ reasoning, not measured on a 1,000-page document.
 | "Large" document | 200 pages | Settings: Large documents | Large ones run one at a time, one after every 5 smaller ones |
 | Documents at the engine at once | Workers × `WORKER_CONCURRENCY` (at least 4) | Deploy; `PORTAL_ENGINE_MAX_IN_FLIGHT` | The rest wait in the portal's queue |
 | A service's documents at once | None | Administration › Services: Most documents at once | The rest wait |
+| Processes for one long document's page work | 3, from 50 pages | Engine: `PAGE_WORKERS`, `PAGE_WORKERS_MIN_PAGES` | Layout analysis, and the checks' reading of each page, are shared out over that many processes, each opening the PDF; the result is the same as one process's. If one fails, the work is done in one process |
 | Engine time for one document | 1 hour | Engine: `TASK_TIME_LIMIT_S` | The document fails: "took too long to process" |
+| Starts of one document whose worker was lost | 2 | Built in: `MAX_STARTS`, `app/worker/tasks.py` | The document fails ("stopped unexpectedly … too large for the engine's memory"), and its pages are given back. The queue hands a lost worker's document out again after `TASK_TIME_LIMIT_S` plus 15 minutes. Meanwhile a running document writes a heartbeat every 30 s; after 2 minutes without one, the engine reports it as lost (`worker_lost`), and the portal shows when it will be tried again |
 | Portal's wait for one document | 12 hours | Built in: `JOB_TIMEOUT`, `portal/worker.py` | The document fails |
 | veraPDF's answer to one check | 600 s | Engine: `VERAPDF_TIMEOUT_S` | The check counts as unavailable; the report says so |
 
@@ -83,6 +91,7 @@ produced, and the report says how much was left.
 | Limit | Default | Change | Past it |
 |---|---|---|---|
 | Figures described | 1,000 per document | Engine: `AI_IMAGES_MAX` | Later figures have no alt text, and fail the check for it |
+| Form fields named by the AI | 200 per document | Engine: `AI_FIELD_LABELS_MAX` | Fields the page doesn't label past it keep their internal name; the review lists them |
 | Tables analyzed | 100 per document | Engine: `AI_TABLES_MAX` | Later tables keep the rules' headers |
 | Pages given an AI reading order | 200 per document | Engine: `AI_ORDER_PAGES_MAX` | Later multi-column pages keep the rules' order |
 | Regions on one page for AI reading order | 60 | Built in: `MAX_ORDER_REGIONS`, `app/pipeline/enrichment.py` | That page keeps the rules' order |
@@ -106,6 +115,15 @@ produced, and the report says how much was left.
 | Whole piece: size of the music pages | 40 MB | Deploy: `MUSIC_WHOLE_SCORE_MAX_MB` | No whole-piece file |
 | A reading in one alt text | 8 measures or 1,200 characters | Built in: `app/pipeline/music.py` | Whole measures from the start, then the file's name |
 | Shortest staff counted as music | 60 points | Built in, same file | Shorter ones are left alone |
+
+## Formula reader
+
+With `FORMULA_READER=on` on a cluster (#403):
+
+| Limit | Default | Change | Past it |
+|---|---|---|---|
+| Formulas read from their pictures | 200 per document | Engine: `FORMULA_OCR_MAX` | The rest keep the AI's reading alone, unchecked |
+| Wait for the reader | 180 s | Engine: `FORMULA_OCR_TIMEOUT_S` | The formulas are checked as without the reader |
 
 ## Checking the result
 
@@ -158,3 +176,6 @@ produced, and the report says how much was left.
 | Report attached to an email | 5 MB | Built in: `MAX_ATTACHMENT`, `portal/report_views.py` | Left out, with a note to download it from the app |
 | Logo | 512 KB | Built in: `LOGO_MAX_BYTES`, `portal/routers/branding.py` | Refused |
 | Signed in without activity, and at most | 8 hours, 7 days | Settings: Sign-in | Sign in again |
+| Sign-in codes asked for | 5 per address, 30 per IP address, every 15 minutes | Portal: `PORTAL_RATE_OTP_PER_EMAIL`, `PORTAL_RATE_OTP_PER_IP`, `PORTAL_RATE_WINDOW_SECONDS` | Refused until the window has passed |
+| Sign-in codes checked | 50 per IP address, every 15 minutes | Portal: `PORTAL_RATE_VERIFY_PER_IP` | The same |
+| Files downloaded, and exports, by one person | 600 and 120 an hour | Portal: `PORTAL_RATE_DOWNLOADS_PER_HOUR`, `PORTAL_RATE_EXPORTS_PER_HOUR` (0: off) | A plain 429; it clears within the hour |

@@ -199,7 +199,7 @@ export function ServiceDetail() {
             {ai && (
               <fieldset className="choices">
                 <legend>Audits <span className="muted small">(Check only: a report without changing the file)</span></legend>
-                {([["free", "Use AI, free", "The AI review runs and no pages are counted."],
+                {([["free", "Use AI, free", "The AI writes alt text and reads tables, reading order and notation for the report, as in a remediation; no pages are counted, so nothing limits what checks cost."],
                   ["charge", "Use AI and count its pages", "Each page counts against this level's pages (not the processing pages)."],
                   ["off", "No AI", "Audits are made without AI and use no pages."]] as const).map(([v, l, d]) => (
                   <label className="check" key={v}>

@@ -14,7 +14,8 @@ const KIND: Record<LedgerEntry["kind"], string> = {
 export function LedgerTable({ entries, emails }: { entries: LedgerEntry[]; emails?: Record<string, string> }) {
   if (entries.length === 0) return <p className="empty">No entries yet.</p>;
   return (
-    <div className="table-wrap">
+    // Wider than a narrow screen, with nothing in it to focus: focusable itself, so the keyboard can scroll it (#369)
+    <div className="table-wrap" tabIndex={0} role="region" aria-label="Page ledger">
       <table>
         <thead>
           <tr>

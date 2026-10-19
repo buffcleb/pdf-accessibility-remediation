@@ -8,6 +8,8 @@ from pathlib import Path
 import pikepdf
 from pikepdf import Dictionary, Name
 
+from app.pipeline.field_labels import Labels
+from app.pipeline.field_labels import apply as apply_field_labels
 from app.pipeline.models import BBox, DocumentAnalysis, bbox_intersection, bbox_union
 from app.tagging.content_marker import ContentMarker, MarkResult, StreamMarks, count_form_uses, existing_mcids, mcid_of
 from app.tagging.empty_spans import remove_empty_spans
@@ -15,6 +17,7 @@ from app.tagging.blank_fonts import fill_blank_fonts
 from app.tagging.font_unicode import map_picture_glyphs
 from app.tagging.existing_tags import DECORATIVE, OUTLINE, ElemInfo, ExistingTree
 from app.tagging.legend import Legends
+from app.tagging.mathml_tags import formula_mathml, has_mathml
 from app.tagging.metadata import apply_document_metadata
 from app.tagging.placement import place_added
 from app.tagging.reorder import reorder_retained
@@ -54,7 +57,13 @@ class TagResult:
     figures_artifacted: int = 0
     readings_on_kept_tags: int = 0  # notation readings written as ActualText on tags the document arrived with
     readings_unplaced: int = 0  # ...and those no kept tag matched
+    kept_notes: int = 0  # footnotes the document's own tags held as plain paragraphs, made Notes
+    kept_note_refs: int = 0  # kept tags holding a footnote's mark (or a cell's table-note symbol) made to name the note
     figure_outlines_released: int = 0  # kept Figures with no description that were only lines around text
+    # Kept Formulas that carry their own MathML (#403): {"page", "bbox", "mathml", "latex", "spoken", "rule"}, and
+    # how many of them got their read-aloud text from it, read by rule (MathCAT), with no AI
+    document_formulas: list = field(default_factory=list)
+    formulas_read_from_mathml: int = 0
     artifact_mcids_resolved: int = 0
     tables: int = 0
     tables_linked: int = 0  # of them, complex tables whose cells name their headers
@@ -65,6 +74,8 @@ class TagResult:
     annotations: int = 0
     annotation_text_added: int = 0
     unmatched_paragraphs: int = 0
+    passages_lang: int = 0
+    fields_named: int = 0  # form fields given a tooltip from their label (#341)
     headings_renumbered: int = 0
     metadata_changes: list[str] = field(default_factory=list)
 
@@ -136,6 +147,65 @@ def _stream_mcids(pdf: pikepdf.Pdf) -> dict[tuple[int, int], set[int]]:
     return found
 
 
+PDF2_NS = "http://iso.org/pdf2/ssn"
+
+
+def _document_in_pdf2_namespace(pdf: pikepdf.Pdf) -> bool:
+    """The structure tree's one Document in the PDF 2.0 namespace (PDF/UA-2 8.2.5.2), where it isn't yet: the
+    namespace is added to the tree's list. True if anything changed. The other tags stay in the default namespace,
+    PDF 1.7's, which PDF 2.0 keeps."""
+    root = pdf.Root.get("/StructTreeRoot")
+    if not isinstance(root, pikepdf.Dictionary):
+        return False
+    kids = root.get("/K")
+    kids = list(kids) if isinstance(kids, pikepdf.Array) else [kids] if kids is not None else []
+    if len(kids) != 1 or not isinstance(kids[0], pikepdf.Dictionary) or kids[0].get("/S") != pikepdf.Name.Document:
+        return False
+    doc = kids[0]
+    if str((doc.get("/NS") or {}).get("/NS", "")) == PDF2_NS:
+        return False
+    spaces = root.get("/Namespaces")
+    if not isinstance(spaces, pikepdf.Array):
+        root.Namespaces = spaces = pikepdf.Array()
+    ns = next((n for n in spaces if isinstance(n, pikepdf.Dictionary) and str(n.get("/NS", "")) == PDF2_NS), None)
+    if ns is None:
+        ns = pdf.make_indirect(pikepdf.Dictionary(Type=pikepdf.Name.Namespace, NS=pikepdf.String(PDF2_NS)))
+        spaces.append(ns)
+    doc.NS = ns
+    return True
+
+
+def _document_formulas(existing: ExistingTree, where, result: TagResult) -> dict:
+    """The kept Formulas that carry their own MathML (#403), into result.document_formulas, each read by rule
+    (MathCAT) for its speech and braille. Returns the readings for those with no read-aloud text yet, by element."""
+    from app.pipeline import mathml, mathspeak
+    found = []
+    for e in existing.elements:
+        if e.role != "Formula":
+            continue
+        raw, latex = formula_mathml(e.obj)
+        clean = mathml.clean(raw, latex) if raw else None
+        if not clean:
+            continue
+        at = where(e)
+        said = str(e.obj.get("/Alt") or e.obj.get("/ActualText") or "").strip()
+        found.append((e, clean, latex, at, said))
+    answers = mathspeak.read_all([m for _, m, _, _, _ in found]) if found else []
+    readings = {}
+    for n, (e, clean, latex, at, said) in enumerate(found):
+        a = answers[n] if n < len(answers) else {}
+        rule = ({"spoken": mathspeak.speech_text(a["speech"]), "nemeth": a.get("nemeth"), "ueb": a.get("ueb")}
+                if a.get("speech") else None)
+        if rule and not said:
+            readings[e.obj.objgen] = rule["spoken"]
+        if at:
+            result.document_formulas.append({"page": at[0], "bbox": list(at[1]), "source": "document",
+                                             "mathml": clean, "latex": latex,
+                                             "spoken": said or (rule or {}).get("spoken"),
+                                             **({"rule": rule} if rule else {})})
+    return readings
+
+
 def tag_document(
     src: Path,
     dst: Path,
@@ -146,11 +216,17 @@ def tag_document(
     pdfua_part: int = 1,
     layout_tables: set[str] | None = None,
     region_alts: list[tuple[int, BBox, str]] | None = None,
+    field_labels: Labels | None = None,
+    ignore_existing: bool = False,
 ) -> TagResult:
     """region_alts: extra alt text for existing Figure elements that matched no detected image
-    (vector drawings, equations), keyed by page and region, from a previous pass."""
+    (vector drawings, equations), keyed by page and region, from a previous pass. field_labels: what each form field
+    is called (#341), set as its tooltip where it has none or only an internal name. ignore_existing: the person
+    asked for the document's own tags to be ignored (they're poor): they're discarded and the tree built afresh,
+    as when they can't be used (#396)."""
     layout_tables = layout_tables or set()
     with pikepdf.open(src) as pdf:
+        fields_named = apply_field_labels(pdf, field_labels) if field_labels else 0
         existing = ExistingTree(pdf, _stream_mcids(pdf))
         report = existing.inspect()
         nested = _nested_mcid_pages(pdf) if report.present else []
@@ -160,6 +236,8 @@ def tag_document(
             report.usable, report.rebuilt_tree = False, True
             report.reason = (f"existing marked content is nested (one tagged section inside another) on "
                              f"page(s) {', '.join(str(p + 1) for p in nested[:10])}")
+        if report.present and ignore_existing:
+            report.usable, report.rebuilt_tree, report.reason = False, True, "ignored at your request"
         retain = report.usable
         if report.present and not retain:
             existing.strip()
@@ -246,11 +324,28 @@ def tag_document(
                         return True
                 return False
 
+            def locate(e: ElemInfo) -> tuple[int, BBox] | None:
+                """Where an element's content is, on the page its content is on (an element need not name its page:
+                it can inherit it, as LaTeX's do)."""
+                boxes, pi = [], None
+                for d in existing._descendants(e):
+                    for m in d.mcrefs:
+                        b = existing_bbox.get(m.owner, {}).get(m.mcid) if m.valid else None
+                        if b:
+                            boxes.append(b)
+                            pi = page_index.get(m.owner) if pi is None else pi
+                return (pi, bbox_union(boxes)) if pi is not None and boxes else None
+
             legends = Legends(src)
             needing_alt: list[ElemInfo] = []  # the elements behind result.figures_needing_alt, in order
 
             def figure_alt(e: ElemInfo) -> str | None:
-                if e.children and not any(m.valid for m in e.mcrefs) and any(
+                carries_math = e.role == "Formula" and has_mathml(e.obj, e.children)
+                if carries_math and math_readings.get(e.obj.objgen):
+                    # Its own MathML, read by rule: the formula as its author wrote it, no AI needed (#403)
+                    result.formulas_read_from_mathml += 1
+                    return math_readings[e.obj.objgen]
+                if not carries_math and e.children and not any(m.valid for m in e.mcrefs) and any(
                         "text" in kinds_of.get(m.owner, {}).get(m.mcid, set())
                         for d in existing._descendants(e) for m in d.mcrefs if m.valid):
                     # A Figure that draws nothing itself and only wraps tagged text (a group of text boxes): a
@@ -258,6 +353,9 @@ def tag_document(
                     result.figure_outlines_released += 1
                     return OUTLINE
                 pi, bbox = elem_bbox(e)
+                if carries_math and (pi is None or bbox is None):
+                    # A formula whose content sits in its MathML elements, or that names no page of its own
+                    pi, bbox = locate(e) or (None, None)
                 if pi is None or bbox is None:
                     return None
                 w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -312,6 +410,7 @@ def tag_document(
                         label = best.list_label
                 return pi, box, label
 
+            math_readings = _document_formulas(existing, locate, result)
             hidden = _hidden_text(marks)
             if hidden:
                 result.hidden_text_artifacted = existing.hide(hidden, "text hidden under a shape drawn over it")
@@ -361,12 +460,24 @@ def tag_document(
                     f"{unplaced} reading(s) of specialist notation could not be attached to the document's own tags "
                     "(no tag holds just that content, or the tag already says something of its own): those tags read "
                     "as they did" + (f"; {placed} were attached" if placed else ""))
+            # Footnotes the analysis found, onto the kept tags that hold them and their marks
+            kept_fn = _footnotes_onto_kept_tags(existing, elem_bbox, analysis)
+            result.kept_notes, result.kept_note_refs = kept_fn["notes"], kept_fn["refs"]
+            if kept_fn["notes"] or kept_fn["refs"]:
+                report.findings.append(
+                    f"footnotes on the document's own tags: {kept_fn['notes']} paragraph(s) made Notes, "
+                    f"{kept_fn['refs']} tag(s) holding a mark made to name their note"
+                    + (f", {kept_fn['said']} of them saying the mark as a footnote" if kept_fn["said"] else ""))
             # Spans around nothing visible (the tab after a form label) are folded into the tag they're in
             existing_kinds = {sm.owner.objgen: sm.existing_kinds for ms in marks.values() for sm in ms}
             result.empty_spans_removed = remove_empty_spans(pdf, src, existing_bbox, existing_kinds, existing.role_map)
 
-        builder = StructTreeBuilder(pdf, analysis, layout_tables)
+        builder = StructTreeBuilder(pdf, analysis, layout_tables, language)
         root = builder.build(marks, retain_root=retain)
+        if not retain:
+            # A new tree's form fields go beside their labels, not after the page's text (#341)
+            fields = [e for e in builder.inserted if str(e.get("/S", "")) == "/Form"]
+            result.added_placed = place_added(pdf, analysis, marks, {}, fields)["placed"] if fields else 0
         if retain:
             # What the engine added (content the old tags left out, untagged fields and links) goes beside the kept
             # tags it follows on its page, not after everything
@@ -387,13 +498,21 @@ def tag_document(
         result.footnote_references = s.footnote_references
         result.annotation_text_added = s.contents_added
         result.unmatched_paragraphs = s.unmatched_paragraphs
+        result.passages_lang = s.passages_lang
+        result.fields_named = fields_named
         result.headings_renumbered = s.headings_renumbered
 
         # Characters in figures and decoration that have no Unicode meaning (note heads, drawn line pieces)
         result.picture_glyphs_mapped, stray = map_picture_glyphs(pdf, picture_glyphs, body_glyphs, glyph_counts)
         # Pages where such a symbol stands in a sentence: nothing says what it is, so a person should
         result.picture_glyphs_in_text = sorted({p + 1 for font in stray for p in body_pages.get(font, ())})
-        result.metadata_changes = apply_document_metadata(pdf, title=title, language=language, pdfua_part=pdfua_part)
+        # A PDF 2.0 file can only be PDF/UA-2 (#409): it's labelled as what it can be, and its Document is in the PDF
+        # 2.0 namespace, as PDF/UA-2 asks (8.2.5.2)
+        part = 2 if str(pdf.pdf_version) >= "2.0" else pdfua_part
+        moved = part == 2 and _document_in_pdf2_namespace(pdf)
+        result.metadata_changes = apply_document_metadata(pdf, title=title, language=language, pdfua_part=part)
+        if moved:
+            result.metadata_changes.append("Document tag put in the PDF 2.0 namespace")
         blank = fill_blank_fonts(pdf)
         if blank:
             result.metadata_changes.append(
@@ -645,6 +764,96 @@ def _area(b: BBox) -> float:
 
 _TEXT_ROLES = {"P", "LBody", "LI", "Lbl", "TD", "TH", "Span", "Caption", "Formula", "H", "H1", "H2", "H3", "H4", "H5",
                "H6", "Quote", "BlockQuote", "Note"}
+
+
+def _footnotes_onto_kept_tags(existing, elem_bbox, analysis) -> dict:
+    """When the document's own tags are kept, the footnotes the analysis found (structure._mark_footnotes and
+    _mark_table_notes) would never reach them. The kept tag that holds a footnote becomes a Note, if it was a plain
+    paragraph (one already a Note stays as it is; the builder gives Notes their IDs); the kept tag that holds the text
+    with its mark, or a table cell with the note's symbol, names the note in /Ref, unless something in it already
+    names one, and says the mark as a footnote ("soils (footnote 1)") when it has nothing of its own to say. Tags are
+    matched by box, as readings are (_readings_onto_kept_tags). Marks aren't cut out as References of their own here:
+    that would rewrite the producer's content. Returns the counts: notes, refs, said."""
+    out = {"notes": 0, "refs": 0, "said": 0}
+
+    def plain(e) -> bool:
+        if e.role not in _TEXT_ROLES or e.objrefs or any(k in e.obj for k in ("/Alt", "/ActualText", "/E")):
+            return False
+        return all(c.role == "Span" and not c.children and not c.objrefs
+                   and not any(k in c.obj for k in ("/Alt", "/ActualText", "/E")) for c in e.children)
+
+    tags: dict[int, list] = {}
+    for e in existing.elements:
+        if e.decision in ("replaced", "removed", "artifacted") or e.role not in _TEXT_ROLES:
+            continue
+        boxes = [b for b in (elem_bbox(d) for d in existing._descendants(e)) if b[1] is not None]
+        if boxes and len({pi for pi, _ in boxes}) == 1:
+            tags.setdefault(boxes[0][0], []).append((e, bbox_union([b for _, b in boxes])))
+
+    def best(pi: int, box: BBox, ok, inside: bool = False) -> object:
+        """The tag whose box and this one cover each other; inside: whose box lies in this one (a table cell's box
+        is its whole cell, the tag's only its glyphs), the largest such."""
+        found, score = None, 0.0
+        for e, eb in tags.get(pi, []):
+            if not ok(e):
+                continue
+            inter = bbox_intersection(box, eb)
+            if inside:
+                s = _area(eb) if inter >= 0.8 * (_area(eb) or 1.0) else 0.0
+            else:
+                union = _area(box) + _area(eb) - inter
+                s = inter / union if union > 0 else 0.0
+            if s > score:  # of two that fit alike, the first (the outer one) holds all of it
+                found, score = e, s
+        return found if (score > 0 if inside else score >= 0.6) else None
+
+    for page in analysis.pages:
+        notes: dict[str, object] = {}
+        for b in page.blocks:
+            if b.role != "Note":
+                continue
+            e = best(page.number, b.bbox, lambda e: e.role in ("Note", "P"))
+            if e is None:
+                continue
+            if e.role == "P":
+                if not plain(e):
+                    continue
+                e.obj.S = Name.Note
+                e.role = e.raw_role = "Note"
+                existing._mark(e, "repaired", "footnote held as a paragraph: tagged as a Note")
+                out["notes"] += 1
+            notes[b.id] = e
+        if not notes:
+            continue
+        held = set(id(e) for e in notes.values())
+
+        def point(e, targets: list, said: str | None) -> None:
+            if any("/Ref" in d.obj for d in existing._descendants(e)):
+                return  # the producer already says what it points at
+            e.obj.Ref = pikepdf.Array([t.obj for t in targets])
+            out["refs"] += 1
+            note = "names its footnote in /Ref"
+            if said and plain(e):
+                e.obj.ActualText = pikepdf.String(said)
+                out["said"] += 1
+                note += ", and says the mark as a footnote"
+            existing._mark(e, "repaired", note)
+
+        for b in page.blocks:
+            targets = [notes[n] for n in b.notes if n in notes]
+            if not targets or b.role == "Note":
+                continue
+            e = best(page.number, b.bbox, lambda e: id(e) not in held and e.role != "Note")
+            if e is not None:
+                point(e, targets, b.actual_text if b.says_marks_only else None)
+        for t in page.tables:
+            for c in t.cells:
+                targets = [notes[n] for sym, n in t.notes.items() if sym in (c.text or "") and n in notes]
+                if targets and c.bbox:
+                    e = best(page.number, c.bbox, lambda e: e.role in ("TD", "TH"), inside=True)
+                    if e is not None:
+                        point(e, targets, c.actual_text)
+    return out
 
 
 def _readings_onto_kept_tags(existing, elem_bbox, analysis) -> tuple[int, int]:

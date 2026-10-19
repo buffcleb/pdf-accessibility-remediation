@@ -30,6 +30,12 @@ wait in the queue rather than fail), and confirm-before-send. It can show a **no
 documents go. Unmetered services count use but never limit it. An AI level also decides what a **Check only** run
 costs: free, counted against the level, or made without AI.
 
+A group's admins (or the super admins, if it has none) are emailed once when its pool runs low, below a share of
+its size or a number of pages (Settings); topping it up re-arms the alert (`portal/pool_alerts.py`, #358).
+
+At upload, a signed or certified PDF is held for the person's confirmation like a service that asks for it, since
+remediating breaks the signature (#339). A dynamic XFA form is refused: it has no standard form to tag (#360).
+
 ## One document's path
 
 ```mermaid
@@ -40,8 +46,8 @@ sequenceDiagram
   participant E as Engine
   participant G as AI gateway
   U->>P: upload (processing service, AI level, kind)
-  P->>P: access checks, page counts, per-document limit
-  alt service asks for confirmation
+  P->>P: access checks, page counts (in a child process<br/>with memory, CPU and time limits), per-document limit
+  alt service asks for confirmation, or the PDF is signed
     P-->>U: held, nothing reserved
     U->>P: confirm
   end
@@ -70,6 +76,7 @@ The portal worker decides what goes to the engine next, and in what order:
 - **large documents** (over a page count) take turns with smaller ones, a few at a time;
 - a service with a **daily page limit** holds documents for the next day once it's reached;
 - a super admin can **pause** a service's queue; its documents wait and go ahead on resume;
+- a service or AI level can have a limit on its documents at the engine at once;
 - the engine has a limit on documents in flight at once.
 
 Edits from the tag editor, AI re-reviews and email have their own queues. Sign-in codes are never queued.

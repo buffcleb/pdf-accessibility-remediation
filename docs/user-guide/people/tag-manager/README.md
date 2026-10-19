@@ -19,13 +19,14 @@ type, read-aloud text and language fields.](../../../images/tag-manager/overview
    or all pages, isolating a tag
 2. [Hearing it read aloud](read-aloud.md): checking order and alt text by ear
 3. [Editing a tag](editing-a-tag.md): the editing panel, the tag menu, changing a tag's type, alt text, read-aloud
-   text and language, selecting several tags
+   text and language, selecting several tags, the document's title and language
 4. [Reading order](reading-order.md): checking it and moving tags
 5. [Merging, splitting and deleting](merge-split-delete.md)
 6. [Lists and tables of contents](lists-and-contents.md): building a list from an outline, nesting items, making a
    table of contents
 7. [Figures](figures.md): alt text, decorative figures, splitting a figure into parts
-8. [Tables](tables.md): header cells and the headers a cell is read with
+8. [Tables](tables.md): the table editor (headers, caption, merging and splitting cells, rows and columns, making a
+   table of paragraphs), header cells and the headers a cell is read with
 9. [Areas: content in the wrong tag, or not tagged](areas.md)
 10. [Footnotes](footnotes.md): linking a mark to its note
 11. [Saving your changes](saving.md): versions, AI review, changes kept between visits
@@ -33,9 +34,9 @@ type, read-aloud text and language fields.](../../../images/tag-manager/overview
 
 ## Who can edit
 
-You can edit your own documents, and group admins can edit their group's. Everyone else who can open a document
-sees it read-only. **Nothing is in the file until you save**: every change collects under **Unsaved changes**,
-where it can be undone, and saving makes a new version. The original results are never changed.
+You can edit your own documents, and group admins can edit their group's. Everyone else who can open a document,
+super admins included, sees it read-only. **Nothing is in the file until you save**: every change collects under
+**Unsaved changes**, where it can be undone, and saving makes a new version. The original results are never changed.
 
 ## A quick check, in five minutes
 

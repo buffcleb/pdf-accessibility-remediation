@@ -1,0 +1,85 @@
+# Prometheus's alerts (#397). Nothing sends them on: the portal's worker reads what's firing once a minute and tells
+# super admins like its own alerts (email, and Administration > Attention), each rule as one problem however many
+# pods it fires for. The portal titles each rule and says what to do (PROM_TITLES and PROM_FIXES in
+# portal/alerts.py; tests/portal/test_alerts.py keeps the names in step); the description here is the detail.
+#
+# What the portal already watches itself isn't repeated: a queue that isn't moving, its own worker stopping, the
+# engine having no workers, the nightly backup. Pods that come and go on purpose (scaled to none, a finished job)
+# aren't alerted.
+groups:
+  - name: pdf-remediation
+    rules:
+      - alert: PodCrashLooping
+        expr: max by (pod, container) (kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}) > 0
+        for: 10m
+        annotations:
+          description: "{{ $labels.pod }} ({{ $labels.container }}) keeps crashing and being restarted."
+
+      - alert: PodRestarting
+        expr: sum by (pod) (increase(kube_pod_container_status_restarts_total[1h])) >= 3
+        annotations:
+          description: "{{ $labels.pod }} restarted {{ $value | humanize }} times in the last hour."
+
+      - alert: PodNotReady
+        expr: |
+          (max by (pod) (kube_pod_status_ready{condition="false"}) > 0)
+          unless on (pod) kube_pod_owner{owner_kind="Job"}
+        for: 15m
+        annotations:
+          description: "{{ $labels.pod }} has been running without being ready for 15 minutes."
+
+      - alert: DeploymentShort
+        expr: kube_deployment_status_replicas_available < kube_deployment_spec_replicas
+        for: 15m
+        annotations:
+          description: "{{ $labels.deployment }} has {{ $value }} pod(s) available, fewer than it should."
+
+      - alert: TargetDown
+        expr: max by (app) (up{job="pods"}) == 0
+        for: 10m
+        annotations:
+          description: "Prometheus hasn't read {{ $labels.app }}'s metrics for 10 minutes."
+
+      - alert: MemoryNearLimit
+        expr: |
+          max by (pod, container) (container_memory_working_set_bytes
+            / on (pod, container) group_left kube_pod_container_resource_limits{resource="memory"}) > 0.9
+        for: 15m
+        annotations:
+          description: "{{ $labels.pod }} ({{ $labels.container }}) is at {{ $value | humanizePercentage }} of its
+            memory limit."
+
+      - alert: VolumeFilling
+        expr: |
+          max by (persistentvolumeclaim) (kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes)
+            < 0.1
+        for: 30m
+        annotations:
+          description: "The volume {{ $labels.persistentvolumeclaim }} has {{ $value | humanizePercentage }} left."
+
+      - alert: RedisDown
+        expr: max(redis_up) == 0
+        for: 5m
+        annotations:
+          description: "The Redis exporter can't reach Redis."
+
+      - alert: PostgresDown
+        expr: max(pg_up) == 0
+        for: 5m
+        annotations:
+          description: "The Postgres exporter can't reach the database."
+
+      # Documents sent to the engine waiting in Redis: every worker's places are taken
+      - alert: EngineQueueWaiting
+        expr: engine_queue_length{queue="engine"} > 0
+        for: 30m
+        annotations:
+          description: "At least {{ $value }} document(s) have been waiting for an engine worker for 30 minutes."
+
+      - alert: PortalErrors
+        expr: |
+          sum(rate(portal_http_requests_total{status=~"5.."}[10m]))
+            / sum(rate(portal_http_requests_total[10m])) > 0.05
+        for: 10m
+        annotations:
+          description: "{{ $value | humanizePercentage }} of the portal's answers in the last 10 minutes were errors."

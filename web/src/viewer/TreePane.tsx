@@ -4,6 +4,7 @@ import { errorMessage } from "../components/ui";
 import { subtree } from "./isolate";
 import { ROLE_NAMES, absorbedBy, draftTree, editMarks, overrides, pageOrder, roleClass, tagsOnPage } from "./draft";
 import { builtPreview, builtSummary, type BuiltRow } from "./outline";
+import { tablePreview, tableReplaced } from "./tablegrid";
 import { splitPreview, type SplitPart } from "./figure";
 import { centered, keptInView } from "./scroll";
 import { loadVersion } from "./pdf";
@@ -80,7 +81,9 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
   const over = useMemo(() => overrides(ops, map), [ops, map]);
   const tree = useMemo(() => (map ? draftTree(map, ops) : null), [map, ops]);
   // Tags no longer in the tree: merged into another, or deleted
-  const gone = useMemo(() => new Set([...absorbedBy(ops).keys(), ...(tree?.deleted ?? [])]), [ops, tree]);
+  const gone = useMemo(() => new Set([...absorbedBy(ops).keys(), ...(tree?.deleted ?? []),
+    ...(map ? ops.flatMap((o) => (o.op === "build_table" || o.op === "rebuild_table" ? tableReplaced(map, o) : [])) : [])]),
+  [ops, tree, map]);
   const isolatedTags = useMemo(() => (isolated !== null && map ? subtree(map, isolated) : null), [isolated, map]);
   const edited = useMemo(() => (map ? editMarks(map, ops) : new Map<number, string[]>()), [map, ops]);
   const [drag, setDrag] = useState<number | null>(null);
@@ -108,7 +111,11 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
 
   const built = useMemo(() => {
     const out = new Map<number, BuiltRow[]>();
-    if (map) for (const op of ops) if (op.op === "build_list") out.set(op.element, builtPreview(map, op));
+    if (map) for (const op of ops) {
+      if (op.op === "build_list") out.set(op.element, builtPreview(map, op));
+      // A table made or edited (#370): drawn as it will be saved, in place of the tag the edit names
+      if (op.op === "build_table" || op.op === "rebuild_table") out.set(op.element, tablePreview(map, op));
+    }
     return out;
   }, [map, ops]);
 

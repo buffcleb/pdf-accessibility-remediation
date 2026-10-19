@@ -76,7 +76,7 @@ export function Verdict({ job }: { job: Job }) {
   if (job.status !== "completed" || !job.result) return <span className="muted">–</span>;
   if (job.report_only) return <span className="pill info">Audit only</span>;
   return job.result.compliant_after ? (
-    <span className="pill good">Passes PDF/UA-1</span>
+    <span className="pill good">Passes PDF/UA-{job.result.pdfua_part ?? 1}</span>
   ) : (
     <span className="pill warn">Needs work</span>
   );

@@ -7,18 +7,20 @@ SELECT ... FOR UPDATE SKIP LOCKED.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import signal
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from portal import (
-    audit, email_reports, helpdesk, notifications, outbox, queues, quota, removal, report_views, services,
-    settings_store,
+    alerts, audit, email_reports, helpdesk, metrics, notifications, outbox, pool_alerts, prometheus, queues, quota,
+    removal, report_views, services, settings_store,
 )
 from portal.config import get_portal_settings
 from portal.db import _sessionmaker
@@ -35,6 +37,8 @@ log = logging.getLogger("portal.worker")
 JOB_TIMEOUT = timedelta(hours=12)
 
 FRIENDLY_ERRORS = {
+    "result_not_saved": "The document was processed, but its result couldn't be saved. "
+                        "The problem has been logged for the support team.",
     "ai_provider_unavailable": "The AI service wasn't available, so the document couldn't be processed. "
                                "Try again later.",
     "tag_integrity_failed": "The remediation engine couldn't produce a valid file for this document. "
@@ -54,7 +58,10 @@ FRIENDLY_ERRORS = {
 
 CONTENT_TYPES = {".pdf": "application/pdf", ".xml": "application/xml", ".md": "text/markdown; charset=utf-8",
                  ".json": "application/json", ".zip": "application/zip",
-                 ".mxl": "application/vnd.recordare.musicxml", ".musicxml": "application/vnd.recordare.musicxml+xml"}
+                 ".mxl": "application/vnd.recordare.musicxml", ".musicxml": "application/vnd.recordare.musicxml+xml",
+                 # The formula list (#403): always downloaded (attachment), never shown on the portal's own site
+                 ".html": "text/html; charset=utf-8",
+                 ".brf": "application/x-brf"}  # braille ready format (#403)
 
 
 def _now() -> datetime:
@@ -62,6 +69,16 @@ def _now() -> datetime:
 
 
 # --- result summary ------------------------------------------------------------------------------
+
+
+def _limits_hit(metrics: dict, findings: int) -> list[dict]:
+    """The limits the document reached (#312): the engine's, and the review list this portal keeps being cut."""
+    out = [x for x in (metrics.get("limits_hit") or []) if isinstance(x, dict)]
+    kept = get_portal_settings().review_findings_max
+    if findings > kept:
+        out.append({"setting": "PORTAL_REVIEW_FINDINGS_MAX", "value": kept, "wanted": findings,
+                    "effect": "review items past it aren't in the Needs review list (the JSON report has them all)"})
+    return out
 
 def improved_label(resp: dict) -> str:
     """Name of the Adobe route's improved copy, from what was done to it."""
@@ -85,7 +102,10 @@ def summarize(resp: dict) -> dict:
     findings = sorted(findings, key=lambda f: (severity_rank.get(f.get("severity"), 3), f.get("page") or 0))
     metrics = resp.get("metrics") or {}
     visual = comp.get("visual_fidelity") or {}
+    # Which PDF/UA the verdicts are by: 2 for a PDF 2.0 document, else 1 (#409)
+    part = 2 if (after or before).get("pdfua_part") == 2 else 1
     return {
+        "pdfua_part": part,
         "compliant_before": before.get("compliant"),
         # The document came tagged and its tags were kept (the tag manager then shows which tags were its own)
         "tags_kept": bool((comp.get("existing_tags") or {}).get("present")
@@ -101,7 +121,7 @@ def summarize(resp: dict) -> dict:
         "visual_fidelity": visual if isinstance(visual, dict) else {},
         "remaining_failures": [
             {k: f.get(k) for k in ("clause", "description", "failed_checks", "pages")}
-            for f in ((after.get("verapdf") or {}).get("ua1") or {}).get("failures", [])][:50],
+            for f in ((after.get("verapdf") or {}).get(f"ua{part}") or {}).get("failures", [])][:50],
         "before_after": {k: [before.get(k), after.get(k)] for k in (
             "headings", "figures", "figures_missing_alt", "tables", "tables_without_headers",
             "content_tagged_ratio", "language", "title")},
@@ -116,7 +136,12 @@ def summarize(resp: dict) -> dict:
         "warnings": resp.get("warnings") or [],
         "metrics": {k: metrics.get(k) for k in ("pages_processed", "processing_time_seconds", "ai_calls",
                                                  "ai_provider", "ai_model", "images_described", "ocr_pages", "route",
-                                                 "stage_seconds")},
+                                                 "stage_seconds", "notation_read_by_ai", "notation_ai_rejected",
+                                                 "notation_ai_rejected_by_reason", "notation_by_rule", "ai_failures",
+                                                 "tables_analyzed", "reading_order_pages_ai", "music_examples",
+                                                 "music_read", "scan_figures", "ocr_ai_words_corrected",
+                                                 "ocr_ai_lines_transcribed", "ocr_ai_rejected")}
+        | {"limits_hit": _limits_hit(metrics, len(findings))},
         "adobe": {k: (metrics.get("adobe") or {}).get(k) for k in ("parts", "pages_sent", "seconds")}
         if metrics.get("adobe") else None,
         "improved_label": improved_label(resp) if files.get("enhanced") else None,
@@ -145,6 +170,10 @@ def _engine_files(resp: dict) -> list[tuple[str, str]]:
     pairs.append(("report_pdf", reports.get("report_pdf")))
     pairs.append(("music_files", reports.get("music_files")))
     pairs.append(("music_score", reports.get("music_score")))
+    pairs.append(("math_files", reports.get("math_files")))
+    pairs.append(("math_list", reports.get("math_list")))
+    pairs.append(("math_nemeth", reports.get("math_nemeth")))
+    pairs.append(("math_ueb", reports.get("math_ueb")))
     return [(k, p) for k, p in pairs if isinstance(p, str) and p.startswith("/api/v1/jobs/")]
 
 
@@ -158,7 +187,7 @@ def _job_mail(job: Job) -> Mail:
         verdict = "passes" if r.get("compliant_after") else "doesn't fully pass yet"
         review = (r.get("review") or {}).get("findings_total") or 0
         body = (f"Your document \"{job.filename}\" has been processed.\n\n"
-                f"Result: it {verdict} the PDF/UA-1 accessibility check.\n"
+                f"Result: it {verdict} the PDF/UA-{r.get('pdfua_part') or 1} accessibility check.\n"
                 f"Items for a person to review: {review}\n\n"
                 f"See the results and download the files:\n{link}\n")
         subject = f"Done: {job.filename}"
@@ -170,6 +199,31 @@ def _job_mail(job: Job) -> Mail:
 
 
 # --- steps ---------------------------------------------------------------------------------------
+
+def _no_nul(x):
+    """The engine's answer without NUL characters, which Postgres can't keep in text or JSONB (alt text read from a
+    PDF can carry one); one of them made saving a finished document fail on every pass."""
+    if isinstance(x, str):
+        return x.replace("\x00", "")
+    if isinstance(x, dict):
+        return {_no_nul(k): _no_nul(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_no_nul(v) for v in x]
+    return x
+
+
+# Liveness (#335): touched after every pass that completes. A pass that fails is logged and the loop goes on, so a
+# worker failing every pass (as on 16 October, until #324) looked alive; with no completed pass for the probe's
+# window, the pod is restarted, and its restarts show the trouble.
+ALIVE_FILE = Path(os.environ.get("PORTAL_WORKER_ALIVE_FILE", "/tmp/portal-worker.alive"))
+
+
+def touch_alive(path: Path | None = None) -> None:
+    try:
+        (path or ALIVE_FILE).touch()
+    except OSError:
+        pass
+
 
 def _fail(db: Session, job: Job, code: str, detail: str | None) -> None:
     log.warning("job %s failed: %s %s", job.id, code, detail)
@@ -344,7 +398,8 @@ def submit_queued(db: Session) -> int:
                 job.engine_job_id = engine.submit(safe_name(job.filename), tmp, job.report_only, _ai_choice(db, job),
                                                   full_review=job.full_review, route=_route(db, job),
                                                   branding=_branding(db, job), no_ai=job.no_ai,
-                                                  validator=validator_flags(rs))
+                                                  validator=validator_flags(rs),
+                                                  ignore_existing=job.ignore_existing)
         except EngineUnavailable as e:
             job.submit_attempts += 1
             log.warning("engine unavailable, job %s stays queued: %s", job.id, e)
@@ -368,7 +423,7 @@ def poll_active(db: Session) -> int:
     engine, done = get_engine_client(), 0
     for job in jobs:
         try:
-            resp = engine.status(job.engine_job_id)
+            resp = _no_nul(engine.status(job.engine_job_id))
         except EngineUnavailable as e:
             log.warning("engine unavailable while polling %s: %s", job.id, e)
             db.commit()
@@ -406,6 +461,13 @@ def poll_active(db: Session) -> int:
             except EngineUnavailable as e:
                 db.rollback()
                 log.warning("couldn't fetch results for %s yet: %s", job.id, e)
+                continue
+            except Exception as e:  # noqa: BLE001 - one document's result mustn't stop every other document
+                db.rollback()
+                log.exception("couldn't save the result of %s", job.id)
+                _fail(db, job, "result_not_saved", f"{type(e).__name__}: {e}"[:2000])
+                db.commit()
+                _notify(db, job)
                 continue
             _notify(db, job)
             done += 1
@@ -613,6 +675,7 @@ def version_summary(resp: dict, label: str) -> dict:
     findings = sorted(tv.get("findings") or [],
                       key=lambda f: ({"high": 0, "review": 1, "suggest": 2}.get(f.get("severity"), 3), f.get("page") or 0))
     out = {
+        "pdfua_part": 2 if snap.get("pdfua_part") == 2 else 1,  # which PDF/UA the verdict is by (#409)
         "compliant": snap.get("compliant"),
         "failed_checks": snap.get("failed_checks"),
         "failed_rules": snap.get("failed_rules"),
@@ -765,7 +828,7 @@ def poll_versions(db: Session) -> int:
     done = 0
     for v in versions:
         try:
-            resp = get_engine_client().status(v.engine_job_id)
+            resp = _no_nul(get_engine_client().status(v.engine_job_id))
         except EngineUnavailable:
             break
         except EngineError as e:
@@ -807,11 +870,12 @@ def _collect_version(db: Session, v: DocumentVersion, resp: dict) -> None:
     before_pdf = db.get(JobFile, before.pdf_file_id) if before is not None and before.pdf_file_id else None
     if before_pdf is not None:
         pdf_name = before_pdf.name
+    ua = 2 if ((reports.get("comparison") or {}).get("after") or {}).get("pdfua_part") == 2 else 1  # #409
     wanted = [
         ("reviewed_pdf", (resp.get("files") or {}).get("remediated_primary"), pdf_name),
         ("reviewed_tagmap", (reports.get("tag_maps") or {}).get("primary"), f"{stem}_tagmap_v{v.number}.json"),
         ("reviewed_verapdf", (reports.get("verapdf_after") or {}).get("primary"),
-         f"{stem}_verapdf_v{v.number}_ua1.xml"),
+         f"{stem}_verapdf_v{v.number}_ua{ua}.xml"),
     ]
     files = {}
     for kind, path, name in wanted:
@@ -890,7 +954,7 @@ def poll_reviews(db: Session) -> int:
     done = 0
     for v in versions:
         try:
-            resp = get_engine_client().status(v.review_engine_job_id)
+            resp = _no_nul(get_engine_client().status(v.review_engine_job_id))
         except EngineUnavailable:
             break
         except EngineError:
@@ -996,8 +1060,13 @@ def run_forever() -> None:
     if s.s3_create_bucket:
         get_storage().ensure_bucket()
     log.info("portal worker started; engine %s", s.engine_url)
-    last_sweep = last_reports = 0.0
+    if s.metrics_enabled:
+        metrics.serve_worker(s.worker_metrics_port)
+    last_sweep = last_reports = last_beat = last_alerts = 0.0
     while not _stop:
+        started = time.monotonic()
+        metrics.WORKER_BUSY.set(1)
+        outcome = "ok"
         try:
             with _sessionmaker()() as db:
                 submit_queued(db)
@@ -1020,8 +1089,38 @@ def run_forever() -> None:
                     last_sweep = time.monotonic()
                     if any(counts.values()):
                         log.info("purge: %s", counts)
+                if time.monotonic() - last_beat > 30:  # for the API and the alerts (#334)
+                    alerts.beat(db)
+                    db.commit()
+                    last_beat = time.monotonic()
+            touch_alive()
         except Exception:  # noqa: BLE001 - keep the worker alive; the error is logged
+            outcome = "failed"
             log.exception("worker tick failed")
+        finally:
+            metrics.WORKER_BUSY.set(0)
+            metrics.WORKER_PASSES.labels(outcome).inc()
+            metrics.WORKER_PASS_SECONDS.observe(time.monotonic() - started)
+        # Alerts in a step of their own, so a pass that fails doesn't stop the alert about it (#334)
+        if time.monotonic() - last_alerts > 60:
+            last_alerts = time.monotonic()
+            try:
+                engine = get_engine_client()
+                asked = hasattr(engine, "capacity")
+                prom, firing = prometheus.get_prometheus(), None
+                if prom is not None:  # the deployment's Prometheus, with MONITORING=on (#397)
+                    try:
+                        firing = prom.firing()
+                    except prometheus.Unreachable as e:
+                        log.warning("Prometheus not reached: %s", e)
+                with _sessionmaker()() as db:
+                    alerts.evaluate(db, engine_asked=asked, engine_workers=engine.capacity() if asked else None,
+                                    prom_asked=prom is not None, prom_firing=firing)
+                    pool_alerts.check(db)  # groups whose pool just ran low: their admins are told (#358)
+                    db.commit()
+                    outbox.send_queued(db)
+            except Exception:  # noqa: BLE001
+                log.exception("alert check failed")
         time.sleep(s.worker_poll_seconds)
     log.info("portal worker stopped")
 

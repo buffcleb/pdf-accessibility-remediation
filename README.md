@@ -11,10 +11,10 @@ look, and shows people exactly what still needs a human eye.**
 ![My documents: pages left for each service, the Submit PDFs box with the AI level, and a list of five documents with their status and result](docs/images/my-documents.png)
 
 A self-hosted service with a web portal. People upload PDFs; the engine adds the structure assistive technology needs
-(headings, lists, tables, figures with alt text, reading order, language), checks the result with veraPDF and its own
-independent verification, and returns the file with a report and a review list. Every page of the main output is
-**pixel-identical** to the original. AI helps where rules can't decide, through a gateway that runs local or cloud
-models, and everything it writes is checked or flagged for review.
+(headings, lists, tables, figures with alt text, reading order, language detected from the text), checks the result
+with veraPDF and its own independent verification, and returns the file with a report and a review list. Every page
+of the main output is **pixel-identical** to the original. AI helps where rules can't decide, through a gateway that
+runs local or cloud models, and everything it writes is checked or flagged for review.
 
 > **Status:** a proof of concept, in use on a test deployment. See [known limitations](docs/evaluation/README.md#known-limitations).
 
@@ -30,10 +30,12 @@ models, and everything it writes is checked or flagged for review.
   block the job), semantic checks with a different PDF parser, and an AI review by a model from a different family.
 - **AI where it adds value, never unchecked:** alt text, table structure, reading order, math and specialist notation
   (chemistry, dosages, engineering units), and OCR correction on scans. Notation readings must match the characters on
-  the page; everything AI wrote is in the review list.
+  the page; everything AI wrote is in the review list. Formulas also come as MathML, read by rule with MathCAT
+  (speech, Nemeth and UEB braille) as a cross-check, and inside the PDF in a PDF 2.0 file (judged as PDF/UA-2).
 - **Scans included:** OCR with per-word confidence, AI correction of unsure words, and figures printed on the scan
   found and tagged, all without changing a pixel.
-- **Keeps what's good:** existing tags are audited and kept, repaired or rebuilt, element by element.
+- **Keeps what's good:** existing tags are audited and kept, repaired or rebuilt, element by element, unless you ask
+  for them to be ignored.
 - **Local or cloud, per group:** AI levels from local models on your own GPU to commercial models, with kinds of
   document (*Math and science*, *Forms*…), an optional classifier that picks the kind, and **local-only** groups that
   never send anything outside.
@@ -122,7 +124,8 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```
 
 The portal's tests need a throwaway PostgreSQL; see [tests/README.md](tests/README.md). GitHub Actions runs both
-suites, plus the web app's type-check, build and unit tests (`npm test` in `web/`), on every pull request. Batch testing against folders of PDFs:
+suites, plus the web app's type-check, build and unit tests (`npm test` in `web/`), on pull requests and pushes to
+main, each job only when files it tests have changed. Batch testing against folders of PDFs:
 [harness/README.md](harness/README.md).
 
 ## License
@@ -133,4 +136,5 @@ its source to the people using it.
 It builds on, among others, PyMuPDF (AGPL-3.0), veraPDF (GPL-3.0+ or MPL-2.0), Tesseract (Apache-2.0), pikepdf
 (MPL-2.0), pdfplumber (MIT), WeasyPrint (BSD), LiteLLM (MIT) and pdf.js (Apache-2.0).
 The optional music reading service is [Audiveris](https://github.com/Audiveris/audiveris) (AGPL-3.0), run as a
-separate program.
+separate program. Formulas are read by rule with [MathCAT](https://github.com/daisy/MathCAT) (MIT), and the optional
+formula reader is RapidLaTeXOCR (Apache-2.0) with pix2tex's model (MIT).

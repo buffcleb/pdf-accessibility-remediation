@@ -22,6 +22,10 @@ spec:
       labels: { app: portal-api }
       annotations:
         checksum/settings: "${PORTAL_ENV_SHA}"
+        # Read by Prometheus when MONITORING=on (#397); /metrics is outside /api/, so never passed on from outside
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
@@ -29,12 +33,13 @@ spec:
         - name: portal-api
           image: ${REGISTRY}/pdfrem-portal:${PORTAL_TAG}
           # Migrations are a separate step (scripts/deploy.sh runs them after a backup), not on start
-          command: ["sh", "-c", "exec uvicorn portal.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*'"]
+          command: ["sh", "-c", "exec uvicorn portal.main:app --host 0.0.0.0 --port 8080 --no-proxy-headers"]
           envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
           env:
-            - name: PORTAL_DB_PASSWORD
-              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
-            - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal:$(PORTAL_DB_PASSWORD)@postgres:5432/portal" }
+            # Its own account: rows only, no tables or triggers (#337, deploy/k8s/app-role.sql)
+            - name: PORTAL_APP_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_APP_DB_PASSWORD } }
+            - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal_app:$(PORTAL_APP_DB_PASSWORD)@postgres:5432/portal" }
             - name: PORTAL_REDIS_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_REDIS_PASSWORD } }
             - { name: PORTAL_REDIS_URL, value: "redis://:$(PORTAL_REDIS_PASSWORD)@redis:6379/1" }
@@ -43,15 +48,27 @@ spec:
             - { name: PORTAL_COOKIE_SECURE, value: "true" }
             - { name: PORTAL_TRUST_PROXY_HEADERS, value: "true" }
             - { name: PORTAL_CLIENT_IP_HEADER, value: "${CLIENT_IP_HEADER}" }
+            # The caller's header counts only from these proxies; uvicorn leaves the connection's own address (#336)
+            - { name: PORTAL_TRUSTED_PROXIES, value: "${API_TRUSTED_PROXIES}" }
             - { name: PORTAL_S3_ENDPOINT_URL, value: "http://seaweedfs:8333" }
             - { name: PORTAL_S3_BUCKET, value: pdf-remediation }
             - { name: PORTAL_S3_CREATE_BUCKET, value: "true" }
             - { name: PORTAL_ENGINE_URL, value: "http://engine:8000" }
             - { name: PORTAL_GATEWAY_ADMIN_URL, value: "${GATEWAY_ADMIN_URL}" }
+            - { name: PORTAL_BACKUP_EXPECTED, value: "${BACKUP_EXPECTED}" }  # the nightly backup's alert (#333)
+            # Monitoring (#397): its alerts and charts, and the link to Grafana; empty with MONITORING=off
+            - { name: PORTAL_PROMETHEUS_URL, value: "${PORTAL_PROMETHEUS_URL}" }
+            - { name: PORTAL_GRAFANA_URL, value: "${PORTAL_GRAFANA_URL}" }
           ports: [{ containerPort: 8080 }]
           readinessProbe:
             httpGet: { path: /api/v1/health, port: 8080 }
             periodSeconds: 10
+          # Liveness (#335) only asks whether the process answers: a database restart mustn't restart the API too
+          livenessProbe:
+            httpGet: { path: /api/v1/live, port: 8080 }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 3Gi }
@@ -78,6 +95,8 @@ spec:
       labels: { app: portal-worker }
       annotations:
         checksum/settings: "${PORTAL_ENV_SHA}"
+        prometheus.io/scrape: "true"  # its metrics port (#397)
+        prometheus.io/port: "9464"
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
@@ -85,11 +104,22 @@ spec:
         - name: portal-worker
           image: ${REGISTRY}/pdfrem-portal:${PORTAL_TAG}
           command: ["python", "-m", "portal.worker"]
+          ports: [{ name: metrics, containerPort: 9464 }]
+          # Liveness (#335): touched after every pass that completes (portal/worker.py). No completed pass for 10
+          # minutes, three checks running: restarted, and the restarts show the trouble.
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,sys,time; sys.exit(time.time() - os.path.getmtime('/tmp/portal-worker.alive') > 600)"]
+            initialDelaySeconds: 180
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
           envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
           env:
-            - name: PORTAL_DB_PASSWORD
-              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_DB_PASSWORD } }
-            - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal:$(PORTAL_DB_PASSWORD)@postgres:5432/portal" }
+            # Its own account: rows only, no tables or triggers (#337, deploy/k8s/app-role.sql)
+            - name: PORTAL_APP_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_APP_DB_PASSWORD } }
+            - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal_app:$(PORTAL_APP_DB_PASSWORD)@postgres:5432/portal" }
             - name: PORTAL_REDIS_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_REDIS_PASSWORD } }
             - { name: PORTAL_REDIS_URL, value: "redis://:$(PORTAL_REDIS_PASSWORD)@redis:6379/1" }
@@ -103,6 +133,10 @@ spec:
             - { name: PORTAL_S3_CREATE_BUCKET, value: "true" }
             - { name: PORTAL_ENGINE_URL, value: "http://engine:8000" }
             - { name: PORTAL_GATEWAY_ADMIN_URL, value: "${GATEWAY_ADMIN_URL}" }
+            - { name: PORTAL_BACKUP_EXPECTED, value: "${BACKUP_EXPECTED}" }  # the nightly backup's alert (#333)
+            # Monitoring (#397): its alerts and charts, and the link to Grafana; empty with MONITORING=off
+            - { name: PORTAL_PROMETHEUS_URL, value: "${PORTAL_PROMETHEUS_URL}" }
+            - { name: PORTAL_GRAFANA_URL, value: "${PORTAL_GRAFANA_URL}" }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi }

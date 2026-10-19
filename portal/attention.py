@@ -12,11 +12,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session
 
-from portal import queues, quota, services as svc
+from portal import queues, quota, services as svc, settings_store
 from portal.models import Group, Job, MailOutbox, Service, User
 
-LOW_SHARE = 0.10  # a pool is "running low" below this share of its size ...
-LOW_MIN = 20  # ... or below this many pages, whichever is larger
 RECENT = timedelta(days=7)
 STUCK = timedelta(hours=2)
 LARGE_WAIT = timedelta(hours=2)
@@ -147,13 +145,20 @@ class Item:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
 
-def _low(left: int, pool: int) -> bool:
-    return left < max(LOW_MIN, LOW_SHARE * pool)
+def _low(left: int, pool: int, rs) -> bool:
+    """Running low (Settings: low_pool_percent, low_pool_pages), as the email to the group's admins counts it."""
+    from portal.pool_alerts import is_low
+    return is_low(left, pool, rs)
 
 
 def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Item]:
     """Items for these groups (None: every group, plus service-wide items), most serious first."""
     items: list[Item] = []
+    rs = settings_store.load(db)
+    if group_ids is None:  # the service's own problems (#334), as emailed to super admins
+        from portal import alerts
+        for a in alerts.active(db):
+            items.append(Item("bad", a.key, alerts.title(a.key), a.detail, fix=alerts.fix(a.key)))
     groups = list(db.scalars(select(Group).where(Group.status == "active")
                              .where(Group.id.in_(group_ids)) if group_ids is not None
                              else select(Group).where(Group.status == "active")))
@@ -168,7 +173,7 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                 items.append(Item("bad", "global_pool_empty", f"{s.label}: no pages left for the whole service",
                                   f"0 of {s.pool_pages:,} left; nobody can use it until pages are added.",
                                   service_key=s.key, fix="Add pages to the service's global pool (Services)."))
-            elif _low(left, s.pool_pages):
+            elif _low(left, s.pool_pages, rs):
                 items.append(Item("warn", "global_pool_low", f"{s.label}: running low for the whole service",
                                   f"{left:,} of {s.pool_pages:,} pages left.", service_key=s.key,
                                   fix="Add pages to the service's global pool (Services)."))
@@ -198,7 +203,7 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                                   f"{who}, but the group's pool is empty ({gs.pool_pages:,} pages, all used or "
                                   "held). Personal limits don't add pages, so they all see 0 left.",
                                   str(g.id), g.name, s.key, fix="Add pages to the group, or request them (its Services and pages)."))
-            elif _low(left, gs.pool_pages):
+            elif _low(left, gs.pool_pages, rs):
                 items.append(Item("warn", "group_pool_low", f"{g.name}: {s.label} running low",
                                   f"{left:,} of {gs.pool_pages:,} pages left; {who}.", str(g.id), g.name, s.key,
                                   fix="Add pages to the group, or request them (its Services and pages)."))
@@ -213,7 +218,7 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                     own_left = None if cap is None else cap - ((us.used_pages + us.reserved_pages) if us else 0)
                     if own_left is None or own_left > left:
                         over += 1
-                if over and _low(left, gs.pool_pages):
+                if over and _low(left, gs.pool_pages, rs):
                     items.append(Item("info", "limits_exceed_pool", f"{g.name}: {s.label} limits exceed the pool",
                                       f"{over} {'person has' if over == 1 else 'people have'} a limit larger than the "
                                       f"{left:,} pages left in the group's pool; the pool runs out first.",
@@ -269,6 +274,17 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                           "or when nothing smaller is waiting. A busy day can hold them back.", count=n,
                           fix="Super admins can use Process now in Queues if one is urgent." if group_ids is None
                           else "Ask support if one is urgent."))
+    # A worker lost mid-way (#315): the engine will try once more after its timeout, or fail it
+    lost = [j for j in db.scalars(select(Job).where(job_scope, Job.status.in_(("submitted", "processing"))))
+            if (j.progress or {}).get("stage") == "worker_lost"]
+    if lost:
+        n = len(lost)
+        items.append(Item("warn", "worker_lost", f"{n} document{'s' if n > 1 else ''} lost {'their' if n > 1 else 'its'} "
+                          "engine worker partway through",
+                          "The worker stopped while processing (often running out of memory on a large document). "
+                          "Each is tried once more after the task time limit, then fails with its pages given back.",
+                          count=n, fix="Check the engine worker's memory limit and logs (operations guide: Monitoring)."
+                          if group_ids is None else "Nothing to do: support is told."))
     if n := count(Job.status.in_(("submitted", "processing")), Job.submitted_at < now - STUCK):
         items.append(Item("warn", "stuck", f"{n} document{'s' if n > 1 else ''} processing for over 2 hours",
                           "Usually a stopped engine worker or an unreachable AI or Adobe service.", count=n,

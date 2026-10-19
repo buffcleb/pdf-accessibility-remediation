@@ -17,11 +17,16 @@ server {
         # The caller, never what the caller claims: the peer's address, or behind proxies named in TRUSTED_PROXIES
         # the address they report (15-trusted-proxies.sh). One address, so the portal can't be handed a made-up one.
         proxy_set_header X-Forwarded-For $remote_addr;
+        # Cloudflare's caller header only from cloudflared (TUNNEL_PROXIES), empty from anywhere else (#336)
+        proxy_set_header CF-Connecting-IP $tunnel_caller;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_request_buffering off;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
+
+    # Optional locations written at start-up: Grafana, when GRAFANA_UPSTREAM is set (16-grafana.sh, #397)
+    include /etc/nginx/conf.d/locations/*.conf;
 
     location = /config.json {
         add_header Cache-Control "no-store" always;

@@ -27,6 +27,25 @@ def _elements_with_alt(path, alts: set[str]) -> set[int]:
     return {e.index for e in index.elements if str(e.obj.get("/Alt", "") or "").strip() in alts}
 
 
+def reading_choices(ops: list[dict]) -> list[dict]:
+    """The choices people made between a formula's two readings (#403), from the edits that carry one: which formula,
+    which reading ("ai", "rule", "picture": the formula reader's, or "own": their own words), and the text the tag
+    now has. For improving the engine:
+    which reading turns out right, on which kinds of formula."""
+    out = []
+    for op in ops:
+        r = op.get("reading")
+        if not isinstance(r, dict) or op.get("op") not in ("set_alt", "set_actual_text"):
+            continue
+        readings = r.get("readings") if isinstance(r.get("readings"), dict) else {}
+        out.append({"formula": str(r.get("formula") or "")[:80], "element": op.get("element"),
+                    "chose": r.get("chose") if r.get("chose") in ("ai", "rule", "picture", "own") else "own",
+                    "readings": {k: str(readings.get(k) or "")[:2000] for k in ("ai", "rule", "picture")
+                                 if k in readings or k != "picture"},
+                    "text": str(op.get("alt") if op["op"] == "set_alt" else op.get("text") or "")[:2000]})
+    return out
+
+
 async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dict:
     meta = store.read_meta() or {}
     started = time.monotonic()
@@ -83,6 +102,8 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
                " AI review: every figure." if review == "full" else ""),
             "ai_review": review,
             "edits_applied": log,
+            # Formulas whose two readings disagreed, and which one a person chose (#403)
+            "math_choices": reading_choices(ops) or None,
             "tag_verification": {"primary": rep.to_dict()},
             "tag_maps": {"primary": tagmap},
         },

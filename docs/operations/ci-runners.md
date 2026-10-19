@@ -31,7 +31,7 @@ Use a separate Linux machine or virtual machine on other hardware:
 - Linux, with Docker: the portal tests start PostgreSQL as a service container, which GitHub supports only on
   Linux runners.
 - Outbound HTTPS to github.com, GitHub's package and action downloads, PyPI, npm, the Ubuntu archive,
-  software.verapdf.org and public.ecr.aws. Nothing inbound.
+  software.verapdf.org, keyserver.ubuntu.com (veraPDF's signing key) and public.ecr.aws. Nothing inbound.
 - 2 CPUs and 4 GB of memory are enough for one job at a time.
 - Register it under the repository's Settings → Actions → Runners → New self-hosted runner, give it a label
   (for example `pdf-ci`), and set the repository variable `CI_RUNNER` to that label.
@@ -46,7 +46,7 @@ public repository anyone can open a pull request, so don't attach a runner to th
 ## Running it by hand
 
 The workflow can also be started from the Actions tab (CI → Run workflow) on any branch. Started that way,
-all four jobs run whatever changed.
+all six jobs run whatever changed.
 
 ## Which jobs run
 
@@ -54,11 +54,27 @@ Each job runs only when files it tests have changed:
 
 | Job | Runs when these change |
 |---|---|
-| Engine tests | `app/`, `tests/engine/`, the requirements files, `pytest.ini` |
+| Engine tests | `app/`, `tests/engine/`, the requirements files, `pytest.ini`, `docker/verapdf-auto-install.xml` |
 | Portal tests | `portal/`, `tests/portal/`, the requirements files, `pytest.ini` |
 | Web build | `web/` |
-| Shell scripts | `scripts/`, `docker/web/` |
-| Dependency audit | the requirements files, `web/package-lock.json` (known advisories against what they resolve to; a hit fails the job, and the fix is a version bump or, for one that doesn't apply, a named exception in the workflow) |
+| Shell scripts | `scripts/` (shellcheck over `scripts/*.sh` and `docker/web/*.sh`) |
+| SQL built from strings | `app/`, `portal/` (Bandit's B608 only: a query made by formatting text fails the job; a line that must build SQL from constants says why and ends `# nosec B608`) |
+| Dependency audit | the requirements files, `web/package-lock.json`, `docker/web/`, `scripts/audit-deps.sh` (known advisories against what they resolve to; a hit fails the job, and the fix is a version bump or, for one that doesn't apply, a named exception in `scripts/audit-deps.sh`) |
 
-A change to the workflow itself runs all five. A change to documentation alone runs none: only the short
+A change to the workflow itself runs all six. A change to documentation alone runs none: only the short
 "What changed" job appears.
+
+Two more run on their own (#362):
+
+- **Weekly dependency audit** (`audit.yml`): the same audit every Monday, so an advisory published after the
+  dependencies last changed is found. It uses `CI_RUNNER` too; run it by hand from the Actions tab.
+- **Dependabot** (`.github/dependabot.yml`): security updates as soon as an advisory is out, and every Monday one
+  pull request per ecosystem (Python, npm, Docker base images, Actions) with every other update. Each runs CI like
+  any pull request, so expect a few runs a week. A new Python, Node or Ubuntu release isn't proposed: that's a
+  change made by hand. Security updates need switching on once, in the repository's Settings → Code security →
+  Dependabot security updates (and Dependabot alerts).
+
+**Accessibility checks** (`a11y.yml`, #369) runs only when started by hand from the Actions tab: axe over the web
+app's main pages (`scripts/a11y.sh`; about five minutes, most of it installing). If it finds a problem, the job fails
+and its details are attached as `axe-report`. Locally: `scripts/a11y.sh` (with `A11Y_CHANNEL=chrome` to use an
+installed Chrome instead of Playwright's own browser).

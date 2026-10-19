@@ -18,11 +18,12 @@ CHANGES = [
 ]
 
 
+# The SQL is built from CHANGES above (constants, quotes already doubled), never from input
 def upgrade() -> None:
     for key, old, new in CHANGES:
-        op.execute(f"update services set description = '{new}' where key = '{key}' and description = '{old}'")
+        op.execute(f"update services set description = '{new}' where key = '{key}' and description = '{old}'")  # nosec B608
 
 
 def downgrade() -> None:
     for key, old, new in CHANGES:
-        op.execute(f"update services set description = '{old}' where key = '{key}' and description = '{new}'")
+        op.execute(f"update services set description = '{old}' where key = '{key}' and description = '{new}'")  # nosec B608

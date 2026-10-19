@@ -92,6 +92,12 @@ def test_jobs_needing_attention(setup):
     items = {i["kind"]: i for i in s["c"]["admin_a"].get(f"{API}/groups/{s['a'].id}/attention").json()}
     assert items["failed"]["count"] == 2 and "tag_integrity_failed (2)" in items["failed"]["detail"]
     assert items["stuck"]["count"] == 1
+    # A worker lost mid-way (#315) is named as such, for super admins and the group's admins
+    stuck.progress = {"stage": "worker_lost", "will_retry": True}
+    db.commit()
+    for client, url in (("super", f"{API}/admin/attention"), ("admin_a", f"{API}/groups/{s['a'].id}/attention")):
+        items = {i["kind"]: i for i in s["c"][client].get(url).json()}
+        assert items["worker_lost"]["count"] == 1 and "engine worker" in items["worker_lost"]["title"], client
 
 
 def test_low_pool_warns_before_it_runs_out(setup):

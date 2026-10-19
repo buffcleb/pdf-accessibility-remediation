@@ -13,7 +13,8 @@ import pymupdf as fitz
 from pikepdf import Array, Dictionary
 
 from app.config import get_settings
-from app.tagging.table_headers import headers_named, id_of
+from app.tagging.metadata import document_info
+from app.tagging.table_headers import headers_named, id_of, table_attrs
 from app.verification.integrity import TagIndex, _items, _is_elem, _mcid, check_integrity
 from app.verification.semantic import SemanticChecker
 
@@ -38,6 +39,14 @@ def _scope(obj) -> str | None:
         if isinstance(a, Dictionary) and "/Scope" in a:
             return str(a.Scope)[1:]
     return None
+
+
+def _span(obj) -> list[int] | None:
+    a = table_attrs(obj)
+    if a is None:
+        return None
+    rs, cs = int(a.get("/RowSpan", 1) or 1), int(a.get("/ColSpan", 1) or 1)
+    return [rs, cs] if rs > 1 or cs > 1 else None
 
 
 def _union(a, b):
@@ -74,24 +83,39 @@ def _pieces(index: TagIndex, checker: SemanticChecker | None) -> list[dict]:
 
 def artifact_sections(path: Path) -> list[dict]:
     """The artifact sections of each page's own stream, numbered as the content marker and the editor number them,
-    with where they are and what they draw, so the editor can tag one."""
+    with where they are and what they draw, so the editor can tag one. A long document's pages are read by several
+    processes (#124)."""
+    from app.pipeline import page_pool
+
+    with pikepdf.open(path) as probe:
+        pages = len(probe.pages)
+    workers = page_pool.workers_for(pages)
+    done = page_pool.run("app.verification.tagmap:artifact_pages", path, pages, workers) if workers > 1 else None
+    if done is None:
+        done = list(artifact_pages(path, range(pages)).values())
+    return [s for sections in done for s in sections]
+
+
+def artifact_pages(path: Path, numbers) -> dict[int, list[dict]]:
+    """artifact_sections for the pages numbered: {page (0-based): its sections}."""
     from app.tagging.content_marker import ContentMarker
 
-    out = []
+    out: dict[int, list[dict]] = {}
     with pikepdf.open(path) as probe, fitz.open(path) as doc:
-        for n, page in enumerate(probe.pages):
-            fp = doc[n]
+        for n in numbers:
+            page, fp = probe.pages[n], doc[n]
             m = fp.transformation_matrix * fp.rotation_matrix
             marker = ContentMarker(probe, page, (m.a, m.b, m.c, m.d, m.e, m.f), lambda *a: ("artifact:Layout", "Artifact"))
+            sections = out[n] = []
             for sm in marker.run().streams[:1]:  # the page's own stream
                 for seq, info in sorted(sm.artifacts.items()):
                     if info["bbox"] is None:
                         continue
                     text = fp.get_textbox(fitz.Rect(info["bbox"])).strip() if "text" in info["kinds"] else ""
-                    out.append({"page": n + 1, "seq": seq, "bbox": [round(v, 2) for v in info["bbox"]],
-                                "kinds": sorted(info["kinds"]), "type": info["type"] or None,
-                                **({"nested": True} if info["nested"] else {}),
-                                **({"text": " ".join(text.split())[:PART_CHARS]} if text else {})})
+                    sections.append({"page": n + 1, "seq": seq, "bbox": [round(v, 2) for v in info["bbox"]],
+                                     "kinds": sorted(info["kinds"]), "type": info["type"] or None,
+                                     **({"nested": True} if info["nested"] else {}),
+                                     **({"text": " ".join(text.split())[:PART_CHARS]} if text else {})})
     return out
 
 
@@ -116,7 +140,8 @@ def annotation_places(path: Path) -> dict[int, tuple[int, tuple, str | None]]:
 
 
 def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | None,
-                artifacts: list[dict] | None = None, annots: dict | None = None) -> dict:
+                artifacts: list[dict] | None = None, annots: dict | None = None,
+                document: dict | None = None) -> dict:
     els = index.elements
     # Own content per element and page, then folded up into ancestors. Children always have higher
     # pre-order indices than their parents, so one reverse pass is enough.
@@ -171,6 +196,7 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
             "actual_text": _text(e.obj.get("/ActualText")),
             "lang": _text(e.obj.get("/Lang")),
             "scope": _scope(e.obj) if e.role in ("TH", "TD") else None,
+            "span": _span(e.obj) if e.role in ("TH", "TD") else None,  # [rows, columns] when more than one (#370)
             "headers": [by_id[h] for h in headers_named(e.obj) if h in by_id] or None if e.role in ("TH", "TD") else None,
             "refs": refs.get(e.index) or None,
             "text": text,
@@ -189,7 +215,7 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
             order += 1
         out.append({k: v for k, v in item.items() if v is not None or k in ("parent", "order")})
     return {"schema": SCHEMA, "pages": pages, "elements": out, "pieces": _pieces(index, checker),
-            "artifacts": artifacts or []}
+            "artifacts": artifacts or [], "document": document or {"title": None, "lang": None}}
 
 
 def _parts(e, index: TagIndex, checker: SemanticChecker | None) -> list[dict] | None:
@@ -238,7 +264,8 @@ def build_tagmap(path: Path) -> dict:
     with pikepdf.open(path) as pdf:
         _, index = check_integrity(pdf)
         if not index.elements:
-            return {"schema": SCHEMA, "pages": pages, "elements": []}
+            return {"schema": SCHEMA, "pages": pages, "elements": [], "document": document_info(pdf)}
         checker = SemanticChecker(path, pdf, index, get_settings().verify_max_pages)
         checker._collect()
-        return tagmap_from(pages, index, checker, artifact_sections(path), annotation_places(path))
+        return tagmap_from(pages, index, checker, artifact_sections(path), annotation_places(path),
+                           document_info(pdf))

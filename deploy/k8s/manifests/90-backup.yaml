@@ -1,0 +1,160 @@
+# The nightly backup (#333), only with BACKUPS=cronjob: both databases and the stored files, onto a NAS share, in the
+# same folders scripts/backup.sh makes (so scripts/restore.sh restores from them). With BACKUPS=external the hosts'
+# own backups are relied on instead (docs/operations/backups-and-migrations.md says what they must cover).
+#
+# The share is mounted as a static NFS volume: on every node alike, unlike a folder on one node, so it doesn't matter
+# where the job runs or which nodes are powered down. Its server, path and options can't change once it exists: to
+# move it, delete the jobs, the claim and the volume (docs/operations/backups-and-migrations.md; nothing on the share
+# is touched), then deploy again. Deployment secrets and the SeaweedFS encryption key are not
+# copied there; they belong in a password manager.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${NAMESPACE}-backups
+spec:
+  capacity: { storage: ${BACKUP_SIZE} }
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: ["vers=${BACKUP_NFS_VERSION}"]  # as the job folder's NFS volume mounts (4.1 on a Synology)
+  nfs: { server: ${BACKUP_NFS_SERVER}, path: ${BACKUP_NFS_PATH} }
+  claimRef: { namespace: ${NAMESPACE}, name: backups }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backups
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: ${NAMESPACE}-backups
+  resources: { requests: { storage: ${BACKUP_SIZE} } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-scripts
+  namespace: ${NAMESPACE}
+data:
+  # First step (the Postgres image): both databases, into a folder that stays "partial" until the end
+  databases.sh: |
+    set -eu
+    umask 077
+    name="backup-$(date +%Y%m%d-%H%M%S)"
+    work="/backup/$name.partial"
+    mkdir -p "$work"
+    echo "$name" > /backup/.current
+    export PGHOST=postgres
+    PGPASSWORD="$PORTAL_DB_PASSWORD" pg_dump -U portal -d portal -Fc -f "$work/portal.dump"
+    test -s "$work/portal.dump"
+    PGPASSWORD="$PORTAL_DB_PASSWORD" psql -U portal -d portal -tAc "select version_num from alembic_version" \
+      > "$work/.revision" || echo unknown > "$work/.revision"
+    PGPASSWORD="$LITELLM_DB_PASSWORD" pg_dump -U litellm -d litellm -Fc -f "$work/litellm.dump"
+    test -s "$work/litellm.dump"
+    echo "databases dumped into $work"
+  # Second step (the portal image): the stored files, the manifest and checksums, then the old backups go and the
+  # portal is told it finished (its alert fires when none has for a while)
+  finish.sh: |
+    set -eu
+    umask 077
+    name="$(cat /backup/.current)"
+    work="/backup/$name.partial"
+    parts="  - portal database (migration $(cat "$work/.revision"))
+      - LiteLLM database"
+    rm -f "$work/.revision"
+    if [ "$BACKUP_FILES" = on ]; then
+      python -m portal.cli export-files > "$work/files.tar"
+      count="$(tar -tf "$work/files.tar" | grep -vc '/$' || true)"
+      parts="$parts
+      - stored files ($count files)"
+    fi
+    {
+      echo "backup:    $name"
+      echo "created:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "host:      the cluster's nightly backup job"
+      echo "contents:"
+      echo "$parts" | sed 's/^ *-/  -/'
+    } > "$work/MANIFEST.txt"
+    (cd "$work" && sha256sum -- * > SHA256SUMS)
+    chmod 600 "$work"/*
+    mv "$work" "/backup/$name"
+    rm -f /backup/.current
+    python -m portal.cli prune-backups /backup --daily "$BACKUP_KEEP_DAILY" --weekly "$BACKUP_KEEP_WEEKLY"
+    python -m portal.cli backup-done
+    echo "done: $name ($(du -sh "/backup/$name" | cut -f1))"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+  namespace: ${NAMESPACE}
+spec:
+  schedule: "${BACKUP_SCHEDULE}"
+  timeZone: "${BACKUP_TIMEZONE}"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels: { app: backup }  # the jobs too, not only their pods: kubectl delete job -l app=backup
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels: { app: backup }
+        spec:
+          restartPolicy: Never
+          imagePullSecrets: [{ name: pdfrem-ghcr }]
+          securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+          initContainers:
+            - name: databases
+              # The server's own image (20-postgres.yaml), so pg_dump matches it
+              image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+              command: ["sh", "/scripts/databases.sh"]
+              env:
+                - { name: HOME, value: /tmp }
+                - name: PORTAL_DB_PASSWORD
+                  valueFrom: { secretKeyRef: { name: pdfrem-db-env, key: PORTAL_DB_PASSWORD } }
+                - name: LITELLM_DB_PASSWORD
+                  valueFrom: { secretKeyRef: { name: pdfrem-db-env, key: LITELLM_DB_PASSWORD } }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { cpu: "1", memory: 512Mi }
+              securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+              volumeMounts:
+                - { name: backups, mountPath: /backup }
+                - { name: scripts, mountPath: /scripts }
+                - { name: tmp, mountPath: /tmp }
+          containers:
+            - name: files
+              image: ${REGISTRY}/pdfrem-portal:${PORTAL_TAG}
+              command: ["sh", "/scripts/finish.sh"]
+              envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
+              env:
+                - name: PORTAL_APP_DB_PASSWORD
+                  valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_APP_DB_PASSWORD } }
+                - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal_app:$(PORTAL_APP_DB_PASSWORD)@postgres:5432/portal" }
+                - { name: PORTAL_S3_ENDPOINT_URL, value: "http://seaweedfs:8333" }
+                - { name: PORTAL_S3_BUCKET, value: pdf-remediation }
+                - { name: PORTAL_APP_URL, value: "https://${APP_HOST}" }
+                - { name: BACKUP_FILES, value: "${BACKUP_FILES}" }
+                - { name: BACKUP_KEEP_DAILY, value: "${BACKUP_KEEP_DAILY}" }
+                - { name: BACKUP_KEEP_WEEKLY, value: "${BACKUP_KEEP_WEEKLY}" }
+              resources:
+                requests: { cpu: 50m, memory: 256Mi }
+                limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 1Gi }
+              securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+              volumeMounts:
+                - { name: backups, mountPath: /backup }
+                - { name: scripts, mountPath: /scripts }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: backups
+              persistentVolumeClaim: { claimName: backups }
+            - name: scripts
+              configMap: { name: backup-scripts }
+            - name: tmp
+              emptyDir: { sizeLimit: 1Gi }

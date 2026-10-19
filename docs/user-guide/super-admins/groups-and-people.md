@@ -57,9 +57,34 @@ or the AI it was charged for turned out not to be needed.
 - **correct their usage:** give pages back or charge more, per service, with a reason. It's recorded in the ledger
   and the audit log. (Use this when a document didn't come out usable, for example.)
 - **disable** their account (it ends their sessions; their documents stay);
-- **make them a super admin**, or remove it.
+- **make them a super admin**, or remove it;
+- **Sign out everywhere:** every session in every browser and device ends, for a lost device or an account
+  someone else may be using. It's audited; they need a new code to sign in.
 
 Personal limits are set in the group's **People** tab, as a group admin does.
+
+## A person's data (records requests)
+
+In **People (all groups)**, open **Manage** for the person, then **Personal data**:
+
+- **Export records** downloads, as JSON, what the service holds about them: their account, roles and group, their
+  documents (names, dates, pages, results), their help requests and messages, their page ledger and the audit entries
+  about them. **Export records and files** adds their documents' files that still exist, in a zip (it can be large).
+  Each export is recorded in the audit log.
+- **Remove this person's data…** is for a request to be forgotten. Type a reason and their email address to confirm.
+  It can't be undone, so export first if they asked for a copy.
+  - Deleted: their documents' files and help attachments; their sign-in sessions and codes; their saved tag-manager
+    drafts, report subscriptions and saved reports; emails queued to them; their address on any group's list.
+  - Kept, without them: their documents (as "document-1a2b3c4d.pdf", with their pages and results), the page ledger,
+    the audit log, saved versions and their help requests (their own messages emptied). Their name and email become
+    "removed person #…" everywhere, including emails the service sent to others about them. So reports, totals and
+    billing still add up.
+  - Their account is closed, and they're signed out everywhere. You can't remove yourself or the last super admin.
+  - What it can't find: words other people wrote about them, such as a staff reply that mentions them by name. Read
+    their help requests before removing, if that matters.
+
+The audit log and the page ledger otherwise can't be changed at all. During a removal, and only then, the database
+allows their identity columns to change and nothing else.
 
 ## Removing documents
 
@@ -69,9 +94,9 @@ in the audit log), then:
 
 - **Remove files now:** the files, report, versions and help requests about them go at once (as at the end of
   retention); the documents stay in their owners' lists, marked "Files removed".
-- **Delete:** the files go at once and the documents leave every document list, their owners' included. Their
-  records stay, so reports, page usage and the ledger still count them; super admins can still open them (from
-  **Reports**), marked as deleted.
+- **Delete** (**Delete the document** on a single document's page): the files go at once and the documents leave
+  every document list, their owners' included. Their records stay, so reports, page usage and the ledger still
+  count them; super admins can still open them (from **Reports**), marked as deleted.
 
 Documents still waiting or in progress can't be ticked. Neither can be undone. A single document has the same two
 choices on its page, under **Downloads → Super admin: remove**, where you can also **Keep the files** of a document
@@ -79,6 +104,12 @@ its owner marked done.
 
 ## When a sign-in code doesn't arrive
 
+The sign-in page answers every address the same way, and sends the email afterwards, so it can't tell the person when
+sending fails. Look in **Reports › Activity › Email** for the address: a failed sign-in code is listed there with
+its error, and the audit log has `login.code_not_sent`. A disabled person gets an email saying their account can't
+sign in, not a code.
+
 If email is failing, the person running the servers can issue a code from the command line with
-`scripts/sign-in-code.sh` (see [Operations → Email](../../operations/email-and-branding.md#when-sign-in-codes-dont-arrive)).
+`scripts/sign-in-code.sh` (see
+[Operations → Email](../../operations/email-and-branding.md#when-sign-in-codes-dont-arrive)).
 It's recorded in the audit log.

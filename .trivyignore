@@ -1,0 +1,2 @@
+# Vulnerabilities scripts/build.sh's Trivy scan should not report (#362): one ID per line, each with the reason it
+# doesn't apply here and the date it was looked at. Revisit when a fix version exists.

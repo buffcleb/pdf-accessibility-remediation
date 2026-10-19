@@ -48,15 +48,15 @@ VERIFY_JUDGE_MODEL=local-judge
 
 - **Adding models:** add entries to `config/litellm.yaml`, for the same family in the cloud, larger models or
   commercial models. Each writer needs a reviewer from a different family; the file has examples (`open-judge` for
-  Qwen writers, `commercial-judge` for Claude). Set their keys, then restart the gateway. A super admin then publishes
-  each writer as an AI level and picks its review model.
+  Qwen writers and the small Claude one, `commercial-judge` for the larger Claude ones). Set their keys, then restart
+  the gateway. A super admin then publishes each writer as an AI level and picks its review model.
 - **Writers the file ships with:** `open-small-vision` (the local model's family, hosted), `open-large-vision` (a
   much larger model of that family), `commercial-small-vision` (a commercial vendor's small model, for a cheaper
   paid level), `commercial-medium-vision` and `commercial-large-vision` (its largest, for a kind of document such
   as *Math and science*). Reviewers: `open-judge` and `commercial-judge`. A name says family, size and role, never
   the model or its version, so the model behind it can be replaced without touching the AI levels.
   Renaming or removing an entry leaves any level or kind that names it without a model: pick another for it in
-  **Administration > Services**.
+  **Administration > Services and AI levels**.
 - **Reviews follow the level:** a document's AI review, and later re-reviews of its saved versions, use the review
   model of the level (or kind) it was processed with, so a cloud level's documents aren't reviewed by a local model,
   or the other way round. The review's cost is part of the job's AI cost.
@@ -74,8 +74,8 @@ VERIFY_JUDGE_MODEL=local-judge
   `deploy/k8s/deploy.env` (it adds `disable_env_credential_login: true` to the gateway's `general_settings`; with
   Docker Compose, add that line to `config/litellm.yaml` yourself). The engine isn't affected: it uses the master
   key, not this login.
-- **Spend backstop:** `max_budget` and `budget_duration` in `config/litellm.yaml` (default $50 per 30 days) cap total
-  spend, on top of the portal's page quotas. Local models are listed at zero cost.
+- **Spend backstop:** `max_budget` and `budget_duration` in `config/litellm.yaml` (as shipped, $150 per 30 days;
+  set it for your deployment) cap total spend, on top of the portal's page quotas. Local models are listed at zero cost.
 - **Cost per job:** the gateway reports each call's cost; the engine adds it up (`metrics.ai_cost_usd`,
   `verification_ai_cost_usd`), and super admins see it on the job page and in the Cost report.
 
@@ -113,7 +113,10 @@ model variants (free endpoints may log prompts).
 
 The engine can call LocalAI, Ollama or OpenRouter directly (`ai_provider=localai|ollama|openrouter`, with the
 `LOCALAI_*`, `OLLAMA_*`, `OPENROUTER_*` settings). Portal jobs without an AI level use `PORTAL_ENGINE_AI_PROVIDER`.
-Prefer the gateway everywhere else: direct calls have no spend tracking, budget or per-job attribution.
+Prefer the gateway everywhere else: direct calls have no spend tracking, budget or per-job attribution. On the
+cluster there's no choice: the engine has no internet access, and with `AI_GATEWAY_ONLY=true` (set by the
+manifests) a direct provider becomes the gateway's `GATEWAY_DEFAULT_MODEL`, and a direct judge its
+`GATEWAY_JUDGE_MODEL` (default `local-judge`) (#361).
 
 ## Specialist notation
 
@@ -129,6 +132,10 @@ engineering units) is read by the job's AI model ([how](../architecture/engine-p
 - **Quality follows the model.** On a research paper, the local 8B model was rarely wrong but often imprecise; a
   commercial model read about two thirds of formulas exactly. Use a stronger level, or a *Math and science* kind, for
   math-heavy documents where accuracy matters ([test report](../evaluation/test-reports/2026-10-07-notation-ai-tiers.md)).
+- **A second reading of formulas, from their pictures** (#403): the optional formula reading service
+  (`docker/formula`; `FORMULA_OCR_ENABLED`, default false, on when the deployment runs it) reads each formula's image,
+  and its reading is checked against the AI's. `FORMULA_OCR_MAX` (200) caps the formulas per document;
+  `FORMULA_OCR_TIMEOUT_S` (180) is how long to wait for an answer.
 - **The Adobe route** reads notation too: the readings go onto Adobe's matching text tags in the improved copy
   ([how](../architecture/adobe-route.md)).
 
@@ -159,9 +166,10 @@ Figures printed on scanned pages are found and tagged automatically; see
 **Let AI decide** (Settings → Uploads and limits) asks the engine's `POST /api/v1/classify` which of an AI level's
 kinds a document is, before the portal sends it. The engine reads the first pages' text (no images) and asks either:
 
-- **Jev** (`typesafe/jev-1.13` through OpenRouter's System One API, using `OPENROUTER_API_KEY`; the model is
-  `CLASSIFIER_JEV_MODEL`). Text only, about $0.042 per million input tokens (about $0.0001 per document), and not
-  trained on requests. Local-only groups never use it.
+- **Jev** (TypeSafe's `jev-1.13` through OpenRouter's System One API, using `OPENROUTER_API_KEY`; the model is
+  `CLASSIFIER_JEV_MODEL`). On the cluster the engine calls the gateway's `/systemone` route
+  (`config/litellm.yaml`), which adds the key, so only the gateway holds it. Text only, about $0.042 per million
+  input tokens (about $0.0001 per document), and not trained on requests. Local-only groups never use it.
 - or **a gateway model** you choose (local, for local-only groups).
 
 If the classifier can't be reached, the document goes on with General, so it never holds up the queue. On 30 sample
@@ -179,3 +187,5 @@ of them (median 0.6 s), and the local 8B model for 29.
 | `VERIFY_AI_READING_ORDER` | `false` | The AI reading-order check (unreliable with the tested local models) |
 | `VERIFY_ROUTES` | empty | JSON: a different reviewer per content type, e.g. charts |
 | `VERIFY_MAX_OUTPUT_TOKENS` | `1500` | Room for the reviewer's answer |
+| `VERIFY_MAX_PAGES` | `400` | Pages per output the verification looks at |
+| `VERIFY_CONTRAST` | `true` | List text below WCAG's contrast minimum, per page, for review |

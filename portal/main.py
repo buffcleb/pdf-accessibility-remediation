@@ -12,10 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import text
+from sqlalchemy.exc import DataError
 
+from portal import metrics
 from portal.config import get_portal_settings
 from portal.db import get_engine
-from portal.routers import admin, auth, branding, email_reports, groups, help, jobs, me, queues, reports, versions
+from portal.routers import (
+    admin, auth, branding, email_reports, groups, help, jobs, me, monitoring, queues, reports, versions,
+)
 from portal.security.tokens import check_config
 
 log = logging.getLogger(__name__)
@@ -113,11 +117,33 @@ def create_app() -> FastAPI:
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         return response
 
+    @app.middleware("http")
+    async def count_requests(request: Request, call_next):
+        # For Prometheus (#397): each API request by its route's pattern (never the path itself, which carries IDs)
+        start = metrics.now()
+        response = await call_next(request)
+        route = getattr(request.scope.get("route"), "path", None)
+        if route is not None and request.url.path.startswith(API_PREFIX):
+            # A router's routes carry their own part only; the API's prefix is put back on
+            label = route if route.startswith(API_PREFIX) else API_PREFIX + route
+            metrics.observe(request.method, label, response.status_code, metrics.now() - start)
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
         fields = [{"field": ".".join(str(p) for p in e["loc"][1:]), "message": e["msg"]} for e in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": {
             "error": "invalid_request", "message": "Some fields are invalid.", "fields": fields}})
+
+    @app.exception_handler(DataError)
+    async def data_error(request: Request, exc: DataError):
+        # A NUL character (in a search, a name, a message) can't be stored or compared in Postgres text: the person
+        # is told, rather than shown a server error (#326). Any other data error is one.
+        text = str(exc.orig or exc)
+        if "NUL" in text or "\\u0000" in text:
+            return JSONResponse(status_code=400, content={"detail": {
+                "error": "invalid_request", "message": "The text contains a character that isn't allowed (NUL)."}})
+        return await unhandled(request, exc)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):
@@ -127,8 +153,40 @@ def create_app() -> FastAPI:
             "error": "server_error", "message": "Something went wrong. Try again later."}})
 
     for r in (auth.router, me.router, jobs.router, versions.router, groups.router, reports.router, admin.router,
-              branding.router, help.router, queues.router, email_reports.router):
+              branding.router, help.router, queues.router, email_reports.router, monitoring.router):
         app.include_router(r, prefix=API_PREFIX)
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics():
+        """For the deployment's Prometheus (#397). Outside /api/: the web app's nginx and the API-origin Ingress don't
+        pass it on, and the network policies let only Prometheus reach the API's port directly."""
+        from starlette.responses import Response
+        from portal.db import _sessionmaker
+        if not get_portal_settings().metrics_enabled:
+            return Response(status_code=404)
+        return Response(metrics.render(_sessionmaker()), media_type=metrics.CONTENT_TYPE)
+
+    @app.get(f"{API_PREFIX}/live", tags=["health"])
+    def live():
+        """For the liveness probe (#335): the process answers. Nothing else is checked, so a database restart
+        doesn't restart the API too; /health says whether it's ready."""
+        return {"status": "alive"}
+
+    @app.get(f"{API_PREFIX}/status", tags=["health"])
+    def status():
+        """For an outside uptime check (#334): 503 while there's a problem super admins are being told about, or the
+        portal worker has stopped completing passes (when it's down, nothing else can email). Only the problems'
+        keys are given; Attention has the rest."""
+        from portal import alerts
+        from portal.db import _sessionmaker
+        try:
+            with _sessionmaker()() as db:
+                # The queue and the worker as they are now; the engine (which the API doesn't ask) as last found
+                problems = sorted(set(alerts.conditions(db)) | {r.key for r in alerts.active(db) if r.key in alerts.ASKED_BY_WORKER})
+        except Exception:  # noqa: BLE001
+            problems = ["database"]
+        return JSONResponse(status_code=503 if problems else 200,
+                            content={"status": "problem" if problems else "ok", "problems": problems})
 
     @app.get(f"{API_PREFIX}/health", tags=["health"])
     def health():

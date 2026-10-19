@@ -65,6 +65,18 @@ shared_key() {
 shared_keys() {
   shared_key REDIS_PASSWORD PORTAL_REDIS_PASSWORD
   shared_key SERVICE_API_KEY PORTAL_ENGINE_API_KEY
+  # The portal's own database account (#337, deploy/k8s/app-role.sql), made once
+  if ! grep -q '^PORTAL_APP_DB_PASSWORD=' "$K8S/portal.env"; then
+    echo "PORTAL_APP_DB_PASSWORD=$(rand 24)" >> "$K8S/portal.env"; log "made PORTAL_APP_DB_PASSWORD (portal.env)"
+  fi
+  # Monitoring's (#397): the Postgres exporter's account (deploy/k8s/monitoring-role.sql), and Grafana's own admin
+  # login (nobody signs in with it: super admins come through the portal) and the key it signs its cookies with
+  local k
+  for k in MONITORING_DB_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY; do
+    if ! grep -q "^$k=" "$K8S/portal.env"; then
+      echo "$k=$(rand 24)" >> "$K8S/portal.env"; log "made $k (portal.env)"
+    fi
+  done
 }
 
 # --- init: settings and secrets, made once ----------------------------------------------------------
@@ -84,6 +96,8 @@ url_safe_passwords() {
   url_safe engine.env LITELLM_DB_PASSWORD
   url_safe portal.env PORTAL_REDIS_PASSWORD
   url_safe portal.env PORTAL_DB_PASSWORD
+  url_safe portal.env PORTAL_APP_DB_PASSWORD
+  url_safe portal.env MONITORING_DB_PASSWORD
 }
 
 copy_env() {
@@ -161,7 +175,7 @@ set -a
 [ -f "$K8S/.last-build" ] && . "$K8S/.last-build"
 set +a
 # deploy.env's own (non-empty) tags win over the last build's
-for v in ENGINE_TAG PORTAL_TAG WEB_TAG MUSIC_TAG; do
+for v in ENGINE_TAG PORTAL_TAG WEB_TAG MUSIC_TAG FORMULA_TAG; do
   own="$(sed -n "s/^$v=//p" "$K8S/deploy.env")"
   [ -n "$own" ] && export "$v=$own"
 done
@@ -170,10 +184,19 @@ FRONTEND="${FRONTEND:-cluster}"
 # controller in the nodes' own network, as RKE2's is, is seen by its node address, so name the node network here.
 # The default lets nothing in that way.
 export API_ORIGIN_SOURCE_CIDR="${API_ORIGIN_SOURCE_CIDR:-127.0.0.1/32}"
+# Who may reach the API origin at all (61-api-origin.yaml): the proxies in front of it, such as Cloudflare's
+# published ranges (https://www.cloudflare.com/ips/). Anyone else could set the caller's header themselves (#336)
+export API_ORIGIN_ALLOWED_SOURCES="${API_ORIGIN_ALLOWED_SOURCES:-}"
+# The proxies whose headers name the caller to the portal API: the pods in front of it (cloudflared and the web
+# pod; RKE2's pod range by default), and with FRONTEND=worker the ingress controller. Headers from anyone else are
+# ignored, so nobody can pick a fresh sign-in rate-limit bucket by setting one (#336)
+export TRUSTED_PROXY_CIDRS="${TRUSTED_PROXY_CIDRS:-10.42.0.0/16}"
 case "$FRONTEND" in
-  cluster) export CLIENT_IP_HEADER=cf-connecting-ip ;;
-  worker) export CLIENT_IP_HEADER=x-client-ip
-          [ -n "${API_ORIGIN_HOST:-}" ] || die "FRONTEND=worker needs API_ORIGIN_HOST in deploy/k8s/deploy.env" ;;
+  cluster) export CLIENT_IP_HEADER=cf-connecting-ip API_TRUSTED_PROXIES="$TRUSTED_PROXY_CIDRS" ;;
+  worker) export CLIENT_IP_HEADER=x-client-ip API_TRUSTED_PROXIES="$TRUSTED_PROXY_CIDRS,$API_ORIGIN_SOURCE_CIDR"
+          [ -n "${API_ORIGIN_HOST:-}" ] || die "FRONTEND=worker needs API_ORIGIN_HOST in deploy/k8s/deploy.env"
+          [ "$API_ORIGIN_SOURCE_CIDR" != 127.0.0.1/32 ] || die "FRONTEND=worker needs API_ORIGIN_SOURCE_CIDR (where the ingress controller's traffic comes from)"
+          [ -n "$API_ORIGIN_ALLOWED_SOURCES" ] || die "FRONTEND=worker needs API_ORIGIN_ALLOWED_SOURCES: the proxies allowed to reach the API origin (Cloudflare's ranges); without it anyone could name themselves to the portal" ;;
   *) die "FRONTEND is cluster or worker" ;;
 esac
 export CLOUDFLARED_IMAGE="${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.10.0@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07}"
@@ -221,18 +244,77 @@ case "$MUSIC_READER" in
   off) export OMR_ENABLED=false ;;
   *) die "MUSIC_READER is on or off" ;;
 esac
+# The formula reading service (37-formula.yaml, #403): off, or on (needs its image: scripts/build.sh --only formula).
+# It reads each formula the AI read again from its picture, to check the AI's reading against
+export FORMULA_READER="${FORMULA_READER:-off}" FORMULA_MAX="${FORMULA_MAX:-2}" FORMULA_PER_POD="${FORMULA_PER_POD:-20}"
+export FORMULA_TAG="${FORMULA_TAG:-}"
+case "$FORMULA_READER" in
+  on) export FORMULA_OCR_ENABLED=true
+      [ -n "$FORMULA_TAG" ] || die "FORMULA_READER=on needs its image: run scripts/build.sh --only formula (or set FORMULA_TAG)" ;;
+  off) export FORMULA_OCR_ENABLED=false ;;
+  *) die "FORMULA_READER is on or off" ;;
+esac
+# Backups (#333): cronjob runs the nightly backup onto an NFS share (90-backup.yaml) and the portal alerts when one
+# hasn't finished for a while; external relies on the hosts' own backups (or none) and alerts nothing
+export BACKUPS="${BACKUPS:-external}" BACKUP_NFS_SERVER="${BACKUP_NFS_SERVER:-}" BACKUP_NFS_PATH="${BACKUP_NFS_PATH:-}"
+export BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-0 2 * * *}" BACKUP_TIMEZONE="${BACKUP_TIMEZONE:-America/New_York}"
+export BACKUP_KEEP_DAILY="${BACKUP_KEEP_DAILY:-14}" BACKUP_KEEP_WEEKLY="${BACKUP_KEEP_WEEKLY:-8}"
+export BACKUP_FILES="${BACKUP_FILES:-on}" BACKUP_SIZE="${BACKUP_SIZE:-20Gi}" BACKUP_NFS_VERSION="${BACKUP_NFS_VERSION:-4.1}"
+case "$BACKUPS" in
+  cronjob)
+    if [ -z "$BACKUP_NFS_SERVER" ] || [ -z "$BACKUP_NFS_PATH" ]; then
+      die "BACKUPS=cronjob needs BACKUP_NFS_SERVER and BACKUP_NFS_PATH (the NAS share)"
+    fi
+    for v in BACKUP_KEEP_DAILY BACKUP_KEEP_WEEKLY; do case "${!v}" in ''|*[!0-9]*) die "$v is a whole number" ;; esac; done
+    case "$BACKUP_FILES" in on|off) ;; *) die "BACKUP_FILES is on or off" ;; esac
+    export BACKUP_EXPECTED=true ;;
+  external) export BACKUP_EXPECTED=false ;;
+  *) die "BACKUPS is cronjob or external" ;;
+esac
+# Monitoring (#397, 95-monitoring.yaml): Prometheus, its alerts to super admins with the portal's own, and Grafana at
+# /grafana for super admins (through the web app, so FRONTEND=cluster only); off removes them but keeps their volumes
+export MONITORING="${MONITORING:-on}" PROMETHEUS_RETENTION="${PROMETHEUS_RETENTION:-15d}"
+export PROMETHEUS_SIZE="${PROMETHEUS_SIZE:-20Gi}" PROMETHEUS_MEMORY_LIMIT="${PROMETHEUS_MEMORY_LIMIT:-2Gi}"
+export GRAFANA_SIZE="${GRAFANA_SIZE:-1Gi}" MONITORING_STORAGE_CLASS="${MONITORING_STORAGE_CLASS:-$STORAGE_CLASS}"
+case "$PROMETHEUS_RETENTION" in
+  ''|*[!0-9ywdh]*|[!0-9]*) die "PROMETHEUS_RETENTION is a time such as 15d, 8w or 1y" ;;
+esac
+# History is also cut to fit its volume: 85% of PROMETHEUS_SIZE unless PROMETHEUS_RETENTION_SIZE says otherwise
+if [ -z "${PROMETHEUS_RETENTION_SIZE:-}" ]; then
+  case "$PROMETHEUS_SIZE" in
+    *Gi) n="${PROMETHEUS_SIZE%Gi}"
+         case "$n" in ''|*[!0-9]*) die "PROMETHEUS_SIZE is a whole number of Gi, such as 20Gi" ;; esac
+         PROMETHEUS_RETENTION_SIZE="$((n * 1024 * 85 / 100))MB" ;;
+    *) die "PROMETHEUS_SIZE is in Gi (20Gi); or set PROMETHEUS_RETENTION_SIZE (e.g. 17GB) yourself" ;;
+  esac
+fi
+export PROMETHEUS_RETENTION_SIZE
+export PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e}"
+export GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana:13.2.3@sha256:b28bae15e219c998fb0e0424ed724930cc61b1f61fb404d47c862f9a23f9e572}"
+export KSM_IMAGE="${KSM_IMAGE:-registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0@sha256:42cfe3723a5f058171c627537fb57a3ea0f26e4380fa18555a95cb1a1b4cfc5b}"
+export REDIS_EXPORTER_IMAGE="${REDIS_EXPORTER_IMAGE:-oliver006/redis_exporter:v1.93.0@sha256:6ca518a72f30f7f576ef92963de1b91d3c3f5fd3aeac949f878bfda183587820}"
+export POSTGRES_EXPORTER_IMAGE="${POSTGRES_EXPORTER_IMAGE:-prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e}"
+case "$MONITORING" in
+  on) export PORTAL_PROMETHEUS_URL=http://prometheus:9090
+      if [ "$FRONTEND" = cluster ]; then export PORTAL_GRAFANA_URL=/grafana/ GRAFANA_UPSTREAM=http://grafana:3000
+      else export PORTAL_GRAFANA_URL="" GRAFANA_UPSTREAM=""; fi ;;
+  off) export PORTAL_PROMETHEUS_URL="" PORTAL_GRAFANA_URL="" GRAFANA_UPSTREAM="" ;;
+  *) die "MONITORING is on or off" ;;
+esac
 [ "$ENGINE_WORKERS_MAX" -ge "$ENGINE_WORKERS" ] || die "ENGINE_WORKERS_MAX is less than ENGINE_WORKERS"
 # With scaling on, the autoscalers own the number of pods: the manifests leave it out, so a deploy doesn't reset it
 set_replicas() {
   if [ "$AUTOSCALE" = on ]; then
     export ENGINE_WORKER_REPLICAS="# replicas: set by the autoscaler" VERAPDF_REPLICAS="# replicas: set by the autoscaler" \
-      LITELLM_REPLICAS="# replicas: set by the autoscaler" MUSIC_REPLICAS="# replicas: set by the autoscaler"
+      LITELLM_REPLICAS="# replicas: set by the autoscaler" MUSIC_REPLICAS="# replicas: set by the autoscaler" \
+      FORMULA_REPLICAS="# replicas: set by the autoscaler"
   else
     export ENGINE_WORKER_REPLICAS="replicas: $ENGINE_WORKERS" VERAPDF_REPLICAS="replicas: 1" LITELLM_REPLICAS="replicas: 1" \
-      MUSIC_REPLICAS="replicas: 1"
+      MUSIC_REPLICAS="replicas: 1" FORMULA_REPLICAS="replicas: 1"
   fi
 }
-export LITELLM_CONFIG_SHA RUN_ID ENGINE_ENV_SHA PORTAL_ENV_SHA TUNNEL_ENV_SHA VERAPDF_CONFIG_SHA
+export LITELLM_CONFIG_SHA RUN_ID ENGINE_ENV_SHA PORTAL_ENV_SHA TUNNEL_ENV_SHA VERAPDF_CONFIG_SHA PROMETHEUS_CONFIG_SHA
+export GRAFANA_DASHBOARDS_SHA
 # The gateway's shared admin login (UI_USERNAME and UI_PASSWORD in engine.env): on, or off once every admin has an
 # account of their own in the gateway's UI
 export GATEWAY_SHARED_LOGIN="${GATEWAY_SHARED_LOGIN:-on}"
@@ -248,6 +330,9 @@ litellm_config() {
 }
 LITELLM_CONFIG_SHA="$(litellm_config | shasum -a 256 | cut -c1-16)"
 VERAPDF_CONFIG_SHA="$(shasum -a 256 deploy/verapdf/validator.xml | cut -c1-16)"
+MON="$K8S/monitoring"
+PROMETHEUS_CONFIG_SHA="$(cat "$MON/prometheus.yml" "$MON/rules.yml" | shasum -a 256 | cut -c1-16)"
+GRAFANA_DASHBOARDS_SHA="$(cat "$MON"/dashboards/*.json | shasum -a 256 | cut -c1-16)"
 # Pods restart when their settings file changes (the checksum is in their template)
 sha_of() { if [ -f "$1" ]; then shasum -a 256 "$1" | cut -c1-16; else echo none; fi; }
 ENGINE_ENV_SHA="$(sha_of "$K8S/engine.env")"
@@ -276,9 +361,16 @@ render_all() {
     case "$(basename "$f")" in
       36-music.yaml) [ "$MUSIC_READER" = on ] || continue ;;
       46-music-autoscale.yaml) if [ "$MUSIC_READER" != on ] || [ "$AUTOSCALE" != on ]; then continue; fi ;;
+      37-formula.yaml) [ "$FORMULA_READER" = on ] || continue ;;
+      47-formula-autoscale.yaml) if [ "$FORMULA_READER" != on ] || [ "$AUTOSCALE" != on ]; then continue; fi ;;
+      90-backup.yaml) [ "$BACKUPS" = cronjob ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
+      95-monitoring.yaml) [ "$MONITORING" = on ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
     esac
     render_file "$f" > "$out/$(basename "$f")" || die "$(basename "$f") uses a setting that isn't set"
   done
+  # Prometheus's own config (its rules and Grafana's dashboards go in as they are: they use $ and {{ }} themselves)
+  render_file "$MON/prometheus.yml" > "$out/prometheus.yml" \
+    || die "monitoring/prometheus.yml uses a setting that isn't set"
 }
 
 if [ "$CMD" = render ]; then
@@ -314,7 +406,8 @@ if [ ! -f "$K8S/engine.env" ] || [ ! -f "$K8S/portal.env" ]; then
 fi
 shared_keys
 url_safe_passwords
-for sc in "$STORAGE_CLASS" "$SHARED_STORAGE_CLASS"; do
+classes=("$STORAGE_CLASS" "$SHARED_STORAGE_CLASS"); [ "$MONITORING" = on ] && classes+=("$MONITORING_STORAGE_CLASS")
+for sc in "${classes[@]}"; do
   "${KC[@]}" get storageclass "$sc" >/dev/null 2>&1 \
     || die "the cluster has no StorageClass '$sc' (install one, or change it in deploy/k8s/deploy.env)"
 done
@@ -327,6 +420,20 @@ if [ "$AUTOSCALE" = on ]; then
   echo "  scaling with the queue: $ENGINE_WORKERS to $ENGINE_WORKERS_MAX workers ($WORKER_CONCURRENCY documents each), veraPDF up to $VERAPDF_MAX, AI gateway up to $LITELLM_MAX"
 else
   echo "  fixed size: $ENGINE_WORKERS worker(s) ($WORKER_CONCURRENCY documents each); scaling is off$([ "$has_keda" = 0 ] && echo " (no KEDA on the cluster)")"
+fi
+if [ "$MONITORING" = on ]; then
+  echo "  monitoring: Prometheus ($PROMETHEUS_RETENTION of history, $PROMETHEUS_SIZE on $MONITORING_STORAGE_CLASS)"
+  [ "$FRONTEND" = cluster ] && echo "    and Grafana at https://$APP_HOST/grafana/ for super admins"
+else
+  echo "  monitoring: off (MONITORING=off)"
+fi
+if [ "$BACKUPS" = cronjob ]; then
+  echo "  nightly backup: $BACKUP_SCHEDULE ($BACKUP_TIMEZONE) onto $BACKUP_NFS_SERVER:$BACKUP_NFS_PATH, keeping $BACKUP_KEEP_DAILY nightly and $BACKUP_KEEP_WEEKLY weekly$([ "$BACKUP_FILES" = on ] && echo ", stored files included")"
+else
+  echo "  nightly backup: none here (BACKUPS=external: the hosts' own backups); no backup alerts"
+fi
+if [ "$FORMULA_READER" = on ]; then
+  echo "  formula reading service: $FORMULA_TAG, $([ "$AUTOSCALE" = on ] && echo "started when there are formulas to read (up to $FORMULA_MAX)" || echo "one pod, always running")"
 fi
 if [ "$MUSIC_READER" = on ]; then
   echo "  music reading service: $MUSIC_TAG, $([ "$AUTOSCALE" = on ] && echo "started when there is music to read (up to $MUSIC_MAX)" || echo "one pod, always running")"
@@ -369,7 +476,18 @@ secret pdfrem-gateway-env "$NAMESPACE" "$K8S/engine.env" --drop "$ENGINE_ONLY"
 secret pdfrem-adobe-env "$NAMESPACE" "$K8S/engine.env" --keys '^ADOBE_CLIENT_'
 secret pdfrem-db-env "$NAMESPACE" "$K8S/engine.env" "$K8S/portal.env" \
   --keys '^(POSTGRES_ADMIN_PASSWORD|PORTAL_DB_PASSWORD|LITELLM_DB_PASSWORD)$'
-secret pdfrem-portal-env "$NAMESPACE" "$K8S/portal.env" --drop '^POSTGRES_ADMIN_PASSWORD$'
+# The portal's pods get their own account's password, not the owner's (#337): that's only for migrations and backups
+MONITORING_KEYS='MONITORING_DB_PASSWORD|GRAFANA_ADMIN_PASSWORD|GRAFANA_SECRET_KEY'
+secret pdfrem-portal-env "$NAMESPACE" "$K8S/portal.env" \
+  --drop "^(POSTGRES_ADMIN_PASSWORD|PORTAL_DB_PASSWORD|$MONITORING_KEYS)\$"
+if [ "$MONITORING" = on ]; then
+  secret pdfrem-monitoring-env "$NAMESPACE" "$K8S/portal.env" \
+    --keys "^($MONITORING_KEYS)\$"
+  "${KC[@]}" "${NS[@]}" create configmap prometheus-config --from-file=prometheus.yml="$WORK/prometheus.yml" \
+    --from-file=rules.yml="$MON/rules.yml" --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
+  "${KC[@]}" "${NS[@]}" create configmap grafana-dashboards --from-file="$MON/dashboards" \
+    --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
+fi
 if [ "$TUNNEL" = 1 ]; then
   python3 "$K8S/env2secret.py" pdfrem-tunnel "$NAMESPACE" "$K8S/tunnel.env" | "${KC[@]}" apply -f - >/dev/null
 fi
@@ -406,6 +524,21 @@ if ! "${KC[@]}" "${NS[@]}" wait --for=condition=complete "job/portal-migrate-$RU
 fi
 log "migrations applied"
 
+# The portal runs as its own account, which can't change tables or triggers (#337): made, and given the rows of
+# whatever the migrations made, on every deploy. The password goes in on standard input, not as an argument.
+app_pw="$(sed -n 's/^PORTAL_APP_DB_PASSWORD=//p' "$K8S/portal.env" | head -1)"
+sed "s/__APP_PASSWORD__/$app_pw/" "$K8S/app-role.sql" \
+  | "${KC[@]}" "${NS[@]}" exec -i statefulset/postgres -- psql -q -v ON_ERROR_STOP=1 -U postgres -d portal >/dev/null \
+  || die "couldn't set up the portal's database account (deploy/k8s/app-role.sql)"
+log "portal database account ready"
+if [ "$MONITORING" = on ]; then
+  mon_pw="$(sed -n 's/^MONITORING_DB_PASSWORD=//p' "$K8S/portal.env" | head -1)"
+  sed "s/__MONITOR_PASSWORD__/$mon_pw/" "$K8S/monitoring-role.sql" \
+    | "${KC[@]}" "${NS[@]}" exec -i statefulset/postgres -- psql -q -v ON_ERROR_STOP=1 -U postgres -d portal >/dev/null \
+    || die "couldn't set up the monitoring database account (deploy/k8s/monitoring-role.sql)"
+  log "monitoring database account ready"
+fi
+
 log "AI gateway, veraPDF, engine, portal and web app"
 apply 30-litellm.yaml
 apply 35-verapdf.yaml
@@ -432,6 +565,39 @@ else
   fi
   "${KC[@]}" "${NS[@]}" delete deployment/music-reader --ignore-not-found >/dev/null
 fi
+if [ "$FORMULA_READER" = on ]; then
+  apply 37-formula.yaml
+  if [ "$AUTOSCALE" = on ]; then
+    apply 47-formula-autoscale.yaml
+  elif [ "$has_keda" = 1 ]; then
+    "${KC[@]}" "${NS[@]}" delete scaledobject/formula-reader triggerauthentication/formula-queue --ignore-not-found >/dev/null
+  fi
+else
+  if [ "$has_keda" = 1 ]; then
+    "${KC[@]}" "${NS[@]}" delete scaledobject/formula-reader triggerauthentication/formula-queue --ignore-not-found >/dev/null
+  fi
+  "${KC[@]}" "${NS[@]}" delete deployment/formula-reader --ignore-not-found >/dev/null
+fi
+if [ "$BACKUPS" = cronjob ]; then
+  apply 90-backup.yaml
+else
+  # The share's volume and claim stay (a static NFS volume never deletes what's on the share)
+  "${KC[@]}" "${NS[@]}" delete cronjob/backup configmap/backup-scripts --ignore-not-found >/dev/null
+fi
+# Before the web app: its nginx looks Grafana up when it starts
+if [ "$MONITORING" = on ]; then
+  apply 95-monitoring.yaml
+else
+  # Their volumes (prometheus-data, grafana-data) stay, with the history and any dashboards made in Grafana
+  "${KC[@]}" "${NS[@]}" delete deployment/prometheus deployment/grafana deployment/kube-state-metrics \
+    deployment/redis-exporter deployment/postgres-exporter service/prometheus service/grafana \
+    configmap/prometheus-config configmap/grafana-provisioning configmap/grafana-dashboards \
+    secret/pdfrem-monitoring-env networkpolicy/prometheus networkpolicy/grafana networkpolicy/exporters \
+    serviceaccount/prometheus serviceaccount/kube-state-metrics role/prometheus role/kube-state-metrics \
+    rolebinding/prometheus rolebinding/kube-state-metrics --ignore-not-found >/dev/null
+  "${KC[@]}" delete clusterrolebinding/"$NAMESPACE"-prometheus clusterrole/"$NAMESPACE"-prometheus \
+    --ignore-not-found >/dev/null
+fi
 if [ "$FRONTEND" = worker ]; then
   apply 61-api-origin.yaml
   "${KC[@]}" "${NS[@]}" delete ingress/web deployment/web service/web --ignore-not-found >/dev/null
@@ -454,6 +620,10 @@ wait_rollout deployment/engine-beat
 [ "${ADOBE_WORKERS:-0}" -gt 0 ] && wait_rollout deployment/engine-adobe-worker
 wait_rollout deployment/portal-api
 wait_rollout deployment/portal-worker
+if [ "$MONITORING" = on ]; then
+  wait_rollout deployment/prometheus
+  wait_rollout deployment/grafana
+fi
 [ "$FRONTEND" = cluster ] && wait_rollout deployment/web
 if [ "$TUNNEL" = 1 ]; then
   apply 70-cloudflared.yaml

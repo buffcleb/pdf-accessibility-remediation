@@ -55,17 +55,35 @@ log.
   - **Local model:** a gateway model on your own servers, for local-only groups (and for everyone when Jev is off).
   - **Use the kind when at least … % sure** (60% by default); below that, General is used.
   - **Pages read** (3 by default): the first ones, plus more spread through long documents.
+- **Alerts**: problems the service notices about itself, emailed to every super admin and shown on **Attention**:
+  one email when one starts, a reminder while it lasts, and one when it clears.
+  - **Queue not moving after** (60 minutes by default): documents are waiting and none has started or finished for
+    this long. A busy queue that's moving never counts, and nor do documents waiting on purpose (a paused service,
+    tomorrow's daily limit, a person's confirmation).
+  - **Background worker stopped after** (15 minutes): the portal's worker hasn't completed a pass (documents, saves,
+    emails) for this long.
+  - **Engine without workers after** (10 minutes): the engine reports no workers, or can't be reached.
+  - **Backup not finished after** (26 hours): only where the cluster runs the nightly backup; never where the hosts'
+    own backups are used.
+  - **A group's pool is running low below** (10% of its size, or 20 pages, whichever is larger): the group's admins
+    (or the super admins, if it has none) get one email when a pool drops below; topping it up re-arms it. Attention
+    uses the same threshold.
+  - **Remind every** (4 hours): while a problem lasts.
+  - When the portal itself is down it can't email anyone: point an outside uptime check at `/api/v1/status`, which
+    answers with an error (503) while there's a problem.
 - **PDF/UA validation (veraPDF)**: how the checks run. The results are the same either way.
   - **As a service kept running** (the default): faster. If the service doesn't answer, the engine runs that check
     from the command line instead.
   - **From the command line in the engine:** Java starts for each check, about a second more each time.
   - **Also check PDF/UA-2** (on by default): shown in reports for information; the verdict is PDF/UA-1. Turning it
-    off halves the number of checks.
+    off halves the number of checks. A PDF 2.0 document (what LaTeX's tagging and other recent tools write) can
+    only be PDF/UA-2: it's labelled and judged as PDF/UA-2 whatever this says, and its results say "PDF/UA-2".
 
 ## Sign-in and data
 
-- **Session timeouts:** idle hours and the most days a session lasts.
-- **New groups require approval:** whether new groups start with *New members need approval* on (each group can
+- **Sign out after no activity for** (8 hours by default) and **Ask to sign in again after** (7 days), even for
+  someone who stays active.
+- **New groups → New members need approval:** whether groups created from now on start with it on (each group can
   change it).
 - **Retention:** how long **files** are kept (30 days by default) and how long **records** (usage, ledger, sign-ins,
   audit) are kept before they're purged. **Files marked done** is the hold before the files of a document its owner

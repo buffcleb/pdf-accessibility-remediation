@@ -169,6 +169,10 @@ def add_message(db: Session, req: HelpRequest, author: User, role: str, kind: st
             req.staff_wrote_at = now
         else:
             req.person_wrote_at = now
+    if author is not None and author.id == req.user_id:
+        # What the person who asked writes or does isn't news to them, whatever their role: a super admin can ask
+        # for help with their own document, and close the request themselves
+        req.person_seen_at = now
     db.flush()
     return msg
 

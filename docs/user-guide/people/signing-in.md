@@ -26,14 +26,17 @@ you to tick a box. If it says it couldn't run, a content blocker may be stopping
 
 **"Your email address isn't set up for this service":** neither your address nor your email's domain is linked to
 a group yet, so the service doesn't know who you are. (Administrators can allow a single address, such as a personal
-gmail.com one, without allowing everyone at that domain.) Contact the people who run the service for your organization. The message
-usually says who.
+gmail.com one, without allowing everyone at that domain.) Contact the people who run the service for your
+organization. The message usually says who.
+
+**"Too many attempts":** too many codes were asked for, or tried, in a short time. Wait a few minutes and try again.
 
 ## Your group
 
 You join your group automatically, by your email address: everyone at the same organization or department ends
 up in the same group, with the same choices and pages. You don't pick it, and you can't be in two groups. If
-you're in the wrong group, your group admin or a super admin can move you.
+you're in the wrong group, ask your group admin: only a super admin can move you, and your group admin can ask
+one to.
 
 ## Waiting for approval
 
@@ -48,6 +51,8 @@ Some groups approve new people before they can submit documents. If yours does:
 ## Signing out and sessions
 
 - **Sign out** is at the top right of every page.
+- **Sign out of all devices**, in **Settings**, ends every session at once, this one too: for a lost laptop or a
+  shared computer you left signed in ([Email and settings](email-and-settings.md#signed-in-devices)).
 - A session ends after a period of inactivity (8 hours by default) and after a few days (7 by default) even if
   you're active. You then sign in again with a new code.
 - If you've changed something and not saved it, the portal asks before letting you sign out.

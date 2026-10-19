@@ -18,6 +18,9 @@ Look for numbers that jump: a paragraph read before the heading above it, a side
 a sentence, a second column read before the first ends. Hearing the page also shows these problems: see [Hearing it
 read aloud](read-aloud.md).
 
+Pages mostly in Arabic or Hebrew are read from the right: columns and items side by side start on the right. The
+review list names these pages ("right-to-left reading order") so you can check them.
+
 ## Moving tags
 
 In the **tag tree** (of a version you can edit), drag a tag to another place, or move it with **Alt+↑** and
@@ -30,4 +33,5 @@ also reads a tag earlier or later on its page.
   or a table's rows, a table cell can only move within its row (another row would make the rows uneven), and a list
   item stays in a list.
 - A moved tag shows an **undo** button (↩) in the tree and in the list; **Alt+Delete** does the same from the
-  keyboard. It takes back that tag's moves only. Other changes are undone under **Unsaved changes**.
+  keyboard. It takes back that tag's moves only. **Undo** (Ctrl+Z) takes back the last change, whatever it was, and
+  other changes can be undone one by one under **Unsaved changes** ([Saving](saving.md)).

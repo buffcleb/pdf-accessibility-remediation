@@ -23,6 +23,10 @@ spec:
       labels: { app: engine-api }
       annotations:
         checksum/settings: "${ENGINE_ENV_SHA}"
+        # The queues' lengths, for Prometheus when MONITORING=on (#397)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /api/v1/metrics
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
@@ -42,11 +46,18 @@ spec:
             - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: AI_GATEWAY_ONLY, value: "true" }  # no AI provider but the gateway (#361)
             - { name: VERAPDF_URL, value: "http://verapdf:8080" }
           ports: [{ containerPort: 8000 }]
           readinessProbe:
             httpGet: { path: /api/v1/health, port: 8000 }
             periodSeconds: 10
+          # Liveness (#335) only asks whether the process answers: Redis or veraPDF being away mustn't restart it
+          livenessProbe:
+            httpGet: { path: /api/v1/live, port: 8000 }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi }
@@ -75,6 +86,9 @@ spec:
       labels: { app: engine-worker }
       annotations:
         checksum/settings: "${ENGINE_ENV_SHA}"
+        # How many documents it's working on, of how many it can take (#397)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
     spec:
       # A worker told to stop (scaling down, a new release) finishes the document it's on first
       terminationGracePeriodSeconds: ${WORKER_GRACE_SECONDS}
@@ -90,6 +104,17 @@ spec:
         - name: engine-worker
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=${WORKER_CONCURRENCY}"]
+          ports: [{ name: metrics, containerPort: 9464 }]
+          # Liveness (#335): the worker's event loop touches /tmp/worker.alive every 30 s while it's connected and
+          # taking tasks (app/worker/celery_app.py). Stale for 3 minutes, three checks running: restarted. A long
+          # document doesn't stop it (tasks run in child processes); a document cut off is handed out again.
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,sys,time; sys.exit(time.time() - os.path.getmtime('/tmp/worker.alive') > 180)"]
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
           envFrom: [{ secretRef: { name: pdfrem-engine-env } }]
           env:
             - name: REDIS_PASSWORD
@@ -97,6 +122,7 @@ spec:
             - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: AI_GATEWAY_ONLY, value: "true" }  # no AI provider but the gateway (#361)
             - { name: VERAPDF_URL, value: "http://verapdf:8080" }
             - { name: OMR_ENABLED, value: "${OMR_ENABLED}" }
             - { name: MUSIC_MAX_EXAMPLES, value: "${MUSIC_MAX_EXAMPLES}" }
@@ -106,6 +132,7 @@ spec:
             - { name: MUSIC_WHOLE_SCORE_MAX_MB, value: "${MUSIC_WHOLE_SCORE_MAX_MB}" }
             - { name: OMR_TIMEOUT_S, value: "${MUSIC_WAIT_SECONDS}" }
             - { name: OMR_PAGE_TIMEOUT_S, value: "${MUSIC_PAGE_SECONDS}" }
+            - { name: FORMULA_OCR_ENABLED, value: "${FORMULA_OCR_ENABLED}" }  # a second reading of formulas (#403)
           resources:
             requests: { cpu: 500m, memory: 1Gi }
             limits: { cpu: "3", memory: ${WORKER_MEMORY_LIMIT}, ephemeral-storage: 6Gi }
@@ -134,6 +161,9 @@ spec:
       labels: { app: engine-adobe-worker }
       annotations:
         checksum/settings: "${ENGINE_ENV_SHA}"
+        # How many documents it's working on, of how many it can take (#397)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
     spec:
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
@@ -147,6 +177,17 @@ spec:
         - name: engine-adobe-worker
           image: ${REGISTRY}/pdfrem-engine:${ENGINE_TAG}
           command: ["celery", "-A", "app.worker.celery_app", "worker", "-Q", "adobe", "-n", "adobe@%h", "--loglevel=INFO", "--concurrency=2"]
+          ports: [{ name: metrics, containerPort: 9464 }]
+          # Liveness (#335): the worker's event loop touches /tmp/worker.alive every 30 s while it's connected and
+          # taking tasks (app/worker/celery_app.py). Stale for 3 minutes, three checks running: restarted. A long
+          # document doesn't stop it (tasks run in child processes); a document cut off is handed out again.
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,sys,time; sys.exit(time.time() - os.path.getmtime('/tmp/worker.alive') > 180)"]
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
           envFrom: [{ secretRef: { name: pdfrem-engine-env } }, { secretRef: { name: pdfrem-adobe-env } }]
           env:
             - name: REDIS_PASSWORD
@@ -154,6 +195,7 @@ spec:
             - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: AI_GATEWAY_ONLY, value: "true" }  # no AI provider but the gateway (#361)
             - { name: VERAPDF_URL, value: "http://verapdf:8080" }
             - { name: OMR_ENABLED, value: "${OMR_ENABLED}" }
             - { name: MUSIC_MAX_EXAMPLES, value: "${MUSIC_MAX_EXAMPLES}" }
@@ -163,6 +205,7 @@ spec:
             - { name: MUSIC_WHOLE_SCORE_MAX_MB, value: "${MUSIC_WHOLE_SCORE_MAX_MB}" }
             - { name: OMR_TIMEOUT_S, value: "${MUSIC_WAIT_SECONDS}" }
             - { name: OMR_PAGE_TIMEOUT_S, value: "${MUSIC_PAGE_SECONDS}" }
+            - { name: FORMULA_OCR_ENABLED, value: "${FORMULA_OCR_ENABLED}" }
           resources:
             requests: { cpu: 100m, memory: 512Mi }
             limits: { cpu: "2", memory: 2Gi, ephemeral-storage: 4Gi }
@@ -211,6 +254,7 @@ spec:
             - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             - { name: DATA_DIR, value: /data }
             - { name: GATEWAY_BASE_URL, value: "http://litellm:4000/v1" }
+            - { name: AI_GATEWAY_ONLY, value: "true" }  # no AI provider but the gateway (#361)
             - { name: VERAPDF_URL, value: "http://verapdf:8080" }
           resources:
             requests: { cpu: 20m, memory: 128Mi }

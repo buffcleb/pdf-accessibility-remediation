@@ -27,7 +27,8 @@ Click a document's name to open its page.
 ### At the top
 
 - The name, page count and when it was submitted.
-- **One verdict**, for example **✓ Passes PDF/UA-1**, with "Failed checks: 120 → 0".
+- **One verdict**, for example **✓ Passes PDF/UA-1**, with "Failed checks: 120 → 0". A PDF 2.0 document (as
+  LaTeX's tagging and other recent tools write them) can only be PDF/UA-2, so its verdict says **PDF/UA-2**.
 - **Download** for the main file and **Open in tag manager**.
 - While it's being processed, a row of steps shows how far it's got: Waiting, Checking the original, Tagging,
   Alt text and tables, Checking the result.
@@ -40,19 +41,20 @@ picked by *Let AI decide*, or that an outside service was used.
 
 ### Three tiles
 
-**Checks fixed**, **items to review** and **rules still failing**. Each opens its tab.
+**Fixed** (accessibility checks), **To review** (items for a person) and **Still failing** (rules). Each opens its
+tab. A check only has two: **Failing** and **To review**.
 
 ### Tabs
 
 - **Needs review:** what a person should check (below).
 - **Report:** the remediation report, in sections (Summary, Changes, Still failing, For review, Details), with
   **Download the report**.
-- **Accessibility check:** the PDF/UA-1 check rule by rule, before and after.
+- **Accessibility check:** the PDF/UA-1 check (PDF/UA-2 for a PDF 2.0 document) rule by rule, before and after.
   Each version saved from the tag manager (Human reviewed 1, 2, …) has a tab of its own there too, with the rules it
   still fails. The "failed checks" count beside a version, in the tag manager, Versions and Downloads, links to it.
 - **Versions:** your saved edits and corrected files, when there are any.
 
-![The Accessibility check tab of the same document: the PDF/UA-1 check by veraPDF on the result (After chosen, beside Before and Visually exact file), marked Compliant, with 106 rules passed, 0 failed, 3,376 checks passed and 0 failed, and Download XML.](../../images/document-checks.png)
+![The Accessibility check tab of the same document: the PDF/UA-1 check by veraPDF on the result (After chosen, beside Before and Visually exact file), marked Compliant, with 106 rules passed, 0 failed, 3,376 checks passed and 0 failed.](../../images/document-checks.png)
 
 The chosen tab and section are in the page's address, so a link opens on them.
 
@@ -67,6 +69,16 @@ The chosen tab and section are in the page's address, so a link opens on them.
   with one MusicXML file per music example, as read by software. Open them in notation software (MuseScore
   is free) to see and play each example: the quickest way to check a reading against the page, and what a
   musician who is blind would use in place of the picture.
+  A document with formulas has **Math: every formula** (a web page) and **Math: every formula (MathML files,
+  zip)**, and where they could be read by rule, **Math in braille: Nemeth** and **UEB**: every formula in braille
+  (BRF files, 40 cells to a line, for a braille display or an embosser), under a heading with its page. Open the
+  web page in a browser: it shows each formula by page with how the accessible PDF reads it
+  aloud, and a screen reader can move through each formula part by part (with NVDA, MathCAT gives the most
+  control), which the PDF's read-aloud text can't do. The zip holds one MathML file per formula, for math software,
+  equation editors and braille translators. Most formulas were transcribed by AI (a formula the PDF already
+  described in MathML keeps its own): check them against the page before relying on them.
+  In a PDF 2.0 document (PDF/UA-2) the MathML is also inside the accessible PDF, attached to each formula, for
+  readers and screen readers that can use it.
 - **Ask for help** ([how](getting-help.md)).
 
 **Hide downloads and help** folds them into a slim menu so the tabs get the whole width; the page remembers your
@@ -120,9 +132,20 @@ proposed rewrite.
   number), and 25 at a time.
 - **Show** opens the item in the tag manager, where you can fix it. **Back** there returns to the same item.
 
+**Signing items off.** Each item has a status: **Not looked at**, **Checked** (looked at, and fine), **Fixed** or
+**Not an issue**, with an optional note. The list says how many are signed off, and **Still to check** shows only the
+rest. The document's owner and their group admins set statuses; everyone who can open the document sees them. A
+status stays with its item in later versions, as long as the item is the same (the same problem, on the same page,
+about the same tag and text). **Download as CSV** gives the list with each item's status, note, who set it and when,
+for a record of the review.
+
 **Typical items:** alt text that may be inaccurate (charts, diagrams), a heading that looks like body text, a
 paragraph that looks like a missed heading, link text that's just a web address, a passage in another
-language, a reading of math or chemistry written by AI, text corrected or transcribed by AI on a scanned page.
+language, a reading of math or chemistry written by AI, text corrected or transcribed by AI on a scanned page, text
+too faint against its background (with its colors and the contrast ratio; the colors are the original's, so fix them
+in the source document if it's hard to read), pages mostly in Arabic or Hebrew, which are read from the right (check
+their reading order), and two readings of a formula that disagree (pick one in the
+[tag manager](tag-manager/editing-a-tag.md#what-can-be-changed)).
 
 **AI-written alt text is a draft.** The AI checker catches many mistakes but not all. Spot-check figures that
 carry meaning: charts, diagrams and formulas.
@@ -136,8 +159,9 @@ check tabs download it too.
 
 ![The first page of the accessibility report PDF for the parking guide: a summary saying the remediated document passes PDF/UA-1, with failed checks going from 111 to 0, a list of what was done (bookmarks, tags, footnotes, alt text, tables, reading order), and a What changed table of headings, figures, tables, language and title before and after.](../../images/report-pdf.png)
 
-The technical files (Markdown and JSON reports, veraPDF's XML) are under **Technical files**, for tools and
-support. Documents processed before the PDF report existed have the Markdown report instead.
+The engine's own files (its Markdown and JSON reports, veraPDF's XML) are for the people who run the service: super
+admins find them under **Technical files**. Everyone has what's in them through the **Report** and **Accessibility
+check** tabs, and the PDF report. Music and math files, when a document has them, are among the main downloads.
 
 ## Scanned documents
 

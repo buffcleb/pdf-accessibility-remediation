@@ -19,8 +19,8 @@ def test_a_title_from_the_file_is_bounded():
 def test_a_language_from_the_file_must_be_a_language_tag():
     from app.pipeline.orchestrator import _pick_language
 
-    assert _pick_language(JobOptions(stem="doc"), _analysis(language="de-CH"), "en-US") == "de-CH"
-    assert _pick_language(JobOptions(stem="doc"), _analysis(language="not a language; drop tables"), "en-US") == "en-US"
-    assert _pick_language(JobOptions(stem="doc"), _analysis(language="x" * 300), "en-US") == "en-US"
-    assert _pick_language(JobOptions(stem="doc", language="fr"), _analysis(language="de-CH"), "en-US") == "fr"
-    assert _pick_language(JobOptions(stem="doc"), _analysis(), "en-US") == "en-US"
+    assert _pick_language(JobOptions(stem="doc"), _analysis(language="de-CH"), "en-US")[0] == "de-CH"
+    assert _pick_language(JobOptions(stem="doc"), _analysis(language="not a language; drop tables"), "en-US")[0] == "en-US"
+    assert _pick_language(JobOptions(stem="doc"), _analysis(language="x" * 300), "en-US")[0] == "en-US"
+    assert _pick_language(JobOptions(stem="doc", language="fr"), _analysis(language="de-CH"), "en-US")[0] == "fr"
+    assert _pick_language(JobOptions(stem="doc"), _analysis(), "en-US")[0] == "en-US"

@@ -19,7 +19,8 @@ code with the tagger, and checks that:
 - every tagged content sequence belongs to exactly one tag, and every tag points at content that exists;
 - the ParentTree, `StructParents` and annotation `StructParent` entries are consistent;
 - parent pointers are correct and there are no cycles;
-- every role resolves to a standard structure type;
+- every role resolves to a standard structure type (elements in the MathML namespace, a document's own MathML under
+  a Formula, say what they are by their namespace and pass, #403);
 - marked content is balanced and not nested;
 - PDF 2.0 nesting rules hold (reported as warnings).
 
@@ -37,8 +38,17 @@ each tag with what it covers:
 - table cells that don't match the table on the page, and data tables without header cells;
 - single-item lists and non-sequential numbering;
 - generic link text;
+- form fields whose tooltip is missing or only an internal name ("Text1"), #341;
 - tag order that disagrees with an independent layout ordering;
-- passages in another language than their tag.
+- passages in another language than their tag;
+- pages mostly in a right-to-left script (Arabic, Hebrew), whose columns were read from the right: one finding naming
+  them, to check the order (#368);
+- text with low contrast (`app/verification/contrast.py`, #367; WCAG 1.4.3): text below 4.5:1 against what it's
+  drawn on, or 3:1 for large text (18 pt, or 14 pt bold), one finding per page with the colors and ratios. The
+  text's color is the one it's painted with; the background is the commonest color behind it on the rendered page,
+  with the glyphs set aside. Invisible text (an OCR layer) is skipped, and so is text over a photograph or gradient,
+  where no single background color can be read. The check reports only: colors are the source document's, and
+  changing them would change how the pages look. `VERIFY_CONTRAST=false` turns it off.
 
 These findings never block a job.
 
@@ -56,11 +66,15 @@ the time, while the Layer 2 check judged them correctly. Enable it only with a r
 
 When a document has two output files, a figure or formula that appears in both is reviewed once.
 
+Formulas whose readings disagree (the AI's against MathCAT's reading by rule, or against the formula reader's
+reading of the picture) are review items too, "two readings of a formula disagree", with each reading and the MathML
+for Edit tag to offer the choice ([math](engine-pipeline.md#math-and-specialist-notation), #403).
+
 Settings: `VERIFY_*` in `.env.example`; `VERIFY_ROUTES` sends specific content types to specific reviewers. See
 [Operations → AI models](../operations/ai-models.md#verification-settings).
 
 ## A pass is not full accessibility
 
-veraPDF checks the machine-verifiable rules of PDF/UA-1. It can't tell whether alt text is accurate, whether headings
-are the right ones, or whether the reading order makes sense. That's why Layers 2 and 3 and the review list exist. The
-same applies to the output of any other remediation tool.
+veraPDF checks the machine-verifiable rules of PDF/UA-1 (PDF/UA-2 for a PDF 2.0 file, #409). It can't tell whether
+alt text is accurate, whether headings are the right ones, or whether the reading order makes sense. That's why
+Layers 2 and 3 and the review list exist. The same applies to the output of any other remediation tool.

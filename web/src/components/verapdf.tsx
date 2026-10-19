@@ -88,7 +88,7 @@ function pageRanges(pages: number[]): string {
 }
 
 export function VeraPdfView({ report, onDownload, downloadLabel = "Download XML" }: {
-  report: VeraReport; onDownload: () => void; downloadLabel?: string;
+  report: VeraReport; onDownload?: () => void; downloadLabel?: string;
 }) {
   const [filter, setFilter] = useState("");
   const rules = report.rules.filter(
@@ -104,7 +104,7 @@ export function VeraPdfView({ report, onDownload, downloadLabel = "Download XML"
         )}
         <span>{report.profile}</span>
         {report.version && <span className="muted small">veraPDF {report.version}</span>}
-        <button className="btn secondary small" onClick={onDownload}>{downloadLabel}</button>
+        {onDownload && <button className="btn secondary small" onClick={onDownload}>{downloadLabel}</button>}
       </div>
       <dl className="grid" style={{ margin: 0, gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))" }}>
         <div className="stat"><dt className="lbl">Rules passed</dt><dd className="num" style={{ margin: 0 }}>{fmtNum(report.passedRules)}</dd></div>

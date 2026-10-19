@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import pymupdf as fitz
 
 from app.ai.base import AIError, AIProvider
-from app.ai.registry import get_provider
+from app.ai.registry import DIRECT, get_provider
 from app.config import get_settings
 from app.pipeline.analyzer import render_png
 from app.verification.model import Finding
@@ -59,6 +59,10 @@ def routes() -> dict[str, dict]:
             table.update(json.loads(s.verify_routes))
         except json.JSONDecodeError:
             log.warning("VERIFY_ROUTES is not valid JSON; using the default judge only")
+    if s.ai_gateway_only:  # no direct providers on the cluster (#361): the gateway's judge instead
+        for kind, route in table.items():
+            if route.get("provider") in DIRECT:
+                table[kind] = {"provider": "gateway", "model": s.gateway_judge_model}
     return table
 
 

@@ -43,7 +43,7 @@ test("one tag: its type can be changed, and its own type isn't offered", () => {
 test("several tags: one change of type for all of them, and one merge in reading order", () => {
   const map = sample();
   const items = tagMenu(map, [], [3, 2]);   // chosen out of order
-  assert.deepEqual(item(items, "role:H3")!.ops!.map((o) => o.element), [2, 3]);
+  assert.deepEqual(item(items, "role:H3")!.ops!.map((o) => ("element" in o ? o.element : null)), [2, 3]);
   assert.deepEqual(item(items, "merge")!.ops, [{ op: "merge", element: 2, expect_role: "P", absorb: [3] }]);
   assert.equal(item(items, "split-text"), undefined);            // splitting is for one tag
   assert.equal(item(items, "earlier"), undefined);
@@ -250,7 +250,7 @@ test("the menu's top level is short: kinds of change open submenus, one-choice k
   const { menu } = menuAndTypes(tagMenu(sample(), [], [6], { page: 1, x: 10, y: 615 }));
   const sections = menuEntries(menu);
   const top = sections.map((s) => s.map((e) => (e.kind === "item" ? e.item.id : `${e.label} >`)));
-  assert.deepEqual(top[0], ["types", "Merge and split >", "build", "Reading order >"]);   // Lists has one choice here: no submenu
+  assert.deepEqual(top[0], ["types", "Merge and split >", "Lists and tables >", "Reading order >", "Mark as artifact >"]);
   assert.deepEqual(top[top.length - 1], ["edit", "delete", "read", "report"]);         // More: on the top level
   const order = sections[0].find((e) => e.kind === "group" && e.group === "order");
   assert.ok(order && order.kind === "group" && order.items.length === 2);
@@ -274,4 +274,53 @@ test("the split window offers a tag's pieces of text, not its pictures", () => {
   assert.deepEqual(splitPieces({ ...el, parts: [{ k: 0, kind: "content", text: "(image)" }, { k: 1, kind: "content", text: "Caption words" }] }).map((p) => p.k), [1]);
   assert.deepEqual(splitPieces({ ...el, parts: undefined, own: true, kids: [], text: "Whole text" }), [{ k: 0, text: "Whole text" }]);
   assert.ok(/window/.test(item(tagMenu(sample(), [], [6]), "split-text")!.note!));
+});
+
+test("any text or figure tag can be made an artifact of a kind, but not one holding a link", () => {
+  const map = sample();
+  const p = tagMenu(map, [], [3]);
+  assert.deepEqual(item(p, "artifact-footer")!.ops, [{ op: "set_decorative", element: 3, expect_role: "P", as: "footer" }]);
+  assert.deepEqual(item(p, "artifact-layout")!.ops, [{ op: "set_decorative", element: 3, expect_role: "P" }]);
+  assert.equal(item(p, "artifact-layout")!.group, "artifact");
+  // A figure's plain artifact is still "Decorative"; it can be a running header's logo too
+  const fig = tagMenu(map, [], [4]);
+  assert.equal(item(fig, "decorative")!.label, "Decorative");
+  assert.ok(item(fig, "artifact-header")!.ops);
+  // The document's top tag stays; a tag holding a link has to stay readable
+  assert.equal(item(tagMenu(map, [], [0]), "artifact-layout"), undefined);
+  const linked = doc([
+    { i: 0, role: "Document", parent: null },
+    { i: 1, role: "P", parent: 0, own: true, text: "See the site" },
+    { i: 2, role: "Link", parent: 1, annot: true },
+  ]);
+  assert.ok(/link or form field/.test(item(tagMenu(linked, [], [1]), "artifact-footer")!.disabled ?? ""));
+});
+
+test("the table editor opens from a table or any of its cells, and text tags can be made a table", () => {
+  const map = doc([
+    { i: 0, role: "Document", parent: null },
+    { i: 1, role: "P", parent: 0, own: true, text: "Lot Price" },
+    { i: 2, role: "P", parent: 0, own: true, text: "North $145" },
+    { i: 3, role: "Table", parent: 0 },
+    { i: 4, role: "TR", parent: 3 },
+    { i: 5, role: "TD", parent: 4, own: true, text: "Q1" },
+  ]);
+  assert.equal(item(tagMenu(map, [], [5]), "table")!.act, "table");
+  assert.equal(item(tagMenu(map, [], [3]), "table")!.disabled, undefined);
+  assert.equal(item(tagMenu(map, [], [1]), "table"), undefined);
+  // Other unsaved changes inside it first
+  const pending = [{ op: "set_cell" as const, element: 5, expect_role: "TD", role: "TH" as const, scope: "Column" }];
+  assert.ok(/other unsaved changes/.test(item(tagMenu(map, pending, [3]), "table")!.disabled ?? ""));
+  // Two paragraphs: enough pieces for a table
+  const make = item(tagMenu(map, [], [1, 2]), "make-table")!;
+  assert.deepEqual([make.act, make.group, make.disabled], ["make-table", "list", undefined]);
+  assert.equal(item(tagMenu(map, [], [1]), "make-table"), undefined);  // one piece isn't a table
+  // A figure that is really a drawn table can be made one too (its alt text goes)
+  const fig = doc([
+    { i: 0, role: "Document", parent: null },
+    { i: 1, role: "Figure", parent: 0, own: true, alt: "A grid", parts: [{ k: 0, kind: "content" }, { k: 1, kind: "content" }] },
+  ]);
+  const f = item(tagMenu(fig, [], [1]), "make-table")!;
+  assert.equal(f.disabled, undefined);
+  assert.ok(/alt text goes/.test(f.note ?? ""));
 });

@@ -16,7 +16,8 @@ terms used throughout (PDF/UA, tags, alt text, AI level and so on).
 
 You upload a PDF. The service adds the hidden structure that screen readers and other assistive technology need
 (headings, paragraphs, lists, tables, figures with descriptions, reading order, language and title), aiming at
-**PDF/UA-1**, the standard behind WCAG and Section 508 conformance for PDFs. It checks the result with veraPDF,
+**PDF/UA-1**, the standard behind WCAG and Section 508 conformance for PDFs (**PDF/UA-2** for a PDF 2.0 file, which
+can't be PDF/UA-1). It checks the result with veraPDF,
 the reference checker, and with its own checks, and gives you a list of what a person should look at. It never
 changes how your document looks, unless that's the only way to make it pass; then you get two files and choose.
 

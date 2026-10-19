@@ -1,0 +1,56 @@
+# Tests for rules.yml: promtool test rules (docs/operations/monitoring.md has the command)
+rule_files: [rules.yml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      # A worker pod not ready for 20 minutes is alerted; a backup job's pod isn't
+      - series: kube_pod_status_ready{pod="engine-worker-a", condition="false"}
+        values: "1x20"
+      - series: kube_pod_status_ready{pod="backup-123-x", condition="false"}
+        values: "1x20"
+      - series: kube_pod_owner{pod="backup-123-x", owner_kind="Job"}
+        values: "1x20"
+      # Documents waiting in the engine's queue for the whole half hour; the Adobe queue's don't count
+      - series: engine_queue_length{queue="engine"}
+        values: "2x40"
+      - series: engine_queue_length{queue="adobe"}
+        values: "5x40"
+      # A container at 95% of its memory limit
+      - series: container_memory_working_set_bytes{pod="engine-worker-b", container="engine-worker"}
+        values: "950x20"
+      - series: kube_pod_container_resource_limits{pod="engine-worker-b", container="engine-worker", resource="memory"}
+        values: "1000x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PodNotReady
+        exp_alerts:
+          - exp_labels: { pod: engine-worker-a }
+            exp_annotations: { description: "engine-worker-a has been running without being ready for 15 minutes." }
+      - eval_time: 20m
+        alertname: EngineQueueWaiting
+        exp_alerts: []
+      - eval_time: 32m
+        alertname: EngineQueueWaiting
+        exp_alerts:
+          - exp_labels: { queue: engine }
+            exp_annotations:
+              description: "At least 2 document(s) have been waiting for an engine worker for 30 minutes."
+      - eval_time: 20m
+        alertname: MemoryNearLimit
+        exp_alerts:
+          - exp_labels: { pod: engine-worker-b, container: engine-worker }
+            exp_annotations: { description: "engine-worker-b (engine-worker) is at 95% of its memory limit." }
+  - interval: 1m
+    input_series:
+      # Five restarts in the hour; another pod's one isn't
+      - series: kube_pod_container_status_restarts_total{pod="portal-worker-a", container="portal-worker"}
+        values: "0 1 2 3 4 5x55"
+      - series: kube_pod_container_status_restarts_total{pod="web-a", container="web"}
+        values: "0 1x59"
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: PodRestarting
+        exp_alerts:
+          - exp_labels: { pod: portal-worker-a }
+            exp_annotations: { description: "portal-worker-a restarted 5 times in the last hour." }

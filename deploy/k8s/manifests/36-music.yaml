@@ -16,6 +16,9 @@ spec:
   template:
     metadata:
       labels: { app: music-reader }
+      annotations:
+        prometheus.io/scrape: "true"  # busy or idle, pictures read (#397)
+        prometheus.io/port: "9464"
     spec:
       terminationGracePeriodSeconds: 180
       imagePullSecrets: [{ name: pdfrem-ghcr }]
@@ -29,6 +32,7 @@ spec:
             - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
             # The same allowance the engine waits for a whole score with (per page)
             - { name: OMR_PAGE_TIMEOUT_S, value: "${MUSIC_PAGE_SECONDS}" }
+          ports: [{ name: metrics, containerPort: 9464 }]
           resources:
             requests: { cpu: 250m, memory: 768Mi }
             limits: { cpu: "2", memory: ${MUSIC_MEMORY_LIMIT}, ephemeral-storage: 4Gi }

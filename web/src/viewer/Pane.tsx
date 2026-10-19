@@ -7,6 +7,7 @@ import { absorbedBy, deletedTags, overrides, pageOrder, type Area } from "./draf
 import { chooseAt, tagsAt, type LastHit } from "./hit";
 import { holes, subtree } from "./isolate";
 import { builtPreview } from "./outline";
+import { tablePreview, tableReplaced } from "./tablegrid";
 import { splitPreview } from "./figure";
 import { loadVersion, type PaneData } from "./pdf";
 import { PageView, type OverlayItem } from "./PageView";
@@ -170,14 +171,17 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
     const deleted = side === "right" ? deletedTags(data.tagmap, ops) : new Set<number>();
     // A list being built from a paragraph is drawn as it will be saved: the heading, each list and each item, in
     // place of the paragraph (and of the tags it takes in)
-    const building = side === "right" ? ops.filter((o): o is Extract<TagEdit, { op: "build_list" }> => o.op === "build_list") : [];
-    const builtFrom = new Set(building.flatMap((o) => [o.element, ...(o.absorb ?? [])]));
+    const building = side === "right" ? ops.filter((o): o is Extract<TagEdit, { op: "build_list" | "build_table" | "rebuild_table" }> =>
+      o.op === "build_list" || o.op === "build_table" || o.op === "rebuild_table") : [];
+    // ...and a table made or edited (#370), in place of the tags it replaces
+    const builtFrom = new Set(building.flatMap((o) => [o.element, ...(o.op === "build_list" ? o.absorb ?? [] : tableReplaced(data.tagmap, o))]));
     for (const op of building) {
       const el = data.tagmap.elements[op.element];
       if (!el || (mode === "off" && el.i !== selected)) continue;
-      for (const row of builtPreview(data.tagmap, op)) {
-        // A list's outline is set a little outside its items', or it would lie on their edges and not be seen
-        const pad = row.role !== "L" ? 0 : row.depth === 0 ? 4 : 2; // a nested list inside the one around it
+      for (const row of op.op === "build_list" ? builtPreview(data.tagmap, op) : tablePreview(data.tagmap, op)) {
+        // A list's (or table's, or row's) outline is set a little outside what it holds, or it would lie on their
+        // edges and not be seen
+        const pad = row.role === "Table" ? 4 : row.role === "TR" ? 2 : row.role !== "L" ? 0 : row.depth === 0 ? 4 : 2;
         for (const b of row.boxes) {
           const [x0, y0, x1, y1] = b.bbox;
           out[b.page - 1]?.items.push({ el, bbox: [x0 - pad, y0 - pad, x1 + pad, y1 + pad], role: row.role, findings: [], text: row.text, pending: true });
@@ -231,7 +235,9 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
   return (
     <section className="pv-pane" aria-label={`${side === "left" ? "Left" : "Right"}: ${version?.label ?? ""}`}>
       {picker}
-      <div className="pv-body" ref={(el) => { bodyRef.current = el; scrollRef(el); }} onScroll={onScroll}>
+      {/* Focusable, so the pages can be scrolled from the keyboard before any tag on them is chosen (#369) */}
+      <div className="pv-body" ref={(el) => { bodyRef.current = el; scrollRef(el); }} onScroll={onScroll} tabIndex={0}
+        role="region" aria-label={`Pages of ${version?.label ?? "this version"}`}>
         {!version || version.status !== "ready" ? (
           <p className="muted pv-msg">This version isn't ready.</p>
         ) : !version.has_tagmap ? (

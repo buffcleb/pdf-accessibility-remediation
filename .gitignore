@@ -35,3 +35,7 @@ deploy/k8s/tunnel.env
 
 # Private words scripts/publish.sh refuses to publish (never committed)
 .publish-deny
+
+# Accessibility checks (scripts/a11y.sh)
+web/a11y/report.json
+docker/mathcat/target/

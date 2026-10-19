@@ -464,7 +464,7 @@ def describe(data: bytes) -> dict | None:
 
 # --------------------------------------------------------------------------- the pipeline step
 def apply(pdf_path, analysis, records: list[dict], files: list[tuple[str, bytes]] | None = None,
-          score: list[tuple[str, bytes]] | None = None, notes: list[str] | None = None) -> int:
+          score: list[tuple[str, bytes]] | None = None, notes: list[str] | None = None, limits=None) -> int:
     """Find the music examples in the document, make each a figure, and (with the reading service) give it a
     reading as alt text. Appends one record per example: {"page", "bbox", "read": True/False, "measures", "notes",
     "full", "error", "file"}, and to `files` the notation of each example that was read, as (name, MusicXML): what
@@ -533,6 +533,9 @@ def apply(pdf_path, analysis, records: list[dict], files: list[tuple[str, bytes]
             cores.update({r.id: page_cores[n] for r, n in zip(made, own)})
             rasters[page.number] = raster
         regions.sort(key=lambda r: (r.page, r.bbox[1], r.bbox[0]))
+        if left_out and limits is not None:
+            limits.limit_hit("MUSIC_MAX_SCORE_LINES" if score_pages else "MUSIC_MAX_EXAMPLES", limit, limit + left_out,
+                             "lines of music were left as they were: not made figures, not read")
         if left_out and notes is not None:
             notes.append(f"{left_out} line(s) of music beyond the limit of {limit} "
                          f"({'MUSIC_MAX_SCORE_LINES' if score_pages else 'MUSIC_MAX_EXAMPLES'}) were left as they were, "

@@ -229,3 +229,125 @@ def test_text_can_be_pointed_at_a_note_by_hand_and_unpointed(tmp_path):
     for bad in ({"op": "link_note", "element": 3, "note": 3}, {"op": "link_note", "element": 3, "note": "4"}):
         with pytest.raises(EditError, match="a link needs the note"):
             validate_ops([bad])
+
+
+def _list_page(tmp_path, nested=False):
+    """A bulleted list whose second item ends in a raised mark (with sub-points under it, if nested), and the footnote
+    at the foot of the page."""
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 90), "The survey team brought the following equipment to every site:", fontsize=11,
+                     fontname="helv")
+    items = [(90, "- Two soil corers and a spare set of blades"), (90, "- A field balance accurate to a tenth of a gram"),
+             (90, "- Sample bags labeled with the site and the date")]
+    if nested:
+        items[2:2] = [(110, "- one for wet soil"), (110, "- one for dry soil")]
+    y = 112
+    for x, text in items:
+        page.insert_text((x, y), text, fontsize=11, fontname="helv")
+        if "balance" in text:
+            page.insert_text((x + fitz.get_text_length(text, "helv", 11), y - 4), "1", fontsize=7, fontname="helv")
+        y += 18
+    page.insert_text((72, y + 16), "Each site took about two hours to survey from start to finish.", fontsize=11,
+                     fontname="helv")
+    page.insert_text((72, 700), "1 Calibrated each morning against a 100 g reference weight.", fontsize=8,
+                     fontname="helv")
+    src = tmp_path / "list_notes.pdf"
+    doc.save(src)
+    return src
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_a_mark_in_a_list_item_is_a_reference_of_its_own(tmp_path, nested):
+    """#285: as in a paragraph, the mark is tagged apart inside the item, names the note, and says "footnote 1"."""
+    src = _list_page(tmp_path, nested)
+    out, result = _tag(src, tmp_path)
+    assert result.footnotes == 1 and result.footnote_references == 1
+    assert _pixels(out) == _pixels(src)                                   # marked apart, drawn the same
+    with pikepdf.open(out) as pdf:
+        findings, index = check_integrity(pdf)
+        assert [f for f in findings if f.severity == "error"] == []
+        note = next(e for e in index.elements if e.role == "Note")
+        ref = next(e for e in index.elements if e.role == "Reference")
+        assert [r.objgen for r in ref.obj.Ref] == [note.obj.objgen]
+        assert str(ref.obj.ActualText) == "footnote 1"
+        holder = index.elements[ref.parent]                                # the item's body (a Span, beside a sub-list)
+        assert holder.role == ("Span" if nested else "LBody") and "/ActualText" not in holder.obj
+        chain = []
+        e = holder
+        while e.parent is not None:
+            e = index.elements[e.parent]
+            chain.append(e.role)
+        assert chain[:2] == (["LBody", "LI"] if nested else ["LI", "L"])
+
+
+def _as_a_producer_tags_it(tagged, dst):
+    """The footnote tagging undone, as many producers leave it: the note a plain paragraph with no ID, the mark part
+    of its sentence (its Reference folded back in), nothing pointing anywhere."""
+    with pikepdf.open(tagged) as pdf:
+        root = pdf.Root.StructTreeRoot
+        if "/IDTree" in root:
+            del root["/IDTree"]
+
+        def walk(e):
+            kids = e.get("/K")
+            if isinstance(kids, pikepdf.Array):
+                out = []
+                for k in kids:
+                    if isinstance(k, pikepdf.Dictionary) and k.get("/S") == Name.Reference:
+                        inner = k.K
+                        out += list(inner) if isinstance(inner, pikepdf.Array) else [inner]
+                        continue
+                    if isinstance(k, pikepdf.Dictionary) and "/S" in k:
+                        walk(k)
+                    out.append(k)
+                e.K = pikepdf.Array(out)
+            elif isinstance(kids, pikepdf.Dictionary) and "/S" in kids:
+                walk(kids)
+            if e.get("/S") == Name.Note:
+                e.S = Name.P
+            for key in ("/ID", "/Ref"):
+                if key in e:
+                    del e[key]
+        walk(root)
+        # the folded marks' parent tree entries now name the paragraph
+        pt = root.ParentTree.Nums
+        for i in range(1, len(pt), 2):
+            arr = pt[i]
+            if isinstance(arr, pikepdf.Array):
+                for j, x in enumerate(arr):
+                    if isinstance(x, pikepdf.Dictionary) and x.get("/S") == Name.Reference:
+                        arr[j] = x.P
+        pdf.save(dst)
+    return dst
+
+
+def test_footnotes_reach_the_documents_own_tags_when_they_are_kept(tmp_path):
+    """#285: a document that arrives tagged, its footnote a plain paragraph: the kept paragraph becomes a Note with an
+    ID, and the kept paragraph with the mark names it and says the mark."""
+    first, _ = _tag(_page(tmp_path), tmp_path)
+    src = _as_a_producer_tags_it(first, tmp_path / "producer.pdf")
+    assert [r for r, _ in _roles(src)].count("Note") == 0 and "Reference" not in [r for r, _ in _roles(src)]
+    out = tmp_path / "kept.pdf"
+    result = tag_document(src, out, prepare_analysis(src), title="Notes", language="en-US")
+    assert result.existing_tags.get("usable"), result.existing_tags     # the document's own tags were kept
+    assert result.kept_notes == 1 and result.kept_note_refs == 1
+    with pikepdf.open(out) as pdf:
+        findings, index = check_integrity(pdf)
+        assert [f for f in findings if f.severity == "error"] == []
+        note = next(e for e in index.elements if e.role == "Note")
+        assert bytes(note.obj.ID).startswith(b"note-")                    # given its ID as any kept Note is
+        pointing = [e for e in index.elements if "/Ref" in e.obj]
+        assert len(pointing) == 1 and pointing[0].role == "P"
+        assert [r.objgen for r in pointing[0].obj.Ref] == [note.obj.objgen]
+        assert "soils (footnote 1)" in str(pointing[0].obj.ActualText)
+
+
+def test_a_kept_footnote_the_producer_already_tagged_is_left_alone(tmp_path):
+    first, _ = _tag(_page(tmp_path), tmp_path)                           # our own tags: Note, Reference, /Ref
+    out = tmp_path / "again.pdf"
+    result = tag_document(first, out, prepare_analysis(first), title="Notes", language="en-US")
+    assert result.kept_notes == 0 and result.kept_note_refs == 0
+    with pikepdf.open(out) as pdf:
+        index = check_integrity(pdf)[1]
+        assert [e.role for e in index.elements if "/Ref" in e.obj] == ["Reference"]

@@ -1,0 +1,426 @@
+# Monitoring (#397; applied when MONITORING=on in deploy.env): Prometheus, Grafana and the exporters they read.
+#
+# - Prometheus keeps ${PROMETHEUS_RETENTION} of history (at most ${PROMETHEUS_RETENTION_SIZE}) on its own volume. It
+#   reads this namespace's pods that ask to be read (prometheus.io/* annotations), the exporters below, and each
+#   node's kubelet for this namespace's containers' CPU, memory and volumes (deploy/k8s/monitoring/prometheus.yml).
+#   Its alerts (monitoring/rules.yml) go to super admins through the portal, with the portal's own.
+# - Grafana is at https://${APP_HOST}/grafana/, for super admins only: the web app's nginx asks the portal about
+#   every request (docker/web/16-grafana.sh), and Grafana takes the user it names (its auth proxy). There's no
+#   Grafana sign-in of its own. Its dashboards come from monitoring/dashboards; ones made in Grafana are kept on
+#   its volume.
+# - kube-state-metrics: what the cluster says about this namespace's pods, deployments and autoscalers (ready,
+#   restarts, wanted and running). Only this namespace: its Role reads nothing else.
+# - Exporters for Redis (queue memory and clients) and Postgres (its own statistics, through an account that reads
+#   no table: deploy/k8s/monitoring-role.sql).
+#
+# Nothing here is reachable from outside the cluster but Grafana, through the web app; the network policies at the
+# end say who may reach what.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: ${NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, endpoints]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus
+  namespace: ${NAMESPACE}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: prometheus }
+subjects: [{ kind: ServiceAccount, name: prometheus, namespace: ${NAMESPACE} }]
+---
+# The nodes, to find their kubelets, and the kubelets' metrics (filtered to this namespace as they're read)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${NAMESPACE}-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [nodes/metrics]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${NAMESPACE}-prometheus
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ${NAMESPACE}-prometheus }
+subjects: [{ kind: ServiceAccount, name: prometheus, namespace: ${NAMESPACE} }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ${MONITORING_STORAGE_CLASS}
+  resources: { requests: { storage: ${PROMETHEUS_SIZE} } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: prometheus }
+  ports: [{ name: http, port: 9090 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }  # one volume, one Prometheus
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus }
+      annotations:
+        checksum/config: "${PROMETHEUS_CONFIG_SHA}"
+        prometheus.io/scrape: "false"  # it reads itself (localhost)
+    spec:
+      serviceAccountName: prometheus
+      securityContext: { runAsUser: 65534, runAsGroup: 65534, fsGroup: 65534, runAsNonRoot: true,
+                         seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: prometheus
+          image: ${PROMETHEUS_IMAGE}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION}
+            - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE}
+            - --web.listen-address=:9090
+          ports: [{ containerPort: 9090 }]
+          readinessProbe:
+            httpGet: { path: /-/ready, port: 9090 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: 9090 }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "1", memory: ${PROMETHEUS_MEMORY_LIMIT}, ephemeral-storage: 256Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: data
+          persistentVolumeClaim: { claimName: prometheus-data }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: ${NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-state-metrics
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: [pods, persistentvolumeclaims]
+    verbs: [list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets]
+    verbs: [list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-state-metrics
+  namespace: ${NAMESPACE}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: kube-state-metrics }
+subjects: [{ kind: ServiceAccount, name: kube-state-metrics, namespace: ${NAMESPACE} }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: kube-state-metrics }
+  template:
+    metadata:
+      labels: { app: kube-state-metrics }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "8080" }
+    spec:
+      serviceAccountName: kube-state-metrics
+      securityContext: { runAsUser: 65534, runAsGroup: 65534, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: kube-state-metrics
+          image: ${KSM_IMAGE}
+          args:
+            - --namespaces=${NAMESPACE}
+            - --resources=pods,deployments,statefulsets,horizontalpodautoscalers,persistentvolumeclaims,jobs,cronjobs
+            # Each pod's app label: which service it belongs to (Administration > System's pods, #398)
+            - --metric-labels-allowlist=pods=[app]
+            - --port=8080
+            - --telemetry-port=8081
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi, ephemeral-storage: 64Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis-exporter }
+  template:
+    metadata:
+      labels: { app: redis-exporter }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9121" }
+    spec:
+      securityContext: { runAsUser: 59000, runAsGroup: 59000, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: redis-exporter
+          image: ${REDIS_EXPORTER_IMAGE}
+          env:
+            - { name: REDIS_ADDR, value: "redis://redis:6379" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
+            # The lengths of the engine's lists (the engine's own metrics have them too, by name)
+            - { name: REDIS_EXPORTER_CHECK_SINGLE_KEYS, value: "db0=celery,db0=adobe,db0=omr:requests" }
+          ports: [{ containerPort: 9121 }]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi, ephemeral-storage: 64Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres-exporter }
+  template:
+    metadata:
+      labels: { app: postgres-exporter }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9187" }
+    spec:
+      securityContext: { runAsUser: 65534, runAsGroup: 65534, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: postgres-exporter
+          image: ${POSTGRES_EXPORTER_IMAGE}
+          env:
+            - name: MONITORING_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-monitoring-env, key: MONITORING_DB_PASSWORD } }
+            - name: DATA_SOURCE_NAME
+              value: "postgresql://pdfrem_monitor:$(MONITORING_DB_PASSWORD)@postgres:5432/portal?sslmode=disable"
+          ports: [{ containerPort: 9187 }]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi, ephemeral-storage: 64Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: ${NAMESPACE}
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: false
+        jsonData: { timeInterval: 30s }
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: pdf-remediation
+        folder: PDF Remediation
+        type: file
+        allowUiUpdates: false
+        options: { path: /var/lib/grafana-dashboards }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ${MONITORING_STORAGE_CLASS}
+  resources: { requests: { storage: ${GRAFANA_SIZE} } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: grafana }
+  ports: [{ name: http, port: 3000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: grafana }
+  template:
+    metadata:
+      labels: { app: grafana }
+      annotations:
+        checksum/dashboards: "${GRAFANA_DASHBOARDS_SHA}"
+    spec:
+      securityContext: { runAsUser: 472, runAsGroup: 472, fsGroup: 472, runAsNonRoot: true,
+                         seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: grafana
+          image: ${GRAFANA_IMAGE}
+          env:
+            - { name: GF_SERVER_ROOT_URL, value: "https://${APP_HOST}/grafana/" }
+            - { name: GF_SERVER_SERVE_FROM_SUB_PATH, value: "true" }
+            # The user is the email the web app's nginx sends, after the portal said it's a super admin's
+            - { name: GF_AUTH_PROXY_ENABLED, value: "true" }
+            - { name: GF_AUTH_PROXY_HEADER_NAME, value: X-WEBAUTH-USER }
+            - { name: GF_AUTH_PROXY_HEADER_PROPERTY, value: email }
+            - { name: GF_AUTH_PROXY_AUTO_SIGN_UP, value: "true" }
+            - { name: GF_USERS_AUTO_ASSIGN_ORG_ROLE, value: Admin }
+            - { name: GF_USERS_ALLOW_SIGN_UP, value: "false" }
+            - { name: GF_AUTH_DISABLE_LOGIN_FORM, value: "true" }
+            - { name: GF_AUTH_DISABLE_SIGNOUT_MENU, value: "true" }
+            - { name: GF_AUTH_BASIC_ENABLED, value: "false" }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "false" }
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-monitoring-env, key: GRAFANA_ADMIN_PASSWORD } }
+            - name: GF_SECURITY_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: pdfrem-monitoring-env, key: GRAFANA_SECRET_KEY } }
+            - { name: GF_SECURITY_COOKIE_SECURE, value: "true" }
+            - { name: GF_SECURITY_DISABLE_GRAVATAR, value: "true" }
+            - { name: GF_ANALYTICS_REPORTING_ENABLED, value: "false" }
+            - { name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false" }
+            - { name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES, value: "false" }
+            - { name: GF_NEWS_NEWS_FEED_ENABLED, value: "false" }
+            - { name: GF_PLUGINS_PREINSTALL_DISABLED, value: "true" }
+          ports: [{ containerPort: 3000 }]
+          readinessProbe:
+            httpGet: { path: /grafana/api/health, port: 3000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /grafana/api/health, port: 3000 }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/grafana }
+            - { name: tmp, mountPath: /tmp }
+            - { name: provisioning, mountPath: /etc/grafana/provisioning/datasources/datasources.yaml,
+                subPath: datasources.yaml }
+            - { name: provisioning, mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml,
+                subPath: dashboards.yaml }
+            - { name: dashboards, mountPath: /var/lib/grafana-dashboards }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: grafana-data }
+        - name: tmp
+          emptyDir: { sizeLimit: 128Mi }
+        - name: provisioning
+          configMap: { name: grafana-provisioning }
+        - name: dashboards
+          configMap: { name: grafana-dashboards }
+---
+# Who may reach monitoring: Prometheus from the portal (alerts, the System page) and Grafana; Grafana from the web
+# app's nginx only, which sets the user header after asking the portal (so nobody else can name themselves to it);
+# the exporters from Prometheus. The services Prometheus reads let it in through 80-network-policies.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: prometheus } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+        - podSelector: { matchLabels: { app: grafana } }
+      ports: [{ port: 9090 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: grafana } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: web } } }]
+      ports: [{ port: 3000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: exporters
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [kube-state-metrics, redis-exporter, postgres-exporter] }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app: prometheus } } }]
+      ports: [{ port: 8080 }, { port: 9121 }, { port: 9187 }]

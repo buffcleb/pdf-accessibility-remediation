@@ -1,6 +1,7 @@
 """Help requests: asking for help with a document, the conversation about it, and the super admins' queue."""
 from __future__ import annotations
 
+import io
 import json
 import uuid
 from datetime import datetime
@@ -8,15 +9,16 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, helpdesk, settings_store
+from portal import approval, audit, helpdesk, malware, paging, settings_store
 from portal.db import get_db
 from portal.deps import Principal, current_principal, group_for_admin, require_super_admin
 from portal.errors import ApiError, conflict, not_found, too_many
 from portal.models import HELP_KINDS, HELP_STATUSES, DocumentVersion, Group, HelpAttachment, HelpRequest, Job, User
+from portal.paging import Page
 from portal.security.ratelimit import RateLimiter, get_rate_limiter
 from portal.storage import get_storage, safe_name
 
@@ -183,6 +185,7 @@ def ask_for_help(job_id: uuid.UUID, request: Request,
             raise ApiError(422, "invalid", "The tag reference isn't valid.") from None
     max_file, max_req = _limits(db)
     uploads = helpdesk.read_attachments(files, 0, max_file, max_req)
+    _scan(db, request, p.user, uploads)
 
     req = HelpRequest(id=uuid.uuid4(), job_id=job.id, filename=job.filename, user_id=p.user.id, group_id=job.group_id,
                       kind=kind, status="open", version_number=version, version_label=label, page=page, tag=tag_data,
@@ -259,6 +262,7 @@ def post_message(request_id: uuid.UUID, request: Request,
         raise too_many()
     max_file, max_req = _limits(db)
     uploads = helpdesk.read_attachments(files, helpdesk.attachments_bytes(db, req), max_file, max_req)
+    _scan(db, request, p.user, uploads)
     msg = helpdesk.add_message(db, req, p.user, role, "note" if internal else "message", body)
     helpdesk.store_attachments(db, req, msg, uploads)
     if not internal:
@@ -343,6 +347,73 @@ def assign(request_id: uuid.UUID, body: Assign, request: Request, p: Principal =
     return _out(db, req, role)
 
 
+# The list's own view of a request, as SQL (#514): it needs a super admin (HelpRequest.needs_staff), and since when it
+# has waited (_summary): since the person last wrote, or since its status last changed
+_NEEDS_STAFF, _WAITING_SINCE = helpdesk.NEEDS_STAFF, helpdesk.WAITING_SINCE
+HELP_SORTS = {"waiting": _WAITING_SINCE, "updated": HelpRequest.updated_at, "created": HelpRequest.created_at,
+              "document": func.lower(HelpRequest.filename)}
+HELP_SHOW = ("needs_us", "active", "all", *HELP_STATUSES)
+
+
+class HelpPage(Page[HelpSummary]):
+    needs_us: int  # active requests needing a super admin, whatever the filters (for the Show list's count)
+
+
+def _help_page(db: Session, scope: list, *, saved: bool | None, show: str, kind: str | None, group_id: uuid.UUID | None,
+               q: str, sort: str, page: int, page_size: int) -> HelpPage:
+    """One page of the requests in `scope` (every one, or a group's): show what needs us, what isn't finished, one
+    status or everything; filter by kind and group; search by document or person; sort by how long it has waited
+    (oldest first), last activity, when it was made, or document."""
+    if show not in HELP_SHOW:
+        raise ApiError(422, "bad_filter", "Unknown view.")
+    stmt = select(HelpRequest).where(*scope)
+    if saved is not None:  # (a group's list has both)
+        stmt = stmt.where(HelpRequest.saved.is_(saved))
+    if not saved:
+        if show == "needs_us":
+            stmt = stmt.where(_NEEDS_STAFF)
+        elif show == "active":
+            stmt = stmt.where(HelpRequest.status.in_(("open", "in_progress", "waiting")))
+        elif show != "all":
+            stmt = stmt.where(HelpRequest.status == show)
+    if kind in HELP_KINDS:
+        stmt = stmt.where(HelpRequest.kind == kind)
+    if group_id:
+        stmt = stmt.where(HelpRequest.group_id == group_id)
+    if q.strip():
+        pattern = paging.like(q)
+        stmt = stmt.where(or_(func.lower(HelpRequest.filename).like(pattern, escape="\\"),
+                              HelpRequest.user_id.in_(select(User.id).where(User.email.like(pattern, escape="\\")))))
+    found = paging.page_of(db, stmt, paging.order_by(sort, HELP_SORTS, HelpRequest.id), page, page_size, lambda r: r)
+    jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_([r.job_id for r in found.items if r.job_id])))}
+    needs = db.scalar(select(func.count()).select_from(HelpRequest).where(*scope, HelpRequest.saved.is_(False),
+                                                                          _NEEDS_STAFF)) or 0
+    return HelpPage(items=[HelpSummary(**_summary(r, jobs.get(r.job_id))) for r in found.items], total=found.total,
+                    page=found.page, page_size=found.page_size, needs_us=needs)
+
+
+@router.get("/admin/help/list", response_model=HelpPage)
+def queue_page(saved: bool = False, show: str = Query("needs_us", max_length=16),
+               kind: str | None = Query(None, max_length=16), group_id: uuid.UUID | None = None,
+               q: str = Query("", max_length=200), sort: str = Query("waiting", max_length=20),
+               page: int = Query(1, ge=1, le=100_000), page_size: int = Query(25, ge=1, le=200),
+               _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Every help request (or the saved ones), a page at a time (#514): see _help_page."""
+    return _help_page(db, [], saved=saved, show=show, kind=kind, group_id=group_id, q=q, sort=sort, page=page,
+                      page_size=page_size)
+
+
+@router.get("/groups/{group_id}/help/list", response_model=HelpPage)
+def group_page(group_id: uuid.UUID, show: str = Query("all", max_length=16), kind: str | None = Query(None, max_length=16),
+               q: str = Query("", max_length=200), sort: str = Query("-updated", max_length=20),
+               page: int = Query(1, ge=1, le=100_000), page_size: int = Query(25, ge=1, le=200),
+               p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """A group's help requests for its admins, a page at a time (#514), newest activity first: see _help_page."""
+    group: Group = group_for_admin(group_id, p, db)
+    return _help_page(db, [HelpRequest.group_id == group.id], saved=None, show=show, kind=kind, group_id=None, q=q,
+                      sort=sort, page=page, page_size=page_size)
+
+
 @router.get("/admin/help", response_model=list[HelpSummary])
 def queue(saved: bool = False, status: str | None = Query(None, max_length=16), kind: str | None = Query(None, max_length=16),
           group_id: uuid.UUID | None = None, q: str | None = Query(None, max_length=200),
@@ -381,6 +452,13 @@ def _active_elsewhere(db: Session, req: HelpRequest) -> bool:
         HelpRequest.status.in_(("open", "in_progress", "waiting")))) is not None
 
 
+def _scan(db: Session, request: Request, user, uploads: list[tuple[str, str, bytes]]) -> None:
+    """Help-desk attachments go to whoever handles the request as they were uploaded: each is scanned first, with
+    MALWARE_SCAN=clamav (#455)."""
+    for name, _ctype, data in uploads:
+        malware.check(db, request, user, io.BytesIO(data), name, "help_attachment")
+
+
 @router.post("/help/{request_id}/corrected", response_model=HelpOut, status_code=201)
 def upload_corrected(request_id: uuid.UUID, request: Request, file: UploadFile = File(...),
                      p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
@@ -397,6 +475,7 @@ def upload_corrected(request_id: uuid.UUID, request: Request, file: UploadFile =
     rs = settings_store.load(db)
     checked = receive_pdf(file, rs.max_file_mb * 1024 * 1024, rs.max_pages_per_document)
     try:
+        malware.check(db, request, p.user, checked.file, file.filename or "corrected file", "corrected_upload")
         if checked.pages != job.pages:
             raise ApiError(422, "page_count", f"The corrected file has {checked.pages} pages; the document has {job.pages}. "
                                               "Corrected files must have the same pages.")

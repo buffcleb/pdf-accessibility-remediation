@@ -14,6 +14,10 @@ model behind a level.
 **Alt text (alternative text).** A short description of an image, read aloud by screen readers instead of the
 image. The AI writes a first draft for every figure; charts and diagrams are worth checking.
 
+**API token.** (New 22 October 2026.) A key a script uses to send documents for you, made in **Settings** when your
+group allows it. Each token sends to one processing option and AI level, and may also check on documents and
+download them. See [Scripting](people/scripting.md).
+
 **Artifact.** Content that's decoration rather than meaning (page numbers, running headers, borders, a scanned
 page's background). Screen readers skip it. In the tag manager, **Mark as artifact** makes a tag's content one.
 

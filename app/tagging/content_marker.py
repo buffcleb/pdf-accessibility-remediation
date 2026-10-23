@@ -79,6 +79,11 @@ class StreamMarks:
     mcids: list[tuple[int, str]] = field(default_factory=list)  # (mcid, target_key) created by us
     existing: dict[int, BBox] = field(default_factory=dict)  # pre-existing MCID -> bbox of its content
     existing_kinds: dict[int, set] = field(default_factory=dict)  # pre-existing MCID -> what it draws (text, image…)
+    # Pre-existing MCIDs whose text draws a visible character: their text that isn't only spaces (#490)
+    existing_ink: set = field(default_factory=set)
+    # Pre-existing MCID -> the Form XObjects drawn inside its sequence (#435: a whole page of text placed as one form
+    # and tagged as one figure)
+    existing_forms: dict[int, list] = field(default_factory=dict)
     # Pre-existing /Artifact sequences, numbered in stream order: their /Type and /Subtype, and how much of their text
     # the layout calls body text (points of width), for releasing body text a producer hid as an artifact
     artifacts: dict[int, dict] = field(default_factory=dict)
@@ -97,6 +102,7 @@ class MarkResult:
     stripped_marks: int = 0
     forms_wrapped: int = 0
     released_artifacts: int = 0  # existing artifact sequences unwrapped so their body text gets tagged
+    released_tags: int = 0  # existing tagged sequences unwrapped so what they draw is tagged afresh (#435)
     # Characters shown inside a figure or as decoration: font (object number, generation) -> character codes.
     # The ones with no Unicode meaning (note heads, pieces of a drawn line) get private-use values afterwards
     picture_glyphs: dict[tuple[int, int], set[int]] = field(default_factory=dict)
@@ -154,6 +160,7 @@ class ContentMarker:
         strip_existing: bool = False,
         recursable_forms: set[tuple[int, int]] | None = None,
         release_artifacts: dict[tuple[int, int], set[int]] | None = None,
+        release_mcids: dict[tuple[int, int], set[int]] | None = None,
     ):
         self.pdf = pdf
         self.page = page
@@ -163,8 +170,12 @@ class ContentMarker:
         self.recursable_forms = recursable_forms or set()
         # Existing /Artifact sequences to unwrap (owner objgen -> sequence numbers): their content is tagged afresh
         self.release_artifacts = release_artifacts or {}
+        # Existing tagged sequences to unwrap (owner objgen -> MCIDs): what they draw is tagged afresh, a form inside
+        # from the inside (#435)
+        self.release_mcids = release_mcids or {}
         self.result = MarkResult()
         self._width_cache: dict = {}
+        self._blank_cache: dict = {}
         self._z = 0  # drawing order across the page and the forms drawn on it
         # The forms being tagged from the inside right now: one that draws itself (or two that draw each other)
         # would otherwise be entered again and again until Python's recursion limit
@@ -204,6 +215,7 @@ class ContentMarker:
         word_space = 0.0
         two_byte = False
         widths: _Widths | None = None
+        blanks: frozenset[int] = frozenset()  # the font's codes that draw only white space
         fdict = None
         fonts = resources.get("/Font") or Dictionary()
         xobjects = resources.get("/XObject") or Dictionary()
@@ -212,6 +224,7 @@ class ContentMarker:
         mc_stack: list[tuple[bool, bool, int | None, int | None]] = []
         art_seq = 0
         release = self.release_artifacts.get(owner.objgen, set()) if owner.is_indirect else set()
+        release_tags = self.release_mcids.get(owner.objgen, set()) if owner.is_indirect else set()
         open_key: str | None = None
         path_buf: list = []
         path_pts: list[tuple[float, float]] = []
@@ -257,7 +270,7 @@ class ContentMarker:
             open_key = key
 
         def emit_unit(kind: str, bbox: BBox | None, ops: list, xref: int = 0, covers: bool = True,
-                      glyphs: bool = False) -> None:
+                      glyphs: bool = False, blank: bool = False) -> None:
             if bbox is not None:
                 self._z += 1
                 if kind == "text":
@@ -272,6 +285,8 @@ class ContentMarker:
                 mcid = current_existing_mcid()
                 if mcid is not None:
                     marks.existing_kinds.setdefault(mcid, set()).add(kind)
+                    if kind == "text" and not blank:
+                        marks.existing_ink.add(mcid)
                 seq = current_artifact()
                 if seq is not None and bbox is not None:
                     info = marks.artifacts[seq]
@@ -290,11 +305,16 @@ class ContentMarker:
                         min(prev[0], bbox[0]), min(prev[1], bbox[1]), max(prev[2], bbox[2]), max(prev[3], bbox[3]))
                 out.extend(ops)
                 return
+            spaces = False
             if bbox is None:
                 key, tag = "artifact:Layout", "Artifact"
             else:
                 key, tag = self.resolve(kind, bbox, xref)
-            if glyphs and fdict is not None and fdict.is_indirect and not two_byte:
+                # Spaces near no text (Word writes one after a picture on its own line) say nothing: tagged as a
+                # paragraph of their own, they were an empty P
+                if blank and key == getattr(self.resolve, "unmatched_key", None):
+                    key, tag, spaces = "artifact:Layout", "Artifact", True
+            if glyphs and not spaces and fdict is not None and fdict.is_indirect and not two_byte:
                 picture = tag == "Figure" or key.startswith("artifact:")
                 codes = (self.result.picture_glyphs if picture else self.result.body_glyphs).setdefault(fdict.objgen, set())
                 counts = self.result.glyph_counts.setdefault(fdict.objgen, [0, 0])
@@ -433,7 +453,9 @@ class ContentMarker:
             bbox = bbox_of_points(apply(m, x, y) for x, y in corners)
             # A drawing font's characters are strokes (LaTeX's picture lines and circles): placed as drawings are,
             # in the figure they lie in or as decoration, never as a paragraph
-            emit_unit("path" if _is_drawing_font(fdict) else "text", bbox, [ins], glyphs=True)
+            blank = bool(blanks) and all(c in blanks for it in items if isinstance(it, pikepdf.String)
+                                         for c in bytes(it))
+            emit_unit("path" if _is_drawing_font(fdict) else "text", bbox, [ins], glyphs=True, blank=blank)
             tm = mat_mul((1, 0, 0, 1, adv, 0), tm)
 
         for ins in instructions:
@@ -500,9 +522,12 @@ class ContentMarker:
                                                     "bbox": None, "kinds": set(),
                                                     "nested": inside_existing()}
                     released = seq is not None and seq in release
-                    strip = is_tag and (self.strip_existing or released)
+                    released_tag = mcid is not None and mcid in release_tags
+                    strip = is_tag and (self.strip_existing or released or released_tag)
                     if released:
                         self.result.released_artifacts += 1
+                    if released_tag:
+                        self.result.released_tags += 1
                     close()
                     mc_stack.append((is_tag, strip, mcid, seq))
                     if strip:
@@ -561,6 +586,7 @@ class ContentMarker:
                 fdict = fonts.get(args[0]) if isinstance(args[0], Name) else None
                 two_byte = bool(fdict is not None and fdict.get("/Subtype") == Name.Type0)
                 widths = _font_widths(fdict, self._width_cache) if fdict is not None else None
+                blanks = _blank_codes(fdict, self._blank_cache) if fdict is not None and not two_byte else frozenset()
 
             # ---- text showing --------------------------------------------------------------
             if op in _TEXT_SHOW:
@@ -589,6 +615,8 @@ class ContentMarker:
                     emit_unit("image", bbox, [ins], xobj.objgen[0], covers="/SMask" not in xobj and "/Mask" not in xobj)
                     continue
                 if subtype == Name.Form:
+                    if inside_existing() and (held := current_existing_mcid()) is not None:
+                        marks.existing_forms.setdefault(held, []).append(xobj.objgen)
                     fm = tuple(_num(v) for v in xobj.get("/Matrix", [1, 0, 0, 1, 0, 0]))
                     form_ctm = mat_mul(fm, gs.ctm)  # type: ignore[arg-type]
                     if (not inside_existing() and xobj.objgen in self.recursable_forms
@@ -753,6 +781,26 @@ def _font_widths(font, cache: dict) -> _Widths | None:
             result = out or None
     except Exception:  # noqa: BLE001 - odd fonts: fall back to estimates
         result = None
+    if key is not None:
+        cache[key] = result
+    return result
+
+
+def _blank_codes(font, cache: dict) -> frozenset[int]:
+    """The codes of a simple font that stand for white space: from its ToUnicode map (Word's subset fonts draw a space
+    as whatever code the subset gave it), else the standard encodings' space, 32. cache belongs to one document."""
+    from app.tagging.font_unicode import parse_tounicode
+
+    key = font.objgen if font.is_indirect else None
+    if key is not None and key in cache:
+        return cache[key]
+    result = frozenset({32})
+    try:
+        tu = font.get("/ToUnicode")
+        if isinstance(tu, pikepdf.Stream):
+            result = frozenset(c for c, t in parse_tounicode(tu.read_bytes()).items() if t.isspace())
+    except Exception:  # noqa: BLE001 - an unreadable map: no code is taken for a space
+        result = frozenset()
     if key is not None:
         cache[key] = result
     return result

@@ -13,6 +13,7 @@ spec:
       # The label the Postgres network policy admits (80-network-policies.yaml) must be on the pod, not only the Job
       labels: { app: portal-migrate }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       restartPolicy: Never
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }

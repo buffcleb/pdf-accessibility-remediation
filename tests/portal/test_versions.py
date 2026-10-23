@@ -498,3 +498,81 @@ def test_describe_needs_an_ai_level_and_says_when_the_ai_is_down(setup):
     s["engine"].describe_answer = EngineUnavailable("gateway down")
     r = s["c"]["user"].post(url, json=body)
     assert r.status_code == 503 and r.json()["detail"]["error"] == "ai_unavailable"
+
+
+def test_an_edit_carries_the_ai_readings_flagged_on_its_base_version(setup):
+    """A reviewed version is an edit job, with no AI enrichment: the AI's readings flagged on the version it's based
+    on go to the engine with the edits, so they're flagged again on the result."""
+    s = setup
+    job_id = _completed_job(s)
+    db = s["db"]
+    base = db.scalar(select(DocumentVersion).where(DocumentVersion.job_id == uuid.UUID(job_id),
+                                                   DocumentVersion.number == 1))
+    two = {"readings": [{"source": "ai", "text": "x squared"}, {"source": "rule", "text": "x cubed"}],
+           "differs": {"numbers": {"ai_only": ["2"], "rule_only": ["3"]}}}
+    base.summary = {**base.summary, "findings": [
+        {"issue": "read-aloud text written by AI", "page": 1, "element": 5,
+         "extra": {"ai_read": [0, [1, 2, 3, 4], "chemistry", "water"]}},
+        {"issue": "two readings of a formula disagree", "page": 2, "element": 9,
+         "extra": {**two, "ai_read": [1, [5, 6, 7, 8], "formula", "x squared"]}},
+        {"issue": "alt text missing", "page": 1, "element": 3}]}
+    db.commit()
+    r = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS})
+    assert r.status_code == 201, r.text
+    worker.submit_versions(db)
+    assert s["engine"].ai_reads[-1] == [
+        {"ai_read": [0, [1, 2, 3, 4], "chemistry", "water"], "element": 5},
+        {"ai_read": [1, [5, 6, 7, 8], "formula", "x squared"], "element": 9, "readings": two}]
+
+
+def _checking(s, job_id):
+    """A saved version whose engine job has published its file and tag map, still checking (#428)."""
+    r = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS})
+    assert r.status_code == 201, r.text
+    db = s["db"]
+    worker.submit_versions(db)
+    v = db.scalar(select(DocumentVersion).where(DocumentVersion.number == r.json()["number"],
+                                                DocumentVersion.job_id == uuid.UUID(job_id)))
+    base = f"/api/v1/jobs/{v.engine_job_id}/files"
+    s["engine"].jobs[v.engine_job_id] = {"status": "processing", "partial": {
+        "files": {"remediated_primary": f"{base}/doc_reviewed.pdf"}, "tag_map": f"{base}/doc_tagmap_primary.json"}}
+    worker.poll_versions(db)
+    return v
+
+
+def test_a_saved_version_opens_while_its_checks_run(setup):
+    s = setup
+    job_id = _completed_job(s)
+    db = s["db"]
+    fetched = []
+    real = s["engine"].fetch
+    s["engine"].fetch = lambda path, out: fetched.append(path.rsplit("/", 1)[1]) or real(path, out)
+    v = _checking(s, job_id)
+    assert (v.status, v.checking) == ("ready", True)
+    assert v.pdf_file_id and v.tagmap_file_id and v.summary is None
+    listed = s["c"]["user"].get(f"{API}/jobs/{job_id}/versions").json()["versions"]
+    out = next(x for x in listed if x["number"] == v.number)
+    assert out["checking"] is True and out["has_tagmap"] is True
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{v.number}/tagmap").status_code == 200
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{v.number}/pdf").status_code == 200
+    assert worker._engine_in_flight(db) >= 1  # it still holds its place at the engine
+    # The checks finish: the verdict and findings fill in, and the file and tag map aren't fetched again
+    pdf_id = v.pdf_file_id
+    s["engine"].complete_edit(v.engine_job_id, compliant=False)
+    worker.poll_versions(db)
+    db.refresh(v)
+    assert (v.status, v.checking, v.pdf_file_id) == ("ready", False, pdf_id)
+    assert v.summary["compliant"] is False
+    assert sorted(fetched) == ["doc_reviewed.pdf", "doc_tagmap_primary.json", "doc_verapdf_after_ua1.xml"]
+
+
+def test_checks_that_dont_finish_leave_the_version_open(setup):
+    s = setup
+    job_id = _completed_job(s)
+    db = s["db"]
+    v = _checking(s, job_id)
+    s["engine"].fail(v.engine_job_id, "worker_lost")
+    worker.poll_versions(db)
+    db.refresh(v)
+    assert (v.status, v.checking) == ("ready", False)
+    assert v.summary["checks_unfinished"] is True and "didn't finish" in v.error_message

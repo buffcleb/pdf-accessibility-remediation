@@ -1,13 +1,38 @@
 import { useState, type FormEvent } from "react";
-import { get, type AccessCheck, type AttentionItem } from "../api";
-import { ErrorNotice, Loading, Notice, useLoad } from "./ui";
+import { Link } from "react-router-dom";
+import { del, get, post, type AccessCheck, type AttentionAck, type AttentionItem } from "../api";
+import { ErrorNotice, LiveRegion, Loading, Notice, fmtDate, useLoad } from "./ui";
 
 const KIND: Record<AttentionItem["severity"], "bad" | "warn" | "info"> = { bad: "bad", warn: "warn", info: "info" };
 const SEVERITY: Record<AttentionItem["severity"], string> = { bad: "Problem", warn: "Warning", info: "Note" };
 
-/** What needs an administrator's attention, most serious first, each with what to do about it. */
+/** What needs an administrator's attention, most serious first, each with what to do about it, a link to what it's
+ * about, and (for a summary or notice) Acknowledge: hidden for everyone who sees this list until something new joins
+ * it (#538). */
 export function AttentionList({ path, title = "Needs attention" }: { path: string; title?: string }) {
   const items = useLoad(() => get<AttentionItem[]>(path), [path]);
+  const [showAcked, setShowAcked] = useState(false);
+  const acked = useLoad(() => showAcked ? get<AttentionAck[]>(`${path}/acknowledged`) : Promise.resolve([]), [path, showAcked]);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState<unknown>(null);
+  const [said, setSaid] = useState("");
+
+  async function act(key: string, title: string, undo: boolean) {
+    setBusy(key);
+    setError(null);
+    try {
+      const now = undo ? await del<AttentionItem[]>(`${path}/acknowledge?key=${encodeURIComponent(key)}`)
+        : await post<AttentionItem[]>(`${path}/acknowledge`, { key });
+      if (now) items.setData(now);
+      if (showAcked) void acked.reload();
+      setSaid(undo ? `Shown again: ${title}` : `Acknowledged: ${title}`);
+    } catch (e) {
+      setError(e);
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <section className="panel" aria-labelledby="att-h">
       <div className="page-head" style={{ alignItems: "center" }}>
@@ -16,6 +41,8 @@ export function AttentionList({ path, title = "Needs attention" }: { path: strin
       </div>
       {items.loading && !items.data && <Loading />}
       <ErrorNotice error={items.error} />
+      <ErrorNotice error={error} />
+      <LiveRegion message={said} />
       {items.data && items.data.length === 0 && (
         <Notice kind="good" title="All clear">No pools are empty or running low, and no documents are stuck or failing.</Notice>
       )}
@@ -28,11 +55,45 @@ export function AttentionList({ path, title = "Needs attention" }: { path: strin
                 <strong><span className="visually-hidden">{SEVERITY[i.severity]}: </span>{i.title}</strong>
                 <span>{i.detail}</span>
                 {i.fix && <span className="small"><strong>What to do:</strong> {i.fix}</span>}
+                {!!i.earlier && <span className="small muted">Not counting {i.earlier} acknowledged earlier.</span>}
+                {(i.link || i.ackable) && (
+                  <span className="small attention-actions">
+                    {i.link && <Link to={i.link}>{i.link_label ?? "Open"}<span className="visually-hidden">: {i.title}</span></Link>}
+                    {i.ackable && (
+                      <button type="button" className="btn secondary small" disabled={busy === i.key}
+                        onClick={() => void act(i.key, i.title, false)}>
+                        {busy === i.key ? "Acknowledging…" : "Acknowledge"}<span className="visually-hidden">: {i.title}</span>
+                      </button>
+                    )}
+                  </span>
+                )}
               </div>
             </li>
           ))}
         </ul>
       )}
+      <details className="attention-acked" onToggle={(e) => setShowAcked((e.target as HTMLDetailsElement).open)}>
+        <summary>Acknowledged</summary>
+        <p className="muted small">Hidden for everyone who sees this list until something new joins them.</p>
+        {acked.loading && !acked.data && <Loading />}
+        <ErrorNotice error={acked.error} />
+        {acked.data && acked.data.length === 0 && <p className="muted small">Nothing acknowledged.</p>}
+        {acked.data && acked.data.length > 0 && (
+          <ul className="attention-acked-list">
+            {acked.data.map((a) => (
+              <li key={a.key}>
+                <strong>{a.title}</strong>
+                <span className="small muted">
+                  By {a.acked_by}, {fmtDate(a.acked_at)}. {a.still === 0 ? "All dealt with or past the list's time."
+                    : `${a.still} of ${a.count} still there.`}
+                </span>
+                <button type="button" className="btn secondary small" disabled={busy === a.key}
+                  onClick={() => void act(a.key, a.title, true)}>Show again<span className="visually-hidden">: {a.title}</span></button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </details>
     </section>
   );
 }

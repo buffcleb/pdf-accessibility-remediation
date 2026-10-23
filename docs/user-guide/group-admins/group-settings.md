@@ -39,11 +39,25 @@ Independently, super admins can show a notice when a particular option is picked
 
 ## Describe with AI
 
+> **Changed 22 October 2026:** one person's setting is in the **Manage** dialog on their row under **People**.
+
 In the tag manager's **Split the figure** window, **Describe with AI** writes the alt text for the part someone picked
 or boxed: one AI call at the document's AI level each time, recorded on the document's cost. Choose whether your
 group's people have it: **Follow the service default** (whatever the super admins set), **On for the group** or
-**Off for the group**. For one person, open their row under **People** and set **Describe with AI** to **Follow
-the group**, **On** or **Off**. The person's setting wins over the group's, and the group's over the service default.
+**Off for the group**. For one person, choose **Manage** on their row under **People** and set **Describe with AI**
+to **Follow the group**, **On** or **Off**. The person's setting wins over the group's, and the group's over the service default.
+
+## API tokens
+
+**Let people make API tokens** allows the group's people to make tokens for scripts that send documents (see the
+people's guide, *Email and settings*). Each token sends to one processing option and AI level the person may use,
+and goes through the same pages and limits as the web app. Super admins switch tokens on for the service first.
+Switching this off stops every token in the group at once.
+
+**The group's API tokens**, under the switch, lists your people's tokens: whose, what each sends to and may do, when
+it expires and was last used (never the token itself). **Revoke** stops one at once, and it's recorded in the audit
+log. Documents sent by a script are marked **sent by script** on their page, and the group's **Documents** can be
+filtered to them.
 
 ## Managed by super admins
 

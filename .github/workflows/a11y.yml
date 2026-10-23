@@ -22,7 +22,10 @@ jobs:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: portal
         ports: ["5432"]
+        # The data in memory: on a runner that stays up, each job's database otherwise leaves an anonymous volume
+        # behind (about 1,700 small files); thousands of them used up the disk's inodes (2026-10-21)
         options: >-
+          --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U portal" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v7

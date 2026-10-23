@@ -211,6 +211,22 @@ def test_split_makes_two_tags_of_the_same_type(report, tmp_path):
     assert "split" in log[0]
 
 
+def test_a_split_can_give_its_new_part_a_type_of_its_own(report, tmp_path):
+    # #427: the new part's type chosen in the tag manager before saving, as it showed it
+    tm = build_tagmap(report)
+    target = next(e for e in tm["elements"] if e.get("parts") and len(e["parts"]) >= 2 and e["role"] == "P")
+    dst, log = _edit(report, tmp_path, [
+        {"op": "split", "element": target["i"], "expect_role": "P", "at": 1, "role": "H2"}])
+    after = build_tagmap(dst)["elements"]
+    assert len(after) == len(tm["elements"]) + 1
+    kept = after[target["i"]]
+    made = next(e for e in after if e["parent"] == kept["parent"] and e["i"] > kept["i"])
+    assert (kept["role"], made["role"]) == ("P", "H2")
+    assert "the new part is a H2" in log[0]
+    with pytest.raises(EditError, match="new part can be"):
+        validate_ops([{"op": "split", "element": 1, "at": 1, "role": "Figure"}])
+
+
 def test_merge_then_split_round_trip_stays_valid(report, tmp_path):
     tm = build_tagmap(report)
     ps = [e for e in tm["elements"] if e["role"] == "P" and e["own"]]
@@ -1025,7 +1041,12 @@ def test_deleting_a_section_keeps_its_links_and_moves_them_up(tmp_path):
     kept = [e for e in after["elements"] if e["role"] == "Link"]
     assert len(kept) == 2 and "2 link(s) and form field(s) kept" in log[0]
     top = next(e for e in after["elements"] if e["parent"] is None)
-    assert all(e["parent"] == top["i"] for e in kept)                    # moved up, in their place and order
+    # Moved up, in their place and order: into the top tag, in a paragraph there (a link doesn't stand directly in a
+    # grouping tag, #438)
+    holders = {e["parent"] for e in kept}
+    assert len(holders) == 1
+    holder = after["elements"][holders.pop()]
+    assert holder["parent"] == top["i"] and holder["role"] == "P"
     assert [e["name"] for e in kept] == [e["name"] for e in links]
     assert not [e for e in after["elements"] if e["role"] == target["role"] and e["i"] != top["i"]
                 and (e.get("text") or "") == (target.get("text") or "")]

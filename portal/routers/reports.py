@@ -17,7 +17,10 @@ from portal.deps import Principal, current_principal, group_for_admin, require_a
 from portal.errors import not_found
 from portal.models import AuditEvent, Group, Job, QuotaLedger, User
 from portal.routers.common import LedgerOut
-from portal.routers.jobs import DocumentsPage, JobOut, documents_page, job_out
+from portal.routers.jobs import (
+    DocumentsPage, ExportPlanOut, ExportRequest, JobOut, Neighbours, documents_page, documents_query, export_plan,
+    export_plan_out, export_zip, job_out, neighbours,
+)
 from portal.schemas import effective_cap, group_balance
 from portal.security.ratelimit import per_person
 
@@ -74,7 +77,7 @@ def group_documents(group_id: uuid.UUID, q: str = Query("", max_length=200), sta
                     result: str | None = Query(None, max_length=20), service: str | None = Query(None, max_length=64),
                     audit: bool | None = None, since: datetime | None = None, until: datetime | None = None,
                     sort: str = Query("-created_at", max_length=20), page: int = Query(1, ge=1, le=100_000),
-                    page_size: int = Query(25, ge=1, le=200),
+                    page_size: int = Query(25, ge=1, le=200), via: str | None = Query(None, pattern="^(script|web)$"),
                     p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """A group's documents for its admins, a page at a time, searched, filtered and sorted like a person's own
     list; the search also finds a person by email. A group with thousands of documents showed only its newest 200."""
@@ -82,7 +85,40 @@ def group_documents(group_id: uuid.UUID, q: str = Query("", max_length=200), sta
     # Cost is for super admins only: what groups are charged isn't the per-page cost
     return documents_page(db, [Job.group_id == group.id], q=q, status=status, result=result, service=service,
                           audit=audit, since=since, until=until, sort=sort, page=page, page_size=page_size,
-                          people=True, show_cost=p.is_super_admin)
+                          people=True, show_cost=p.is_super_admin, via=via)
+
+
+@router.get("/groups/{group_id}/documents/neighbours/{job_id}", response_model=Neighbours)
+def group_document_neighbours(group_id: uuid.UUID, job_id: uuid.UUID, q: str = Query("", max_length=200),
+                              status: str | None = Query(None, max_length=20),
+                              result: str | None = Query(None, max_length=20),
+                              service: str | None = Query(None, max_length=64), audit: bool | None = None,
+                              since: datetime | None = None, until: datetime | None = None,
+                              sort: str = Query("-created_at", max_length=20),
+                              via: str | None = Query(None, pattern="^(script|web)$"),
+                              p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Previous and Next on a document's page, opened from a group's documents: the same filters and sort."""
+    group = group_for_admin(group_id, p, db)
+    where, order = documents_query([Job.group_id == group.id], q=q, status=status, result=result, service=service,
+                                   audit=audit, since=since, until=until, sort=sort, people=True, via=via)
+    return neighbours(db, job_id, select(Job).where(*where), order)
+
+
+@router.post("/groups/{group_id}/documents/export/plan", response_model=ExportPlanOut)
+def group_export_plan(group_id: uuid.UUID, body: ExportRequest, p: Principal = Depends(current_principal),
+                      db: Session = Depends(get_db)):
+    """What exporting these of a group's documents would hold, for its admins: shown before downloading."""
+    group = group_for_admin(group_id, p, db)
+    return export_plan_out(*export_plan(db, p, [Job.group_id == group.id], body, people=True))
+
+
+@router.post("/groups/{group_id}/documents/export", dependencies=[Depends(per_person("document_export"))])
+def group_export(group_id: uuid.UUID, body: ExportRequest, request: Request, p: Principal = Depends(current_principal),
+                 db: Session = Depends(get_db)):
+    """A group's chosen documents (or everything its list shows), as one zip, for its admins. Each file from someone
+    else's document is recorded as a download is."""
+    group = group_for_admin(group_id, p, db)
+    return export_zip(db, request, p, [Job.group_id == group.id], body, people=True, group_id=group.id)
 
 
 @router.get("/groups/{group_id}/ledger", response_model=list[LedgerOut])
@@ -259,6 +295,20 @@ def export_live_report(name: str, request: Request, since: datetime | None = Non
                           "scope": "one group" if group_id else ("all groups" if scope is None else "their groups")})
     db.commit()
     return _csv(rows, header, label.lower().replace(" ", "-"))
+
+
+@router.get("/reports/{name}/neighbours/{job_id}", response_model=Neighbours)
+def live_report_neighbours(name: str, job_id: uuid.UUID, request: Request, since: datetime | None = None,
+                           until: datetime | None = None, q: str = "", sort: str = "", group_id: uuid.UUID | None = None,
+                           p: Principal = Depends(require_any_admin), db: Session = Depends(get_db)):
+    """Previous and Next on a document's page, opened from a report that lists documents: the report's own filters,
+    search and sort, and only the documents this admin can open."""
+    scope = _live_scope(p, db, group_id)
+    stmt, order, id_col, name_col = live_reports.document_order(
+        db, name, _live_query(request, since, until, q, sort, 1, 1, None), scope, p.is_super_admin)
+    if not p.is_super_admin:
+        stmt = stmt.where(Job.deleted_at.is_(None))  # a deleted document is gone for everyone but super admins
+    return neighbours(db, job_id, stmt, order, id_col=id_col, name_col=name_col)
 
 
 @router.get("/reports/{name}")

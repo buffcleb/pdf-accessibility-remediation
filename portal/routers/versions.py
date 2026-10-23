@@ -50,6 +50,7 @@ class VersionOut(BaseModel):
     summary: dict | None
     error_message: str | None
     has_tagmap: bool
+    checking: bool = False  # open, but its checks are still running: its verdict and findings follow (#428)
     pdf_file_id: uuid.UUID | None
     pdf_name: str | None
     pdf_size: int | None
@@ -91,7 +92,7 @@ def can_edit(p: Principal, job: Job) -> bool:
 def _version_out(db: Session, v: DocumentVersion, numbers: dict[uuid.UUID, int]) -> VersionOut:
     pdf = db.get(JobFile, v.pdf_file_id) if v.pdf_file_id else None
     return VersionOut(
-        id=v.id, number=v.number, kind=v.kind, label=v.label, status=v.status,
+        id=v.id, number=v.number, kind=v.kind, label=v.label, status=v.status, checking=bool(v.checking),
         based_on=numbers.get(v.based_on_id) if v.based_on_id else None, created_by_email=v.created_by_email,
         note=v.note, edits_count=len(v.edits or []), summary=finding_marks.summary_with_keys(v.summary, "findings"),
         error_message=v.error_message,

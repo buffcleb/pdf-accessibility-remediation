@@ -2,8 +2,10 @@
 
 [Guide for super admins](README.md) › Help requests
 
-**Administration → Help requests** has every request, oldest wait first. A badge counts the ones waiting on a super
-admin: new, or the person replied. Filter by status, kind or group, or search.
+**Administration → Help requests** has every request, a page at a time, oldest wait first (click **Waiting** or
+**Document** to sort). A badge counts the ones waiting on a super admin: new, or the person replied. Show what needs
+you, what isn't finished, one status or everything; pick a kind, a group under **Filters**, or search by document or
+person.
 
 ## Handling a request
 
@@ -37,7 +39,7 @@ replaces. Failed checks are shown to you, not blocking.
 Or **Close without changes** when nothing needs fixing.
 
 The person sees the outcome on the document's page, with **Compare in the tag manager**, and can **reopen** the
-request within 14 days (configurable in Settings → Uploads and limits).
+request within 14 days (configurable in Settings → Uploads and limits → **Help**).
 
 ## Keeping a request
 

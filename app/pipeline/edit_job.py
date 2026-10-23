@@ -18,7 +18,7 @@ from app.tagging.editor import apply_edits
 from app.validation.audit import audit_pdf
 from app.verification.integrity import check_integrity
 from app.verification.model import IntegrityError
-from app.verification.verify import VerifyOptions, verify_output
+from app.verification.verify import VerifyOptions, carried_ai_read, verify_output
 
 
 def _elements_with_alt(path, alts: set[str]) -> set[int]:
@@ -73,6 +73,8 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
         edited = await asyncio.to_thread(_elements_with_alt, dst, new_alts) if new_alts else set()
         opts = VerifyOptions(ai=bool(meta.get("verify_ai", True)) and bool(edited), seed=store.job_id,
                              only_elements=edited, judge_model=meta.get("judge_model") or None)
+    # The AI's readings the version it's based on flagged stay flagged, unless a person wrote that tag's text now
+    opts.ai_read = carried_ai_read(meta.get("ai_read") or [], ops)
     rep = await verify_output(dst, opts)
     if not rep.integrity_passed:
         raise IntegrityError("reviewed", rep.errors)
@@ -80,13 +82,18 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
     # document's own working bookmarks are never touched, and a file checked without edits stays as it is
     bookmarks = (await _bookmarks(dst, rep.tagmap))[0] if ops else None
 
+    # The file and its tag map are final now: published before the checks that follow, so the version can be opened
+    # while veraPDF and the pixel comparison run (#428). The tag tree passed its integrity check above
+    tagmap = await _tagmap_file(out, stem, "primary", dst, rep.tagmap)
+    store.write_partial({"files": {"remediated_primary": dst.name}, "tag_map": tagmap})
+
     progress("validating", 70)
     vera = await asyncio.to_thread(_validate, dst, work, "after", stem)
     snapshot = _snapshot(await asyncio.to_thread(audit_pdf, dst), vera)
-    tagmap = await _tagmap_file(out, stem, "primary", dst, rep.tagmap)
     # A corrected file is compared with the version it replaces; an edit with the file it started from
     reference = work / "reference.pdf" if meta.get("reference") else None
-    fidelity = await asyncio.to_thread(_visual_fidelity, reference if reference and reference.exists() else store.input_pdf, dst)
+    compared = reference if reference and reference.exists() else None
+    fidelity = await asyncio.to_thread(_visual_fidelity, compared or store.input_pdf, dst, edited=compared is None)
 
     result = {
         "files": {"remediated_primary": dst.name, "remediated_visual_fallback": None},

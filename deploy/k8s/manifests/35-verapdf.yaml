@@ -29,6 +29,7 @@ spec:
       annotations:
         checksum/config: "${VERAPDF_CONFIG_SHA}"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       securityContext: { runAsUser: 100, runAsGroup: 101, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: verapdf

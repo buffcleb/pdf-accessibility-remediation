@@ -11,30 +11,14 @@ Running the service on AWS managed services: containers on **ECS with Fargate**,
 > careful plan, not a recipe that's been run. (On EKS, use the [Kubernetes guide](kubernetes.md) instead, with EBS
 > and EFS storage classes.)
 
-```mermaid
-flowchart LR
-  U[People] -- HTTPS --> ALB["ALB<br/>(ACM certificate)"]
-  subgraph VPC ["VPC: private subnets"]
-    ALB --> WEB["ECS service: web"]
-    ALB -- "/api/*" --> PAPI["ECS service: portal-api"]
-    PW["ECS service: portal-worker"]
-    EAPI["ECS service: engine-api"]
-    EW["ECS service: engine-worker"]
-    BEAT["ECS service: engine-beat"]
-    GW["ECS service: litellm"]
-    PAPI & PW --> RDS[("RDS PostgreSQL<br/>portal + litellm DBs")]
-    PAPI & EAPI & EW --> EC[("ElastiCache Redis")]
-    PAPI & PW --> S3[("S3 bucket<br/>SSE-KMS")]
-    EAPI & EW --- EFS[("EFS<br/>job folder")]
-    PW --> EAPI
-    EW --> GW
-    GW --> RDS
-  end
-  PW & PAPI --> SES[SES]
-  GW --> MODELS["Models: Bedrock, OpenRouter,<br/>or a GPU instance"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/aws-plan-dark.svg">
+  <img src="../images/diagrams/aws-plan.svg" alt="People reach an Application Load Balancer with an ACM certificate; in the VPC's private subnets, ECS services run the web app, portal and engine, the AI gateway and the scheduler, with RDS PostgreSQL, ElastiCache Redis, an S3 bucket encrypted with KMS and EFS for the job folder; mail goes through SES, and the gateway reaches Bedrock, OpenRouter or a GPU instance. Not yet tested end to end.">
+</picture>
 
 ## Pieces
+
+> **Changed 22 October 2026:** a note on keeping the portal's Redis apart from the engine's, as on Kubernetes.
 
 | Part | AWS service | Notes |
 |---|---|---|
@@ -44,7 +28,7 @@ flowchart LR
 | AI gateway | ECS service from `ghcr.io/berriai/litellm` | `config/litellm.yaml` from S3 or baked into a small derived image |
 | veraPDF | ECS service from `verapdf/rest`, with `deploy/verapdf/validator.xml` | Internal only; the engine's `VERAPDF_URL`. Without it, each check runs from the command line inside the worker |
 | Databases | RDS for PostgreSQL 16 | Two databases (portal and gateway) on one instance; Multi-AZ for production |
-| Queue and rate limits | ElastiCache for Redis | Engine on db 0, portal on db 1 |
+| Queue and rate limits | ElastiCache for Redis | Engine on db 0, portal on db 1. The Kubernetes deployment gives the portal a Redis of its own with its own password (#472), so a compromised engine can't reach the portal's rate limits; two small ElastiCache clusters, or a user for each with ElastiCache's access control, do the same here |
 | Files | S3 | Private bucket, SSE-KMS, versioning off (so deletion is real); a lifecycle rule as a retention backstop |
 | Job folder | EFS | Mounted at `/data` in every engine task; an access point with UID/GID 10001 |
 | Email | SES (`PORTAL_MAIL_BACKEND=ses`) | Verify the domain, set up DKIM, and leave the SES sandbox |

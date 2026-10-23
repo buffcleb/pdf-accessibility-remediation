@@ -143,7 +143,7 @@ export function outlineEdit(els: TagElement[], lines: OutlineLine[]): TagEdit {
  * depth under the tag's place (a list, its items one deeper, a nested list one deeper again), its type and text. */
 export type BuiltRow = { role: string; depth: number; text: string; boxes: { page: number; bbox: [number, number, number, number] }[] };
 
-type Box = BuiltRow["boxes"][number];
+export type Box = BuiltRow["boxes"][number];
 /** One box per page around all of these. */
 export function unite(boxes: Box[]): Box[] {
   const pages = new Map<number, [number, number, number, number]>();

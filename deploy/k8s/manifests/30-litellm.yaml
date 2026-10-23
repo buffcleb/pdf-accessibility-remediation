@@ -25,6 +25,7 @@ spec:
         checksum/config: "${LITELLM_CONFIG_SHA}"
         checksum/settings: "${ENGINE_ENV_SHA}"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       securityContext: { seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: litellm
@@ -32,6 +33,9 @@ spec:
           args: ["--config", "/app/config.yaml", "--port", "4000"]
           envFrom: [{ secretRef: { name: pdfrem-gateway-env } }]
           env:
+${EGRESS_PROXY_ENV}
+            # Its price list from the image, not fetched from GitHub at start-up (#453)
+            - { name: LITELLM_LOCAL_MODEL_COST_MAP, value: "True" }
             - name: LITELLM_DB_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-gateway-env, key: LITELLM_DB_PASSWORD } }
             - { name: LITELLM_DATABASE_URL, value: "postgresql://litellm:$(LITELLM_DB_PASSWORD)@postgres:5432/litellm" }

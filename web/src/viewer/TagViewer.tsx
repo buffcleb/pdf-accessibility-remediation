@@ -13,12 +13,13 @@ import { useConfirmLeave, useUnsavedChanges } from "../components/unsaved";
 import type { Area } from "./draft";
 import { DeleteTag, EditPanel, ReviewStatus, SaveChanges } from "./EditPanel";
 import { Reader } from "./Reader";
-import { LONG_DOCUMENT_PAGES, addEdit, describe, draftTree, jumpQuestion, undoMoves } from "./draft";
+import { LONG_DOCUMENT_PAGES, ROLE_NAMES, addEdit, describe, draftTree, jumpQuestion, undoMoves } from "./draft";
 import { fresh, historyKey, push, redo, undo, type History } from "./history";
 import { PAGE_TOP, Pane, TREE, VersionPicker, type OverlayMode, type PaneLayout } from "./Pane";
 import { TreePane } from "./TreePane";
 import { TagMenu } from "./TagMenu";
 import { centered } from "./scroll";
+import { typedPage } from "./pageBox";
 import { isolateItem } from "./isolate";
 import { inReadingOrder, menuAndTypes, pageMenu, pick, tagMenu, type MenuItem, type MenuPoint } from "./menu";
 import { ListBuilder } from "./ListBuilder";
@@ -31,6 +32,10 @@ import { HeadingDialog } from "./ChangesDialog";
 import { DocumentPanel } from "./DocumentPanel";
 import { TableDialog } from "./TableDialog";
 import { clearVersionCache, type PaneData } from "./pdf";
+import { findItem, spotExtent, spotFor, spotWords, type Spot } from "./spot";
+import { newTags } from "./areaPreview";
+import { changePending, dropPending, justMade, makesTag } from "./pending";
+import { PendingTag } from "./PendingTag";
 
 // 1 = fit the page to the pane's width; larger values scroll sideways
 const ZOOMS = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3];
@@ -43,7 +48,7 @@ const MODES: { value: OverlayMode; label: string }[] = [
 ];
 
 function pending(v: DocVersion) {
-  return v.status === "queued" || v.status === "submitted" || v.status === "processing"
+  return v.status === "queued" || v.status === "submitted" || v.status === "processing" || !!v.checking
     || v.review_status === "queued" || v.review_status === "running";
 }
 
@@ -148,7 +153,9 @@ export function TagViewer() {
     if (left === null) setLeft(Number(params.get("left") ?? usable[0].number));
     if (right === null) {
       const wanted = params.get("v") ?? params.get("right");
-      const fallback = [...usable].reverse().find((v) => v.kind === "reviewed" || v.kind === "corrected") ?? usable.find((v) => v.kind === "primary") ?? usable[usable.length - 1];
+      // The newest saved version; else the Adobe route's improved copy, the document people get (#499); else the result
+      const fallback = [...usable].reverse().find((v) => v.kind === "reviewed" || v.kind === "corrected")
+        ?? usable.find((v) => v.kind === "enhanced") ?? usable.find((v) => v.kind === "primary") ?? usable[usable.length - 1];
       setRight(wanted !== null && usable.some((v) => v.number === Number(wanted)) ? Number(wanted) : fallback.number);
     }
   }, [usable, left, right, params]);
@@ -221,7 +228,7 @@ export function TagViewer() {
     const v = list.find((x) => x.number === waitingFor);
     if (!v) return;
     if (v.status === "ready") {
-      setAnnounce(`${v.label} is ready.`);
+      setAnnounce(v.checking ? `${v.label} is saved and open; it's still being checked.` : `${v.label} is ready.`);
       setRight(v.number);
       setSelected(null);
       setWaitingFor(null);
@@ -352,17 +359,43 @@ export function TagViewer() {
     });
   }, [onPageShown]);
 
-  // Jump to ?el= (from "Show in document" on the review list) once the right pane has loaded
+  // A review item's area, highlighted on its page (#426): from Show on the review list, or the page's own list
+  const [spot, setSpot] = useState<Spot | null>(null);
+  const showSpot = useCallback((s: Spot) => {
+    setSpot(s);
+    setAnnounce(spotWords(s));
+    setRightPage(s.page);
+    const at = spotExtent(s);
+    window.setTimeout(() => scrollTo("right", s.page, at?.[1] ?? 0, at?.[3]), 100);
+  }, [scrollTo]);
+  const closeSpot = useCallback(() => {
+    setSpot(null);
+    setAnnounce("Highlight closed.");
+    scrollEls.current.right?.focus({ preventScroll: true }); // the label had focus: back to the pages
+  }, []);
+
+  // Jump to ?el= and ?page= (from Show on the review list) once the right pane has loaded: the item's tag selected,
+  // and the area it's about highlighted
   const jumped = useRef(false);
   useEffect(() => {
     const el = params.get("el");
-    if (jumped.current || el === null || !rightData) return;
-    const e = rightData.tagmap.elements[Number(el)];
-    if (!e?.boxes.length) return;
+    const page = params.get("page");
+    if (jumped.current || (el === null && page === null) || !rightData) return;
     jumped.current = true;
-    setSelected({ side: "right", i: e.i });
-    window.setTimeout(() => scrollTo("right", e.boxes[0].page, e.boxes[0].bbox[1], e.boxes[0].bbox[3]), 100);
-  }, [params, rightData, scrollTo]);
+    const e = el === null ? undefined : rightData.tagmap.elements[Number(el)];
+    if (e) setSelected({ side: "right", i: e.i });
+    const findings = list.find((v) => v.number === right)?.summary?.findings ?? [];
+    const item = findItem(findings, params.get("f"), page === null ? null : Number(page),
+      e ? e.i : null);
+    const n = page === null ? null : Number(page);
+    const s = item ? spotFor(item, rightData.tagmap)
+      : n !== null && rightData.tagmap.pages[n - 1] ? { page: n, boxes: [], issue: `Page ${n}` } : null;
+    if (s && (item || !e)) showSpot(s);
+    else if (e?.boxes.length) {
+      const b = e.boxes[0];
+      window.setTimeout(() => scrollTo("right", b.page, b.bbox[1], b.bbox[3]), 100);
+    }
+  }, [params, rightData, list, right, scrollTo, showSpot]);
 
   const selectFrom = (side: "left" | "right") => (i: number | null) => {
     setSelected(i === null ? null : { side, i });
@@ -471,6 +504,14 @@ export function TagViewer() {
     if (next !== onePage) setAnnounce(`Page ${next} of ${pageCount}.`);
     setOnePage(next);
   }, [pageCount, onePage]);
+  // What's being typed in the page box (null: it shows the page). Enter or leaving the box turns to it; anything
+  // that isn't a number puts the page back, Escape too
+  const [pageText, setPageText] = useState<string | null>(null);
+  function typedTo(text: string) {
+    const n = typedPage(text, pageCount);
+    if (n !== null) goToPage(n);
+    setPageText(null);
+  }
   function setView(v: "all" | "one", sure = false) {
     viewChosen.current = true;
     if (v === "all" && long && !sure) { setAskAll(true); return; }
@@ -506,6 +547,30 @@ export function TagViewer() {
   const allowFullReview = !job.data?.ai_tier || (tierChoice?.allow_full_review ?? true);
   const leftVersion = list.find((v) => v.number === left);
   const editable = !!versions.data?.can_edit && !!rightVersion && rightVersion.kind !== "original" && !readOnlyFor && !lostDraft;
+  // A tag pending edits make, chosen before it's saved (#427), by the place of the edit making it. A tag just made
+  // from an area or a split is chosen at once, so its type or alt text can be set straight away
+  const [pendingSel, setPendingSel] = useState<number | null>(null);
+  const madeTags = useMemo(() => (rightData && editable ? newTags(rightData.tagmap, ops) : []),
+    [rightData, editable, ops]);
+  const lastOps = useRef(ops);
+  useEffect(() => {
+    const made = justMade(lastOps.current, ops);
+    const same = lastOps.current.length === ops.length; // edits taken out or undone: the places have moved
+    lastOps.current = ops;
+    if (made !== null) {
+      setPendingSel(made);
+      setSelected(null); // the new tag is the one chosen now, not the tag it came from
+      setAnnounce("New tag chosen. Not in the file until you save; its type and alt text can be changed.");
+    } else setPendingSel((cur) => (cur !== null && same && makesTag(ops[cur]) ? cur : null));
+  }, [ops]);
+  const choosePending = (op: number) => {
+    setPendingSel(op);
+    setSelected(null);
+    const t = madeTags.find((x) => x.op === op);
+    if (t?.boxes.length) scrollTo("right", t.boxes[0].page, t.boxes[0].bbox[1], t.boxes[0].bbox[3]);
+  };
+  useEffect(() => { if (selected) setPendingSel(null); }, [selected]);
+  const pendingTag = pendingSel === null ? undefined : madeTags.find((t) => t.op === pendingSel);
   // Undo and redo, saying what was undone or redone: the edit one list has and the other doesn't
   const stepHistory = useCallback((way: "undo" | "redo") => {
     const next = way === "undo" ? undo(history) : redo(history);
@@ -597,15 +662,22 @@ export function TagViewer() {
             <option value="one">One page</option>
           </select>
           {view === "one" && (
-            <div className="pv-zoom" role="group" aria-label="Page">
-              <button className="btn secondary small" disabled={onePage <= 1} onClick={() => goToPage(onePage - 1)}
-                title="Previous page ( [ )">‹<span className="visually-hidden">Previous page</span></button>
+            <div className="pv-pager" role="group" aria-label="Page">
+              <button className="pv-pager-btn" disabled={onePage <= 1} onClick={() => goToPage(onePage - 1)}
+                title="Previous page ( [ )"><Chevron up /><span className="visually-hidden">Previous page</span></button>
+              <span className="pv-pager-divider" aria-hidden="true" />
+              <button className="pv-pager-btn" disabled={onePage >= pageCount} onClick={() => goToPage(onePage + 1)}
+                title="Next page ( ] )"><Chevron /><span className="visually-hidden">Next page</span></button>
               <label htmlFor="pv-page" className="visually-hidden">Page</label>
-              <input id="pv-page" className="pv-page-input" type="number" min={1} max={pageCount || 1} value={onePage}
-                onChange={(e) => goToPage(Number(e.target.value))} />
+              <input id="pv-page" className="pv-page-input" type="text" inputMode="numeric" autoComplete="off"
+                style={{ width: `calc(${String(pageCount || 1).length}ch + 22px)` }}
+                value={pageText ?? String(onePage)} onChange={(e) => setPageText(e.target.value)}
+                onFocus={(e) => e.target.select()} onBlur={(e) => typedTo(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") typedTo(e.currentTarget.value);
+                  else if (e.key === "Escape") setPageText(null);
+                }} />
               <span className="small muted">of {pageCount}</span>
-              <button className="btn secondary small" disabled={onePage >= pageCount} onClick={() => goToPage(onePage + 1)}
-                title="Next page ( ] )">›<span className="visually-hidden">Next page</span></button>
             </div>
           )}
           <label htmlFor="pv-mode" className="small">Show</label>
@@ -757,6 +829,26 @@ export function TagViewer() {
                 : `Unsaved changes kept ${kept.at!.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. You can close this page and carry on later; nothing is in the file until you save.`}
             </p>
           )}
+          {pendingTag && ops[pendingTag.op] && (
+            <PendingTag tag={pendingTag} op={ops[pendingTag.op]} all={madeTags} onChoose={choosePending}
+              onClose={() => {
+                setPendingSel(null);
+                setAnnounce("New tag no longer chosen.");
+                scrollEls.current.right?.focus({ preventScroll: true }); // the bar had focus: back to the pages
+              }}
+              onChange={(role, alt) => {
+                const next = changePending(ops, pendingTag.op, role, alt);
+                if (!next) return false;
+                setOps(next);
+                setAnnounce(`The new tag is now ${ROLE_NAMES[role] ?? role}. Not in the file until you save.`);
+                return true;
+              }}
+              onRemove={() => {
+                setOps(dropPending(ops, pendingTag.op));
+                setAnnounce("The new tag was taken back.");
+                scrollEls.current.right?.focus({ preventScroll: true });
+              }} />
+          )}
           <div className={`pv-grid${tree === "right" || !panel ? " no-side" : ""}`} ref={gridRef}
             style={{ "--pv-l": `${split}fr`, "--pv-r": `${100 - split}fr`, "--pv-side": `${sideWidth}px` } as React.CSSProperties}>
             {left !== null && (tree === "left" && right !== null && rightVersion ? (
@@ -769,7 +861,9 @@ export function TagViewer() {
                   target: target.i, expect_target_role: target.role, position }]) : undefined}
                 selected={selected?.side === "right" ? selected.i : null} onSelect={showFromTree("right")}
                 picked={picked} onPick={(el, how, visible) => pickRight(el.i, how, visible)} isolated={isolated}
+                pendingSel={pendingSel} onPendingSelect={editable ? choosePending : undefined}
                 onMenu={(el, x, y) => openMenu(el.i, x, y)}
+                onReadAll={(el) => { selectFrom("right")(el.i); setEditFor(el.i); }}
                 onHover={(i) => setHover(i === null ? null : { side: "right", i })} />
             ) : (
               <Pane side="left" tools={leftTools} jobId={id} versions={list} number={left} onNumber={setLeft} mode={mode} zoom={zoom}
@@ -796,11 +890,14 @@ export function TagViewer() {
                 selected={selected?.side === "right" ? selected.i : null} onSelect={selectFrom("right")} ops={ops}
                 scrollRef={(el) => { scrollEls.current.right = el; }} onScroll={onScroll("right")} onPage={setRightPage}
                 onLayout={noteLayout("right")} onData={setRightData} onlyPage={only}
+                pendingSel={pendingSel} onPendingSelect={editable ? choosePending : undefined}
                 areaMode={areaMode && editable} area={editable ? area : null}
                 onArea={(p, bbox) => { setArea({ page: p, bbox }); setRightPage(p); setAreaMode(false); setAreaOpen(true); }}
                 highlight={hover?.side === "right" ? hover.i : null}
                 picked={picked} onPick={(i) => pickRight(i, "toggle")} onMenu={openMenu}
                 onPageMenu={(page, x, y) => setMenu({ x, y, ids: [], at: null, page })} isolated={isolated}
+                spot={spot} onSpotClose={closeSpot}
+                onSpot={(f) => { const s = spotFor(f, rightData?.tagmap ?? null); if (s) showSpot(s); }}
                 onTree={() => openTree("right")} treeDisabled={tree === "left"} />
             ))}
             {rightData && rightVersion && tree !== "right" && panel && (
@@ -968,5 +1065,13 @@ function Ask({ title, children, actions, cancel, onCancel }: {
         ))}
       </div>
     </dialog>
+  );
+}
+
+/** The page buttons' arrows, as a PDF viewer draws them: up for the previous page, down for the next. */
+function Chevron({ up = false }: { up?: boolean }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden="true"><path d={up ? "M6 15l6-6 6 6" : "M6 9l6 6 6-6"} /></svg>
   );
 }

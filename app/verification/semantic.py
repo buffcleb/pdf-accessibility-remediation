@@ -14,13 +14,14 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 import pdfplumber
+import pdfplumber.page as _plumb_page
 import pikepdf
 import pymupdf as fitz
 from pikepdf import Dictionary, Name
 
 from app.pipeline import page_pool
 from app.verification.integrity import TagIndex, _items
-from app.verification.model import Finding
+from app.verification.model import Finding, area_boxes
 
 log = logging.getLogger(__name__)
 
@@ -89,14 +90,18 @@ def _gap(prev: dict, c: dict) -> bool:
     return c["x0"] - prev["x1"] > 0.25 * size
 
 
-def glyph_text(chars: list) -> tuple[str, list[int]]:
+def glyph_text(chars: list, limit: int | None = None) -> tuple[str, list[int]]:
     """The text of these glyphs, in drawing order: whitespace collapsed, and a space where a line ends or a gap stands
     for one (a paragraph's lines are drawn without a space between them). Also where each glyph's text starts in it,
-    so a place in the text can be found among the glyphs (splitting a tag there)."""
+    so a place in the text can be found among the glyphs (splitting a tag there). limit: only the first that many
+    characters are wanted; the glyphs are read in order, so stopping there gives the same start as reading them all
+    (a whole document's text isn't made to keep its first 200 characters)."""
     out: list[str] = []
     starts: list[int] = []
     last_space, prev = True, None
     for c in chars:
+        if limit is not None and len(out) > limit:
+            return "".join(out)[:limit], starts
         t = c["text"]
         if prev is not None and not last_space and t.strip() and _gap(prev, c):
             out.append(" ")
@@ -133,6 +138,10 @@ class Content:
     @property
     def text(self) -> str:
         return glyph_text(self.chars)[0]
+
+    def text_upto(self, limit: int) -> str:
+        """The first `limit` characters of text, the same as text[:limit], without making the rest."""
+        return glyph_text(self.chars, limit)[0][:limit]
 
     @property
     def bbox(self):
@@ -237,12 +246,75 @@ def _image_clips(page: pikepdf.Page) -> dict[int | None, list[fitz.Rect | None]]
     return out
 
 
+class _FormsDevice(_plumb_page.PDFPageAggregatorWithMarkedContent):
+    """pdfplumber's device, also noting which Form XObjects were open when each marked-content sequence began (#423).
+    A form numbers its marked content on its own (its tags point at it through /Stm), so an MCID alone doesn't say
+    which tag content inside a form belongs to. The forms are noted where the sequence begins, not where a glyph is
+    drawn: a Figure marked on the page around a form that marks nothing itself is the page's content."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._forms: list[str] = []
+        self.cur_forms: tuple = ()
+
+    def begin_figure(self, name, bbox, matrix):
+        self._forms.append(name)
+        super().begin_figure(name, bbox, matrix)
+
+    def end_figure(self, name):
+        super().end_figure(name)
+        if self._forms:
+            self._forms.pop()
+
+    def begin_tag(self, tag, props=None):
+        super().begin_tag(tag, props)
+        self.cur_forms = tuple(self._forms)
+
+    def end_tag(self):
+        super().end_tag()
+        self.cur_forms = ()
+
+    def tag_cur_item(self):
+        super().tag_cur_item()
+        if self.cur_item._objs:
+            self.cur_item._objs[-1].mcid_forms = self.cur_forms  # type: ignore[attr-defined]
+
+
+_plumb_page.PDFPageAggregatorWithMarkedContent = _FormsDevice
+_plumb_page.ALL_ATTRS.add("mcid_forms")
+_UNKNOWN_FORM = ("?",)  # a form that couldn't be followed: its content belongs to no tag, not to the page's MCIDs
+
+
+def _form_owner(pkpage, forms: tuple, cache: dict):
+    """The Form XObject a marked-content sequence is in, by the resource names that led to it (the page's own stream:
+    None): its (object, generation), as the tags' /Stm references name it."""
+    if not forms:
+        return None
+    if forms not in cache:
+        owner = None
+        res = pkpage.obj.get("/Resources") if pkpage is not None else None
+        try:
+            for name in forms:
+                xo = (res.get("/XObject") if isinstance(res, Dictionary) else None) or {}
+                form = xo.get("/" + str(name).lstrip("/"))
+                if not isinstance(form, pikepdf.Stream) or form.get("/Subtype") != "/Form" or not form.is_indirect:
+                    owner = _UNKNOWN_FORM
+                    break
+                owner = form.objgen
+                res = form.get("/Resources") or res
+        except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
+            owner = _UNKNOWN_FORM
+        cache[forms] = owner
+    return cache[forms]
+
+
 @dataclass
 class PageContent:
     """What one page holds, for SemanticChecker: by tag (element index), by marked-content item, and its artifacts."""
     page_size: tuple = (0.0, 0.0)
     own: dict = field(default_factory=dict)  # element index -> Content, in the order first seen
     by_mcid: dict = field(default_factory=dict)  # (page, mcid) -> Content
+    by_form_mcid: dict = field(default_factory=dict)  # (page, form's objgen, mcid) -> Content (#423)
     artifact: Content | None = None  # None: nothing on the page asked for it
     tables: list = field(default_factory=list)
 
@@ -289,11 +361,18 @@ def _collect_page(i: int, page, fpage: fitz.Page, pkpage, by_page_mcid: dict) ->
             r = r * rot
         return (r.x0, r.y0, r.x1, r.y1)
 
+    forms_cache: dict = {}
+
+    def key(o):
+        """Where o's marked content is numbered: (page, mcid) in the page's own stream, (page, form, mcid) in a form."""
+        owner = _form_owner(pkpage, o.get("mcid_forms") or (), forms_cache)
+        return (i, o.get("mcid")) if owner is None else (i, owner, o.get("mcid"))
+
     def bucket(o) -> Content:
         mcid = o.get("mcid")
         if mcid is None or o.get("tag") == "Artifact":
             return artifact()
-        idx = by_page_mcid.get((i, mcid))
+        idx = by_page_mcid.get(key(o))
         if idx is None:
             return artifact()
         return out.own.setdefault(idx, Content())
@@ -301,20 +380,22 @@ def _collect_page(i: int, page, fpage: fitz.Page, pkpage, by_page_mcid: dict) ->
     def piece(o) -> Content | None:
         """The content of the one marked-content item o belongs to (for the tag manager)."""
         mcid = o.get("mcid")
-        if mcid is None or o.get("tag") == "Artifact" or (i, mcid) not in by_page_mcid:
+        k = key(o) if mcid is not None else None
+        if mcid is None or o.get("tag") == "Artifact" or k not in by_page_mcid:
             return None
-        return out.by_mcid.setdefault((i, mcid), Content())
+        return (out.by_mcid if len(k) == 2 else out.by_form_mcid).setdefault(k, Content())
 
     for c in page.chars:
         b = vbox(c)
         # Only what the checks read: pdfplumber's own dict has some 25 fields per glyph, which on a
         # 332-page document came to gigabytes (the worker was killed for memory, 2026-10-16)
+        where = {"mcid": c.get("mcid"), "tag": c.get("tag"), "mcid_forms": c.get("mcid_forms")}
         c = {k: c.get(k) for k in _CHAR_KEYS} | {"vbox": b}
-        dest = bucket(c)
+        dest = bucket(where)
         dest.chars.append(c)
         dest.boxes.append(b)
         dest.page_boxes.append((i, b))
-        if (pc := piece(c)) is not None:
+        if (pc := piece(where)) is not None:
             pc.chars.append(c)
             pc.boxes.append(b)
     # Images drawn under a clip show only inside it (see _image_clips); matched to pdfplumber's
@@ -381,6 +462,7 @@ class SemanticChecker:
         self.tables: dict[int, list] = {}
         self.skipped: list[str] = []
         self.by_mcid: dict[tuple[int, int], Content] = {}  # (page, mcid) -> content, for the tag manager
+        self.by_form_mcid: dict[tuple, Content] = {}  # (page, form's objgen, mcid) -> content inside a form (#423)
 
     def add(self, severity: str, issue: str, e=None, **kw) -> None:
         if e is not None:
@@ -394,11 +476,14 @@ class SemanticChecker:
     # ------------------------------------------------------------------ content extraction
     def _collect(self) -> None:
         owner_for_page = {i: og for i, og in enumerate(self.index.page_objgens)}
-        by_page_mcid: dict[tuple[int, int], int] = {}
+        # The tag each piece of marked content belongs to: (page, mcid) in a page's own stream, (page, form, mcid) in
+        # a Form XObject drawn on it (#423)
+        by_page_mcid: dict[tuple, int] = {}
         for (owner, mcid), users in self.index.refs.items():
             page = self.index.page_of_owner.get(owner)
-            if page is not None and owner == owner_for_page.get(page):
-                by_page_mcid[(page, mcid)] = users[0]
+            if page is None:
+                continue
+            by_page_mcid[(page, mcid) if owner == owner_for_page.get(page) else (page, tuple(owner), mcid)] = users[0]
         count = len(self.pdf.pages)
         pages = min(count, self.max_pages)
         # A long document's pages read by several processes (#124), each page on its own, put back in page order
@@ -422,6 +507,7 @@ class SemanticChecker:
         for idx, c in part.own.items():
             self.own.setdefault(idx, Content()).add(c)
         self.by_mcid.update(part.by_mcid)
+        self.by_form_mcid.update(part.by_form_mcid)
         self.tables[i] = part.tables
 
     def _page_of(self, e) -> int | None:
@@ -462,8 +548,47 @@ class SemanticChecker:
         self._fields(els)
         self._reading_order(els)
         self._language(els)
+        self._levels(els)
         self._cut_off()
         return self._cap(self.findings)
+
+    def _levels(self, els) -> None:
+        """Tags at the right level, as PAC checks them (#437, #438): a figure or formula on one page without its
+        bounding box, a figure standing as a block without saying so, inline tags straight in a grouping tag, a P in a
+        P, a Document inside the tree. One finding per kind, with how many and where."""
+        from app.tagging.structure_rules import GROUPING, INLINE
+
+        def attr(e, key) -> bool:
+            a = e.obj.get("/A")
+            return any(isinstance(d, Dictionary) and key in d for d in (a if isinstance(a, pikepdf.Array) else [a]))
+
+        found: dict[tuple, list] = {}
+        for e in els:
+            parent = els[e.parent].role if e.parent is not None else None
+            if e.role in ("Figure", "Formula") and not attr(e, "/BBox"):
+                pages = {pg for pg, _ in self.subtree(e).page_boxes}
+                if len(pages) == 1:
+                    found.setdefault(("high", "figure on one page without a bounding box"), []).append(e)
+            if e.role in ("Figure", "Formula", "Form") and parent in GROUPING and not attr(e, "/Placement"):
+                found.setdefault(("review", "figure standing as a block without saying so"), []).append(e)
+            if e.role in INLINE and parent in GROUPING:
+                found.setdefault(("review", "inline tag standing directly in a grouping tag"), []).append(e)
+            if e.role == "P" and parent == "P":
+                found.setdefault(("review", "paragraph inside a paragraph"), []).append(e)
+            if e.role == "Document" and e.parent is not None:
+                found.setdefault(("review", "Document tag inside the tree"), []).append(e)
+        actions = {
+            "figure on one page without a bounding box": "Its bounding box (BBox) is missing: PAC fails the file on it",
+            "figure standing as a block without saying so": "Give it /Placement /Block, or put it in a paragraph",
+            "inline tag standing directly in a grouping tag": "Put it in a paragraph (P), or make it one",
+            "paragraph inside a paragraph": "Make the outer one a grouping tag (Div), or the inner one a Span",
+            "Document tag inside the tree": "Only the top tag is a Document: make this one a Part",
+        }
+        for (severity, issue), es in found.items():
+            pages = sorted({p + 1 for e in es if (p := self._page_of(e)) is not None})
+            where = ", ".join(map(str, pages[:8])) + (f" and {len(pages) - 8} more" if len(pages) > 8 else "")
+            self.add(severity, issue, es[0], detail=f"{len(es)} tag(s), on page(s) {where}" if pages else
+                     f"{len(es)} tag(s)", action=actions[issue], extra={"count": len(es), "pages": pages[:200]})
 
     def _cut_off(self) -> None:
         """A page whose picture is much larger than the page: part of it can't be seen (a web page or a wide sheet
@@ -623,7 +748,7 @@ class SemanticChecker:
             if not w:
                 continue
             page_area = w * h
-            tagged = [ch["vbox"] for (pg, _), piece in self.by_mcid.items() if pg == page
+            tagged = [ch["vbox"] for k, piece in (*self.by_mcid.items(), *self.by_form_mcid.items()) if k[0] == page
                       for ch in piece.chars if ch["text"].strip()]
             for b, _, area in c.images:
                 # A picture with the page's tagged text lying over it is that text's background: a scanned page
@@ -633,7 +758,7 @@ class SemanticChecker:
                     continue
                 if 0.10 * page_area <= area < 0.9 * page_area:
                     self.add("review", "large image marked as decorative (hidden from screen readers)",
-                             page=page + 1, detail=f"{area / page_area:.0%} of the page",
+                             page=page + 1, detail=f"{area / page_area:.0%} of the page", boxes=area_boxes([b]),
                              action="confirm it is decorative, or tag it as a Figure with alt text", confidence=0.6)
             body = [ch for ch in c.chars if ch["text"].strip()
                     and h * 0.1 < (ch["vbox"][1] + ch["vbox"][3]) / 2 < h * 0.9]
@@ -641,6 +766,7 @@ class SemanticChecker:
                 sample = glyph_text(body[:80])[0]
                 self.add("high", "text in the body of the page is marked as an artifact", page=page + 1,
                          text=sample[:80], detail=f"{len(body)} characters hidden from assistive technology",
+                         boxes=area_boxes([ch["vbox"] for ch in body]),
                          action="tag it as content unless it is a watermark or background", confidence=0.7)
 
     def _tables(self, els) -> None:

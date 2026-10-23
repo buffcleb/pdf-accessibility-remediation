@@ -8,6 +8,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session
@@ -140,9 +141,20 @@ class Item:
     service_key: str | None = None
     count: int | None = None
     fix: str | None = None
+    # What it's about, in the app (#538): one thing goes straight to it (a document, or its open help request),
+    # several to the list of them. Only pages the viewer can open: a group's admins never get a super admin's page.
+    link: str | None = None
+    link_label: str | None = None
+    # Acknowledging (#538): a summary or notice can be, for everyone who sees the list, until something new joins it.
+    # `ids`: what it's about now (documents, emails, an alert); `earlier`: how many were acknowledged before. Live
+    # problems (the service's alerts, empty pools, people waiting) can't be: they go when they're fixed.
+    key: str | None = None
+    ackable: bool = False
+    earlier: int = 0
+    ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        return {k: v for k, v in asdict(self).items() if v is not None and k != "ids" and not (k == "earlier" and not v)}
 
 
 def _low(left: int, pool: int, rs) -> bool:
@@ -151,14 +163,123 @@ def _low(left: int, pool: int, rs) -> bool:
     return is_low(left, pool, rs)
 
 
-def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Item]:
-    """Items for these groups (None: every group, plus service-wide items), most serious first."""
+# Why a document failed, as an admin reads it (the person sees the longer message, portal/worker.py)
+REASONS = {
+    "adobe_rejected": "Adobe refused the PDF", "adobe_failed": "Adobe didn't finish", "adobe_quota": "Adobe's usage limit",
+    "adobe_unavailable": "Adobe unavailable", "engine_rejected": "the engine refused it",
+    "engine_lost": "the engine lost track of it", "worker_lost": "the engine's worker stopped",
+    "time_limit_exceeded": "it took too long", "tag_integrity_failed": "no valid file could be made",
+    "ai_provider_unavailable": "the AI was unavailable", "result_not_saved": "its result couldn't be saved",
+    "stopped": "it was stopped",
+}
+# A service alert's page: where to look (Administration > System unless another says more)
+ALERT_LINKS = {"queue_stuck": ("/admin/queues", "Open Queues"),
+               "siem_behind": ("/admin/system/audit-export", "Open Audit export")}
+# A job's status as the group's document list filters it, and as the Documents report does
+_LIST_STATUS = {"failed": "failed", "held": "held", "queued": "waiting", "submitted": "in_progress",
+                "processing": "in_progress", "completed": "done"}
+
+
+def _waited(hours: float) -> str:
+    if hours < 1:
+        return "less than an hour"
+    if hours < 48:
+        return f"{int(hours)} hour{'s' if int(hours) != 1 else ''}"
+    return f"{int(hours // 24)} days"
+
+
+def _reason(code: str | None) -> str:
+    return REASONS.get(code or "", code or "unknown")
+
+
+def _alert_link(key: str) -> tuple[str, str]:
+    return ALERT_LINKS.get(key, ("/admin/system", "Open System"))
+
+
+def _documents_link(db: Session, jobs: list[Job], everyone: bool, days: int | None = None,
+                    live: str | None = None) -> tuple[str | None, str | None]:
+    """Where to see these documents: one, on its page (its help request's, when one is open); several of one group,
+    on the group's documents filtered to their status (and the last `days` days); several of several groups, for a
+    super admin (`everyone`), the live queue view (`live`: its state) or the Documents report."""
+    if not jobs:
+        return None, None
+    if len(jobs) == 1:
+        from portal.models import HelpRequest
+        req = db.scalar(select(HelpRequest.id).where(HelpRequest.job_id == jobs[0].id, HelpRequest.status.in_(
+            ("open", "in_progress", "waiting"))).limit(1))
+        return (f"/admin/help/{req}", "Open its help request") if req else (f"/jobs/{jobs[0].id}", "Open the document")
+    statuses = {j.status for j in jobs}
+    groups = {j.group_id for j in jobs}
+    if len(groups) == 1 and not (everyone and live):
+        q = f"status={_LIST_STATUS.get(statuses.pop(), '')}" if len(statuses) == 1 else ""
+        if days:
+            since = (_now() - timedelta(days=days - 1)).date().isoformat()
+            q += ("&" if q else "") + f"from={since}"
+        return f"/admin/groups/{groups.pop()}/documents" + (f"?{q}" if q else ""), "Show them"
+    if not everyone:
+        return None, None  # a group admin of several groups: each group's own list
+    if live:
+        return f"/admin/queues?view=live&state={live}", "Show them in Queues"
+    q = f"status={statuses.pop()}&" if len(statuses) == 1 else ""
+    return f"/admin/reports?report=documents&{q}range={days or 30}d", "Show them in the Documents report"
+
+
+def scope_of(group_ids: list[uuid.UUID] | None) -> str | None:
+    """Whose list it is, for acknowledging: super admins' ("all"), or one group's admins' (its id)."""
+    if group_ids is None:
+        return "all"
+    return str(group_ids[0]) if len(group_ids) == 1 else None
+
+
+def attention(db: Session, group_ids: list[uuid.UUID] | None = None, with_acknowledged: bool = False) -> list[Item]:
+    """Items for these groups (None: every group, plus service-wide items), most serious first. Acknowledged ones
+    (#538) count only what's new since; with_acknowledged, they're counted in full as if never acknowledged (for
+    acknowledging them again)."""
     items: list[Item] = []
     rs = settings_store.load(db)
+    from portal.models import AttentionAck
+    scope = scope_of(group_ids)
+    acked: dict[str, set[str]] = {} if scope is None or with_acknowledged else {
+        a.key: set(a.ids or []) for a in db.scalars(select(AttentionAck).where(AttentionAck.scope == scope))}
+
+    def fresh(key: str, things: list, id_of=lambda t: str(t.id)) -> tuple[list, int]:
+        """What's new since this item was acknowledged, and how many were acknowledged before."""
+        seen = acked.get(key, set())
+        new = [t for t in things if id_of(t) not in seen]
+        return new, len(things) - len(new)
     if group_ids is None:  # the service's own problems (#334), as emailed to super admins
         from portal import alerts
         for a in alerts.active(db):
-            items.append(Item("bad", a.key, alerts.title(a.key), a.detail, fix=alerts.fix(a.key)))
+            link, label = _alert_link(a.key)
+            items.append(Item("bad", a.key, alerts.title(a.key), a.detail, fix=alerts.fix(a.key), link=link,
+                              link_label=label))
+        from portal import security_alerts  # patterns in the audit log, for a day (#456)
+        for ev in security_alerts.recent(db):
+            if str(ev.id) in acked.get(f"security:{ev.id}", set()):
+                continue
+            d = ev.details or {}
+            rule = d.get("rule", "")
+            search = d.get("search") or ("" if str(d.get("subject", "")).startswith("event:") else d.get("subject", ""))
+            items.append(Item("warn", f"security:{rule}", security_alerts.TITLES.get(rule, "Security alert"),
+                              d.get("detail", ""), group_id=str(ev.group_id) if ev.group_id else None,
+                              fix=security_alerts.FIXES.get(rule),
+                              link=f"/admin/reports?report=audit&range=7d&q={quote(search)}" if search
+                              else "/admin/reports?report=audit&range=7d", link_label="Show it in the audit log",
+                              key=f"security:{ev.id}", ackable=True, ids=[str(ev.id)]))
+        # Help requests waiting for support (#538): new, or the person's last word unanswered
+        from portal import helpdesk
+        from portal.models import HelpRequest
+        waiting_help = db.execute(select(HelpRequest.id, helpdesk.WAITING_SINCE).where(
+            helpdesk.NEEDS_STAFF, HelpRequest.saved.is_(False)).order_by(helpdesk.WAITING_SINCE)).all()
+        if waiting_help:
+            n, oldest = len(waiting_help), waiting_help[0][1]
+            hours = (_now() - oldest).total_seconds() / 3600 if oldest else 0
+            items.append(Item("warn" if hours >= 24 else "info", "help_waiting",
+                              f"{n} help request{'s' if n > 1 else ''} waiting for support",
+                              f"The oldest has waited {_waited(hours)}.", count=n,
+                              fix="Answer them, or set them in progress (Help requests).",
+                              link=f"/admin/help/{waiting_help[0][0]}" if n == 1 else "/admin/help",
+                              link_label="Open the help request" if n == 1 else "Open Help requests"))
     groups = list(db.scalars(select(Group).where(Group.status == "active")
                              .where(Group.id.in_(group_ids)) if group_ids is not None
                              else select(Group).where(Group.status == "active")))
@@ -172,11 +293,13 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
             if left <= 0:
                 items.append(Item("bad", "global_pool_empty", f"{s.label}: no pages left for the whole service",
                                   f"0 of {s.pool_pages:,} left; nobody can use it until pages are added.",
-                                  service_key=s.key, fix="Add pages to the service's global pool (Services)."))
+                                  service_key=s.key, fix="Add pages to the service's global pool (Services).",
+                                  link=f"/admin/services/{s.key}", link_label="Open the service"))
             elif _low(left, s.pool_pages, rs):
                 items.append(Item("warn", "global_pool_low", f"{s.label}: running low for the whole service",
                                   f"{left:,} of {s.pool_pages:,} pages left.", service_key=s.key,
-                                  fix="Add pages to the service's global pool (Services)."))
+                                  fix="Add pages to the service's global pool (Services).",
+                                  link=f"/admin/services/{s.key}", link_label="Open the service"))
 
     for g in groups:
         waiting = db.scalar(select(func.count()).select_from(User).where(
@@ -185,7 +308,8 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
             items.append(Item("warn", "members_waiting",
                               f"{g.name}: {waiting} {'person' if waiting == 1 else 'people'} waiting for approval",
                               "They can sign in but can't submit documents until someone approves them.",
-                              str(g.id), g.name, count=waiting, fix="Approve or decline them (the group's People tab)."))
+                              str(g.id), g.name, count=waiting, fix="Approve or decline them (the group's People tab).",
+                              link=f"/admin/groups/{g.id}/people", link_label="Open People"))
         members = db.scalar(select(func.count()).select_from(User).where(User.group_id == g.id,
                                                                           User.status == "active")) or 0
         for gs in g.services:
@@ -202,11 +326,13 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                 items.append(Item("bad", "group_pool_empty", f"{g.name}: no {s.label} pages left",
                                   f"{who}, but the group's pool is empty ({gs.pool_pages:,} pages, all used or "
                                   "held). Personal limits don't add pages, so they all see 0 left.",
-                                  str(g.id), g.name, s.key, fix="Add pages to the group, or request them (its Services and pages)."))
+                                  str(g.id), g.name, s.key, fix="Add pages to the group, or request them (its Services and pages).",
+                                  link=f"/admin/groups/{g.id}/services", link_label="Open Services and pages"))
             elif _low(left, gs.pool_pages, rs):
                 items.append(Item("warn", "group_pool_low", f"{g.name}: {s.label} running low",
                                   f"{left:,} of {gs.pool_pages:,} pages left; {who}.", str(g.id), g.name, s.key,
-                                  fix="Add pages to the group, or request them (its Services and pages)."))
+                                  fix="Add pages to the group, or request them (its Services and pages).",
+                                  link=f"/admin/groups/{g.id}/services", link_label="Open Services and pages"))
             # Personal limits that promise more than the pool holds
             if left > 0:
                 over = 0
@@ -222,26 +348,32 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                     items.append(Item("info", "limits_exceed_pool", f"{g.name}: {s.label} limits exceed the pool",
                                       f"{over} {'person has' if over == 1 else 'people have'} a limit larger than the "
                                       f"{left:,} pages left in the group's pool; the pool runs out first.",
-                                      str(g.id), g.name, s.key, over, "Add pages to the group, or lower the limits."))
+                                      str(g.id), g.name, s.key, over, "Add pages to the group, or lower the limits.",
+                                      link=f"/admin/groups/{g.id}/services", link_label="Open Services and pages"))
 
     gid = [g.id for g in groups]
     job_scope = Job.group_id.in_(gid) if group_ids is not None else true()
     now = _now()
 
-    def count(*where) -> int:
-        return db.scalar(select(func.count()).select_from(Job).where(job_scope, *where)) or 0
-
-    if n := count(Job.status == "held", Job.created_at < now - HELD_LONG):
+    everyone = group_ids is None
+    held_long, earlier = fresh("held", db.scalars(select(Job).where(
+        job_scope, Job.status == "held", Job.created_at < now - HELD_LONG)).all())
+    if n := len(held_long):
+        link, label = _documents_link(db, held_long, everyone)
         items.append(Item("info", "held", f"{n} document{'s' if n > 1 else ''} waiting for confirmation",
                           "Held for more than a day: the person hasn't sent them yet. Nothing is charged until they do.",
-                          count=n))
+                          count=n, link=link, link_label=label, key="held", ackable=True, earlier=earlier,
+                          ids=[str(j.id) for j in held_long]))
     waiting = [j for j in db.scalars(select(Job).where(job_scope, Job.status == "queued"))
                if (j.progress or {}).get("stage") == "waiting_daily_cap"]
     if waiting:
         keys = sorted({k for j in waiting for k in (j.progress or {}).get("services") or []})
+        link, label = (f"/admin/services/{keys[0]}", "Open the service") if everyone and len(keys) == 1 \
+            else _documents_link(db, waiting, everyone, live="waiting")
         items.append(Item("warn", "daily_cap", f"{len(waiting)} document{'s' if len(waiting) > 1 else ''} waiting "
                           "for tomorrow's daily limit", f"Held back by the daily limit of: {', '.join(keys)}.",
-                          count=len(waiting), fix="Raise the daily limit if they shouldn't wait (Services)."))
+                          count=len(waiting), fix="Raise the daily limit if they shouldn't wait (Services).", link=link,
+                          link_label=label))
     # Paused queues: everyone sees the documents held by a paused service; super admins also see every paused queue
     pauses = queues.paused(db)
     if pauses:
@@ -253,60 +385,154 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None) -> list[Ite
                 items.append(Item("warn", "queue_paused", f"{labels.get(key, key)} is paused",
                                   f"Paused by {p.paused_by} on {p.paused_at:%Y-%m-%d %H:%M} UTC"
                                   + (f": {p.note}" if p.note else "") + ". Nothing new starts until it's resumed.",
-                                  fix="Resume it in Queues when it's ready."))
+                                  fix="Resume it in Queues when it's ready.", link=f"/admin/queues?queue={key}",
+                                  link_label="Open the queue"))
         elif held:
+            link, label = _documents_link(db, held, everyone)
             items.append(Item("info", "queue_paused", f"{len(held)} document{'s' if len(held) > 1 else ''} waiting "
                               "for a paused service", "Support has paused a processing option these documents use. "
-                              "They'll go ahead when it's resumed; nothing more is needed.", count=len(held)))
+                              "They'll go ahead when it's resumed; nothing more is needed.", count=len(held), link=link,
+                              link_label=label))
     if group_ids is None:
-        if n := db.scalar(select(func.count()).select_from(MailOutbox).where(
-                MailOutbox.status == "failed", MailOutbox.created_at > now - RECENT)):
+        failed_mail, earlier = fresh("mail_failed", db.scalars(select(MailOutbox).where(
+            MailOutbox.status == "failed", MailOutbox.created_at > now - RECENT)).all())
+        if n := len(failed_mail):
             items.append(Item("warn", "mail_failed", f"{n} email{'s' if n > 1 else ''} couldn't be sent in the last 7 days",
                               "The mail provider refused them or kept failing.", count=n,
-                              fix="See why and try them again in Queues → Email."))
-    large_waiting = [j for j in db.scalars(select(Job).where(job_scope, Job.status == "queued",
-                                                             Job.created_at < now - LARGE_WAIT))
-                     if (j.progress or {}).get("stage") == "waiting_large"]
+                              fix="See why and try them again in Queues → Email.",
+                              link=f"/admin/queues?queue={queues.MAIL}&state=failed", link_label="Show them",
+                              key="mail_failed", ackable=True, earlier=earlier, ids=[str(m.id) for m in failed_mail]))
+    large_waiting, large_earlier = fresh("large_waiting", [
+        j for j in db.scalars(select(Job).where(job_scope, Job.status == "queued", Job.created_at < now - LARGE_WAIT))
+        if (j.progress or {}).get("stage") == "waiting_large"])
     if large_waiting:
         n = len(large_waiting)
+        link, label = _documents_link(db, large_waiting, everyone, live="waiting")
         items.append(Item("info", "large_waiting", f"{n} large document{'s' if n > 1 else ''} waiting over "
                           f"{LARGE_WAIT.seconds // 3600} hours", "Large documents start after every few smaller ones, "
                           "or when nothing smaller is waiting. A busy day can hold them back.", count=n,
                           fix="Super admins can use Process now in Queues if one is urgent." if group_ids is None
-                          else "Ask support if one is urgent."))
+                          else "Ask support if one is urgent.", link=link, link_label=label, key="large_waiting",
+                          ackable=True, earlier=large_earlier, ids=[str(j.id) for j in large_waiting]))
     # A worker lost mid-way (#315): the engine will try once more after its timeout, or fail it
-    lost = [j for j in db.scalars(select(Job).where(job_scope, Job.status.in_(("submitted", "processing"))))
-            if (j.progress or {}).get("stage") == "worker_lost"]
+    lost, lost_earlier = fresh("worker_lost", [
+        j for j in db.scalars(select(Job).where(job_scope, Job.status.in_(("submitted", "processing"))))
+        if (j.progress or {}).get("stage") == "worker_lost"])
     if lost:
         n = len(lost)
+        link, label = _documents_link(db, lost, everyone, live="active")
         items.append(Item("warn", "worker_lost", f"{n} document{'s' if n > 1 else ''} lost {'their' if n > 1 else 'its'} "
                           "engine worker partway through",
                           "The worker stopped while processing (often running out of memory on a large document). "
                           "Each is tried once more after the task time limit, then fails with its pages given back.",
                           count=n, fix="Check the engine worker's memory limit and logs (operations guide: Monitoring)."
-                          if group_ids is None else "Nothing to do: support is told."))
-    if n := count(Job.status.in_(("submitted", "processing")), Job.submitted_at < now - STUCK):
+                          if group_ids is None else "Nothing to do: support is told.", link=link, link_label=label,
+                          key="worker_lost", ackable=True, earlier=lost_earlier, ids=[str(j.id) for j in lost]))
+    stuck = db.scalars(select(Job).where(job_scope, Job.status.in_(("submitted", "processing")),
+                                         Job.submitted_at < now - STUCK)).all()
+    if n := len(stuck):
+        link, label = _documents_link(db, stuck, everyone, live="active")
         items.append(Item("warn", "stuck", f"{n} document{'s' if n > 1 else ''} processing for over 2 hours",
                           "Usually a stopped engine worker or an unreachable AI or Adobe service.", count=n,
-                          fix="Check the engine's workers and logs (operations guide: Monitoring)."))
-    failed = list(db.execute(select(Job.error_code, func.count()).where(
-        job_scope, Job.status == "failed", Job.finished_at > now - RECENT).group_by(Job.error_code)))
-    if failed:
-        total = sum(n for _, n in failed)
-        top = ", ".join(f"{code or 'unknown'} ({n})" for code, n in sorted(failed, key=lambda r: -r[1])[:4])
+                          fix="Check the engine's workers and logs (operations guide: Monitoring).", link=link,
+                          link_label=label))
+    failed_jobs, failed_earlier = fresh("failed", db.scalars(select(Job).where(
+        job_scope, Job.status == "failed", Job.finished_at > now - RECENT)).all())
+    if failed_jobs:
+        total, by_code = len(failed_jobs), {}
+        for j in failed_jobs:
+            by_code[j.error_code] = by_code.get(j.error_code, 0) + 1
+        top = ", ".join(f"{_reason(code)} ({n})" for code, n in sorted(by_code.items(), key=lambda r: -r[1])[:4])
+        link, label = _documents_link(db, failed_jobs, everyone, days=7)
         items.append(Item("warn" if total >= 3 else "info", "failed",
                           f"{total} document{'s' if total > 1 else ''} failed in the last 7 days", f"Reasons: {top}.",
-                          count=total, fix="Open the documents to see why (Documents, filtered by failed)."))
-    refunds = [j for j in db.scalars(select(Job).where(job_scope, Job.status == "completed",
-                                                       Job.finished_at > now - RECENT))
-               if (j.cost or {}).get("ai_refunded") and not (j.cost or {}).get("ai_unused")]
+                          count=total, fix="Open the document to see why." if total == 1 else
+                          "Open the documents to see why.", link=link, link_label=label, key="failed", ackable=True,
+                          earlier=failed_earlier, ids=[str(j.id) for j in failed_jobs]))
+    refunds, ai_earlier = fresh("ai_unavailable", [
+        j for j in db.scalars(select(Job).where(job_scope, Job.status == "completed", Job.finished_at > now - RECENT))
+        if (j.cost or {}).get("ai_refunded") and not (j.cost or {}).get("ai_unused")])
     if refunds:
         tiers = sorted({j.ai_tier or "?" for j in refunds})
+        link, label = _documents_link(db, refunds, everyone, days=7)
         items.append(Item("warn", "ai_unavailable", f"The AI wasn't available for {len(refunds)} "
                           f"document{'s' if len(refunds) > 1 else ''} in the last 7 days",
                           f"Every AI call failed, so they used layout rules only (AI pages given back). "
                           f"AI levels: {', '.join(tiers)}.", count=len(refunds),
-                          fix="Check the AI gateway and its models (Administration → AI gateway)."))
+                          fix="Check the AI gateway and its models (Administration → AI gateway).", link=link,
+                          link_label=label, key="ai_unavailable", ackable=True, earlier=ai_earlier,
+                          ids=[str(j.id) for j in refunds]))
+    for i in items:
+        i.key = i.key or ":".join(x for x in (i.kind, i.group_id, i.service_key) if x)
+        if i.ackable and scope is None:
+            i.ackable = False  # a list of several groups: acknowledge it in each group's own
     order = {"bad": 0, "warn": 1, "info": 2}
     items.sort(key=lambda i: (order[i.severity], i.group_name or "", i.title))
     return items
+
+
+def acknowledge(db: Session, group_ids: list[uuid.UUID] | None, key: str, by: str):
+    """Acknowledge an item in this list (#538): it's hidden, for everyone who sees the list, until something new joins
+    what it's about. Returns the row; None if there's no such item, or it can't be acknowledged."""
+    from portal.models import AttentionAck
+    scope = scope_of(group_ids)
+    item = next((i for i in attention(db, group_ids, with_acknowledged=True) if i.key == key), None)
+    if scope is None or item is None or not item.ackable:
+        return None
+    # Alerts acknowledged over a week ago are long off the list: their rows go
+    db.query(AttentionAck).filter(AttentionAck.scope == scope, AttentionAck.key.like("security:%"),
+                                  AttentionAck.acked_at < _now() - RECENT).delete(synchronize_session=False)
+    row = db.scalar(select(AttentionAck).where(AttentionAck.scope == scope, AttentionAck.key == key))
+    if row is None:
+        row = AttentionAck(scope=scope, key=key, group_id=None if group_ids is None else group_ids[0])
+        db.add(row)
+    row.ids, row.title, row.detail, row.acked_by, row.acked_at = item.ids, item.title[:300], item.detail, by, _now()
+    db.flush()
+    return row
+
+
+def unacknowledge(db: Session, group_ids: list[uuid.UUID] | None, key: str):
+    """Show an acknowledged item again, in full. Returns the row removed, or None."""
+    from portal.models import AttentionAck
+    row = db.scalar(select(AttentionAck).where(AttentionAck.scope == scope_of(group_ids), AttentionAck.key == key))
+    if row is not None:
+        db.delete(row)
+        db.flush()
+    return row
+
+
+def acknowledged(db: Session, group_ids: list[uuid.UUID] | None) -> list[dict]:
+    """The list's acknowledged items, newest first: what each said, who acknowledged it and when, and how many of
+    the things it was about are still there (0: all of them dealt with or out of its window)."""
+    from portal.models import AttentionAck
+    scope = scope_of(group_ids)
+    if scope is None:
+        return []
+    current = {i.key: set(i.ids) for i in attention(db, group_ids, with_acknowledged=True) if i.ackable}
+    rows = db.scalars(select(AttentionAck).where(AttentionAck.scope == scope).order_by(AttentionAck.acked_at.desc()))
+    return [{"key": r.key, "title": r.title, "detail": r.detail, "acked_by": r.acked_by, "acked_at": r.acked_at,
+             "count": len(r.ids or []), "still": len(current.get(r.key, set()) & set(r.ids or []))} for r in rows]
+
+
+def acked(db: Session, request, p, group_ids, row, key: str) -> list[dict]:
+    """For the endpoints, super admins' and a group's: the audit entry, and the list as it is now."""
+    from portal import audit
+    from portal.errors import ApiError
+    if row is None:
+        raise ApiError(409, "not_acknowledgeable", "That item isn't on the list now, or it can't be acknowledged: "
+                                                   "it goes when it's fixed.")
+    audit.record(db, request, "attention.acknowledged", actor=p.user, target_type="attention", target_id=key,
+                 group_id=row.group_id, details={"key": key, "title": row.title, "count": len(row.ids or [])})
+    db.commit()
+    return [i.to_dict() for i in attention(db, group_ids)]
+
+
+def unacked(db: Session, request, p, group_ids, row, key: str) -> list[dict]:
+    """The audit entry for showing an item again, and the list as it is now."""
+    from portal import audit
+    if row is not None:
+        audit.record(db, request, "attention.unacknowledged", actor=p.user, target_type="attention", target_id=key,
+                     group_id=row.group_id, details={"key": key, "title": row.title,
+                                                     "acknowledged_by": row.acked_by})
+        db.commit()
+    return [i.to_dict() for i in attention(db, group_ids)]

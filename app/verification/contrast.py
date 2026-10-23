@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pymupdf as fitz
 
-from app.verification.model import Finding
+from app.verification.model import Finding, area_boxes
 
 SCALE = 1.5          # rendering scale (108 dpi): enough pixels under 9 pt text to find its background
 MIN_SHARE = 0.35     # the background's color covers at least this much of the box's pixels left after the glyphs
@@ -84,51 +84,66 @@ def _background(pix: np.ndarray, box, text_rgb) -> tuple[float, float, float] | 
     return tuple(float(v) for v in rest[keys == values[top]].mean(axis=0))
 
 
-def check(path: Path, max_pages: int) -> list[Finding]:
-    out: list[Finding] = []
+def _page(page, n: int) -> Finding | None:
+    """One page's low-contrast text, as one finding (None: none)."""
+    # Painted text only: not an invisible OCR layer (type 3), nor text drawn fully transparent (hidden text,
+    # which would otherwise read as "the same color as its background")
+    spans = [s for s in page.get_texttrace() if s.get("type") == 0 and s.get("chars")
+             and (s.get("opacity") is None or float(s["opacity"]) >= 0.1)]
+    if not spans:
+        return None
+    pm = page.get_pixmap(matrix=fitz.Matrix(SCALE, SCALE), colorspace=fitz.csRGB, alpha=False)
+    pix = np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, 3)
+    rot = page.rotation_matrix
+    low = []
+    for s in spans:
+        rgb = _rgb(s.get("color"), int(s.get("colorspace") or 0))
+        if rgb is None:
+            continue
+        text = "".join(chr(c[0]) for c in s["chars"] if c[0] > 31).strip()
+        if len(text) < 2:
+            continue  # a bullet or a stray mark
+        box = fitz.Rect(s["bbox"]) * rot
+        bg = _background(pix, box, rgb)
+        if bg is None:
+            continue
+        opacity = float(s.get("opacity") if s.get("opacity") is not None else 1.0)
+        shown = tuple(opacity * t + (1 - opacity) * b for t, b in zip(rgb, bg))
+        need = LARGE if _large(s) else NORMAL
+        r = ratio(shown, bg)
+        if r < need - 0.05:  # rounding: 4.48 reads as 4.5
+            low.append((r, need, text, shown, bg, tuple(box)))
+    if not low:
+        return None
+    low.sort(key=lambda x: x[0])
+    examples = "; ".join(f"“{t[:40]}” {_hex(fg)} on {_hex(bg)}, {r:.1f}:1 (needs {need:g}:1)"
+                         for r, need, t, fg, bg, _ in low[:MAX_EXAMPLES])
+    more = f" and {len(low) - MAX_EXAMPLES} more" if len(low) > MAX_EXAMPLES else ""
+    r, need, t, fg, bg, _ = low[0]
+    return Finding(
+        layer="visual", severity="review", issue="text with low contrast", page=n + 1, text=t[:120],
+        detail=f"{len(low)} run(s) of text below the minimum contrast: {examples}{more}",
+        action="Check it can be read; the colors are in the source document, so fix them there and convert "
+               "again if it's too faint",
+        extra={"ratio": round(r, 2), "needs": need, "color": _hex(fg), "background": _hex(bg),
+               "count": len(low)},
+        boxes=area_boxes([x[5] for x in low]))
+
+
+def check_pages(path: Path, numbers) -> dict[int, Finding | None]:
+    """The pages numbered, each checked as check() does (one page_pool worker's share, #124)."""
     with fitz.open(path) as doc:
-        for n, page in enumerate(doc):
-            if n >= max_pages:
-                break
-            # Painted text only: not an invisible OCR layer (type 3), nor text drawn fully transparent (hidden text,
-            # which would otherwise read as "the same color as its background")
-            spans = [s for s in page.get_texttrace() if s.get("type") == 0 and s.get("chars")
-                     and (s.get("opacity") is None or float(s["opacity"]) >= 0.1)]
-            if not spans:
-                continue
-            pm = page.get_pixmap(matrix=fitz.Matrix(SCALE, SCALE), colorspace=fitz.csRGB, alpha=False)
-            pix = np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, 3)
-            rot = page.rotation_matrix
-            low = []
-            for s in spans:
-                rgb = _rgb(s.get("color"), int(s.get("colorspace") or 0))
-                if rgb is None:
-                    continue
-                text = "".join(chr(c[0]) for c in s["chars"] if c[0] > 31).strip()
-                if len(text) < 2:
-                    continue  # a bullet or a stray mark
-                box = fitz.Rect(s["bbox"]) * rot
-                bg = _background(pix, box, rgb)
-                if bg is None:
-                    continue
-                opacity = float(s.get("opacity") if s.get("opacity") is not None else 1.0)
-                shown = tuple(opacity * t + (1 - opacity) * b for t, b in zip(rgb, bg))
-                need = LARGE if _large(s) else NORMAL
-                r = ratio(shown, bg)
-                if r < need - 0.05:  # rounding: 4.48 reads as 4.5
-                    low.append((r, need, text, shown, bg))
-            if not low:
-                continue
-            low.sort(key=lambda x: x[0])
-            examples = "; ".join(f"“{t[:40]}” {_hex(fg)} on {_hex(bg)}, {r:.1f}:1 (needs {need:g}:1)"
-                                 for r, need, t, fg, bg in low[:MAX_EXAMPLES])
-            more = f" and {len(low) - MAX_EXAMPLES} more" if len(low) > MAX_EXAMPLES else ""
-            r, need, t, fg, bg = low[0]
-            out.append(Finding(
-                layer="visual", severity="review", issue="text with low contrast", page=n + 1, text=t[:120],
-                detail=f"{len(low)} run(s) of text below the minimum contrast: {examples}{more}",
-                action="Check it can be read; the colors are in the source document, so fix them there and convert "
-                       "again if it's too faint",
-                extra={"ratio": round(r, 2), "needs": need, "color": _hex(fg), "background": _hex(bg),
-                       "count": len(low)}))
-    return out
+        return {n: _page(doc[n], n) for n in numbers}
+
+
+def check(path: Path, max_pages: int) -> list[Finding]:
+    """Text with low contrast, page by page: a long document's pages are checked by several processes (#124)."""
+    from app.pipeline import page_pool
+
+    with fitz.open(path) as doc:
+        pages = min(doc.page_count, max_pages)
+    workers = page_pool.workers_for(pages)
+    done = page_pool.run("app.verification.contrast:check_pages", path, pages, workers) if workers > 1 else None
+    if done is None:
+        done = list(check_pages(path, range(pages)).values())
+    return [f for f in done if f is not None]

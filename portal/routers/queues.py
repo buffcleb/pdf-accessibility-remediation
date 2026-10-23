@@ -57,6 +57,9 @@ class ItemsOut(BaseModel):
     queue: str
     state: str
     items: list[ItemOut]
+    total: int  # in this state (and search), over every page (#514)
+    page: int
+    page_size: int
 
 
 class LiveItemOut(BaseModel):
@@ -110,9 +113,11 @@ def live(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None, 
 
 
 @router.get("/{key}/items", response_model=ItemsOut)
-def list_items(key: str, state: str = "waiting", p: Principal = Depends(require_super_admin),
+def list_items(key: str, state: str = "waiting", q: str = Query("", max_length=200), page: int = Query(1, ge=1, le=100_000),
+               page_size: int = Query(25, ge=1, le=200), p: Principal = Depends(require_super_admin),
                db: Session = Depends(get_db)):
-    return queues.items(db, key, state)
+    """One queue's items in one state, a page at a time, searched by document or person (#514)."""
+    return queues.items(db, key, state, q=q, page=page, page_size=page_size)
 
 
 @router.post("/{key}/pause", response_model=list[QueueOut])

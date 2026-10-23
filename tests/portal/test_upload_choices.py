@@ -3,7 +3,9 @@ an audit follows its AI level's setting (free, counted against the level, or mad
 from __future__ import annotations
 
 import json
+import uuid
 
+from portal.models import Job
 from tests.portal.test_ai_levels import _kind
 from tests.portal.test_ai_tiers import _tier
 from tests.portal.test_jobs import API, fake_engine, pdf_bytes, run_worker, setup, topup  # noqa: F401
@@ -32,7 +34,7 @@ def test_a_group_sets_one_ai_level_for_everything(setup):
     premium = _tier(s, "Premium AI", "commercial", metered=False)
     _kind(s, premium, "Math and science", "local-vision")
     assert s["c"]["user"].get(f"{API}/upload-options").json() == {
-        "ai_mode": "choose", "ai_level": None, "ai_kind": None, "show_external": False}
+        "ai_mode": "choose", "ai_level": None, "ai_kind": None, "show_external": False, "malware_scan": False}
     # The level has to be one the group uses, and the kind one the level offers
     assert _group(s, ai_mode="fixed").json()["detail"]["error"] == "level_required"
     assert _group(s, ai_mode="fixed", ai_level=premium, ai_kind="forms").json()["detail"]["error"] == "unknown_kind"
@@ -40,7 +42,8 @@ def test_a_group_sets_one_ai_level_for_everything(setup):
     assert r.status_code == 200, r.text
     assert r.json()["ai_mode"] == "fixed" and r.json()["show_external"] is True
     assert s["c"]["user"].get(f"{API}/upload-options").json() == {
-        "ai_mode": "fixed", "ai_level": premium, "ai_kind": "math-and-science", "show_external": True}
+        "ai_mode": "fixed", "ai_level": premium, "ai_kind": "math-and-science", "show_external": True,
+        "malware_scan": False}
     # What people ask for is set aside
     job = _jobs(s, ai_tier=basic, ai_kind="general")[0]
     assert job["ai_tier"] == premium and job["ai_kind"] == "math-and-science"
@@ -95,3 +98,42 @@ def test_an_audit_follows_its_levels_setting(setup):
 
     assert sup.patch(f"{API}/admin/services/{level}", json={"audit_ai": "sometimes"}).status_code == 422
     assert sup.patch(f"{API}/admin/services/standard", json={"audit_ai": "off"}).status_code == 422
+
+
+def test_the_same_file_again_while_the_first_is_in_progress(setup):
+    """#560: an upload took a while, the page was refreshed and the file sent again. The copy is refused, saying the
+    first is in Your documents, and uses no pages; the same file with other choices, or once the first is done,
+    goes ahead."""
+    s = setup
+    topup(s, s["a"].id, 50)
+    basic = _tier(s, "Basic AI", "local-vision", default=True, metered=False)
+    premium = _tier(s, "Premium AI", "commercial", metered=False)
+    same = pdf_bytes(2)
+
+    def send(**data):
+        files = [("files", ("report.pdf", same, "application/pdf"))]
+        r = s["c"]["user"].post(f"{API}/jobs", files=files, data={k: v for k, v in data.items() if v is not None})
+        assert r.status_code == 200, r.text
+        return r.json()[0]
+
+    first = send(ai_tier=basic)
+    assert first["accepted"]
+    again = send(ai_tier=basic)
+    assert not again["accepted"]
+    assert again["error"]["error"] == "already_in_progress"
+    assert "already in Your documents" in again["error"]["message"] and "waiting its turn" in again["error"]["message"]
+    # Only the first was charged
+    assert s["c"]["user"].get(f"{API}/jobs").json()[0]["id"] == first["job"]["id"]
+    assert len(s["c"]["user"].get(f"{API}/jobs").json()) == 1
+    # Other choices: a real comparison, so it goes ahead
+    assert send(ai_tier=premium)["accepted"]
+    assert send(ai_tier=basic, report_only="true")["accepted"]
+    # Two copies in one upload: the second is refused the same way
+    files = [("files", ("a.pdf", pdf_bytes(1), "application/pdf"))] * 2
+    both = s["c"]["user"].post(f"{API}/jobs", files=files, data={"ai_tier": basic}).json()
+    assert [b["accepted"] for b in both] == [True, False]
+    # Once the first is finished, the same file can be sent again
+    db = s["db"]
+    db.get(Job, uuid.UUID(first["job"]["id"])).status = "completed"
+    db.commit()
+    assert send(ai_tier=basic)["accepted"]

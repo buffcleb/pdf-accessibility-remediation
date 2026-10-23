@@ -15,6 +15,8 @@ Delete the variable to go back to GitHub's runners, for example while the runner
 
 ## Where to put a runner
 
+> **Changed 22 October 2026:** the portal tests' database is in memory, so jobs leave no Docker volumes.
+
 **Not on the machines that run the service.** On 11 October 2026 a runner set was installed on the service's own
 cluster with GitHub's Actions Runner Controller, and three test jobs started at once. Twenty-three seconds
 after the last of them started, the network card of the physical host under all three nodes stalled (an Intel
@@ -32,7 +34,10 @@ Use a separate Linux machine or virtual machine on other hardware:
   Linux runners.
 - Outbound HTTPS to github.com, GitHub's package and action downloads, PyPI, npm, the Ubuntu archive,
   software.verapdf.org, keyserver.ubuntu.com (veraPDF's signing key) and public.ecr.aws. Nothing inbound.
-- 2 CPUs and 4 GB of memory are enough for one job at a time.
+- 2 CPUs and 4 GB of memory are enough for one job at a time. The portal tests' PostgreSQL keeps its data in
+  memory (`--tmpfs`, #498): before that, each job left an anonymous Docker volume behind, and thousands of them used
+  up the runner's inodes ("No space left on device" with 36 GB free). A runner set up before 21 October may still
+  have them: `docker volume prune` clears them.
 - Register it under the repository's Settings → Actions → Runners → New self-hosted runner, give it a label
   (for example `pdf-ci`), and set the repository variable `CI_RUNNER` to that label.
 - The runner must be version 2.327.1 or later: the workflow's actions (checkout v7, setup-python v7, setup-node v7,
@@ -50,19 +55,22 @@ all six jobs run whatever changed.
 
 ## Which jobs run
 
+> **Changed 22 October 2026:** the engine, portal and shell-script jobs also run for the deployment files their tests
+> read (#467), and one documentation page runs the engine tests.
+
 Each job runs only when files it tests have changed:
 
 | Job | Runs when these change |
 |---|---|
-| Engine tests | `app/`, `tests/engine/`, the requirements files, `pytest.ini`, `docker/verapdf-auto-install.xml` |
-| Portal tests | `portal/`, `tests/portal/`, the requirements files, `pytest.ini` |
+| Engine tests | `app/`, `tests/engine/`, the requirements files, `pytest.ini`, `docker/verapdf-auto-install.xml`; and `deploy/`, `config/`, `scripts/` and `docs/operations/ai-models.md`, which engine tests read (the manifests, the gateway's models, the scripts) |
+| Portal tests | `portal/`, `tests/portal/`, the requirements files, `pytest.ini`, `deploy/k8s/manifests/` (every workload needs a System-page entry) |
 | Web build | `web/` |
-| Shell scripts | `scripts/` (shellcheck over `scripts/*.sh` and `docker/web/*.sh`) |
+| Shell scripts | `scripts/`, `docker/web/*.sh`, `deploy/node/` (shellcheck over them) |
 | SQL built from strings | `app/`, `portal/` (Bandit's B608 only: a query made by formatting text fails the job; a line that must build SQL from constants says why and ends `# nosec B608`) |
 | Dependency audit | the requirements files, `web/package-lock.json`, `docker/web/`, `scripts/audit-deps.sh` (known advisories against what they resolve to; a hit fails the job, and the fix is a version bump or, for one that doesn't apply, a named exception in `scripts/audit-deps.sh`) |
 
-A change to the workflow itself runs all six. A change to documentation alone runs none: only the short
-"What changed" job appears.
+A change to the workflow itself runs all six. A change to documentation alone runs none (except
+`docs/operations/ai-models.md`, above): only the short "What changed" job appears.
 
 Two more run on their own (#362):
 

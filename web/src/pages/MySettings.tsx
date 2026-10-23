@@ -8,6 +8,7 @@ import { useAuth } from "../auth";
 import { VIEW_FREQUENCIES } from "../components/ScheduleView";
 import { ErrorNotice, Loading, Notice, useLoad, useTitle } from "../components/ui";
 import { useConfirmLeave } from "../components/unsaved";
+import { ApiTokens } from "../components/ApiTokens";
 
 const NOTIFY: [NotifyChoice, string][] = [["each", "As they happen"], ["daily", "Once a day"], ["off", "Off"]];
 const REPORT_FREQUENCIES: [EmailReportChoice["frequency"], string][] = [
@@ -34,6 +35,12 @@ export function MySettings() {
       <Notifications />
       <EmailReportsCard />
       <ReportViews isAdmin={isAdmin} />
+      <ApiTokens wrap={(children) => (
+        <Card id="tokens" title="API tokens"
+          intro="For scripts that send documents, and if you choose, check on them and fetch the results. Each token sends to one processing option and AI level. Documents it sends appear in My documents.">
+          {children}
+        </Card>
+      )} />
       <Devices />
     </div>
   );
@@ -54,7 +61,7 @@ function Devices() {
   return (
     <Card id="devices" title="Signed-in devices"
       intro="Signed in on a computer you no longer have, or one other people use? Sign out everywhere: every browser and device, this one too. You'll need a new code to sign in again.">
-      <div className="actions">
+      <div className="setting-row">
         <button className="btn secondary" disabled={busy} onClick={() => void everywhere()}>Sign out of all devices</button>
       </div>
     </Card>

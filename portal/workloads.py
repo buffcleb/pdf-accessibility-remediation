@@ -16,9 +16,15 @@ A workload is a deployment or stateful set. Its boxes run from its minimum to it
 
 A row is "waiting" when documents have waited 15 minutes or more while it's at its maximum (the engine's workers:
 the only queue whose waits are timed), and "scaling" while it has fewer ready pods than it wants.
+
+Each container says the release it runs (#541), for checking against an advisory: from its image's tag (this
+service's own images are tagged with the commit they were built from), or, where the tag names only the major release
+(postgres:16-alpine, redis:7-alpine), from what the program reports through its exporter. And the image's digest as
+running, and whether it's the one pinned in the manifests. Nothing is asked of the programs or the registries.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -51,14 +57,28 @@ Q = {
     "terminated": "kube_pod_container_status_last_terminated_reason == 1",
     "probe_fail_1h": 'sum by (pod, probe_type) (increase(prober_probe_total{result="failed"}[1h]))',
     "liveness_fail_10m": 'sum by (pod) (increase(prober_probe_total{probe_type="Liveness", result="failed"}[10m]))',
-    "cpu": "sum by (pod) (rate(container_cpu_usage_seconds_total[5m]))",
-    "memory": "sum by (pod) (container_memory_working_set_bytes)",
+    # Containers only: the node's own totals (id="/", no container; kept for #522) aren't a pod's
+    "cpu": 'sum by (pod) (rate(container_cpu_usage_seconds_total{container!=""}[5m]))',
+    "memory": 'sum by (pod) (container_memory_working_set_bytes{container!=""})',
     "cpu_limit": 'sum by (pod) (kube_pod_container_resource_limits{resource="cpu"})',
     "memory_limit": 'sum by (pod) (kube_pod_container_resource_limits{resource="memory"})',
     "busy": "max by (pod) ({__name__=~\"" + "|".join(BUSY) + "\"})",
     "places": "max by (pod) (engine_worker_places)",
     "queue": "max by (queue) (engine_queue_length)",
     "oldest": "max(portal_queue_oldest_seconds)",
+    # What the database and Redis report about themselves, through their exporters
+    "reported_postgres": "pg_static",
+    "reported_redis": "redis_instance_info",
+}
+# The workload each of those describes, and the label that says its release
+REPORTED = {"postgres": "version", "redis": "redis_version"}  # "PostgreSQL 16.15 on x86_64…", "7.4.11"
+OWN_IMAGE = "pdfrem-"  # scripts/build.sh: $REGISTRY/pdfrem-engine:<commit>, …
+# Products in words, by image (without its registry); any other image is named after its last part
+PRODUCTS = {
+    "postgres": "PostgreSQL", "redis": "Redis", "berriai/litellm": "LiteLLM", "clamav/clamav": "ClamAV",
+    "prom/prometheus": "Prometheus", "grafana/grafana": "Grafana", "chrislusf/seaweedfs": "SeaweedFS",
+    "oliver006/redis_exporter": "Redis exporter", "prometheuscommunity/postgres-exporter": "Postgres exporter",
+    "ubuntu/squid": "Squid", "verapdf/rest": "veraPDF REST", "curlimages/curl": "curl",
 }
 
 
@@ -82,7 +102,7 @@ class Pod:
     busy: float | None = None
     places: float | None = None
     namespace: str | None = None
-    containers: list[dict] = field(default_factory=list)  # {"name", "image"}, in name order
+    containers: list[dict] = field(default_factory=list)  # {"name", "image", image_release()'s}, in name order
 
 
 @dataclass
@@ -124,6 +144,51 @@ def _num(v: float | None) -> float | None:
     return None if v is None or v != v else v  # NaN: nothing
 
 
+def image_release(spec: str, image_id: str | None, reported: str | None = None) -> dict:
+    """The release an image carries, from its reference as the manifests give it (`image_spec`) and the image as
+    running (`image_id`: repo@sha256:…).
+
+    product: what it is in words; release: its version, or the commit for this service's own images (source "build");
+    source: tag | reported (the program says, through its exporter) | build; digest: as running; pinned: the digest the
+    manifests ask for; matches: whether they're the same (None when either isn't known).
+    """
+    ref, _, pinned = spec.partition("@")
+    repo, tag = ref, None
+    if ":" in ref.rsplit("/", 1)[-1]:
+        repo, tag = ref.rsplit(":", 1)
+    first, _, rest = repo.partition("/")
+    path = rest if rest and ("." in first or ":" in first or first == "localhost") else repo  # without its registry
+    path = path.removeprefix("library/")
+    name = path.rsplit("/", 1)[-1]
+    digest = image_id.rpartition("@")[2] if image_id and "@" in image_id else None
+    out = {"product": PRODUCTS.get(path, name), "release": None, "source": None, "digest": digest,
+           "pinned": pinned or None, "matches": (digest == pinned) if digest and pinned else None}
+    if name.startswith(OWN_IMAGE) and tag:
+        out.update(release=tag, source="build")
+    elif reported:
+        out.update(release=reported, source="reported")
+    elif tag and tag != "latest":
+        out.update(release=re.sub(r"^v(?=\d)", "", tag), source="tag")
+    return out
+
+
+def _reported(r: dict, app: dict, containers: dict) -> dict:
+    """Running digest to the release its program reports (#541): the exporters say what the database and Redis run,
+    which the same image runs wherever else it's used (redis-portal)."""
+    out = {}
+    for workload, label in REPORTED.items():
+        said = next(((s.get("metric") or {}).get(label) for s in r[f"reported_{workload}"]), None)
+        m = re.search(r"\d+(\.\d+)+", said or "")
+        if not m:
+            continue
+        for pod in (p for p, a in app.items() if a == workload):
+            for spec, image_id in containers.get(pod, {}).values():
+                d = image_release(spec, image_id)
+                if d["digest"] and d["product"] == PRODUCTS.get(workload):
+                    out[d["digest"]] = m.group(0)
+    return out
+
+
 def pod_state(ready: bool, phase: str | None, age_s: float | None, deleting: bool, waiting_reason: str | None,
               liveness_fails_10m: float, busy: float | None, reports_busy: bool) -> str:
     if deleting:
@@ -148,11 +213,13 @@ def collect(prom: Prometheus, now: float | None = None) -> list[Workload]:
               s["metric"].get("horizontalpodautoscaler") for s in r["hpa_target"] if s.get("metric")}
     app = _labels(r["labels"], "pod", "label_app")
     info = {(s.get("metric") or {}).get("pod"): s.get("metric") or {} for s in r["info"]}
-    containers: dict[str, dict[str, str]] = {}
+    containers: dict[str, dict[str, tuple[str, str | None]]] = {}
     for c in r["containers"]:
         m = c.get("metric") or {}
         if m.get("pod") and m.get("container"):
-            containers.setdefault(m["pod"], {})[m["container"]] = m.get("image_spec") or m.get("image") or ""
+            containers.setdefault(m["pod"], {})[m["container"]] = (m.get("image_spec") or m.get("image") or "",
+                                                                   m.get("image_id") or None)
+    reported = _reported(r, app, containers)
     started, ready = _by(r["started"], "pod"), _by(r["ready"], "pod")
     phase = _labels(r["phase"], "pod", "phase")
     deleting, restarts = _by(r["deleting"], "pod"), _by(r["restarts"], "pod")
@@ -191,7 +258,8 @@ def collect(prom: Prometheus, now: float | None = None) -> list[Workload]:
                 cpu_cores=_num(cpu.get(pod)), cpu_limit=_num(cpu_lim.get(pod)), memory_bytes=_num(mem.get(pod)),
                 memory_limit=_num(mem_lim.get(pod)), busy=_num(busy.get(pod)), places=_num(places.get(pod)),
                 namespace=meta.get("namespace") or None,
-                containers=[{"name": n, "image": i} for n, i in sorted(containers.get(pod, {}).items())]))
+                containers=[_container(n, spec, image_id, reported)
+                            for n, (spec, image_id) in sorted(containers.get(pod, {}).items())]))
         if name in QUEUES:
             w.queue = QUEUES[name]
             w.waiting = queue.get(w.queue)
@@ -203,6 +271,11 @@ def collect(prom: Prometheus, now: float | None = None) -> list[Workload]:
             w.state = "scaling"
         out.append(w)
     return out
+
+
+def _container(name: str, spec: str, image_id: str | None, reported: dict) -> dict:
+    digest = image_release(spec, image_id)["digest"]
+    return {"name": name, "image": spec, **image_release(spec, image_id, reported.get(digest))}
 
 
 def as_dicts(workloads: list[Workload]) -> list[dict]:

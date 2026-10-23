@@ -8,6 +8,7 @@
 - [The gateway](#the-gateway)
 - [The local model server](#the-local-model-server)
 - [Cloud models through OpenRouter](#cloud-models-through-openrouter)
+- [AWS Bedrock](#aws-bedrock)
 - [Without the gateway (development only)](#without-the-gateway-development-only)
 - [Specialist notation](#specialist-notation)
 - [OCR correction](#ocr-correction)
@@ -108,6 +109,39 @@ OpenRouter list prices per million tokens (input / output), checked October 2026
 With any cloud model, page images leave your infrastructure: check the provider's data-retention terms before sending
 documents with personal, student, patient or personnel information, mark the level **external**, and avoid `:free`
 model variants (free endpoints may log prompts).
+
+## AWS Bedrock
+
+The gateway also serves models from AWS Bedrock, under an AWS agreement rather than OpenRouter's: AWS doesn't train on
+prompts or answers, or pass them to the model's maker, and keeps no copy unless model invocation logging is turned on
+(it's off by default; leave it off). `config/litellm.yaml` has one so far: **`trial-a-vision`**, Amazon's Nova Lite
+($0.06 / $0.24 per million tokens, reads images), a writer for comparing with `commercial-small-vision` (Claude Haiku).
+Pair it with `open-judge`. Amazon's own models are usually available to an account straight away; other makers' newest
+ones may not be (below).
+
+**In the AWS account** (the console's region: US East, N. Virginia):
+
+1. **A budget** with an alert (Billing › Budgets), on the whole account: Claude and other makers' models are billed
+   as AWS Marketplace items, not under "Amazon Bedrock".
+2. **The models available to the account.** Each model's **cross-region** tokens-per-minute quota (Service Quotas ›
+   Amazon Bedrock) must be above 0; request the default if it isn't. AWS may refuse a new model for an account with
+   little history ("not available for this account"); it may open up later, or the account's AWS team can ask.
+3. **A first call from someone allowed to subscribe** (a console user, in Bedrock's chat playground or CloudShell):
+   it accepts the maker's terms for the whole account. The gateway's own user can't, by design.
+4. **A user for the gateway** with no console access and only `bedrock:InvokeModel` and
+   `bedrock:InvokeModelWithResponseStream`, on each model's `us.` inference profile and the models behind it in
+   every region (`arn:aws:bedrock:*::foundation-model/…`): a cross-region call needs both. An access key for it, kept
+   in a password manager. (On premises for production: IAM Roles Anywhere, for short-lived credentials instead.)
+
+**In the service:** the key in `engine.env` (or `.env` locally) as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
+with `AWS_REGION_NAME=us-east-1`; `deploy.sh` puts them in the gateway's secret only. Then an AI level for
+`trial-a-vision` with `open-judge` (Administration › Services).
+
+**Choosing models:** use `us.` inference profiles (they stay in US regions), never `global.` ones, and set each
+model's Bedrock price in its `model_info` so the portal's costs are right. A reviewer is still from a different family
+from its writer, and on Bedrock a model the review needs may be missing: Google's Gemma runs only on Bedrock's
+separate "mantle" endpoint, so `open-judge` stays on OpenRouter until a Bedrock reviewer is chosen (Nova Lite is
+the cheapest one that reads images).
 
 ## Without the gateway (development only)
 

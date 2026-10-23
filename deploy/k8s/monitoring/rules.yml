@@ -42,7 +42,7 @@ groups:
 
       - alert: MemoryNearLimit
         expr: |
-          max by (pod, container) (container_memory_working_set_bytes
+          max by (pod, container) (container_memory_working_set_bytes{container!=""}
             / on (pod, container) group_left kube_pod_container_resource_limits{resource="memory"}) > 0.9
         for: 15m
         annotations:

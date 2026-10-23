@@ -613,6 +613,61 @@
    }
   },
   {
+   "type": "timeseries",
+   "title": "Malware scans of uploads",
+   "description": "With MALWARE_SCAN=clamav: how long scanning an upload takes (median and 95th percentile), part of the wait before an upload is accepted. Empty while scanning is off.",
+   "id": 21,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "fillOpacity": 15,
+      "showPoints": "never"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(portal_malware_scan_seconds_bucket[15m])))",
+     "legendFormat": "median",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(portal_malware_scan_seconds_bucket[15m])))",
+     "legendFormat": "95th percentile",
+     "refId": "B"
+    }
+   ],
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 31
+   }
+  },
+  {
    "type": "row",
    "title": "Resources (this namespace)",
    "id": 16,
@@ -621,7 +676,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 31
+    "y": 39
    },
    "panels": []
   },
@@ -659,7 +714,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total[5m]))",
+     "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{container!=\"\"}[5m]))",
      "legendFormat": "{{pod}}",
      "refId": "A"
     }
@@ -668,7 +723,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 32
+    "y": 40
    }
   },
   {
@@ -705,7 +760,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum by (pod) (container_memory_working_set_bytes)",
+     "expr": "sum by (pod) (container_memory_working_set_bytes{container!=\"\"})",
      "legendFormat": "{{pod}}",
      "refId": "A"
     }
@@ -714,7 +769,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 32
+    "y": 40
    }
   },
   {
@@ -760,7 +815,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 40
+    "y": 48
    }
   },
   {
@@ -806,7 +861,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 40
+    "y": 48
    }
   }
  ],

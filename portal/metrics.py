@@ -20,6 +20,10 @@ REGISTRY = CollectorRegistry()
 REQUESTS = Counter("portal_http_requests", "API requests served", ["method", "route", "status"], registry=REGISTRY)
 LATENCY = Histogram("portal_http_request_seconds", "Time to answer an API request", ["method", "route"],
                     buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30), registry=REGISTRY)
+# Uploads scanned for malware (#455), by outcome (clean, blocked, unavailable), and how long a scan takes
+MALWARE_SCANS = Counter("portal_malware_scans", "Uploads scanned for malware", ["outcome"], registry=REGISTRY)
+MALWARE_SCAN_SECONDS = Histogram("portal_malware_scan_seconds", "Time to scan an upload for malware",
+                                 buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120), registry=REGISTRY)
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 

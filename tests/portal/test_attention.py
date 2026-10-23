@@ -1,6 +1,7 @@
 """#14 part A: the Attention list and "why can't this person use this service?"."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -90,8 +91,11 @@ def test_jobs_needing_attention(setup):
     stuck.submitted_at = datetime.now(timezone.utc) - timedelta(hours=3)
     db.commit()
     items = {i["kind"]: i for i in s["c"]["admin_a"].get(f"{API}/groups/{s['a'].id}/attention").json()}
-    assert items["failed"]["count"] == 2 and "tag_integrity_failed (2)" in items["failed"]["detail"]
+    # The reason in words, and a link to them (#538): two of one group, its documents filtered to failed
+    assert items["failed"]["count"] == 2 and "no valid file could be made (2)" in items["failed"]["detail"]
+    assert items["failed"]["link"].startswith(f"/admin/groups/{s['a'].id}/documents?status=failed&from=")
     assert items["stuck"]["count"] == 1
+    assert items["stuck"]["link"] == f"/jobs/{stuck.id}" and items["stuck"]["link_label"] == "Open the document"
     # A worker lost mid-way (#315) is named as such, for super admins and the group's admins
     stuck.progress = {"stage": "worker_lost", "will_retry": True}
     db.commit()
@@ -123,3 +127,87 @@ def test_group_services_count_people_and_own_limits(setup):
     std = next(x for x in g["services"] if x["key"] == "standard")
     assert extra["people_with_access"] == 1 and extra["own_limits"] == 1
     assert std["people_with_access"] >= 2 and std["own_limits"] == 0  # everyone has Standard
+
+
+
+def test_each_item_links_to_what_its_about(setup):
+    """#538: one document goes straight to it, or to its help request when one is open; help requests waiting for
+    support are an item of their own, for super admins; a group's items link to the group's pages."""
+    from portal.models import HelpRequest
+    from tests.portal.test_help import _ask, _completed
+
+    s = setup
+    db = s["db"]
+    job_id = _completed(s)
+    # One failed document of the group: straight to it
+    job = db.get(Job, uuid.UUID(job_id))
+    job.status, job.error_code, job.finished_at = "failed", "adobe_rejected", datetime.now(timezone.utc)
+    db.commit()
+    items = {i["kind"]: i for i in s["c"]["super"].get(f"{API}/admin/attention").json()}
+    assert "Adobe refused the PDF (1)" in items["failed"]["detail"]
+    assert (items["failed"]["link"], items["failed"]["link_label"]) == (f"/jobs/{job_id}", "Open the document")
+    # With a help request open about it: to the request, and the request is waiting for support
+    req = _ask(s, job_id).json()["id"]
+    items = {i["kind"]: i for i in s["c"]["super"].get(f"{API}/admin/attention").json()}
+    assert items["failed"]["link"] == f"/admin/help/{req}"
+    assert items["help_waiting"]["title"] == "1 help request waiting for support"
+    assert items["help_waiting"]["link"] == f"/admin/help/{req}"
+    # Answered: no longer waiting for support
+    db.get(HelpRequest, uuid.UUID(req)).status = "waiting"
+    db.commit()
+    items = {i["kind"]: i for i in s["c"]["super"].get(f"{API}/admin/attention").json()}
+    assert "help_waiting" not in items
+    # The group's admins: no service-wide item, and their links are the group's
+    group = {i["kind"]: i for i in s["c"]["admin_a"].get(f"{API}/groups/{s['a'].id}/attention").json()}
+    assert "help_waiting" not in group and not any(str(i.get("link", "")).startswith(("/admin/queues", "/admin/reports",
+                                                                                     "/admin/system"))
+                                                   for i in group.values())
+
+
+
+def test_acknowledging_hides_an_item_until_something_new(setup):
+    """#538: acknowledged for everyone who sees that list (super admins', or the group's admins'), audited; it comes
+    back counting only what's new; it can be shown again. Live problems can't be acknowledged."""
+    from portal.models import AuditEvent
+
+    s = setup
+    db = s["db"]
+    topup(s, s["a"].id, 100)
+
+    def fail(name):
+        job_id = upload(s["c"]["user"], (name, pdf_bytes(1))).json()[0]["job"]["id"]
+        job = db.get(Job, uuid.UUID(job_id))
+        job.status, job.error_code, job.finished_at = "failed", "engine_rejected", datetime.now(timezone.utc)
+        db.commit()
+
+    def kinds(client, url):
+        return {i["kind"]: i for i in s["c"][client].get(url).json()}
+
+    root, group = f"{API}/admin/attention", f"{API}/groups/{s['a'].id}/attention"
+    fail("one.pdf")
+    item = kinds("super", root)["failed"]
+    assert item["ackable"] and item["key"] == "failed"
+    r = s["c"]["super"].post(f"{root}/acknowledge", json={"key": "failed"})
+    assert r.status_code == 200 and "failed" not in {i["kind"] for i in r.json()}
+    assert "failed" not in kinds("super", root)
+    [ack] = s["c"]["super"].get(f"{root}/acknowledged").json()
+    assert ack["acked_by"] == "root@admin.test" and ack["count"] == 1 and ack["still"] == 1
+    assert db.scalars(select(AuditEvent).where(AuditEvent.action == "attention.acknowledged")).one().details["key"] == "failed"
+    # The group's admins have their own list: still there for them, until they acknowledge it
+    assert "failed" in kinds("admin_a", group)
+    assert s["c"]["admin_a"].post(f"{group}/acknowledge", json={"key": "failed"}).status_code == 200
+    assert "failed" not in kinds("admin_a", group)
+    assert s["c"]["admin_b"].post(f"{API}/groups/{s['a'].id}/attention/acknowledge",
+                                  json={"key": "failed"}).status_code == 404  # not their group (as for its other pages)
+    # Something new: back, counting only the new one
+    fail("two.pdf")
+    back = kinds("super", root)["failed"]
+    assert back["count"] == 1 and back["earlier"] == 1 and back["title"].startswith("1 document failed")
+    # Shown again in full
+    assert s["c"]["super"].delete(f"{root}/acknowledge", params={"key": "failed"}).status_code == 200
+    assert kinds("super", root)["failed"]["count"] == 2
+    # A live problem can't be: it goes when it's fixed
+    upload(s["c"]["user"], ("big.pdf", pdf_bytes(95)))  # the pool runs low
+    low = kinds("super", root)["group_pool_low"]
+    assert not low.get("ackable")
+    assert s["c"]["super"].post(f"{root}/acknowledge", json={"key": low["key"]}).status_code == 409

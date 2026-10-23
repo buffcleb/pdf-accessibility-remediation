@@ -1,5 +1,7 @@
 """${message}
 
+Undoing it: <what downgrade() loses, or "can't be undone, restore the backup"> (docs/operations/rollback.md)
+
 Revision ID: ${up_revision}
 Revises: ${down_revision | comma,n}
 Create Date: ${create_date}

@@ -6,14 +6,15 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import false, func, or_, select
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, services
+from portal import approval, audit, paging, services
 from portal.db import get_db
 from portal.deps import Principal, current_principal, group_for_admin
 from portal.errors import ApiError, not_found
-from portal.models import AuditEvent, Group, User
+from portal.models import AuditEvent, Group, GroupDomain, RoleAssignment, User, UserService
+from portal.paging import Page
 from portal.routers.admin import revoke_sessions
 from portal.routers.common import AuditOut, audit_query
 from portal.schemas import GroupOut, UserOut, group_out, user_out
@@ -41,6 +42,28 @@ def my_admin_groups(p: Principal = Depends(current_principal), db: Session = Dep
     return [group_out(g) for g in db.scalars(stmt)]
 
 
+GROUP_SORTS = {"name": func.lower(Group.name), "created": Group.created_at}
+
+
+@router.get("/browse", response_model=Page[GroupOut])
+def browse_groups(q: str = Query("", max_length=200), status: str | None = Query(None, pattern="^(active|disabled)$"),
+                  sort: str = Query("name", max_length=20), page: int = Query(1, ge=1, le=100_000),
+                  page_size: int = Query(25, ge=1, le=200), p: Principal = Depends(current_principal),
+                  db: Session = Depends(get_db)):
+    """The groups the caller administers (every group for super admins), a page at a time (#514): search by name or
+    email domain, filter by status, sort by name or when it was made."""
+    stmt = select(Group)
+    if not p.is_super_admin:
+        stmt = stmt.where(Group.id.in_(p.user.admin_group_ids() or [uuid.UUID(int=0)]))
+    if q.strip():
+        pattern = paging.like(q)
+        stmt = stmt.where(or_(func.lower(Group.name).like(pattern, escape="\\"),
+                              Group.id.in_(select(GroupDomain.group_id).where(GroupDomain.domain.like(pattern, escape="\\")))))
+    if status:
+        stmt = stmt.where(Group.status == status)
+    return paging.page_of(db, stmt, paging.order_by(sort, GROUP_SORTS, Group.id), page, page_size, group_out)
+
+
 @router.get("/{group_id}", response_model=GroupOut)
 def group_overview(group_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     return group_out(group_for_admin(group_id, p, db))
@@ -62,6 +85,44 @@ def group_users(group_id: uuid.UUID, q: str | None = Query(None, max_length=200)
     if status:
         stmt = stmt.where(User.status == status)
     return [user_out(u) for u in db.scalars(stmt.order_by(User.email).limit(limit).offset(offset))]
+
+
+MEMBER_SORTS = {"email": User.email, "last_login": User.last_login_at, "joined": User.created_at}
+
+
+@router.get("/{group_id}/people", response_model=Page[UserOut])
+def group_people(group_id: uuid.UUID, q: str = Query("", max_length=200),
+                 status: str | None = Query(None, pattern="^(active|disabled|declined|admin)$"),
+                 service: str | None = Query(None, max_length=64), has: bool | None = None,
+                 sort: str = Query("email", max_length=20), page: int = Query(1, ge=1, le=100_000),
+                 page_size: int = Query(25, ge=1, le=200), p: Principal = Depends(current_principal),
+                 db: Session = Depends(get_db)):
+    """A group's people for its admins, a page at a time (#514). People waiting for approval aren't here: the People
+    tab lists them on their own (/users?approval=pending). Search by email or name; filter by status (active,
+    disabled, declined, the group's admins) and, with `service`, by whether they have it; sort by email, last sign-in
+    or when they joined."""
+    group = group_for_admin(group_id, p, db)
+    stmt = select(User).where(User.group_id == group.id, User.approval != "pending")
+    if q.strip():
+        pattern = paging.like(q)
+        stmt = stmt.where(or_(User.email.like(pattern, escape="\\"), func.lower(User.name).like(pattern, escape="\\")))
+    if status in ("active", "disabled"):
+        stmt = stmt.where(User.status == status)
+    elif status == "declined":
+        stmt = stmt.where(User.approval == "declined")
+    elif status == "admin":
+        stmt = stmt.where(User.id.in_(select(RoleAssignment.user_id).where(
+            RoleAssignment.role == "group_admin", RoleAssignment.group_id == group.id)))
+    if service and has is not None:
+        gs = group.service(service)
+        if gs is None:
+            raise ApiError(422, "bad_filter", "Unknown service.")
+        if not gs.all_users:  # (with everyone given it, everyone has it)
+            granted = select(UserService.user_id).where(UserService.service_key == service, UserService.granted.is_(True))
+            stmt = stmt.where(User.id.in_(granted) if has else User.id.not_in(granted))
+        elif not has:
+            stmt = stmt.where(false())
+    return paging.page_of(db, stmt, paging.order_by(sort, MEMBER_SORTS, User.id), page, page_size, user_out)
 
 
 @router.patch("/{group_id}/users/{user_id}", response_model=UserOut)
@@ -111,6 +172,8 @@ class GroupSettings(BaseModel):
     ai_kind: str | None = Field(None, max_length=40)  # fixed: the kind ("" or "general": General)
     show_external: bool | None = None  # show people which options send documents to an external provider
     ai_describe: bool | None = None  # "Describe with AI" for its people; null follows the service default
+    # Its people may make API tokens for scripts (#518), when super admins allow them; off stops existing tokens
+    api_tokens_enabled: bool | None = None
 
 
 @router.patch("/{group_id}", response_model=GroupOut)
@@ -139,7 +202,7 @@ def update_group_settings(group_id: uuid.UUID, body: GroupSettings, request: Req
             raise ApiError(422, "unknown_kind", "That kind of document isn't offered with this AI level.")
         sent["ai_level"], sent["ai_kind"] = level, kind
     for field, value in sent.items():
-        if value is None and field in ("local_only", "require_approval", "ai_mode", "show_external"):
+        if value is None and field in ("local_only", "require_approval", "ai_mode", "show_external", "api_tokens_enabled"):
             continue
         if value != getattr(group, field):
             audit.record(db, request, "group.updated", actor=p.user, target_type="group", target_id=group.id,
@@ -282,6 +345,34 @@ def group_attention(group_id: uuid.UUID, p: Principal = Depends(current_principa
     from portal.attention import attention
     group = group_for_admin(group_id, p, db)
     return [i.to_dict() for i in attention(db, [group.id])]
+
+
+class AckIn(BaseModel):
+    key: str = Field(min_length=1, max_length=200)
+
+
+@router.get("/{group_id}/attention/acknowledged")
+def group_acknowledged(group_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The items this group's admins have acknowledged (#538)."""
+    from portal.attention import acknowledged
+    return acknowledged(db, [group_for_admin(group_id, p, db).id])
+
+
+@router.post("/{group_id}/attention/acknowledge")
+def group_acknowledge(group_id: uuid.UUID, body: AckIn, request: Request, p: Principal = Depends(current_principal),
+                      db: Session = Depends(get_db)):
+    """Acknowledge an item for every admin of the group, until something new joins it (#538)."""
+    from portal.attention import acknowledge, acked
+    ids = [group_for_admin(group_id, p, db).id]
+    return acked(db, request, p, ids, acknowledge(db, ids, body.key, p.user.email), body.key)
+
+
+@router.delete("/{group_id}/attention/acknowledge")
+def group_unacknowledge(group_id: uuid.UUID, request: Request, key: str = Query(min_length=1, max_length=200),
+                        p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    from portal.attention import unacked, unacknowledge
+    ids = [group_for_admin(group_id, p, db).id]
+    return unacked(db, request, p, ids, unacknowledge(db, ids, key), key)
 
 
 @router.get("/{group_id}/access-check")

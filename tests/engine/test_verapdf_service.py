@@ -100,26 +100,69 @@ def test_failed_rules_are_listed_in_clause_order():
     assert [(f.clause, f.test) for f in res.failures] == [("7.2", "9"), ("7.2", "10"), ("7.21.5", "1")]
 
 
-def test_worker_capacity_adds_up_the_running_workers(monkeypatch):
+def _inspect(stats, active=None):
+    class Inspect:
+        def stats(self):
+            if isinstance(stats, Exception):
+                raise stats
+            return stats
+
+        def active(self):
+            return active
+
+    return lambda timeout=1.0: Inspect()
+
+
+def test_worker_capacity_adds_up_the_running_workers(monkeypatch, tmp_path):
     from app.api import routes
+    from app.config import get_settings
     from app.worker.celery_app import celery_app
 
-    class Inspect:
-        def __init__(self, stats):
-            self._stats = stats
-
-        def stats(self):
-            if isinstance(self._stats, Exception):
-                raise self._stats
-            return self._stats
-
+    monkeypatch.setattr(get_settings(), "data_dir", tmp_path)
     two = {"celery@a": {"pool": {"max-concurrency": 2}}, "celery@b": {"pool": {"max-concurrency": 2}}}
-    monkeypatch.setattr(celery_app.control, "inspect", lambda timeout=1.0: Inspect(two))
-    assert routes.worker_capacity() == {"workers": 2, "documents_at_once": 4}
-    monkeypatch.setattr(celery_app.control, "inspect", lambda timeout=1.0: Inspect(None))
-    assert routes.worker_capacity() == {"workers": 0, "documents_at_once": None}
-    monkeypatch.setattr(celery_app.control, "inspect", lambda timeout=1.0: Inspect(ConnectionError("no queue")))
-    assert routes.worker_capacity() == {"workers": None, "documents_at_once": None}
+    monkeypatch.setattr(celery_app.control, "inspect", _inspect(two, {}))
+    assert routes.worker_capacity() == {"workers": 2, "documents_at_once": 4, "documents_on_stopping_workers": 0}
+    monkeypatch.setattr(celery_app.control, "inspect", _inspect(None))
+    assert routes.worker_capacity() == {"workers": 0, "documents_at_once": None, "documents_on_stopping_workers": 0}
+    monkeypatch.setattr(celery_app.control, "inspect", _inspect(ConnectionError("no queue")))
+    assert routes.worker_capacity() == {"workers": None, "documents_at_once": None, "documents_on_stopping_workers": 0}
+
+
+def test_a_stopping_workers_document_keeps_its_place(monkeypatch, tmp_path):
+    """#531: during a deploy the old worker finishes its document but stops answering; the new one answers with a
+    place free. The old worker's document still counts as a place, so the portal sends the next to the new worker.
+    A document an answering worker has, a finished one and one whose heartbeat went stale don't add a place."""
+    import json
+    import time
+
+    from app.api import routes
+    from app.config import get_settings
+    from app.storage import JobStore
+    from app.worker.celery_app import celery_app
+
+    monkeypatch.setattr(get_settings(), "data_dir", tmp_path)
+    now = time.time()
+
+    def job(job_id, beat_ago, finished=False):
+        store = JobStore(job_id, tmp_path / "jobs")
+        store.create()
+        (store.dir / "heartbeat.json").write_text(json.dumps({"at": now - beat_ago}))
+        if finished:
+            store.write_result({"status": "completed"})
+
+    old, new = "10000000-0000-4000-8000-000000000000", "20000000-0000-4000-8000-000000000000"
+    job(old, 10)  # on the stopping worker
+    job(new, 5)  # on the new worker
+    job("30000000-0000-4000-8000-000000000000", 5, finished=True)
+    job("40000000-0000-4000-8000-000000000000", 600)  # its worker was lost
+    (tmp_path / "jobs" / "not-a-job").mkdir()
+    answering = {"celery@new": {"pool": {"max-concurrency": 1}}}
+    active = {"celery@new": [{"id": "t1", "name": "app.worker.tasks.remediate", "args": [new]}]}
+    monkeypatch.setattr(celery_app.control, "inspect", _inspect(answering, active))
+    assert routes.worker_capacity() == {"workers": 1, "documents_at_once": 2, "documents_on_stopping_workers": 1}
+    # With no worker answering at all, each fresh document still holds its place
+    monkeypatch.setattr(celery_app.control, "inspect", _inspect(None))
+    assert routes.worker_capacity() == {"workers": 0, "documents_at_once": 2, "documents_on_stopping_workers": 2}
 
 
 OOM_REPORT = (b"<report><jobs><job><taskResult><exceptionMessage>Exception: OutOfMemory caught when validating item "

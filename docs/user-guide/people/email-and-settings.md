@@ -9,7 +9,7 @@
 For each kind of email: **As they happen** (the default), **Once a day** (one email with all of them, at the
 service's send time) or **Off**.
 
-![The Settings page: Email notifications for Your documents and Help requests, each As they happen, Once a day or Off, with a "Not while I have it open" check box; and Email reports for Your documents, Monthly, Weekly, Daily or Off, with Email me a sample.](../../images/my-settings.png)
+![The Settings page: tabs for Email notifications, Email reports and Signed-in devices; Your documents and Help requests each As they happen, Once a day or Off; Email reports for Your documents, Monthly, Weekly, Daily or Off, with Email me a sample; and Signed-in devices with Sign out of all devices](../../images/my-settings.png)
 
 | Kind | What it's about |
 |---|---|
@@ -50,6 +50,33 @@ without signing in.
 If you set up scheduled views of the live reports (see the [group admin guide](../group-admins/reports.md)), they're
 listed here: change how often, who gets it and the CSV, email yourself a sample, or delete. Views others send you
 are listed too, with **Stop getting it**.
+
+## API tokens
+
+> **Changed 22 October 2026:** this section now covers **Confirm sending automatically**, and that a group admin can
+> revoke a token.
+
+When your group allows it, **API tokens** lets you make tokens for scripts that send documents, for example a
+nightly job that sends a folder of PDFs.
+
+- **What it sends to:** each token sends to one processing option and AI level (and kind of document), chosen when
+  you make it. A script can't change that.
+- **What it may do:** every token can submit. Tick **Check their status** for a script that needs to know when
+  documents are done.
+  - Downloads are optional: **Everything** (each document's zip) or **Chosen files** (for example just the
+    remediated PDF and the report).
+  - A script can ask only for the finished documents it hasn't downloaded yet, so a sending job and a separate
+    fetching job can each run on their own schedule.
+- **Confirm sending automatically:** offered when the token's option asks before documents go to an outside service.
+  Ticked, the script's documents go without asking; otherwise they wait in **My documents** for you to send them.
+- **Copy it at once:** the token is shown once, when you make it. If you lose it, revoke it and make another.
+- **Your documents:** everything a token sends appears in **My documents**, as if you'd uploaded it, with the same
+  pages, emails and review.
+- **When tokens stop:** a token stops working when you (or one of your group's admins) revoke it, when it expires (90 days unless you choose
+  otherwise), after a long time unused, or if your group or the service switches tokens off. You get an email a
+  week before one expires, and when one stops unused.
+
+[Scripting](scripting.md) has examples with `curl`.
 
 ## Signed-in devices
 

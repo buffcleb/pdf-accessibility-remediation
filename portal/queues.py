@@ -28,7 +28,6 @@ REVIEWS = "reviews"
 MAIL = outbox.MAIL_QUEUE
 RECENT = timedelta(days=7)
 STATES = ("waiting", "active", "failed")
-MAX_ITEMS = 200
 
 
 def _now() -> datetime:
@@ -197,10 +196,17 @@ def _wait_reason(job: Job, pauses: dict[str, QueuePause], labels: dict[str, str]
         return "Waiting for a free place: " + ", ".join(labels.get(k, k) for k in (job.progress or {}).get("services") or [])
     if stage == "waiting_daily_cap":
         return "Daily limit reached: " + ", ".join(labels.get(k, k) for k in (job.progress or {}).get("services") or [])
+    if stage == "waiting_per_person":
+        return f"Waiting for the person's own documents: {(job.progress or {}).get('at_once')} at once at most"
+    if stage == "waiting_engine":
+        p = job.progress or {}
+        return f"Waiting for a place at the engine: {p.get('in_use')} of {p.get('places')} in use"
     return "Waiting its turn"
 
 
-def items(db: Session, key: str, state: str) -> dict:
+def items(db: Session, key: str, state: str, *, q: str = "", page: int = 1, page_size: int = 25) -> dict:
+    """One queue's items in one state, a page at a time (#514), searched by document or person (or an email's subject
+    or address). Returns {queue, state, items, total, page, page_size}."""
     if state not in STATES:
         raise ApiError(422, "bad_state", f"State must be one of {', '.join(STATES)}.")
     d = _definition(db, key)
@@ -209,12 +215,25 @@ def items(db: Session, key: str, state: str) -> dict:
     pauses = paused(db)
     threshold = settings_store.load(db).large_doc_pages
     rows: list[dict] = []
+    size = max(1, min(page_size, 200))
+    like = _like(q) if q.strip() else None
+    total = 0
+
+    def paged(stmt, order):
+        nonlocal total
+        total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+        return db.scalars(stmt.order_by(*order).limit(size).offset((page - 1) * size))
+
     if d.kind == "documents":
         where = {"waiting": Job.status == "queued", "active": Job.status.in_(("submitted", "processing")),
                  "failed": (Job.status == "failed") & (Job.finished_at > since)
                  & ~_removed("documents", Job.id, Job.finished_at)}[state]
-        order = Job.created_at if state != "failed" else Job.finished_at.desc()
-        for j in db.scalars(select(Job).where(_job_filter(d), where).order_by(order).limit(MAX_ITEMS)):
+        order = (Job.created_at if state != "failed" else Job.finished_at.desc(), Job.id)
+        stmt = select(Job).where(_job_filter(d), where)
+        if like:
+            stmt = stmt.where(or_(func.lower(Job.filename).like(like, escape="\\"),
+                                  Job.user_id.in_(select(User.id).where(func.lower(User.email).like(like, escape="\\")))))
+        for j in paged(stmt, order):
             rows.append({
                 "id": str(j.id), "job_id": str(j.id), "title": j.filename, "who": j.user.email, "pages": j.pages,
                 "options": " + ".join(labels.get(k, k) for k in job_services(j)),
@@ -239,8 +258,13 @@ def items(db: Session, key: str, state: str) -> dict:
                 "active": DocumentVersion.review_status == "running",
                 "failed": (DocumentVersion.review_status == "failed") & (DocumentVersion.created_at > since)
                 & ~_removed("reviews", DocumentVersion.id, _REVIEW_FAILED_AT)}[state]
-        order = DocumentVersion.created_at if state != "failed" else DocumentVersion.created_at.desc()
-        for v in db.scalars(select(DocumentVersion).where(where).order_by(order).limit(MAX_ITEMS)):
+        order = (DocumentVersion.created_at if state != "failed" else DocumentVersion.created_at.desc(), DocumentVersion.id)
+        stmt = select(DocumentVersion).where(where)
+        if like:
+            stmt = stmt.where(DocumentVersion.job_id.in_(select(Job.id).where(or_(
+                func.lower(Job.filename).like(like, escape="\\"),
+                Job.user_id.in_(select(User.id).where(func.lower(User.email).like(like, escape="\\")))))))
+        for v in paged(stmt, order):
             job = v.job
             if d.kind == "edits":
                 detail = v.error_message if state == "failed" else None
@@ -263,11 +287,15 @@ def items(db: Session, key: str, state: str) -> dict:
             })
     else:
         if state == "active":
-            return {"queue": d.label, "state": state, "items": []}
+            return {"queue": d.label, "state": state, "items": [], "total": 0, "page": page, "page_size": size}
         where = MailOutbox.status == "queued" if state == "waiting" else (
             (MailOutbox.status == "failed") & (MailOutbox.created_at > since) & ~_removed("mail", MailOutbox.id, MailOutbox.finished_at))
-        order = MailOutbox.created_at if state == "waiting" else MailOutbox.created_at.desc()
-        for m in db.scalars(select(MailOutbox).where(where).order_by(order).limit(MAX_ITEMS)):
+        order = (MailOutbox.created_at if state == "waiting" else MailOutbox.created_at.desc(), MailOutbox.id)
+        stmt = select(MailOutbox).where(where)
+        if like:
+            stmt = stmt.where(or_(func.lower(MailOutbox.subject).like(like, escape="\\"),
+                                  func.lower(MailOutbox.to_addr).like(like, escape="\\")))
+        for m in paged(stmt, order):
             rows.append({
                 "id": str(m.id), "job_id": None, "title": m.subject, "who": m.to_addr, "pages": None, "options": None,
                 "created_at": m.created_at, "started_at": None, "finished_at": m.finished_at,
@@ -278,7 +306,7 @@ def items(db: Session, key: str, state: str) -> dict:
                 "error_code": None, "can_retry": state == "failed", "can_cancel": state == "waiting",
                 "can_remove": state == "failed",
             })
-    return {"queue": d.label, "state": state, "items": rows}
+    return {"queue": d.label, "state": state, "items": rows, "total": total, "page": page, "page_size": size}
 
 
 # --- everything at once, as it happens ------------------------------------------------------------
@@ -348,7 +376,7 @@ def live(db: Session, *, q: str = "", group_id: uuid.UUID | None = None, queue: 
         if kind == "edits":
             state_of = {"queued": "waiting", "submitted": "active", "processing": "active", "ready": "done", "failed": "failed"}
             col, done_at, started = DocumentVersion.status, DocumentVersion.finished_at, DocumentVersion.submitted_at
-            where = [or_(col.in_(("queued", "submitted", "processing")),
+            where = [or_(col.in_(("queued", "submitted", "processing")), DocumentVersion.checking,
                          col.in_(("ready", "failed")) & started.is_not(None) & (done_at > since))]
         else:
             state_of = {"queued": "waiting", "running": "active", "done": "done", "failed": "failed"}
@@ -363,6 +391,8 @@ def live(db: Session, *, q: str = "", group_id: uuid.UUID | None = None, queue: 
         for v in take(select(DocumentVersion).join(Job, Job.id == DocumentVersion.job_id).where(*where)
                       .order_by(DocumentVersion.created_at.desc())):
             job, st = v.job, state_of.get(getattr(v, "status" if kind == "edits" else "review_status"), "waiting")
+            if kind == "edits" and v.checking:
+                st = "active"  # open already, still being checked (#428)
             if kind == "edits":
                 who, detail = v.created_by_email or job.user.email, v.error_message if st == "failed" else None
                 at_start, at_end = v.submitted_at, v.finished_at

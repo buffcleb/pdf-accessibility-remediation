@@ -41,6 +41,8 @@ def test_faint_text_is_listed_once_per_page_with_colors_and_ratio(page_of_colors
     assert "Gray on dark blue large" in f.detail and "needs 3:1" in f.detail
     assert "fine" not in f.detail and "Invisible" not in f.detail and "Transparent" not in f.detail
     assert "Covered" not in f.detail
+    # Where the two faint runs are, for Show (#426): the light gray line, and the large gray one on the blue
+    assert len(f.boxes) == 2 and 140 < f.boxes[0][1] < 165 and 210 < f.boxes[1][1] < 240
 
 
 def test_text_over_a_photograph_isnt_guessed_at(tmp_path):

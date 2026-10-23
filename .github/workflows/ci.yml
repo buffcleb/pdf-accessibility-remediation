@@ -47,6 +47,12 @@ jobs:
               - 'app/**'
               - 'tests/engine/**'
               - 'docker/verapdf-auto-install.xml'
+              # Read by engine tests too: the manifests, the gateway's config and the guide naming its models, and the
+              # scripts they run (a manifest-only change broke two of them unseen in #461)
+              - 'deploy/**'
+              - 'config/**'
+              - 'scripts/**'
+              - 'docs/operations/ai-models.md'
             portal:
               - '.github/workflows/**'
               - 'requirements*.txt'
@@ -54,12 +60,15 @@ jobs:
               - 'tests/__init__.py'
               - 'portal/**'
               - 'tests/portal/**'
+              - 'deploy/k8s/manifests/**'   # test_workloads.py: every workload has a System-page entry
             web:
               - '.github/workflows/**'
               - 'web/**'
             scripts:
               - '.github/workflows/**'
               - 'scripts/**'
+              - 'docker/web/*.sh'
+              - 'deploy/node/**'
             python:
               - '.github/workflows/**'
               - 'app/**'
@@ -134,7 +143,10 @@ jobs:
           POSTGRES_DB: portal
         # Any free port on the runner: a fixed one can still be held by the run before on a runner that stays up
         ports: ["5432"]
+        # The data in memory: on a runner that stays up, each job's database otherwise leaves an anonymous volume
+        # behind (about 1,700 small files); thousands of them used up the disk's inodes (2026-10-21)
         options: >-
+          --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U portal" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v7
@@ -193,7 +205,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: shellcheck (GitHub's runners have it; a self-hosted one may not)
         run: command -v shellcheck || { sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck; }
-      - run: shellcheck scripts/*.sh docker/web/*.sh
+      - run: shellcheck scripts/*.sh docker/web/*.sh deploy/node/*.sh
 
   sql:
     name: SQL built from strings

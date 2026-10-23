@@ -379,10 +379,11 @@ def test_a_header_only_table_gets_a_tbody(tmp_path):
     src = _table_tagged(tmp_path, "header_only")
     out = tmp_path / "o.pdf"
     res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
-    assert _table_kids(out) == [("TBody", ["TR"])]  # its header cells stay TH
+    # The THead became the TBody, and then, a body with no head beside it (#438), its row stands in the table
+    assert _table_kids(out) == [("TR", None)]  # its header cells stay TH
     with pikepdf.open(out) as pdf:
         table = next(k for k in pdf.Root.StructTreeRoot.K[0].K if str(k.S) == "/Table")
-        assert [str(c.S) for c in table.K[0].K[0].K] == ["/TH", "/TH"]
+        assert [str(c.S) for c in table.K[0].K] == ["/TH", "/TH"]
     assert "THead became the TBody" in " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
 
 
@@ -548,3 +549,382 @@ def test_control_characters_are_removed_from_kept_tag_text(samples, tmp_path):
     res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
     assert _figure_alts(out) in ([], [None])  # undescribed: no figure, or one without alt text
     assert "missing Alt" in " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+
+
+def _numbered_heading(tmp_path):
+    """InDesign's numbered box anchored in its heading (#486): Header (-> H2) > Story (-> Sect) > Number (-> H2)."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    lines = [(72, 720, "Account form"), (72, 700, "4."), (90, 700, "Transfer the account to a new owner"),
+             (72, 680, "Fill in the new owner's name and address below.")]
+    ops = [f"/P <</MCID {m}>> BDC BT /F1 11 Tf {x} {y} Td ({t}) Tj ET EMC" for m, (x, y, t) in enumerate(lines)]
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)))),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot, RoleMap=Dictionary(
+        Story=Name.Sect, App_Header=Name.H2, Box_Number=Name.H2)))
+    mk = lambda s, parent, k=None: pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name(s), P=parent, Pg=pg,  # noqa: E731
+                                                                K=k if k is not None else Array()))
+    doc = mk("/Document", root)
+    title = mk("/H1", doc, 0)
+    head = mk("/App_Header", doc)
+    story = mk("/Story", head)
+    number = mk("/Box_Number", story, 1)
+    story.K = Array([number])
+    head.K = Array([story, 2])
+    body = mk("/P", doc, 3)
+    doc.K = Array([title, head, body])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([title, number, head, body])])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / "numbered.pdf"
+    pdf.save(src)
+    return src
+
+
+def test_a_section_inside_a_heading_becomes_part_of_it(tmp_path):
+    src = _numbered_heading(tmp_path)
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    reasons = " ".join(r for s in res.existing_tags["samples"] for r in s["reasons"])
+    assert "made part of it" in reasons
+    with pikepdf.open(out) as pdf:
+        rm = {str(k): str(v) for k, v in dict(pdf.Root.StructTreeRoot.get("/RoleMap") or {}).items()}
+
+        def walk(e):
+            for k in (e.K if isinstance(e.get("/K"), pikepdf.Array) else [e.get("/K")]):
+                if isinstance(k, pikepdf.Dictionary) and k.get("/Type") not in (pikepdf.Name.MCR, pikepdf.Name.OBJR):
+                    yield k
+                    yield from walk(k)
+        roles = [rm.get(str(e.S), str(e.S)) for e in walk(pdf.Root.StructTreeRoot)]
+        assert "/Sect" not in roles and roles.count("/H2") == 1
+        heading = next(e for e in walk(pdf.Root.StructTreeRoot) if rm.get(str(e.S), str(e.S)) == "/H2")
+        assert list(heading.K) == [1, 2]  # the number, then the heading's words: one heading
+    from app.verification.tagmap import build_tagmap
+    head = next(e for e in build_tagmap(out)["elements"] if e["role"] == "H2")
+    assert head["text"].startswith("4.") and "Transfer" in head["text"]
+
+
+def _word_picture(tmp_path, alt, lines_only=False):
+    from pikepdf import Array, Dictionary, Name, String
+
+    pdf = pikepdf.new()
+    ops = ["/P <</MCID 0>> BDC BT /F1 11 Tf 72 700 Td (Which compound is a phenol?) Tj ET EMC",
+           "/Figure <</MCID 1>> BDC " + ("0 G 2 w 72 600 m 152 660 l S 152 600 m 72 660 l S" if lines_only
+                                         else "q 80 0 0 60 72 600 cm /Im1 Do Q") + " EMC"]
+    image = pdf.make_stream(bytes(range(256)) * 3 * 16, Type=Name.XObject, Subtype=Name.Image, Width=64, Height=64,
+                            ColorSpace=Name.DeviceRGB, BitsPerComponent=8)
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))), XObject=Dictionary(Im1=image)),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot, RoleMap=Dictionary(InlineShape=Name.Sect)))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=pg))
+    para = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.P, P=doc, Pg=pg))
+    shape = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name("/InlineShape"), P=para, Pg=pg, K=1,
+                                         Alt=String(alt)))
+    para.K = Array([0, shape])
+    doc.K = Array([para])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([para, shape])])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / f"shape{len(alt)}{lines_only}.pdf"
+    pdf.save(src)
+    out = tmp_path / f"o{len(alt)}{lines_only}.pdf"
+    tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    with pikepdf.open(out) as pdf:
+        para = pdf.Root.StructTreeRoot.K[0].K[0]
+        (figure,) = [k for k in para.K if isinstance(k, pikepdf.Dictionary)]
+        return str(figure.S), str(figure.get("/Alt") or "")
+
+
+def test_a_word_picture_mapped_to_sect_becomes_a_figure(tmp_path):
+    """Word's InlineShape, mapped to Sect, inside a paragraph: a Figure, never dissolved into the paragraph (#486).
+    Its description is kept; an empty one is left for the AI's description, as any figure's is (none here)."""
+    assert _word_picture(tmp_path, "Six benzene rings, numbered I to VI") == ("/Figure",
+                                                                               "Six benzene rings, numbered I to VI")
+    assert _word_picture(tmp_path, "")[0] == "/Figure"
+    # Drawn in lines only, but described: a figure, not decoration
+    assert _word_picture(tmp_path, "A crossed-out box", lines_only=True) == ("/Figure", "A crossed-out box")
+
+
+def test_blank_lines_kept_as_paragraphs_become_artifacts(tmp_path):
+    """#490: Word's blank lines are paragraphs holding a space, and a picture alone in its paragraph has a space beside
+    it. Those runs become artifacts and a blank paragraph goes; spaces between a paragraph's words stay."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    image = pdf.make_stream(bytes(range(256)) * 3 * 16, Type=Name.XObject, Subtype=Name.Image, Width=64, Height=64,
+                            ColorSpace=Name.DeviceRGB, BitsPerComponent=8)
+    t = "BT /F1 11 Tf {x} {y} Td ({s}) Tj ET"
+    ops = [f"/P <</MCID 0>> BDC {t.format(x=72, y=720, s='Which compound is a phenol?')} EMC",
+           f"/P <</MCID 1>> BDC {t.format(x=72, y=700, s=' ')} EMC",                       # a blank line
+           "/Figure <</MCID 2>> BDC q 80 0 0 60 72 620 cm /Im1 Do Q EMC",
+           f"/P <</MCID 3>> BDC {t.format(x=152, y=620, s=' ')} EMC",                      # the space by the picture
+           f"/P <</MCID 4>> BDC {t.format(x=72, y=600, s='Answer')} EMC",
+           f"/P <</MCID 5>> BDC {t.format(x=110, y=600, s=' ')} EMC",                      # between two words
+           f"/P <</MCID 6>> BDC {t.format(x=115, y=600, s='below')} EMC"]
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))), XObject=Dictionary(Im1=image)),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    mk = lambda s, parent, k=None, **kw: pdf.make_indirect(Dictionary(  # noqa: E731
+        Type=Name.StructElem, S=Name(s), P=parent, Pg=pg, K=k if k is not None else Array(), **kw))
+    doc = mk("/Document", root)
+    question, blank = mk("/P", doc, 0), mk("/P", doc, 1)
+    holder = mk("/P", doc)
+    figure = mk("/Figure", holder, 2, Alt=pikepdf.String("A benzene ring with OH"))
+    holder.K = Array([figure, 3])
+    words = mk("/P", doc, Array([4, 5, 6]))
+    doc.K = Array([question, blank, holder, words])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([question, blank, figure, holder, words,
+                                                                           words, words])])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / "blank.pdf"
+    pdf.save(src)
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert res.blank_runs_artifacted == 2
+    with pikepdf.open(out) as pdf:
+        doc = pdf.Root.StructTreeRoot.K[0]
+        kids = [k for k in doc.K if isinstance(k, pikepdf.Dictionary)]
+        assert [str(k.S) for k in kids] == ["/P", "/P", "/P"]  # the blank paragraph is gone
+        holder = kids[1]
+        assert [str(k.S) for k in holder.K if isinstance(k, pikepdf.Dictionary)] == ["/Figure"]
+        assert not [k for k in holder.K if not isinstance(k, pikepdf.Dictionary)]  # its space went
+        assert len([k for k in kids[2].K]) == 3  # the space between the words stays
+    # The two spaces are artifacts now, not left untagged: every run still marked names a tag
+    with pikepdf.open(out) as pdf:
+        tagged, artifacts = set(), 0
+        for operands, op in pikepdf.parse_content_stream(pdf.pages[0]):
+            if str(op) == "BDC" and isinstance(operands[1], pikepdf.Dictionary) and "/MCID" in operands[1]:
+                tagged.add(int(operands[1].MCID))
+            if str(op) in ("BDC", "BMC") and str(operands[0]) == "/Artifact":
+                artifacts += 1
+        assert artifacts >= 2 and not tagged & {1, 3}
+
+
+
+def test_a_space_in_a_span_straight_in_a_text_box_becomes_an_artifact(tmp_path):
+    """#526: a text box (Textbox, mapped to Sect) holding a paragraph and a Span of one space. Folded into the box, the
+    space would be content in a Sect, which PAC flags; it becomes an artifact and the Span goes. A Span of one space
+    between two words in a paragraph stays (empty_spans folds it into the paragraph)."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    t = "BT /F1 11 Tf {x} {y} Td ({s}) Tj ET"
+    ops = [f"/P <</MCID 0>> BDC {t.format(x=72, y=720, s='Hypoglycemia')} EMC",
+           f"/Span <</MCID 1>> BDC q 70 690 200 40 re W n {t.format(x=72, y=700, s=' ')} Q EMC",  # the stray space
+           f"/Span <</MCID 2>> BDC {t.format(x=72, y=680, s='Level')} EMC",
+           f"/Span <</MCID 3>> BDC {t.format(x=100, y=680, s=' ')} EMC",                         # between two words
+           f"/Span <</MCID 4>> BDC {t.format(x=105, y=680, s='one')} EMC"]
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)))),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot, RoleMap=Dictionary(Textbox=Name.Sect)))
+    mk = lambda s, parent, k=None: pdf.make_indirect(Dictionary(  # noqa: E731
+        Type=Name.StructElem, S=Name(s), P=parent, Pg=pg, K=k if k is not None else Array()))
+    doc = mk("/Document", root)
+    box = mk("/Textbox", doc)
+    para, stray = mk("/P", box, 0), mk("/Span", box, 1)
+    words = mk("/P", doc)
+    spans = [mk("/Span", words, n) for n in (2, 3, 4)]
+    words.K = Array(spans)
+    box.K = Array([para, stray])
+    doc.K = Array([box, words])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([para, stray] + spans)])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / "box.pdf"
+    pdf.save(src)
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert res.blank_runs_artifacted == 1
+    with pikepdf.open(out) as pdf:
+        doc = pdf.Root.StructTreeRoot.K[0]
+        box = doc.K[0]
+        assert [str(k.S) for k in box.K] == ["/P"]  # the Span and its space have left the box
+        assert len(doc.K[1].K) == 3  # the space between the words stays, in its paragraph
+        tagged, artifacts = set(), 0
+        for operands, op in pikepdf.parse_content_stream(pdf.pages[0]):
+            if str(op) == "BDC" and isinstance(operands[1], pikepdf.Dictionary) and "/MCID" in operands[1]:
+                tagged.add(int(operands[1].MCID))
+            if str(op) in ("BDC", "BMC") and str(operands[0]) == "/Artifact":
+                artifacts += 1
+        assert artifacts >= 1 and 1 not in tagged
+
+def _linked_paragraph(tmp_path, runs, rects=None, quads=None, name="link"):
+    """A paragraph of runs ((x, y, text) each, one MCID per run), the last in a Span of its own, with a link annotation
+    attached straight to the paragraph, as some producers do: the kept-tags repair wraps the annotation alone in a
+    Link. The link covers `rects` (PDF space) or its QuadPoints."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    ops = [f"/P <</MCID {n}>> BDC BT /F1 11 Tf {x} {y} Td ({s}) Tj ET EMC" for n, (x, y, s) in enumerate(runs)]
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)))),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    annot = pdf.make_indirect(Dictionary(Type=Name.Annot, Subtype=Name.Link, Rect=Array(rects), StructParent=1,
+                                         A=Dictionary(S=Name.URI, URI=pikepdf.String("https://example.org"))))
+    if quads:
+        annot.QuadPoints = Array(quads)
+    pg.Annots = Array([annot])
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root, Pg=pg))
+    para = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.P, P=doc, Pg=pg))
+    span = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Span, P=para, Pg=pg, K=len(runs) - 1))
+    para.K = Array(list(range(len(runs) - 1)) + [span, Dictionary(Type=Name.OBJR, Obj=annot, Pg=pg)])
+    doc.K = Array([para])
+    root.K = Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array([para] * (len(runs) - 1) + [span]), 1,
+                                                               para])))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / f"{name}.pdf"
+    pdf.save(src)
+    out = tmp_path / f"{name}_out.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    with pikepdf.open(out) as pdf:
+        para = pdf.Root.StructTreeRoot.K[0].K[0]
+
+        def shape(k):
+            if isinstance(k, pikepdf.Dictionary) and k.get("/Type") == pikepdf.Name.OBJR:
+                return "annot"
+            if isinstance(k, pikepdf.Dictionary) and "/S" in k:
+                return (str(k.S), [shape(x) for x in (k.K if isinstance(k.K, pikepdf.Array) else [k.K])])
+            return int(k) if not isinstance(k, pikepdf.Dictionary) else int(k.MCID)
+        return res.links_given_words, [shape(k) for k in para.K]
+
+
+def test_a_link_tag_takes_the_words_inside_the_link(tmp_path):
+    """#489: the link's words are their own run: they move into the Link, which takes their place."""
+    runs = [(72, 700, "See the "), (112, 700, "course page"), (172, 700, " for details."), (72, 686, "Thanks.")]
+    assert _linked_paragraph(tmp_path, runs, rects=[110, 696, 172, 711], name="own") == (
+        1, [0, ("/Link", [1, "annot"]), 2, ("/Span", [3])])
+
+
+def test_a_run_the_link_only_partly_covers_stays(tmp_path):
+    """A whole line tagged as one run, the link over a few of its words: a run can't be split, so it stays."""
+    runs = [(72, 700, "See the course page for details."), (72, 686, "Thanks.")]
+    assert _linked_paragraph(tmp_path, runs, rects=[112, 696, 172, 711], name="whole") == (
+        0, [0, ("/Span", [1]), ("/Link", ["annot"])])
+
+
+def test_a_link_across_two_lines_takes_both_parts(tmp_path):
+    """A link that wraps: its QuadPoints give a box on each line, and the run on each goes into the Link."""
+    runs = [(72, 700, "Read the "), (120, 700, "full"), (72, 686, "guidelines"), (125, 686, " first."),
+            (72, 672, "Thanks.")]
+    quads = [118, 711, 145, 711, 118, 696, 145, 696, 70, 697, 125, 697, 70, 682, 125, 682]
+    assert _linked_paragraph(tmp_path, runs, rects=[70, 682, 145, 711], quads=quads, name="wrap") == (
+        1, [0, ("/Link", [1, 2, "annot"]), 3, ("/Span", [4])])
+
+
+def _links_apart(tmp_path, cells, rects, name):
+    """A table of one row, a cell per entry of `cells` (runs: (x, y, text) each, one MCID per run), and after it a
+    paragraph holding nothing but a Link tag per entry of `rects` (PDF space), each holding only its annotation, as
+    Word writes a table's links. Returns (links given words, the Document's kids as (tag, kids))."""
+    from pikepdf import Array, Dictionary, Name
+
+    pdf = pikepdf.new()
+    runs = [r for cell in cells for r in cell]
+    ops = [f"/P <</MCID {n}>> BDC BT /F1 11 Tf {x} {y} Td ({s}) Tj ET EMC" for n, (x, y, s) in enumerate(runs)]
+    page = pikepdf.Page(Dictionary(
+        Type=Name.Page, MediaBox=[0, 0, 612, 792],
+        Resources=Dictionary(Font=Dictionary(F1=pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)))),
+        Contents=pdf.make_stream("\n".join(ops).encode())))
+    pdf.pages.append(page)
+    pg = pdf.pages[0].obj
+    pg.StructParents = 0
+    annots = [pdf.make_indirect(Dictionary(Type=Name.Annot, Subtype=Name.Link, Rect=Array(r), StructParent=n + 1,
+                                           A=Dictionary(S=Name.URI, URI=pikepdf.String(f"https://example.org/{n}"))))
+              for n, r in enumerate(rects)]
+    pg.Annots = Array(annots)
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+
+    def mk(s, parent, k=None):
+        e = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name(s), P=parent, Pg=pg))
+        if k is not None:
+            e.K = k
+        return e
+
+    doc = mk("/Document", root)
+    table = mk("/Table", doc)
+    tr = mk("/TR", table)
+    tds, n, owners = [], 0, []
+    for cell in cells:
+        tds.append(mk("/TD", tr, Array(list(range(n, n + len(cell))))))
+        owners += [tds[-1]] * len(cell)
+        n += len(cell)
+    tr.K, table.K = Array(tds), Array([tr])
+    para = mk("/P", doc)
+    links = [mk("/Link", para, Array([Dictionary(Type=Name.OBJR, Obj=a, Pg=pg)])) for a in annots]
+    para.K = Array(links)
+    doc.K = Array([table, para])
+    root.K = Array([doc])
+    nums = [0, Array(owners)]
+    for i, link in enumerate(links):
+        nums += [i + 1, link]
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array(nums)))
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    src = tmp_path / f"{name}.pdf"
+    pdf.save(src)
+    out = tmp_path / f"{name}_out.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    with pikepdf.open(out) as pdf:
+        def shape(k):
+            if isinstance(k, pikepdf.Dictionary) and k.get("/Type") == pikepdf.Name.OBJR:
+                return "annot"
+            if isinstance(k, pikepdf.Dictionary) and "/S" in k:
+                return (str(k.S), [shape(x) for x in (k.K if isinstance(k.K, pikepdf.Array) else [k.K])])
+            return int(k) if not isinstance(k, pikepdf.Dictionary) else int(k.MCID)
+        doc = pdf.Root.StructTreeRoot.K[0]
+        return res.links_given_words, [shape(k) for k in doc.K]
+
+
+def test_a_tables_links_move_into_the_cells_holding_their_words(tmp_path):
+    """#489: Word's table links, in a paragraph of their own, go into the cell with their words; the paragraph goes."""
+    cells = [[(72, 700, "Overview"), (140, 700, ", page "), (180, 700, "4")],
+             [(300, 700, "Modes"), (360, 700, " (see below)")]]
+    assert _links_apart(tmp_path, cells, [[70, 696, 135, 711], [178, 696, 190, 711], [298, 696, 340, 711]],
+                        "table") == (3, [
+                            ("/Table", [("/TR", [("/TD", [("/Link", [0, "annot"]), 1, ("/Link", [2, "annot"])]),
+                                                 ("/TD", [("/Link", [3, "annot"]), 4])])])])
+
+
+def test_a_link_whose_box_covers_words_in_two_tags_stays(tmp_path):
+    """Words inside the link's box in two cells: whose link it is isn't certain, so it stays as it was."""
+    cells = [[(72, 700, "Left")], [(110, 700, "Right")]]
+    assert _links_apart(tmp_path, cells, [[70, 696, 150, 711]], "two") == (0, [
+        ("/Table", [("/TR", [("/TD", [0]), ("/TD", [1])])]), ("/P", [("/Link", ["annot"])])])

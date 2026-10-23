@@ -58,6 +58,8 @@ class _FakeProm:
 
     def query_range(self, q, start, end, step):
         self.asked.append(q)
+        if "by (node)" in q:
+            return [{"metric": {"node": n}, "values": [[start, "1"], [end, "2"]]} for n in ("node-a", "node-b")]
         if "by (app)" in q:  # more services than a chart shows: the busiest eight
             return [{"metric": {"app": f"svc{i}"}, "values": [[start, str(i)], [end, str(i)]]} for i in range(10)]
         return [{"metric": {"status": "queued"}, "values": [[start, "1"], [end, "NaN"]]}]
@@ -83,3 +85,28 @@ def test_the_system_page_reads_prometheus_with_fixed_queries(setup, monkeypatch)
     monkeypatch.setattr(prometheus, "get_prometheus", lambda: _FakeProm(fail=True))
     r = sup.get(f"{API}/admin/monitoring/system").json()
     assert r["reachable"] is False and "refused" in r["error"] and r["charts"] == []
+
+
+def test_cpu_and_memory_by_node_and_for_the_whole_environment(setup, monkeypatch):
+    """#522: each node's whole use against its size, this service's share of each node, and every node together; the
+    service's own figures count its containers only, never the node-wide series kept beside them."""
+    from portal import prometheus
+    s = setup
+    fake = _FakeProm()
+    monkeypatch.setattr(prometheus, "get_prometheus", lambda: fake)
+    r = s["c"]["super"].get(f"{API}/admin/monitoring/system").json()
+    now = {f["key"]: f for f in r["now"]}
+    assert now["env_cpu"]["value"] == 3 and now["env_cpu"]["of"] == 3 and now["env_cpu"]["unit"] == "cores"
+    assert now["env_memory"]["unit"] == "GiB" and now["svc_memory"]["of"] == 3
+    charts = {c["key"]: c["chart"] for c in r["charts"]}
+    for key in ("node_cpu", "node_memory", "svc_node_cpu", "svc_node_memory"):
+        assert {p["series"] for p in charts[key]["points"]} == {"node-a", "node-b"}, key
+    assert {p["series"] for p in charts["env"]["points"]} == {"CPU", "Memory"}
+    assert charts["node_cpu"]["measures"][0]["unit"] == "%"
+    # Every container query is either this service's containers or a node's own total: none counts both
+    container_queries = [q for q in fake.asked if "container_cpu" in q or "container_memory" in q]
+    assert container_queries and all('container!=""' in q or 'id="/"' in q for q in container_queries)
+    assert any("machine_cpu_cores" in q for q in fake.asked) and any("machine_memory_bytes" in q for q in fake.asked)
+    # The pods view's figures count containers only too
+    from portal import workloads
+    assert all('container!=""' in q for k, q in workloads.Q.items() if k in ("cpu", "memory"))

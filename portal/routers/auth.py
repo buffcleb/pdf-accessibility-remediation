@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, outbox, settings_store
+from portal import approval, audit, outbox, rls, settings_store
 from portal.config import get_portal_settings
 from portal.db import get_db
 from portal.deps import Principal, current_principal
@@ -119,6 +119,7 @@ def request_code(body: CodeRequest, request: Request, background: BackgroundTask
                                                 "and try again; if it keeps happening, contact the people who run "
                                                 "this service.")
 
+    rls.identify(db, email=email)  # only this address's own account (row-level security, #350)
     elig = eligibility(db, email)
     runtime = settings_store.load(db)
     if not elig.allowed:
@@ -195,6 +196,7 @@ def verify_code(body: CodeVerify, request: Request, response: Response,
     challenge.consumed_at = _now()
 
     # Eligibility is checked again: the domain or group may have changed since the code was sent.
+    rls.identify(db, email=email)
     elig = eligibility(db, email)
     runtime = settings_store.load(db)
     if not elig.allowed:
@@ -205,6 +207,8 @@ def verify_code(body: CodeVerify, request: Request, response: Response,
     created = user is None
     if created:
         user = provision(db, email, "email", elig)
+    rls.as_person(db, user, request)  # the code was right: their groups' rows (their group's admins, for approval)
+    if created:
         audit.record(db, request, "user.provisioned", actor=user, target_type="user", target_id=user.id,
                      group_id=user.group_id, details={"method": "email", "super_admin": elig.bootstrap})
         if user.approval == "pending":
@@ -245,6 +249,7 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
     if session is None:
         reused = db.scalar(select(AuthSession).where(AuthSession.previous_hash == digest).with_for_update())
         if reused is not None and reused.revoked_at is None:
+            rls.identify(db, user_id=reused.user_id)
             if (now - reused.last_used_at).total_seconds() > REFRESH_GRACE_SECONDS:
                 # An old refresh token was replayed: assume it was stolen and end the session.
                 reused.revoked_at = now
@@ -264,6 +269,7 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
             db.commit()
         _clear_refresh_cookie(response)
         raise unauthorized("Your session has ended. Sign in again.")
+    rls.identify(db, user_id=session.user_id)
     user = session.user
     if _blocked_message(db, user):
         session.revoked_at = now
@@ -272,6 +278,7 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
         _clear_refresh_cookie(response)
         raise unauthorized("Your account has been disabled.")
 
+    rls.as_person(db, user, request, session.id)
     new_token = new_refresh_token()
     session.previous_hash = session.refresh_hash
     session.refresh_hash = keyed_hash(new_token, "refresh")
@@ -291,6 +298,7 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)):
     if token:
         session = db.scalar(select(AuthSession).where(AuthSession.refresh_hash == keyed_hash(token, "refresh")))
         if session is not None and session.revoked_at is None:
+            rls.identify(db, user_id=session.user_id)
             session.revoked_at = _now()
             session.revoked_reason = "logout"
             audit.record(db, request, "logout", actor=session.user, group_id=session.user.group_id)

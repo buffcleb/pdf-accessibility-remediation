@@ -13,12 +13,15 @@ from app.pipeline.field_labels import apply as apply_field_labels
 from app.pipeline.models import BBox, DocumentAnalysis, bbox_intersection, bbox_union
 from app.tagging.content_marker import ContentMarker, MarkResult, StreamMarks, count_form_uses, existing_mcids, mcid_of
 from app.tagging.empty_spans import remove_empty_spans
+from app.tagging.link_words import move_link_words
 from app.tagging.blank_fonts import fill_blank_fonts
 from app.tagging.font_unicode import map_picture_glyphs
+from app.tagging import structure_rules
 from app.tagging.existing_tags import DECORATIVE, OUTLINE, ElemInfo, ExistingTree
 from app.tagging.legend import Legends
 from app.tagging.mathml_tags import formula_mathml, has_mathml
 from app.tagging.metadata import apply_document_metadata
+from app.tagging.self_links import drop_self_links
 from app.tagging.placement import place_added
 from app.tagging.reorder import reorder_retained
 from app.tagging.struct_tree import StructTreeBuilder
@@ -36,15 +39,22 @@ class TagResult:
     stripped_marks: int = 0
     forms_wrapped: int = 0
     empty_spans_removed: int = 0  # kept tags: Spans around nothing visible, folded into their parent
+    # Tags put at the right level and figures' bounding boxes (structure_rules, #437/#438): what was done, by kind
+    structure_rules: dict = field(default_factory=dict)
+    groupings_artifacted: int = 0  # kept Art/Sect/Div/Part tags holding only lines or shapes, made decoration (#438)
+    form_pages_retagged: int = 0  # kept figures holding a whole page of text drawn as one form, tagged afresh (#435)
     picture_glyphs_mapped: dict = field(default_factory=dict)  # font -> characters given private-use values
     picture_glyphs_in_text: list = field(default_factory=list)  # pages (1-based) where one stands in a sentence
     added_placed: int = 0  # kept tags: added tags put beside the kept tag they follow
     added_headings_demoted: int = 0  # ...and added "headings" made paragraphs (the document has its own outline)
     orphans_retagged: int = 0
     orphans_artifacted: int = 0  # untagged decorative pictures in the old tree, now artifacts
+    blank_runs_artifacted: int = 0  # kept runs of only spaces in tags with no visible text (blank lines), #490
+    links_given_words: int = 0  # kept Link tags that held only their annotation, given the words in its box (#489)
     artifacts_released: int = 0  # body text the old tagging hid as artifacts, now tagged
     containers_reordered: int = 0  # kept tags put in reading order
     hidden_text_artifacted: int = 0  # kept tags whose text is covered by shapes drawn over it
+    off_page_artifacted: int = 0  # kept tags whose content is all outside the page's visible area (#438)
     legend_marks: int = 0  # marks given their legend's label as alt text
     elements: dict = field(default_factory=dict)
     figures_with_alt: int = 0
@@ -206,6 +216,9 @@ def _document_formulas(existing: ExistingTree, where, result: TagResult) -> dict
     return readings
 
 
+FORM_PAGE_MIN_TEXT = 20  # text-showing operators: below this, a form is a picture with labels, not a page of text
+
+
 def tag_document(
     src: Path,
     dst: Path,
@@ -239,6 +252,7 @@ def tag_document(
         if report.present and ignore_existing:
             report.usable, report.rebuilt_tree, report.reason = False, True, "ignored at your request"
         retain = report.usable
+        kept_boxes: dict = {}  # kept figures' places (#437), when the document's tags are kept
         if report.present and not retain:
             existing.strip()
             log.info("existing structure tree discarded: %s", report.reason)
@@ -260,11 +274,12 @@ def tag_document(
         # The streams as they are, for the pages that have to be marked a second time (below)
         originals = _original_streams(pdf, recursable) if retain else {}
 
-        def mark(page_no: int, release: dict) -> MarkResult:
+        def mark(page_no: int, release: dict, release_tags: dict | None = None) -> MarkResult:
             pa = analysis.pages[page_no]
             resolvers[page_no] = PageResolver(pa, layout_tables)
             marker = ContentMarker(pdf, pdf.pages[page_no], pa.pdf_to_page, resolvers[page_no],
-                                   strip_existing=not retain, recursable_forms=recursable, release_artifacts=release)
+                                   strip_existing=not retain, recursable_forms=recursable, release_artifacts=release,
+                                   release_mcids=release_tags)
             return marker.run()
 
         results = [mark(page_no, {}) for page_no in range(len(pdf.pages))]
@@ -274,11 +289,26 @@ def tag_document(
             # are put back as they were and marked again with those sections unwrapped, so their text is tagged.
             # Most documents have none, and are marked once.
             release = _body_artifacts(results)
+            # A whole page of text placed as one form and tagged as one figure (#435): read as a picture, its text
+            # is lost to a screen reader. Its tagged sequence is unwrapped and the form tagged from the inside, as
+            # the layout reads it; the figure loses that content (and goes, when that was all it had)
+            release_tags, form_pages = _form_pages(pdf, existing, results, recursable)
             for page_no, mr in enumerate(results):
                 owners = {sm.owner.objgen for sm in mr.streams}
-                if owners & release.keys():
+                if owners & (release.keys() | release_tags.keys()):
                     _restore_streams(pdf, pdf.pages[page_no], owners, originals)
-                    results[page_no] = mark(page_no, release)
+                    results[page_no] = mark(page_no, release, release_tags)
+            for e in form_pages:
+                gone = [m for m in e.mcrefs if m.mcid in release_tags.get(m.owner, set())]
+                existing._remove_refs(e, gone)
+                e.mcrefs = [m for m in e.mcrefs if m not in gone]
+                if not e.mcrefs and not e.children and not e.objrefs:
+                    existing._mark(e, "removed", "a page of text drawn as one figure: tagged afresh from the layout")
+            result.form_pages_retagged = len(form_pages)
+            if form_pages:
+                report.findings.append(
+                    f"{len(form_pages)} figure tag(s) held a whole page of text drawn as one picture, which a screen "
+                    "reader can't read: that text was tagged afresh from the page's layout")
         for page_no, mr in enumerate(results):
             marks[page_no] = mr.streams
             result.tagged_units += mr.tagged_units
@@ -414,10 +444,37 @@ def tag_document(
             hidden = _hidden_text(marks)
             if hidden:
                 result.hidden_text_artifacted = existing.hide(hidden, "text hidden under a shape drawn over it")
+            # Kept tags on content drawn wholly outside the page's visible area: no one sees it, and PAC flags it as
+            # content in a possibly inadmissible location (#438)
+            off = _off_page(marks, {pi: (p.width, p.height) for pi, p in enumerate(analysis.pages)})
+            if off:
+                result.off_page_artifacted = existing.hide(off, "content drawn outside the page's visible area")
+            # A grouping tag holding nothing but lines and shapes (a bar down the page's edge) is decoration (#438),
+            # unless it's described: Word's pictures are mapped to Sect, and a described one is a figure (#486)
+            for e in existing.elements:
+                described = str(e.obj.get("/Alt") or "").strip() or str(e.obj.get("/ActualText") or "").strip()
+                if (e.role in ("Art", "Sect", "Div", "Part") and not e.children and not e.objrefs and e.mcrefs
+                        and all(m.valid for m in e.mcrefs) and not described):
+                    kinds = [kinds_of.get(m.owner, {}).get(m.mcid, set()) for m in e.mcrefs]
+                    if all(k and k <= {"path", "shading"} for k in kinds):
+                        existing._mark(e, "artifacted", "a grouping tag holding only lines or shapes: decoration")
+                        result.groupings_artifacted += 1
+            # Runs of only spaces in tags with no visible text of their own (Word's blank lines) become artifacts (#490)
+            blank = {(sm.owner.objgen, mcid) for ms in marks.values() for sm in ms
+                     for mcid, kinds in sm.existing_kinds.items() if kinds == {"text"} and mcid not in sm.existing_ink}
+            result.blank_runs_artifacted = existing.hide_blank(blank) if blank else 0
+            if result.blank_runs_artifacted:
+                existing.report.findings.append(
+                    f"{result.blank_runs_artifacted} run(s) of only spaces in tags with nothing else to read (blank "
+                    "lines kept as paragraphs) made artifacts")
+            existing.page_tables = {pi: p.tables for pi, p in enumerate(analysis.pages)}
             try:
                 referenced = existing.repair(figure_alt, describe)
             finally:
                 legends.close()
+            # Where the kept figures and formulas are, for their bounding box (#437)
+            kept_boxes = {e.obj.objgen: elem_bbox(e) for e in existing.elements
+                          if e.role in ("Figure", "Formula") and e.obj.is_indirect}
             result.figure_handles = _figure_handles(existing, needing_alt, [(pi, b) for pi, b in result.figures_needing_alt])
             # "/Artifact <</MCID n>>" says both "skip me" and "I am tagged". Resolve each by whether the
             # tree uses it: referenced -> real content (drop the Artifact label), else -> artifact (drop the MCID).
@@ -471,6 +528,11 @@ def tag_document(
             # Spans around nothing visible (the tab after a form label) are folded into the tag they're in
             existing_kinds = {sm.owner.objgen: sm.existing_kinds for ms in marks.values() for sm in ms}
             result.empty_spans_removed = remove_empty_spans(pdf, src, existing_bbox, existing_kinds, existing.role_map)
+            # Link tags holding only their annotation take the words inside the link's box (#489)
+            matrices = {pdf.pages[i].objgen: p.pdf_to_page for i, p in enumerate(analysis.pages) if i < len(pdf.pages)}
+            result.links_given_words = move_link_words(pdf, existing_bbox, existing_kinds, matrices, existing.role_map)
+            if result.links_given_words:
+                report.findings.append(f"{result.links_given_words} link tag(s) given the words inside the link")
 
         builder = StructTreeBuilder(pdf, analysis, layout_tables, language)
         root = builder.build(marks, retain_root=retain)
@@ -511,6 +573,10 @@ def tag_document(
         part = 2 if str(pdf.pdf_version) >= "2.0" else pdfua_part
         moved = part == 2 and _document_in_pdf2_namespace(pdf)
         result.metadata_changes = apply_document_metadata(pdf, title=title, language=language, pdfua_part=part)
+        self_links = drop_self_links(pdf)  # links that point to themselves (#484)
+        if self_links:
+            result.metadata_changes.append(f"{self_links} link(s) that only pointed to themselves removed (the "
+                                           "words stay)")
         if moved:
             result.metadata_changes.append("Document tag put in the PDF 2.0 namespace")
         blank = fill_blank_fonts(pdf)
@@ -519,12 +585,52 @@ def tag_document(
                 f"{len(blank)} font(s) of invisible text ({', '.join(sorted(set(blank))[:3])}) could only draw the "
                 "missing glyph: each was given an empty glyph to draw (nothing on the page changes)")
         result.existing_tags = report.to_dict()
+        # Tags at the right level, figures and formulas with their bounding box (#437, #438); before the figure
+        # handles are taken, as a P put around inline tags changes the tree's walk
+        result.structure_rules = structure_rules.apply(pdf, {**kept_boxes, **builder.boxes},
+                                                       [pa.pdf_to_page for pa in analysis.pages])
         if result.figure_handles:
             # Object numbers don't survive the save; the element's place in a walk of the final tree does
             place = {e.objgen: n for n, e in enumerate(_tree_walk(root)) if e.is_indirect}
             result.figure_handles = [(pi, bbox, place.get(og), si, kept) for pi, bbox, og, si, kept in result.figure_handles]
         pdf.save(dst)
     return result
+
+
+def _form_pages(pdf: pikepdf.Pdf, existing: ExistingTree, results: list, recursable: set) -> tuple[dict, list]:
+    """The kept Figures and Formulas whose content is a whole page of text placed as a form (#435): each of their
+    tagged sequences draws Form XObjects, each used once, with no tagged content of its own and many lines of text.
+    Returns the sequences to unwrap (owner objgen -> MCIDs) and the tags."""
+    import re
+
+    forms_by_owner = {sm.owner.objgen: sm.existing_forms for mr in results for sm in mr.streams}
+    verdict: dict = {}
+
+    def text_page(og) -> bool:
+        if og not in verdict:
+            ok = False
+            if og in recursable:
+                try:
+                    form = pdf.get_object(og)
+                    data = form.read_bytes()
+                    ok = ("/StructParents" not in form and "/StructParent" not in form and b"/MCID" not in data
+                          and len(re.findall(rb"T[jJ]\b", data)) >= FORM_PAGE_MIN_TEXT)
+                except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
+                    ok = False
+            verdict[og] = ok
+        return verdict[og]
+
+    release: dict = {}
+    chosen = []
+    for e in existing.elements:
+        if e.role not in ("Figure", "Formula") or not e.mcrefs or not all(m.valid for m in e.mcrefs):
+            continue
+        forms = [forms_by_owner.get(m.owner, {}).get(m.mcid, []) for m in e.mcrefs]
+        if all(f and all(text_page(og) for og in f) for f in forms):
+            chosen.append(e)
+            for m in e.mcrefs:
+                release.setdefault(m.owner, set()).add(m.mcid)
+    return release, chosen
 
 
 def _tree_walk(root) -> list:
@@ -724,6 +830,21 @@ def _hidden_text(marks: dict) -> set[tuple]:
                 if all_covered and sm.existing_kinds.get(mcid, {"text"}) <= {"text"}:
                     hidden.add((sm.owner.objgen, mcid))
     return hidden
+
+
+def _off_page(marks: dict, sizes: dict) -> set[tuple]:
+    """Existing marked sections drawn wholly outside their page's visible area (sizes: page index -> width and
+    height, the layout's page space the boxes are in)."""
+    out: set[tuple] = set()
+    for pi, streams in marks.items():
+        w, h = sizes.get(pi, (0, 0))
+        if not w or not h:
+            continue
+        for sm in streams:
+            for mcid, b in sm.existing.items():
+                if b[2] <= 0 or b[0] >= w or b[3] <= 0 or b[1] >= h:
+                    out.add((sm.owner.objgen, mcid))
+    return out
 
 
 def _mark_as_artifacts(pdf: pikepdf.Pdf, marks: dict, targets: set) -> int:

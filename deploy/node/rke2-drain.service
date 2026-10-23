@@ -1,0 +1,19 @@
+# Drain this node before shutdown and uncordon it after boot (rke2-drain.sh). Install on each server node:
+# docs/deployment/first-cluster/os.md#drain-on-shutdown
+[Unit]
+Description=Drain this Kubernetes node before shutdown, uncordon it after boot
+After=rke2-server.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/rke2-drain.sh up
+ExecStop=/usr/local/sbin/rke2-drain.sh down
+# Time for documents being remediated on this node to finish (the drain's own limit is 10 minutes). The hypervisor's
+# shutdown timeout must be at least as long, or it powers the VM off mid-drain
+TimeoutStartSec=20min
+TimeoutStopSec=15min
+
+[Install]
+WantedBy=multi-user.target

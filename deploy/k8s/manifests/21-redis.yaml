@@ -1,6 +1,6 @@
-# Queues: the engine's Celery broker (db 0) and the portal's (db 1). A password (REDIS_PASSWORD in engine.env, the
-# same value as PORTAL_REDIS_PASSWORD in portal.env; deploy.sh keeps them together) and the network policies in
-# 80-network-policies.yaml keep the queues to the pods that use them.
+# The engine's queues: its Celery broker (db 0), and the music and formula readers' work lists. A password
+# (REDIS_PASSWORD in engine.env) and the network policies in 80-network-policies.yaml keep them to the engine's pods.
+# The portal has a Redis of its own (23-redis-portal.yaml, #472).
 apiVersion: v1
 kind: Service
 metadata:
@@ -23,7 +23,10 @@ spec:
   template:
     metadata:
       labels: { app: redis }
+      # Restarted when its password changes (scripts/deploy.sh)
+      annotations: { checksum/password: "${REDIS_KEY_SHA}" }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       securityContext: { fsGroup: 999, runAsUser: 999, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: redis

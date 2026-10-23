@@ -367,7 +367,8 @@ SIGN_INS = Report(
 
 MAIL_KINDS = {"sign_in": "Sign-in code", "job": "Document", "help": "Help request", "digest": "Daily summary",
               "approval": "Approval request", "account": "Account decision", "report": "Email report",
-              "report_view": "Scheduled report view", "report_preview": "Report preview", "test": "Test email"}
+              "report_view": "Scheduled report view", "report_preview": "Report preview", "test": "Test email",
+              "api_token": "API token"}
 MAIL_STATUSES = {"sent": "Sent", "failed": "Failed", "queued": "Waiting or retrying", "held": "Held (email paused)",
                  "seen": "Not sent: already seen in the portal", "combined": "Combined into a daily summary",
                  "canceled": "Canceled"}
@@ -481,7 +482,7 @@ AUDIT = Report(
         Col("ip", "IP address", cast(AuditEvent.ip, String), default=False),
     ],
     group_col=AuditEvent.group_id, date_col=AuditEvent.created_at,
-    search=[AuditEvent.actor_email, AuditEvent.action, cast(AuditEvent.details, Text)],
+    search=[AuditEvent.actor_email, AuditEvent.action, cast(AuditEvent.details, Text), func.host(AuditEvent.ip)],
     filters=[
         Filter("event", "Event", lambda st, v: st.where(AuditEvent.action.startswith(v, autoescape=True)),
                lambda db: [(p, p) for p in sorted({a.split(".")[0] for a in db.scalars(
@@ -967,14 +968,32 @@ def _build(db: Session, report: Report, query: Query, group_ids: list[uuid.UUID]
     return stmt, cols
 
 
-def _order(stmt: Select, report: Report, cols: list[Col], sort: str) -> Select:
+def _order_by(report: Report, cols: list[Col], sort: str) -> list:
     by = {c.key: c for c in cols}
     key = sort or report.sort
     desc = key.startswith("-")
     col = by.get(key.lstrip("-")) or by.get(report.sort.lstrip("-")) or cols[0]
     target = literal_column(f'"{col.key}"') if report.group_by else col.expr  # grouped: by output column name
-    expr = target.desc().nulls_last() if desc else target.asc().nulls_last()
-    return stmt.order_by(expr)
+    order = [target.desc().nulls_last() if desc else target.asc().nulls_last()]
+    if not report.group_by and "job_id" in report.links:
+        order.append(report.links["job_id"])  # the same order on every page, and for a document's Previous and Next
+    return order
+
+
+def _order(stmt: Select, report: Report, cols: list[Col], sort: str) -> Select:
+    return stmt.order_by(*_order_by(report, cols, sort))
+
+
+def document_order(db: Session, name: str, query: Query, group_ids: list[uuid.UUID] | None, is_super: bool
+                   ) -> tuple[Select, list, ColumnElement, ColumnElement]:
+    """A report that lists documents, as the query, order, document id and file name of a document's Previous and
+    Next: the rows as the table shows them (the same filters, search and sort), however many pages."""
+    report = _report(name, is_super)
+    named = next((c for c in report.cols if c.link == "job"), None)
+    if report.group_by or named is None or "job_id" not in report.links:
+        raise ApiError(404, "not_found", "This report doesn't list documents.")
+    stmt, cols = _build(db, report, query, group_ids, is_super)
+    return stmt, _order_by(report, cols, query.sort), report.links["job_id"], named.expr
 
 
 def _shown(cols: list[Col], query: Query) -> list[Col]:

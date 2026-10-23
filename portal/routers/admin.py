@@ -10,12 +10,13 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, quota, services, settings_store
+from portal import approval, audit, paging, quota, services, settings_store
 from portal.db import get_db
 from portal.deps import Principal, require_super_admin
 from portal.errors import ApiError, conflict, not_found
 from portal.identity import Eligibility, domain_of, lookup_email, normalize_domain, normalize_email, provision
 from portal.models import AuditEvent, AuthSession, Group, GroupDomain, GroupEmail, RoleAssignment, Service, User
+from portal.paging import Page
 from portal.routers.common import AuditOut, LedgerOut, audit_query
 from portal.schemas import GroupOut, UserOut, group_out, user_out
 from portal.security.ratelimit import per_person
@@ -335,6 +336,41 @@ def search_users(q: str | None = Query(None, max_length=200), group_id: uuid.UUI
     if status:
         stmt = stmt.where(User.status == status)
     return [user_out(u) for u in db.scalars(stmt.order_by(User.email).limit(limit).offset(offset))]
+
+
+PEOPLE_SORTS = {"email": User.email, "group": select(Group.name).where(Group.id == User.group_id).scalar_subquery(),
+                "last_login": User.last_login_at, "joined": User.created_at}
+
+
+@router.get("/people", response_model=Page[UserOut])
+def people(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None,
+           role: str | None = Query(None, pattern="^(super_admin|group_admin|member)$"),
+           status: str | None = Query(None, pattern="^(active|disabled|pending|declined|removed)$"),
+           sort: str = Query("email", max_length=20), page: int = Query(1, ge=1, le=100_000),
+           page_size: int = Query(25, ge=1, le=200), _: Principal = Depends(require_super_admin),
+           db: Session = Depends(get_db)):
+    """Everyone, a page at a time (#514): search by email or name; filter by group, role and status (active, disabled,
+    waiting for approval, declined, data removed); sort by email, group, last sign-in or when they joined."""
+    stmt = select(User)
+    if q.strip():
+        pattern = paging.like(q)
+        stmt = stmt.where(or_(User.email.like(pattern, escape="\\"), func.lower(User.name).like(pattern, escape="\\")))
+    if group_id:
+        stmt = stmt.where(User.group_id == group_id)
+    roles = select(RoleAssignment.user_id)
+    if role == "super_admin":
+        stmt = stmt.where(User.id.in_(roles.where(RoleAssignment.role == "super_admin")))
+    elif role == "group_admin":
+        stmt = stmt.where(User.id.in_(roles.where(RoleAssignment.role == "group_admin")))
+    elif role == "member":
+        stmt = stmt.where(User.id.not_in(roles))
+    if status in ("active", "disabled"):
+        stmt = stmt.where(User.status == status, User.removed_at.is_(None))
+    elif status in ("pending", "declined"):
+        stmt = stmt.where(User.approval == status, User.removed_at.is_(None))
+    elif status == "removed":
+        stmt = stmt.where(User.removed_at.is_not(None))
+    return paging.page_of(db, stmt, paging.order_by(sort, PEOPLE_SORTS, User.id), page, page_size, user_out)
 
 
 @router.patch("/users/{user_id}", response_model=UserOut)
@@ -926,6 +962,35 @@ def admin_attention(_: Principal = Depends(require_super_admin), db: Session = D
     """What needs a super admin's attention, across every group and service, most serious first."""
     from portal.attention import attention
     return [i.to_dict() for i in attention(db)]
+
+
+class AckIn(BaseModel):
+    key: str = Field(min_length=1, max_length=200)
+
+
+@router.get("/attention/acknowledged")
+def admin_acknowledged(_: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """The items super admins have acknowledged (#538): what each said, who and when."""
+    from portal.attention import acknowledged
+    return acknowledged(db, None)
+
+
+@router.post("/attention/acknowledge")
+def admin_acknowledge(body: AckIn, request: Request, p: Principal = Depends(require_super_admin),
+                      db: Session = Depends(get_db)):
+    """Acknowledge an item for every super admin, until something new joins it (#538)."""
+    from portal.attention import acknowledge, acked
+    return acked(db, request, p, None, acknowledge(db, None, body.key, p.user.email), body.key)
+
+
+@router.delete("/attention/acknowledge")
+def admin_unacknowledge(request: Request, key: str = Query(min_length=1, max_length=200),
+                        p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+    """Show an acknowledged item again."""
+    from portal.attention import unacked, unacknowledge
+    return unacked(db, request, p, None, unacknowledge(db, None, key), key)
+
+
 
 
 @router.get("/access-check")

@@ -12,7 +12,7 @@
 #   - a file looks like a real settings or key file (*.env other than *.example, *.pem, *.key, .claude/…);
 #   - the text has a private network address, or an email address outside the placeholder domains
 #     (the reserved *.test, *.example, *.invalid and *.localhost; example.org, example.com, example.edu; GitHub
-#     no-reply); RKE2's default pod range, 10.42.0.0/16, is allowed;
+#     no-reply); RKE2's default pod and service ranges, 10.42.0.0/16 and 10.43.0.0/16, are allowed;
 #   - the text matches a line of .publish-deny: your own private words (hostnames, names, …), one
 #     case-insensitive extended regular expression per line. That file is git-ignored, so it is never published.
 #   - a file repeats a sentence from a document in samples/regression (scripts/sample_text_check.py). The
@@ -86,12 +86,12 @@ done < <(cd "$EXPORT" && find . -type f \( \
   \) | sed 's|^\./||')
 
 log "checking for private network addresses"
-# Each address found on its own. RKE2's and k3s's default pod range, 10.42.0.0/16, is the same on every cluster, so
-# it says nothing about a network: the defaults and examples use it
+# Each address found on its own. RKE2's and k3s's default pod and service ranges, 10.42.0.0/16 and 10.43.0.0/16, are
+# the same on every cluster, so they say nothing about a network: the defaults and examples use them
 while IFS= read -r hit; do
   problem "private address: $hit"
 done < <(grep -rnoIE '(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})([^0-9]|$)' \
-  "$EXPORT" | sed "s|^$EXPORT/||" | grep -vE ':[0-9]+:[^0-9.]?10\.42\.[0-9]{1,3}\.[0-9]{1,3}[^0-9]?$' || true)
+  "$EXPORT" | sed "s|^$EXPORT/||" | grep -vE ':[0-9]+:[^0-9.]?10\.4[23]\.[0-9]{1,3}\.[0-9]{1,3}[^0-9]?$' || true)
 
 log "checking email addresses"
 while IFS= read -r hit; do

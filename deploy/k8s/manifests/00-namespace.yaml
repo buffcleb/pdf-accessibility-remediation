@@ -4,3 +4,17 @@ metadata:
   name: ${NAMESPACE}
   labels:
     app.kubernetes.io/part-of: pdf-remediation
+    # Pod Security (#466): a pod that breaks the "baseline" standard (privileged, host namespaces or paths, extra
+    # capabilities) is refused here; "restricted" is warned and audited (two known exceptions: deploy/k8s/README.md)
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# Pods get no Kubernetes API token unless they name a service account that has rights (#470): the three that use the
+# API (Prometheus, kube-state-metrics, the veraPDF restart job) have their own; every other pod also says so itself
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: ${NAMESPACE}
+automountServiceAccountToken: false

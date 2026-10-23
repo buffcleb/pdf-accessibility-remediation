@@ -24,7 +24,10 @@ Two Compose stacks run side by side on one machine: the **engine** (`docker-comp
 | `music-reader` | Optional (profile `music`, with `OMR_ENABLED=true` in `.env`): reads the notes of music examples |
 | `fake-adobe` | Testing only (profile `fake-adobe`): a stand-in for Adobe |
 
-The formula reader (#403) isn't in the Compose files; it's a Kubernetes option (`FORMULA_READER`).
+> **Changed 22 October 2026:** malware scanning and the egress proxy are named among the Kubernetes options.
+
+The formula reader (#403) isn't in the Compose files; it's a Kubernetes option (`FORMULA_READER`). So are malware
+scanning with ClamAV (`MALWARE_SCAN`) and the egress proxy (`EGRESS_PROXY`).
 
 **Portal stack** (`docker-compose.portal.yml`):
 

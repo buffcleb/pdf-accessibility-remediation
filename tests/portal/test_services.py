@@ -303,16 +303,23 @@ def test_super_admin_sets_limits_for_group_members_and_it_is_audited(setup):
 
 
 def test_the_scaling_query_counts_documents_workers_could_process(setup):
-    """The query KEDA runs (deploy/k8s/manifests/45-autoscale.yaml) against the portal's database."""
+    """The query KEDA runs (deploy/k8s/manifests/45-autoscale.yaml) against the portal's database, as KEDA does: as
+    portal_app, whose own reads row-level security scopes (#350). The count comes from the table owner."""
     import re
     from pathlib import Path
 
     from sqlalchemy import text
 
+    from portal.db import get_engine
+
     manifest = (Path(__file__).parents[2] / "deploy/k8s/manifests/45-autoscale.yaml").read_text()
-    query = " ".join(re.search(r"query: >-\n((?:\s{10}.*\n?)+)", manifest).group(1).split())
+    query = re.search(r"\n\s+query: (.+)\n", manifest).group(1)
     s = setup
-    count = lambda: s["db"].execute(text(query)).scalar()  # noqa: E731
+
+    def count() -> int:
+        with get_engine().connect() as c:
+            assert c.execute(text("select current_user")).scalar() == "portal_app"
+            return c.execute(text(query)).scalar()
     assert count() == 0
     _add_service(s["db"], max_at_once=1)
     _enable_everywhere(s, pages=100)
@@ -324,3 +331,64 @@ def test_the_scaling_query_counts_documents_workers_could_process(setup):
     worker.submit_queued(s["db"])
     s["db"].commit()
     assert count() == 2  # two at the engine; the one held by its service's limit doesn't call for another worker
+
+
+def _held(s, *pages):
+    """Documents of these page counts uploaded to a service that asks first: their ids, in upload order."""
+    user = s["c"]["user"]
+    ids = []
+    for n, p in enumerate(pages):
+        r = _upload_to(user, EXTRA, (f"doc{n}.pdf", pdf_bytes(p))).json()[0]
+        assert r["job"]["status"] == "held", r
+        ids.append(r["job"]["id"])
+    return ids
+
+
+def _extra_reserved(user):
+    return next(x for x in user.get(f"{API}/me").json()["services"] if x["key"] == EXTRA)["reserved_pages"]
+
+
+def test_send_all_is_judged_as_a_batch(setup):
+    """#494: "Send all" sent each document as it came, until the pages ran out, and showed one error. Now a batch
+    that doesn't fit is refused whole, with the pages needed and left, and a dry run says so beforehand."""
+    s = setup
+    _add_service(s["db"], confirm_before_send=True)
+    _enable_everywhere(s, pages=10)
+    user = s["c"]["user"]
+    ids = _held(s, 4, 3, 5)  # 12 pages, 10 left
+    preview = user.post(f"{API}/jobs/confirm", json={"job_ids": ids, "dry_run": True}).json()
+    assert preview["needed_pages"] == 12 and preview["remaining_pages"] == 10
+    assert preview["sent"] == ids[:2] and preview["held"] == ids[2:] and preview["sent_pages"] == 7
+    assert _extra_reserved(user) == 0  # a dry run reserves nothing
+    r = user.post(f"{API}/jobs/confirm", json={"job_ids": ids, "mode": "all"})
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "over_quota"
+    assert r.json()["detail"]["needed_pages"] == 12 and r.json()["detail"]["remaining_pages"] == 10
+    assert _extra_reserved(user) == 0
+    assert all(user.get(f"{API}/jobs/{i}").json()["status"] == "held" for i in ids)
+
+
+def test_send_the_ones_that_fit_in_upload_order(setup):
+    s = setup
+    _add_service(s["db"], confirm_before_send=True)
+    _enable_everywhere(s, pages=10)
+    user = s["c"]["user"]
+    ids = _held(s, 4, 3, 5, 1)
+    r = user.post(f"{API}/jobs/confirm", json={"job_ids": ids, "mode": "fit"}).json()
+    # The first two fit (7 pages); the third (5) doesn't, and the rest wait with it, in order
+    assert r["sent"] == ids[:2] and r["held"] == ids[2:] and r["sent_pages"] == 7 and r["message"]
+    assert _extra_reserved(user) == 7
+    assert [user.get(f"{API}/jobs/{i}").json()["status"] for i in ids] == ["queued", "queued", "held", "held"]
+    # A batch that fits goes whole
+    topup(s, s["a"].id, 10, service=EXTRA)
+    r = user.post(f"{API}/jobs/confirm", json={"job_ids": ids[2:], "mode": "all"})
+    assert r.status_code == 200 and r.json()["sent"] == ids[2:] and _extra_reserved(user) == 13
+
+
+def test_only_your_own_held_documents_are_sent(setup):
+    s = setup
+    _add_service(s["db"], confirm_before_send=True)
+    _enable_everywhere(s, pages=10)
+    ids = _held(s, 2)
+    other = s["c"]["admin_a"]  # someone else, even an admin of the group
+    assert other.post(f"{API}/jobs/confirm", json={"job_ids": ids}).status_code == 409
+    assert s["c"]["user"].get(f"{API}/jobs/{ids[0]}").json()["status"] == "held"

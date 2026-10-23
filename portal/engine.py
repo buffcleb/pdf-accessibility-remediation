@@ -33,7 +33,7 @@ class Engine(Protocol):
                no_ai: bool = False, validator: dict | None = None, ignore_existing: bool = False) -> str: ...
     def submit_edit(self, filename: str, fileobj: BinaryIO, edits: list[dict], review: str = "none",
                     judge: str | None = None, reference: BinaryIO | None = None,
-                    validator: dict | None = None) -> str: ...
+                    validator: dict | None = None, ai_read: list[dict] | None = None) -> str: ...
     def status(self, engine_job_id: str) -> dict: ...
     def classify(self, filename: str, fileobj: BinaryIO, kinds: list[dict], backend: str, model: str | None = None,
                  pages: int = 3) -> dict: ...
@@ -93,11 +93,14 @@ class HttpEngine:
 
     def submit_edit(self, filename: str, fileobj: BinaryIO, edits: list[dict], review: str = "none",
                     judge: str | None = None, reference: BinaryIO | None = None,
-                    validator: dict | None = None) -> str:
+                    validator: dict | None = None, ai_read: list[dict] | None = None) -> str:
         """Apply edits (none, for a review only) and validate; review="sampled" adds the AI tag review.
         judge: the document's AI tier's review model. reference: for a corrected file, the version it replaces,
-        which the visual comparison is made against."""
+        which the visual comparison is made against. ai_read: the AI's readings flagged on the version it's based
+        on, so they stay flagged (worker.carried_ai_read)."""
         data = {"edits": json.dumps(edits), "review": review}
+        if ai_read:
+            data["ai_read"] = json.dumps(ai_read)
         if validator:
             data["validator"] = validator.get("validator", "service")
             data["verapdf_ua2"] = "true" if validator.get("verapdf_ua2", True) else "false"

@@ -135,6 +135,8 @@ CONTENT_ROLES = {"H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "Block
 # Tags a new area can become (a cell, list part or link needs its structure, so isn't made from artifacts)
 NEW_AREA_ROLES = {"H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "Code", "Quote",
                   "Figure", "Formula"}
+# What the new part of a split text tag can be (#427: chosen before saving, as the tag manager shows it)
+SPLIT_ROLES = NEW_AREA_ROLES - {"Figure", "Formula"}
 SCOPES = {"Row", "Column", "Both"}
 MAX_OPS = 5000
 MAX_TEXT = 4000
@@ -159,6 +161,7 @@ class _Ctx:
     # Artifact sections already tagged by earlier edits, per page (numbered as in the tag map)
     tagged_sections: dict | None = None
     ids_changed: bool = False  # an element ID was given or taken away: the IDTree is rebuilt before saving
+    made: Dictionary | None = None  # the tag the last split made
 
 
 def validate_ops(ops) -> list[dict]:
@@ -283,6 +286,8 @@ def validate_ops(ops) -> list[dict]:
             if (not isinstance(op.get("at"), int) or op["at"] < (0 if inside else 1)
                     or (inside and (not isinstance(op["char"], int) or isinstance(op["char"], bool) or op["char"] < 1))):
                 raise EditError(f"Edit {n}: a split needs the position to split at.")
+            if op.get("role") is not None and op["role"] not in SPLIT_ROLES:
+                raise EditError(f"Edit {n}: the new part can be {', '.join(sorted(SPLIT_ROLES))}.")
         clean.append(op)
     return clean
 
@@ -366,6 +371,9 @@ def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
             log.append(_apply(ctx, op, e, t, n))
         if ctx.ids_changed:
             write_id_tree(pdf, root, _walk(root))
+        # The edited tree keeps tags at the right level (#438): a figure made a block, inline tags in a paragraph
+        from app.tagging import structure_rules
+        structure_rules.apply(pdf)
         pdf.save(dst)
     return log
 
@@ -423,9 +431,15 @@ def _apply(ctx: _Ctx, op: dict, e: Elem | None, t: Elem | None, n: int) -> str:
     if kind == "merge":
         return _merge(ctx, e, t, n)
     if kind == "split":
-        if op.get("char") is not None:
-            return _split_inside(ctx, e, op["at"], op["char"], n)
-        return _split(ctx, e, op["at"], n)
+        said = (_split_inside(ctx, e, op["at"], op["char"], n) if op.get("char") is not None
+                else _split(ctx, e, op["at"], n))
+        role = op.get("role")
+        if role and ctx.made is not None and role != e.role:  # the new part's own type (#427)
+            ctx.made.S = Name("/" + role)
+            if role == "Note":
+                _give_id(ctx, ctx.made, f"note-{ctx.made.objgen[0]}")
+            said += f"; the new part is a {role}"
+        return said
     if kind == "delete":
         return _delete(ctx, e, op["children"], n)
     if kind == "assign":
@@ -1575,6 +1589,7 @@ def _new_sibling(ctx: _Ctx, e: Elem, keep: list, give, n: int) -> Dictionary:
         raise EditError(f"Edit {n}: the tag wasn't found under its parent.")
     siblings.insert(pos + 1, new)
     parent.K = Array(siblings)
+    ctx.made = new
     return new
 
 

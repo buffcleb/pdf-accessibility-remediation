@@ -25,6 +25,9 @@ runs veraPDF and confirms the pages look the same.](../../../images/tag-manager/
   kept for 24 hours: until then, **Undo this save** under **Versions** on the document's page puts it back.
 - Each save is checked like the original: tag integrity, the accessibility check, and that the pages still look
   identical.
+- A new version opens as soon as its file and tags are saved, marked **checking…**, while the accessibility check
+  and the page comparison finish: on a long document that's a minute or two sooner. Its result and review items
+  appear when they're done. (A save into a version waits for the checks, as it replaces that version only then.)
 - The new version appears under **Versions** on the document's page, with its own downloads.
 
 ## AI review

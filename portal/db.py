@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from portal import rls
 from portal.config import get_portal_settings
 
 
@@ -29,9 +30,19 @@ def open_session() -> Session:
     return _sessionmaker()()
 
 
-def get_db() -> Iterator[Session]:
-    """One session per request; committed by the route, rolled back on error."""
+def system_session(reason: str) -> Session:
+    """A session for cross-group work outside a person's request (the worker, the status check, metrics): it bypasses
+    row-level security, and that is audited once per process and reason (portal/rls.py)."""
     db = _sessionmaker()()
+    rls.bypass(db, reason)
+    return db
+
+
+def get_db() -> Iterator[Session]:
+    """One session per request; committed by the route, rolled back on error. It sees no group-scoped rows until
+    the signed-in person is known (portal/deps.py) or the sign-in routes say whose they are (portal/rls.py)."""
+    db = _sessionmaker()()
+    rls.identify(db)
     try:
         yield db
     except Exception:

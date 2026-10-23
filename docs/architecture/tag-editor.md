@@ -5,22 +5,13 @@
 People compare versions side by side (`/jobs/{id}/tags`), with overlays, a tag tree and the review findings, and fix
 tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-manager/README.md).
 
-```mermaid
-sequenceDiagram
-  actor R as Reviewer
-  participant V as Tag manager
-  participant P as Portal API
-  participant W as Portal worker
-  participant E as Engine
-  R->>V: edit tags (role, alt, read-aloud text, language,<br/>cells, reading order, merge, split, delete,<br/>areas: move content, tag artifacts)
-  V->>V: only valid changes offered<br/>(roles.ts mirrors the engine's rules)
-  R->>P: save (optionally with AI review)
-  P->>W: new version "Human reviewed N" (queued)
-  W->>E: POST /edit (base version's PDF + edits)
-  E->>E: apply edits (reshape lists, split text runs),<br/>pages stay pixel-identical
-  E->>E: integrity (fails the save), semantics,<br/>veraPDF, AI review if asked
-  W->>P: new version ready (tag map, findings)
-```
+> **Changed 22 October 2026:** pending edits show as the tags they'll make, and those can be chosen before saving
+> (#427); a saved version opens before its checks finish (#428); a review item with a page shows its area (#426).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/tag-editor-save-dark.svg">
+  <img src="../images/diagrams/tag-editor-save.svg" alt="A reviewer edits tags in the tag manager, which offers only valid changes; saving queues a new version, the portal worker sends the base version's PDF and the edits to the engine, which applies them with the pages unchanged and checks integrity, semantics, veraPDF and, if asked, AI review; the new version then appears with its tag map and findings.">
+</picture>
 
 - **The viewer** renders pages with pdf.js and draws each tag's boxes from the **tag map** the engine writes for every
   output: each tag's role, page boxes, text and pieces. Nothing is parsed from the PDF in the browser.
@@ -99,9 +90,16 @@ sequenceDiagram
   in reading order with pending edits applied, and speaks it with the browser's Web Speech API (no service, no cost).
   Each tag's own text is in the tag map in full (`say`, where it differs from the shortened `text`). The wording is
   tested with Node's test runner (`npm test` in `web/`).
+- **Pending tags.** Tags that pending edits make or reshape (a new tag from an area, a split, a list or table built)
+  show at once, in the tree and on the page, as they'll be saved (`pending.ts`, `PendingTag.tsx`, #427); a new one
+  can be chosen before it's saved, and its type or alt text changed, which changes the pending edit.
+- **Review items on the page.** Every review item that has a page has **Show**, which opens that page with the area
+  it's about highlighted (`SpotLayer.tsx`, #426).
 - **Every save is a new version.** Engine outputs are never changed. The edit is applied by the engine
   (`app/tagging/editor.py`), on the base version's PDF, and checked like an original output: integrity (which fails the
-  save), the semantic checks, veraPDF, and pixel identity with the base version.
+  save), the semantic checks, veraPDF, and pixel identity with the base version. The new version opens as soon as its
+  file and tag map are final, while its checks still run (the engine's `partial` answer, #428), marked as still
+  being checked.
 - **Reviews.** A saved version can be reviewed by AI (flagged figures plus a sample, or every figure) when it's saved
   or later, without changing its file. Reviews use the review model of the document's AI level.
 - **Support's fixes.** A super admin handling a help request can upload a corrected PDF made in another tool; it

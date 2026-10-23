@@ -6,7 +6,8 @@
   3. Validate Adobe's output as it is (veraPDF, tag integrity, tag review)  -> "after" report
   4. With an AI model: write alt text for the figures Adobe left without it, and readings of specialist notation
      (math, chemistry, doses) as ActualText on Adobe's text tags, as tag edits to a separate copy (pixel-identical
-     to Adobe's), and validate that copy too  -> "enhanced"
+     to Adobe's), with the PDF/UA identifier, a usable title and header cells' Scope that Adobe leaves out, and
+     validate that copy too  -> "enhanced"
 
 Adobe's file is always kept unchanged (merged, for a large document). Problems in it are reported,
 never fixed in it; the alt text and readings go only into the separate copy.
@@ -14,6 +15,7 @@ never fixed in it; the alt text and readings go only into the separate copy.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -110,12 +112,12 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
                             "The file is kept as Adobe returned it")
     tag_maps["primary"] = await _tagmap_file(out, stem, "primary", primary, primary_map)
 
-    # Improved copy: AI alt text and lossless font fixes. Adobe's file stays as it is. ----------------
+    # Improved copy: AI alt text, document fixes and lossless font fixes. Adobe's file stays as it is. ----------------
     enhanced_name = None
     vera_enhanced = None
     enrichment = EnrichmentStats()
-    improvements: dict = {"alt_text": 0, "decorative": 0, "notation": 0, "unicode_maps": [], "glyph_lists": [],
-                          "glyph_widths": 0}
+    improvements: dict = {"alt_text": 0, "decorative": 0, "notation": 0, "title": None, "pdfua_identifier": False,
+                          "header_scope": 0, "unicode_maps": [], "glyph_lists": [], "glyph_widths": 0}
     ai_stats = {"calls": 0, "failures": 0, "cost": 0.0, "tokens": {"prompt_tokens": 0, "completion_tokens": 0},
                 "model": None}
     candidate = work / "improved.pdf"
@@ -141,6 +143,12 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
                                                or (e["op"] == "set_alt" and e["expect_role"] == "Formula"))
     # The readings that reached Adobe's tags, as MathML and read by rule (#403), before the copy is checked
     await _read_formulas(enrichment, (), src)
+    # What PDF/UA asks of the document that Adobe leaves out: the identifier, a title that isn't "Microsoft Word -
+    # x.docx", and Scope on header cells (before the font fixes, whose veraPDF check is the copy's)
+    tagmap = primary_map
+    if tagmap is None and tag_maps["primary"] and (out / tag_maps["primary"]).is_file():
+        tagmap = json.loads((out / tag_maps["primary"]).read_text())
+    improvements.update(await asyncio.to_thread(_document_fixes, candidate, tagmap, opts))
     progress("font_fixes", 86)
     improvements.update(await asyncio.to_thread(_font_fixes, primary, candidate, work, stem, warnings))
     vera_candidate = improvements.pop("vera")
@@ -288,6 +296,123 @@ def _font_fixes(primary, pdf, work, stem: str, warnings: list[str]) -> dict:
     return out
 
 
+def _document_fixes(path, tagmap: dict | None, opts: JobOptions) -> dict:
+    """Fixes to the document that never change how it looks, applied to path in place: the PDF/UA identifier
+    (5-1), a title in place of one that is only the application and file name, and Scope on the header cells whose
+    rows say what they head (7.5-1). Returns what was done."""
+    import pikepdf
+
+    from app.pipeline.orchestrator import usable_title
+    from app.tagging.metadata import document_info, fix_dates, set_title
+    from app.tagging.self_links import drop_self_links
+
+    done: dict = {"title": None, "pdfua_identifier": False, "header_scope": 0, "self_links": 0, "dates": 0}
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        title = document_info(pdf)["title"]
+        new = opts.title or (None if usable_title(title) else _heading_title(tagmap) or opts.stem.replace("_", " "))
+        if new and new != title:
+            set_title(pdf, new)
+            done["title"] = new
+        with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
+            if not meta.get("pdfuaid:part"):
+                part = 2 if pdf.pdf_version >= "2.0" else 1  # PDF/UA-2 is for PDF 2.0 files
+                meta["pdfuaid:part"] = str(part)
+                if part == 2:
+                    meta["pdfuaid:rev"] = "2024"
+                done["pdfua_identifier"] = True
+        done["header_scope"] = _header_scopes(pdf)
+        done["self_links"] = drop_self_links(pdf)  # links that point to themselves (#484)
+        done["dates"] = fix_dates(pdf)  # dates PAC can read (#483)
+        if any(done.values()):
+            pdf.save(path)
+    return done
+
+
+def _heading_title(tagmap: dict | None) -> str | None:
+    """The first top-level heading's text in Adobe's tags (Adobe's Title tag is one), else the first heading's."""
+    heads = [e for e in (tagmap or {}).get("elements", [])
+             if re.fullmatch(r"H\d?", e.get("role") or "") and (e.get("text") or "").strip()]
+    first = next((e for e in heads if e["role"] == "H1"), heads[0] if heads else None)
+    return " ".join(first["text"].split())[:200] if first else None
+
+
+def _header_scopes(pdf) -> int:
+    """Scope on Adobe's TH cells that have none, where the row says it: a row of header cells (or one in THead)
+    heads columns; the first cell of a row of data heads its row. Any other header cell is left as it is, and so is a
+    table whose cells name their headers. Returns how many were given one."""
+    from pikepdf import Array, Dictionary
+
+    from app.tagging.existing_tags import _is_struct_elem, _role_map, resolve_role
+
+    root = pdf.Root.get("/StructTreeRoot")
+    if root is None:
+        return 0
+    roles = _role_map(root)
+
+    def kids(e) -> list:
+        k = e.get("/K")
+        return [x for x in (list(k) if isinstance(k, Array) else [k]) if _is_struct_elem(x)]
+
+    def role(e) -> str:
+        return resolve_role(str(e.get("/S", ""))[1:], roles)
+
+    def attrs(e) -> list:
+        a = e.get("/A")
+        return [x for x in (list(a) if isinstance(a, Array) else [a]) if isinstance(x, Dictionary)]
+
+    def walk(e, seen: set):
+        for k in kids(e):
+            if k.is_indirect:
+                if k.objgen in seen:
+                    continue
+                seen.add(k.objgen)
+            yield k
+            yield from walk(k, seen)
+
+    given = 0
+    for table in [e for e in walk(root, set()) if role(e) == "Table"]:
+        rows: list[tuple[object, bool]] = []  # (row, in THead)
+        for k in kids(table):
+            r = role(k)
+            if r == "TR":
+                rows.append((k, False))
+            elif r in ("THead", "TBody", "TFoot"):
+                rows += [(x, r == "THead") for x in kids(k) if role(x) == "TR"]
+        if any("/Headers" in c for row, _ in rows for c in kids(row)):
+            continue
+        for row, head in rows:
+            mates = [x for x in kids(row) if role(x) in ("TH", "TD")]
+            header_row = head or all(role(x) == "TH" for x in mates)
+            for n, c in enumerate(mates):
+                if role(c) != "TH" or any("/Scope" in a for a in attrs(c)):
+                    continue
+                if header_row:
+                    scope = "Column"
+                elif n == 0:
+                    scope = "Row"
+                else:
+                    continue
+                _set_scope(c, scope)
+                given += 1
+    return given
+
+
+def _set_scope(c, scope: str) -> None:
+    from pikepdf import Array, Dictionary, Name
+
+    attrs = c.get("/A")
+    table = next((a for a in (list(attrs) if isinstance(attrs, Array) else [attrs])
+                  if isinstance(a, Dictionary) and a.get("/O") == Name.Table), None)
+    if table is not None:
+        table.Scope = Name("/" + scope)
+    elif attrs is None:
+        c.A = Dictionary(O=Name.Table, Scope=Name("/" + scope))
+    elif isinstance(attrs, Array):
+        attrs.append(Dictionary(O=Name.Table, Scope=Name("/" + scope)))
+    else:
+        c.A = Array([attrs, Dictionary(O=Name.Table, Scope=Name("/" + scope))])
+
+
 def _describe(imp: dict) -> str:
     parts = []
     if imp.get("alt_text"):
@@ -304,6 +429,16 @@ def _describe(imp: dict) -> str:
         parts.append(f"{imp['glyph_widths']} glyph width(s) corrected")
     if imp.get("bookmarks"):
         parts.append(f"{imp['bookmarks']} bookmark(s) made from the headings")
+    if imp.get("title"):
+        parts.append(f"title \"{imp['title']}\" in place of Adobe's")
+    if imp.get("pdfua_identifier"):
+        parts.append("PDF/UA identifier added")
+    if imp.get("header_scope"):
+        parts.append(f"Scope given to {imp['header_scope']} table header cell(s)")
+    if imp.get("self_links"):
+        parts.append(f"{imp['self_links']} link(s) that only pointed to themselves removed")
+    if imp.get("dates"):
+        parts.append(f"{imp['dates']} date(s) that weren't valid PDF dates rewritten or removed")
     return ("Changes: " + "; ".join(parts) + ".") if parts else ""
 
 

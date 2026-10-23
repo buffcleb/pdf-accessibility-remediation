@@ -32,4 +32,14 @@ As a super admin, the menu on the left has: **Attention**, **Groups**, **Help re
 levels**, **People (all groups)**, **Queues**, **System**, **Reports**, **Settings** and **+ Offer a service to a
 group**. When the AI gateway's admin UI is configured, a link to it appears in the menu and on Services and AI levels.
 
-![Administration, Attention for a super admin: Across every group and service showing All clear, and the access check, Why can't this person use a service?](../../images/admin-attention.png)
+![Administration, Attention for a super admin: Across every group and service with 1 document failed in the last 7 days (reason: the engine refused it), Open its help request and Acknowledge; 2 help requests waiting for support, with Open Help requests; an Acknowledged section; and the access check, Why can't this person use a service?](../../images/admin-attention.png)
+
+**Attention** lists what a group's admins see for every group, and the service's own: its alerts, security alerts,
+and help requests waiting for support (new, or the person's last message unanswered). Each item links to what it's
+about: the document or the help request when there's one, otherwise the list of them (Queues, the Documents
+report, the audit log) or the page to fix it on (System, a service, a group's pages).
+
+Summaries and notices (failed documents, emails that couldn't be sent, security alerts and the like) can be
+**acknowledged**, for every super admin, until something new happens; the group's admins have their own list to
+acknowledge. The service's alerts and help requests waiting can't be: they go when they're fixed or answered, and an
+alert's reminder emails go on until then.

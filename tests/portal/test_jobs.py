@@ -23,9 +23,12 @@ API = "/api/v1"
 
 
 def pdf_bytes(pages: int, password: str | None = None) -> bytes:
+    """A blank PDF, different on each call (its own /Subject): the same file sent twice while the first is in
+    progress is refused (#560), which only the tests of that rule mean to do."""
     pdf = pikepdf.new()
     for _ in range(pages):
         pdf.add_blank_page()
+    pdf.docinfo["/Subject"] = uuid.uuid4().hex
     buf = io.BytesIO()
     if password:
         pdf.save(buf, encryption=pikepdf.Encryption(user=password, owner=password))
@@ -78,8 +81,10 @@ class FakeEngine:
         self.jobs[jid] = {"status": "processing", "progress": {"stage": "tagging"}}
         return jid
 
-    def submit_edit(self, filename, fileobj, edits, review="none", judge=None, reference=None, validator=None):
+    def submit_edit(self, filename, fileobj, edits, review="none", judge=None, reference=None, validator=None,
+                    ai_read=None):
         jid = uuid.uuid4().hex
+        self.ai_reads = getattr(self, "ai_reads", []) + [ai_read]
         self.validators = getattr(self, "validators", []) + [validator]
         self.submitted.append((filename, "edit", edits, review))
         self.references = getattr(self, "references", []) + [reference.read() if reference else None]
@@ -564,6 +569,37 @@ def test_jobs_at_the_engine_follow_its_running_workers(setup, monkeypatch):
     worker.submit_queued(s["db"])
     assert at_engine() == 7
 
+
+
+def test_waiting_documents_say_what_they_wait_for(setup, monkeypatch):
+    """#530: a document left in the queue says why: the person's own documents at the engine (the most at once), or
+    no free place at the engine, with how many are in use of how many. Super admins see it on Run details."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    ps = worker.get_portal_settings()
+    monkeypatch.setattr(ps, "engine_max_in_flight", 2)
+    monkeypatch.setattr(ps, "engine_capacity_cache_seconds", 0.0)
+    monkeypatch.setattr(worker, "_capacity", (0.0, None))
+    s["c"]["super"].patch(f"{API}/admin/settings", json={"max_concurrent_jobs_per_user": 1})
+    ids = [r["job"]["id"] for r in upload(s["c"]["user"], *[(f"d{n}.pdf", pdf_bytes(1)) for n in range(3)]).json()]
+    upload(s["c"]["user2"], ("other.pdf", pdf_bytes(1)))
+    db = s["db"]
+
+    def stages():
+        db.expire_all()
+        return [(db.get(Job, uuid.UUID(i)).status, db.get(Job, uuid.UUID(i)).progress) for i in ids]
+
+    worker.submit_queued(db)  # 2 places: the person's first, and the other person's
+    assert stages()[1:] == [("queued", {"stage": "waiting_per_person", "at_once": 1})] * 2
+    s["c"]["super"].patch(f"{API}/admin/settings", json={"max_concurrent_jobs_per_user": 50})
+    worker.submit_queued(db)  # every place in use: nothing is picked, and the rest say so
+    assert stages()[1:] == [("queued", {"stage": "waiting_engine", "in_use": 2, "places": 2})] * 2
+    s["engine"].capacity = lambda: 3
+    worker.submit_queued(db)  # one more place: the next goes, the last waits with 3 of 3 in use
+    assert stages()[1][0] == "submitted"
+    assert stages()[2] == ("queued", {"stage": "waiting_engine", "in_use": 3, "places": 3})
+    seen = s["c"]["super"].get(f"{API}/jobs/{ids[2]}").json()
+    assert seen["progress"]["stage"] == "waiting_engine" and seen["staff"]["engine_job_id"] is None
 
 def test_the_engines_own_reports_and_dollar_costs_are_super_admins_only(setup):
     """#314: re-billing is by pages, so only super admins see the AI's cost in dollars. The engine's JSON report carries

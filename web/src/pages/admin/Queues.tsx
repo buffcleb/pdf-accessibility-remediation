@@ -1,8 +1,9 @@
 import { Fragment, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
-import { get, post } from "../../api";
+import { get, post, type Paged } from "../../api";
 import { ErrorNotice, Loading, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { QueuesLive } from "./QueuesLive";
+import { ListBar, ListPager } from "../../components/lists";
 
 type Queue = {
   key: string; label: string; kind: "documents" | "edits" | "reviews" | "mail";
@@ -140,10 +141,26 @@ export function QueuesPage() {
 }
 
 function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () => void; onClose: () => void }) {
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const location = useLocation();
   const state = (["waiting", "active", "failed"].includes(params.get("state") ?? "") ? params.get("state") : "waiting") as State;
-  const list = useLoad(() => get<{ items: Item[] }>(`${path(queue.key)}/items?state=${state}`), [queue.key, state], always, 10000);
+  // A page at a time, searched, the view in the address (#514)
+  const page = Number(params.get("page")) || 1;
+  const size = Number(params.get("size")) || 25;
+  const api = new URLSearchParams({ state, page: String(page), page_size: String(size) });
+  if (params.get("q")) api.set("q", params.get("q")!);
+  const list = useLoad(() => get<Paged<Item>>(`${path(queue.key)}/items?${api}`), [queue.key, api.toString()], always, 10000);
+  const update = (changes: Record<string, string | null>, keepPage = false) => {
+    const next = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(changes)) { if (v === null || v === "") next.delete(k); else next.set(k, v); }
+    if (!keepPage) next.delete("page");
+    setParams(next, { replace: true });
+  };
+  const pager = (where: "top" | "bottom") => list.data && (
+    <ListPager page={page} pageSize={list.data.page_size} total={list.data.total} noun={["item", "items"]} where={where}
+      topId="qi-top" onPage={(n) => update({ page: n > 1 ? String(n) : null }, true)}
+      onSize={(n) => update({ size: n === 25 ? null : String(n) })} />
+  );
   const [error, setError] = useState<unknown>(null);
   const [done, setDone] = useState("");
   const isMail = queue.kind === "mail";
@@ -190,10 +207,15 @@ function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () =
             aria-current={k === state ? "page" : undefined}>{label} ({fmtNum(n)})</Link>
         ))}
       </nav>
+      <ListBar label={`Search ${queue.label}`} searchId="qi-q" query={params.get("q") ?? ""}
+        placeholder={isMail ? "Search by subject or address" : "Search by document or person"}
+        onQuery={(q) => update({ q: q || null })} chips={[]} onRemove={() => {}} onClear={() => update({ q: null })} />
       <ErrorNotice error={error} />
       <div role="status" className="small">{done}</div>
       {list.loading && !list.data ? <Loading /> : !list.data ? <ErrorNotice error={list.error} /> :
-        list.data.items.length === 0 ? <p className="empty">Nothing {state === "waiting" ? "waiting" : state === "active" ? "in progress" : "failed in the last 7 days"}.</p> : (
+        list.data.items.length === 0 ? <p className="empty">{params.get("q") ? "Nothing matches." : `Nothing ${state === "waiting" ? "waiting" : state === "active" ? "in progress" : "failed in the last 7 days"}.`}</p> : (
+          <>
+          <div id="qi-top">{pager("top")}</div>
           <div className="table-wrap">
             <table>
               <thead><tr><th scope="col">{isMail ? "Subject" : "Item"}</th><th scope="col">{isMail ? "To" : "Person"}</th>
@@ -229,8 +251,9 @@ function QueueItems({ queue, onChange, onClose }: { queue: Queue; onChange: () =
               </tbody>
             </table>
           </div>
+          {pager("bottom")}
+          </>
         )}
-      {list.data && list.data.items.length >= 200 && <p className="muted small">Showing the first 200.</p>}
     </section>
   );
 }

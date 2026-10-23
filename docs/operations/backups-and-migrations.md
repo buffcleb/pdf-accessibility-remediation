@@ -12,6 +12,9 @@ undone automatically, so **back up before deploying a new version**.
   if they fail; the portal API doesn't migrate on start there.
 - **Elsewhere:** run `python -m portal.cli migrate` once, with the portal's settings, before starting the new version.
 
+Taking a release back, with its migrations (`scripts/deploy.sh downgrade`, or a restore from the backup made before
+them), is in [rolling back](rollback.md).
+
 ## Backing up
 
 ```bash

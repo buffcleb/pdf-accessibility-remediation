@@ -1,16 +1,19 @@
-import { Fragment, useState, type FormEvent } from "react";
+import { Fragment, useState, type FormEvent, type ReactNode } from "react";
 import { Link, Navigate, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
-  get, patch, post, put, type AccessCheck, type Group, type GroupService, type LedgerEntry, type User,
+  get, patch, post, put, type AccessCheck, type Group, type GroupService, type LedgerEntry, type Paged, type User,
 } from "../../api";
 import { useAuth } from "../../auth";
 import { AccessCheckForm, AccessCheckView, AttentionList, serviceOptions } from "../../components/attention";
 import { DocumentsList } from "../../components/DocumentsList";
 import { LiveReports } from "../../components/LiveReport";
 import { AdminRemoveBar, canAdminRemove } from "../../components/removal";
+import { ListBar, ListPager, SortHeading, type Chip } from "../../components/lists";
 import { LedgerTable } from "../../components/tables";
 import { ErrorNotice, Loading, Meter, Notice, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
-import { SAVED, useConfirmLeave, useUnsavedChanges } from "../../components/unsaved";
+import { AdminDialog, DialogButton } from "../../components/AdminDialog";
+import { GroupApiTokens } from "../../components/ApiTokens";
+import { SAVED, useUnsavedChanges } from "../../components/unsaved";
 import { GroupHelp } from "./Help";
 import { Adjust, Domains, GroupAdmins, GroupEmails, GroupSettings, LimitInput, Topup } from "./shared";
 
@@ -18,39 +21,55 @@ import { Adjust, Domains, GroupAdmins, GroupEmails, GroupSettings, LimitInput, T
 export function GroupsList() {
   const { me } = useAuth();
   const navigate = useNavigate();
-  const groups = useLoad(() => get<Group[]>(me?.is_super_admin ? "/admin/groups" : "/groups"), [me?.is_super_admin]);
-  const [q, setQ] = useState("");
-  const [name, setName] = useState("");
-  const [domains, setDomains] = useState("");
-  const [error, setError] = useState<unknown>(null);
-  useUnsavedChanges(!!(name.trim() || domains.trim()));
+  // A page at a time, the view in the address (#514): search by name or domain, status, sort
+  const [params, setParams] = useSearchParams();
+  const sort = params.get("sort") ?? "name";
+  const page = Number(params.get("page")) || 1;
+  const size = Number(params.get("size")) || 25;
+  const api = new URLSearchParams();
+  if (params.get("q")) api.set("q", params.get("q")!);
+  if (params.get("status")) api.set("status", params.get("status")!);
+  api.set("sort", sort);
+  api.set("page", String(page));
+  api.set("page_size", String(size));
+  const groups = useLoad(() => get<Paged<Group>>(`/groups/browse?${api}`), [api.toString()]);
   useTitle("Groups");
+  const update = (changes: Record<string, string | null>, keepPage = false) => {
+    const next = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(changes)) { if (v === null || v === "") next.delete(k); else next.set(k, v); }
+    if (!keepPage) next.delete("page");
+    setParams(next, { replace: true });
+  };
   if (groups.loading && !groups.data) return <Loading />;
   if (!groups.data) return <ErrorNotice error={groups.error} />;
-  if (!me?.is_super_admin && groups.data.length === 1) return <Navigate to={`/admin/groups/${groups.data[0].id}`} replace />;
+  const filtered = !!(params.get("q") || params.get("status"));
+  if (!me?.is_super_admin && !filtered && groups.data.total === 1) return <Navigate to={`/admin/groups/${groups.data.items[0].id}`} replace />;
 
-  async function create(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    try {
-      const g = await post<Group>("/admin/groups", { name, domains: domains.split(/[\s,]+/).filter(Boolean) });
-      navigate(`/admin/groups/${g.id}`, { state: SAVED });
-    } catch (err) {
-      setError(err);
-    }
-  }
-
-  const list = groups.data.filter((g) => !q || g.name.toLowerCase().includes(q.toLowerCase()));
+  const list = groups.data.items;
+  const pager = (where: "top" | "bottom") => (
+    <ListPager page={page} pageSize={groups.data!.page_size} total={groups.data!.total} noun={["group", "groups"]} where={where}
+      topId="groups-top" onPage={(n) => update({ page: n > 1 ? String(n) : null }, true)}
+      onSize={(n) => update({ size: n === 25 ? null : String(n) })} />
+  );
   return (
     <>
       <h1>Groups</h1>
-      <div className="field" style={{ maxWidth: 360 }}>
-        <label htmlFor="g-q">Search groups</label>
-        <input id="g-q" type="search" value={q} onChange={(e) => setQ(e.target.value)} />
-      </div>
+      <ListBar label="Search and filter groups" searchId="g-q" query={params.get("q") ?? ""} placeholder="Search by name or email domain"
+        onQuery={(q) => update({ q: q || null })} chips={[]} active={!!params.get("status")} onRemove={() => {}}
+        onClear={() => { const keep = new URLSearchParams(); for (const k of ["size", "sort"]) if (params.get(k)) keep.set(k, params.get(k)!); setParams(keep, { replace: true }); }}>
+        <label htmlFor="g-status" className="visually-hidden">Status</label>
+        <select id="g-status" className="report-select" value={params.get("status") ?? ""} onChange={(e) => update({ status: e.target.value })}>
+          <option value="">Active and disabled</option>
+          <option value="active">Active</option>
+          <option value="disabled">Disabled</option>
+        </select>
+      </ListBar>
+      <div id="groups-top">{groups.data.total === 0 ? <p className="small muted list-count" role="status">No group matches.</p> : pager("top")}</div>
       <div className="table-wrap">
         <table>
-          <thead><tr><th scope="col">Group</th><th scope="col">Email domains</th><th scope="col">Services on</th><th scope="col">Pages</th></tr></thead>
+          <thead><tr>
+            <SortHeading label="Group" sortKey="name" sort={sort} onSort={(v) => update({ sort: v === "name" ? null : v }, true)} />
+            <th scope="col">Email domains</th><th scope="col">Services on</th><th scope="col">Pages</th></tr></thead>
           <tbody>
             {list.map((g) => {
               const on = g.services.filter((x) => x.enabled);
@@ -70,20 +89,41 @@ export function GroupsList() {
           </tbody>
         </table>
       </div>
+      {pager("bottom")}
       {me?.is_super_admin && (
-        <details className="panel">
-          <summary>Create a group</summary>
-          <form onSubmit={create} className="form-row">
-            <div className="field"><label htmlFor="g-name">Name</label>
-              <input id="g-name" type="text" required value={name} onChange={(e) => setName(e.target.value)} /></div>
-            <div className="field"><label htmlFor="g-domains">Email domains <span className="hint">(comma-separated, e.g. example.org)</span></label>
-              <input id="g-domains" type="text" value={domains} onChange={(e) => setDomains(e.target.value)} /></div>
-            <button className="btn" type="submit" disabled={!name.trim()}>Create group</button>
-          </form>
-          <ErrorNotice error={error} />
-        </details>
+        <p><DialogButton label="Create a group" title="Create a group" formId="new-group">
+          {() => <NewGroup onCreated={(g) => navigate(`/admin/groups/${g.id}`, { state: SAVED })} />}
+        </DialogButton></p>
       )}
     </>
+  );
+}
+
+/** A new group, in the admin edit dialog (#511): opens once it's made. */
+function NewGroup({ onCreated }: { onCreated: (g: Group) => void }) {
+  const [name, setName] = useState("");
+  const [domains, setDomains] = useState("");
+  const [error, setError] = useState<unknown>(null);
+  useUnsavedChanges(!!(name.trim() || domains.trim()));
+
+  async function create(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try {
+      onCreated(await post<Group>("/admin/groups", { name, domains: domains.split(/[\s,]+/).filter(Boolean) }));
+    } catch (err) {
+      setError(err);
+    }
+  }
+  return (
+    <form id="new-group" onSubmit={create} className="dialog-form">
+      <div className="field"><label htmlFor="g-name">Name</label>
+        <input id="g-name" type="text" required value={name} onChange={(e) => setName(e.target.value)} /></div>
+      <div className="field"><label htmlFor="g-domains">Email domains <span className="hint">(comma-separated, e.g. example.org)</span></label>
+        <input id="g-domains" type="text" value={domains} onChange={(e) => setDomains(e.target.value)} /></div>
+      <div className="actions"><button className="btn" type="submit" disabled={!name.trim()}>Create group</button></div>
+      <ErrorNotice error={error} />
+    </form>
   );
 }
 
@@ -173,14 +213,8 @@ function ServicesAndPages({ group, isSuper, onChange, reload }: {
   group: Group; isSuper: boolean; onChange: (g: Group) => void; reload: () => void;
 }) {
   const { config } = useAuth();
+  // Edit and Add pages open the admin edit dialog (#511), which asks before closing over unsaved changes
   const [open, setOpen] = useState<{ key: string; what: "edit" | "pages" } | null>(null);
-  const confirmLeave = useConfirmLeave();
-  // Closing or switching panels drops what's typed in the open one, so ask first (Cancel is the explicit discard).
-  const toggle = async (key: string, what: "edit" | "pages") => {
-    const next = open?.key === key && open.what === what ? null : { key, what };
-    if (open && (await confirmLeave())) setOpen(next);
-    else if (!open) setOpen(next);
-  };
   return (
     <>
       <p className="muted">
@@ -217,17 +251,16 @@ function ServicesAndPages({ group, isSuper, onChange, reload }: {
                     ? <Link to={`/admin/groups/${group.id}/people?service=${encodeURIComponent(x.key)}`}>{x.own_limits} {x.own_limits === 1 ? "person" : "people"}</Link>
                     : <span className="muted">none</span>}</td>
                   <td>
-                    <div className="actions">
+                    <div className="row-actions">
+                      <button className="btn secondary small" aria-haspopup="dialog" onClick={() => setOpen({ key: x.key, what: "edit" })}>
+                        Edit<span className="visually-hidden"> {x.label}</span>
+                      </button>
                       {x.metered && x.enabled && (
-                        <button className={`btn small${empty ? "" : " secondary"}`} aria-expanded={open?.key === x.key && open.what === "pages"}
-                          onClick={() => void toggle(x.key, "pages")}>
+                        <button className={`btn small${empty ? "" : " secondary"}`} aria-haspopup="dialog"
+                          onClick={() => setOpen({ key: x.key, what: "pages" })}>
                           {isSuper ? "Add pages" : "Request pages"}<span className="visually-hidden"> for {x.label}</span>
                         </button>
                       )}
-                      <button className="btn secondary small" aria-expanded={open?.key === x.key && open.what === "edit"}
-                        onClick={() => void toggle(x.key, "edit")}>
-                        Edit<span className="visually-hidden"> {x.label}</span>
-                      </button>
                     </div>
                   </td>
                 </tr>
@@ -238,18 +271,26 @@ function ServicesAndPages({ group, isSuper, onChange, reload }: {
       </div>
       {open && (() => {
         const x = group.services.find((y) => y.key === open.key)!;
-        if (open.what === "edit") return <ServiceForGroup key={x.key} group={group} svc={x} onSaved={(g) => { onChange(g); setOpen(null); }} onCancel={() => setOpen(null)} />;
-        if (isSuper) return <Topup base={`/admin/groups/${group.id}`} ledger={`/groups/${group.id}/ledger?kind=topup&limit=20`} fixedService={x.key}
-          onDone={reload} title={`Add ${x.label} pages to ${group.name}`} />;
+        const close = () => setOpen(null);
+        if (open.what === "edit") return (
+          <AdminDialog title={`${x.label} for ${group.name}`} formId="sfg-form" onClose={close}>
+            <ServiceForGroup key={x.key} group={group} svc={x} onSaved={(g) => { onChange(g); close(); }} onCancel={close} />
+          </AdminDialog>
+        );
+        if (isSuper) return (
+          <AdminDialog title={`Add ${x.label} pages to ${group.name}`} formId="topup-form" onClose={close} wide>
+            <Topup base={`/admin/groups/${group.id}`} ledger={`/groups/${group.id}/ledger?kind=topup&limit=20`} fixedService={x.key}
+              onDone={reload} formId="topup-form" bare />
+          </AdminDialog>
+        );
         return (
-          <section className="panel" aria-labelledby="req-h">
-            <h2 id="req-h">More {x.label} pages for {group.name}</h2>
+          <AdminDialog title={`More ${x.label} pages for ${group.name}`} onClose={close}>
             <p>Super admins add pages to a group's pool, each under an approving ticket.</p>
             {config.supportUrl
               ? <p><a className="btn" href={config.supportUrl} target="_blank" rel="noreferrer noopener">Request pages<span className="visually-hidden"> (opens in a new tab)</span></a></p>
               : <p className="muted">Ask the people who run this service{config.contactEmail ? <> at <a href={`mailto:${config.contactEmail}`}>{config.contactEmail}</a></> : ""}.</p>}
             <p className="small muted">Say the group ({group.name}), the service ({x.label}) and how many pages.</p>
-          </section>
+          </AdminDialog>
         );
       })()}
     </>
@@ -281,8 +322,7 @@ function ServiceForGroup({ group, svc, onSaved, onCancel }: { group: Group; svc:
   }
 
   return (
-    <form className="panel edit-panel" onSubmit={save} aria-labelledby="sfg-h">
-      <h2 id="sfg-h">{svc.label} for {group.name}</h2>
+    <form id="sfg-form" className="dialog-form" onSubmit={save}>
       <label className="check"><input type="checkbox" checked={enabled} disabled={standard || (!svc.enabled && blocked)} onChange={(e) => setEnabled(e.target.checked)} />
         <span>On for the group{blocked && !svc.enabled ? <span className="muted small"> ({!svc.globally_enabled ? "switched off for everyone" : "blocked: the group is local-only"})</span> : ""}</span></label>
       <fieldset className="choices" disabled={!enabled}>
@@ -311,6 +351,10 @@ function ServiceForGroup({ group, svc, onSaved, onCancel }: { group: Group; svc:
 
 // --- people --------------------------------------------------------------------------------------
 
+const PEOPLE_STATUSES: [string, string][] = [["", "Everyone"], ["active", "Active"], ["disabled", "Disabled"],
+  ["declined", "Declined"], ["admin", "The group's admins"]];
+const HAS: [string, string][] = [["yes", "Has"], ["no", "Doesn't have"]];
+
 /** The group's people, with each one's access and limit for one service at a time: the only place limits are edited. */
 function People({ group, onChange }: { group: Group; onChange: () => void }) {
   const { me, reloadMe } = useAuth();
@@ -318,8 +362,30 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
   const enabled = group.services.filter((x) => x.enabled);
   const key = params.get("service") ?? enabled[0]?.key ?? "standard";
   const svc = group.services.find((x) => x.key === key) ?? enabled[0];
-  const users = useLoad(() => get<User[]>(`/groups/${group.id}/users?limit=1000`), [group.id]);
-  const [q, setQ] = useState("");
+  // The view lives in the address (#514): search, status, who has the service, sort, page; people waiting for
+  // approval are listed on their own, above
+  const sort = params.get("sort") ?? "email";
+  const page = Number(params.get("page")) || 1;
+  const size = Number(params.get("size")) || 25;
+  const api = new URLSearchParams();
+  if (params.get("q")) api.set("q", params.get("q")!);
+  if (params.get("status")) api.set("status", params.get("status")!);
+  if (params.get("has")) { api.set("service", key); api.set("has", params.get("has") === "yes" ? "true" : "false"); }
+  api.set("sort", sort);
+  api.set("page", String(page));
+  api.set("page_size", String(size));
+  const users = useLoad(() => get<Paged<User>>(`/groups/${group.id}/people?${api}`), [group.id, api.toString()]);
+  const pending = useLoad(() => get<User[]>(`/groups/${group.id}/users?approval=pending&limit=1000`), [group.id]);
+  const update = (changes: Record<string, string | null>, keepPage = false) => {
+    const next = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(changes)) { if (v === null || v === "") next.delete(k); else next.set(k, v); }
+    if (!keepPage) next.delete("page");
+    setParams(next, { replace: true });
+  };
+  const replaceUser = (updated: User) => {
+    if (users.data) users.setData({ ...users.data, items: users.data.items.map((x) => (x.id === updated.id ? updated : x)) });
+  };
+  const findUser = (id: string | null) => users.data?.items.find((x) => x.id === id) ?? pending.data?.find((x) => x.id === id);
   const [error, setError] = useState<unknown>(null);
   const [saved, setSaved] = useState("");
   // One person's row opens a panel with the access check for the chosen service and the account actions
@@ -331,7 +397,7 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
     setError(null);
     try {
       const updated = await put<User>(`/groups/${group.id}/users/${u.id}/services/${encodeURIComponent(svc.key)}`, body);
-      users.setData((users.data ?? []).map((x) => (x.id === u.id ? updated : x)));
+      replaceUser(updated);
       setSaved(`${what} for ${u.email}.`);
       onChange();
       if (open === u.id) await check(u);
@@ -345,7 +411,7 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
     const on = value === "on" ? true : value === "off" ? false : null;
     try {
       const updated = await patch<User>(`/groups/${group.id}/users/${u.id}`, { ai_describe: on });
-      users.setData((users.data ?? []).map((x) => (x.id === u.id ? updated : x)));
+      replaceUser(updated);
       setSaved(`Describe with AI ${on === null ? "follows the group" : on ? "is on" : "is off"} for ${u.email}.`);
     } catch (e) {
       setError(e);
@@ -356,7 +422,7 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
     setError(null);
     try {
       const updated = await patch<User>(`/groups/${group.id}/users/${u.id}`, { status: u.status === "active" ? "disabled" : "active" });
-      users.setData((users.data ?? []).map((x) => (x.id === u.id ? updated : x)));
+      replaceUser(updated);
       setSaved(`${u.email} ${updated.status === "active" ? "enabled" : "disabled"}.`);
       await check(u);
     } catch (e) {
@@ -379,7 +445,8 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
     setError(null);
     try {
       const updated = await post<User>(`/groups/${group.id}/users/${u.id}/${action}`, action === "decline" ? { reason: reason || null } : undefined);
-      users.setData((users.data ?? []).map((x) => (x.id === u.id ? updated : x)));
+      replaceUser(updated);
+      await Promise.all([users.reload(), pending.reload()]);  // they move from the waiting list into the list
       setSaved(`${u.email} ${action === "approve" ? "approved" : "declined"}.`);
       onChange();
       void reloadMe();
@@ -391,44 +458,62 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
 
   function manage(u: User) {
     setError(null);
-    if (open === u.id) { setOpen(null); return; }
     setOpen(u.id);
     void check(u);
   }
 
   if (!svc) return <p className="muted">No services are on for this group yet.</p>;
-  const waiting = (users.data ?? []).filter((u) => u.approval === "pending");
-  const list = (users.data ?? []).filter((u) => u.approval !== "pending"
-    && (!q || u.email.includes(q.toLowerCase()) || (u.name ?? "").toLowerCase().includes(q.toLowerCase())));
+  const waiting = pending.data ?? [];
+  const list = users.data?.items ?? [];
+  const label = (l: [string, string][], v: string | null) => l.find(([k]) => k === v)?.[1] ?? v ?? "";
+  const chips: Chip[] = params.get("has") ? [{ key: "has", text: `${label(HAS, params.get("has"))} ${svc?.label ?? ""}` }] : [];
+  const pager = (where: "top" | "bottom") => users.data && (
+    <ListPager page={page} pageSize={users.data.page_size} total={users.data.total} noun={["person", "people"]} where={where}
+      topId="gp-top" onPage={(n) => update({ page: n > 1 ? String(n) : null }, true)}
+      onSize={(n) => update({ size: n === 25 ? null : String(n) })} />
+  );
   const def = svc.default_user_cap === null ? "No limit" : `Default ${fmtNum(svc.default_user_cap)}`;
   return (
     <>
     {waiting.length > 0 && <WaitingList people={waiting} onDecide={decide} />}
     <section className="panel" aria-labelledby="people-h">
       <h2 id="people-h">People</h2>
-      <div className="form-row">
-        <div className="field"><label htmlFor="p-q">Search</label>
-          <input id="p-q" type="search" value={q} onChange={(e) => setQ(e.target.value)} /></div>
-        <div className="field"><label htmlFor="p-svc">Show access and limits for</label>
-          <select id="p-svc" value={svc.key} onChange={(e) => {
-            setParams({ service: e.target.value });
-            const u = (users.data ?? []).find((x) => x.id === open);
-            if (u) void check(u, e.target.value);
-          }}>
-            {enabled.map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}
-          </select></div>
-      </div>
+      <div className="field" style={{ maxWidth: 320 }}><label htmlFor="p-svc">Show access and limits for</label>
+        <select id="p-svc" value={svc.key} onChange={(e) => {
+          update({ service: e.target.value, has: null });
+          const u = findUser(open);
+          if (u) void check(u, e.target.value);
+        }}>
+          {enabled.map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}
+        </select></div>
+      <ListBar label="Search and filter the group's people" searchId="p-q" query={params.get("q") ?? ""} placeholder="Search by email or name"
+        onQuery={(q) => update({ q: q || null })} chips={chips} active={!!params.get("status")}
+        onRemove={(k) => update({ [k]: null })}
+        onClear={() => { const keep = new URLSearchParams(); for (const k of ["service", "size", "sort"]) if (params.get(k)) keep.set(k, params.get(k)!); setParams(keep, { replace: true }); }}
+        more={<div className="field"><label htmlFor="p-has">Has {svc.label}</label>
+          <select id="p-has" value={params.get("has") ?? ""} onChange={(e) => update({ has: e.target.value })}>
+            <option value="">Either</option>
+            {HAS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select></div>}>
+        <label htmlFor="p-status" className="visually-hidden">Status</label>
+        <select id="p-status" className="report-select" value={params.get("status") ?? ""} onChange={(e) => update({ status: e.target.value })}>
+          {PEOPLE_STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+      </ListBar>
       <p className="muted small">
         {svc.label}: {svc.all_users ? "everyone in the group has it" : "only the people ticked below have it"}.
         {svc.metered ? ` An empty limit means the group default (${svc.default_user_cap === null ? "no limit" : fmtNum(svc.default_user_cap)} pages).` : " Use is counted, never limited."}
       </p>
       <ErrorNotice error={error} />
       <div className="visually-hidden" role="status" aria-live="polite">{saved}</div>
-      {users.loading && !users.data ? <Loading /> : (
+      {users.loading && !users.data ? <Loading /> : users.data && (
+        <>
+        <div id="gp-top">{users.data.total === 0 ? <p className="small muted list-count" role="status">Nobody matches.</p> : pager("top")}</div>
         <div className="table-wrap">
           <table>
             <thead>
-              <tr><th scope="col">Person</th><th scope="col">Has it</th>
+              <tr><SortHeading label="Person" sortKey="email" sort={sort} onSort={(v) => update({ sort: v === "email" ? null : v }, true)} />
+                <th scope="col">Has it</th>
                 {svc.metered && <th scope="col">Limit</th>}<th scope="col" className="num">Used</th>
                 {svc.metered && <th scope="col" className="num">Left</th>}
                 <th scope="col"><span className="visually-hidden">Manage</span></th></tr>
@@ -437,10 +522,9 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
               {list.map((u) => {
                 const us = u.services.find((y) => y.key === svc.key);
                 const admin = u.roles.some((r) => r.role === "group_admin" && r.group_id === group.id);
-                const cols = 4 + (svc.metered ? 2 : 0);
                 return (
                   <Fragment key={u.id}>
-                    <tr className={open === u.id ? "row-open" : undefined}>
+                    <tr>
                       <td>
                         <div>{u.email}{u.status !== "active" && <> <span className="pill muted">Disabled</span></>}
                           {u.approval === "declined" && <> <span className="pill warn">Declined</span></>}
@@ -460,57 +544,65 @@ function People({ group, onChange }: { group: Group; onChange: () => void }) {
                       {svc.metered && <td className="num">{u.approval !== "approved" && !admin ? "–"
                         : us?.remaining_pages === null || us?.remaining_pages === undefined ? "No limit" : fmtNum(us.remaining_pages)}</td>}
                       <td>
-                        <button className="btn secondary small" aria-expanded={open === u.id} onClick={() => manage(u)}>
+                        <button className="btn secondary small" aria-haspopup="dialog" onClick={() => manage(u)}>
                           Manage<span className="visually-hidden"> {u.email}</span>
                         </button>
                       </td>
                     </tr>
-                    {open === u.id && (
-                      <tr className="row-panel"><td colSpan={cols}>
-                        <div className="person-panel">
-                          {u.approval === "declined" && (
-                            <Notice kind="warn" title="Declined">
-                              <p>{u.approval_by ? `By ${u.approval_by}` : "Declined"}{u.approval_at ? `, ${fmtDate(u.approval_at)}` : ""}.
-                                {u.decline_reason ? ` Reason: ${u.decline_reason}` : ""}</p>
-                              <p><button className="btn small" onClick={() => void decide(u, "approve")}>Approve {u.email}</button></p>
-                            </Notice>
-                          )}
-                          <h3>Can {u.email} use {svc.label}?</h3>
-                          {why ? <AccessCheckView result={why} /> : whyError ? <ErrorNotice error={whyError} /> : <Loading />}
-                          <div className="person-section">
-                            <h3>Describe with AI</h3>
-                            <div className="field">
-                              <label htmlFor={`d-${u.id}`} className="small">In the tag manager, for {u.email}</label>
-                              <select id={`d-${u.id}`} value={u.ai_describe === true ? "on" : u.ai_describe === false ? "off" : "inherit"}
-                                onChange={(e) => void describe(u, e.target.value)}>
-                                <option value="inherit">Follow the group</option>
-                                <option value="on">On</option>
-                                <option value="off">Off</option>
-                              </select>
-                            </div>
-                          </div>
-                          {u.id !== me?.id && (
-                            <div className="person-section">
-                              <h3>Account</h3>
-                              <div className="actions">
-                                <button className={`btn small ${u.status === "active" ? "danger" : "secondary"}`} onClick={() => void status(u)}>
-                                  {u.status === "active" ? "Disable account" : "Enable account"}
-                                </button>
-                                <span className="muted small">{u.status === "active" ? "Disabling signs them out and stops them signing in." : "Enabling lets them sign in again."}</span>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </td></tr>
-                    )}
                   </Fragment>
                 );
               })}
             </tbody>
           </table>
         </div>
+        {pager("bottom")}
+        </>
       )}
     </section>
+    {/* One person's access check and account actions, in the admin edit dialog (#511): each takes effect at once */}
+    {(() => {
+      const u = findUser(open);
+      if (!u) return null;
+      return (
+        <AdminDialog title={`Manage ${u.email}`} onClose={() => setOpen(null)}>
+          <ErrorNotice error={error} />
+          <div className="person-panel">
+            {u.approval === "declined" && (
+              <Notice kind="warn" title="Declined">
+                <p>{u.approval_by ? `By ${u.approval_by}` : "Declined"}{u.approval_at ? `, ${fmtDate(u.approval_at)}` : ""}.
+                  {u.decline_reason ? ` Reason: ${u.decline_reason}` : ""}</p>
+                <p><button className="btn small" onClick={() => void decide(u, "approve")}>Approve {u.email}</button></p>
+              </Notice>
+            )}
+            <h3>Can {u.email} use {svc.label}?</h3>
+            {why ? <AccessCheckView result={why} /> : whyError ? <ErrorNotice error={whyError} /> : <Loading />}
+            <div className="person-section">
+              <h3>Describe with AI</h3>
+              <div className="field">
+                <label htmlFor={`d-${u.id}`} className="small">In the tag manager, for {u.email}</label>
+                <select id={`d-${u.id}`} value={u.ai_describe === true ? "on" : u.ai_describe === false ? "off" : "inherit"}
+                  onChange={(e) => void describe(u, e.target.value)}>
+                  <option value="inherit">Follow the group</option>
+                  <option value="on">On</option>
+                  <option value="off">Off</option>
+                </select>
+              </div>
+            </div>
+            {u.id !== me?.id && (
+              <div className="person-section">
+                <h3>Account</h3>
+                <div className="actions">
+                  <button className={`btn small ${u.status === "active" ? "danger" : "secondary"}`} onClick={() => void status(u)}>
+                    {u.status === "active" ? "Disable account" : "Enable account"}
+                  </button>
+                  <span className="muted small">{u.status === "active" ? "Disabling signs them out and stops them signing in." : "Enabling lets them sign in again."}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        </AdminDialog>
+      );
+    })()}
     </>
   );
 }
@@ -566,7 +658,8 @@ function Documents({ group }: { group: Group }) {
         services: group.services.filter((s) => s.enabled || s.balance.used_pages > 0).map((s) => ({ key: s.key, label: s.label })),
         backLabel: `${group.name}: documents`,
         ...(isSuper ? { can: canAdminRemove,
-          bar: (selected: Set<string>, onDone: (message: string) => void) => <AdminRemoveBar selected={selected} onDone={onDone} /> } : {}),
+          bar: (selected: Set<string>, onDone: (message: string) => void, extra: ReactNode) =>
+            <AdminRemoveBar selected={selected} onDone={onDone} extra={extra} /> } : {}),
       }} />
     </section>
   );
@@ -589,6 +682,15 @@ function GroupSettingsTab({ group, isSuper, onChange, reload }: { group: Group; 
     try {
       onChange(await patch<Group>(`/groups/${group.id}`, { show_external: on }));
       setMsg(on ? "External options are now marked on the upload form." : "External options are no longer marked.");
+    } catch (e) {
+      setError(e);
+    }
+  }
+  async function apiTokens(on: boolean) {
+    setError(null);
+    try {
+      onChange(await patch<Group>(`/groups/${group.id}`, { api_tokens_enabled: on }));
+      setMsg(on ? "People in the group can now make API tokens." : "API tokens are off for the group; the ones already made stop working.");
     } catch (e) {
       setError(e);
     }
@@ -639,6 +741,18 @@ function GroupSettingsTab({ group, isSuper, onChange, reload }: { group: Group; 
           <span><strong>Show which options are external.</strong> Mark the processing options and AI levels that send
             documents to an outside provider on the upload form.</span>
         </label>
+        <label className="check">
+          <input type="checkbox" checked={group.api_tokens_enabled} onChange={(e) => void apiTokens(e.target.checked)} />
+          <span><strong>Let people make API tokens.</strong> For scripts that send documents (and, if they choose, fetch
+            the results), each token tied to one processing option and AI level. Super admins switch tokens on for the
+            service first. Switching this off stops the group's tokens at once.</span>
+        </label>
+        {group.api_tokens_enabled && (
+          <details className="group-tokens">
+            <summary>The group's API tokens</summary>
+            <GroupApiTokens groupId={group.id} />
+          </details>
+        )}
         <div className="field">
           <label htmlFor="g-describe"><strong>Describe with AI</strong> in the tag manager</label>
           <select id="g-describe" value={group.ai_describe === true ? "on" : group.ai_describe === false ? "off" : "inherit"}

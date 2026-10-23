@@ -838,8 +838,8 @@ queue and talk it over with them.
   workers is emailed to super admins, with reminders and a cleared note, and shown on Attention.
 - **Nightly backups** (#333, #346): `BACKUPS=cronjob` runs a CronJob onto an NFS share, with pruning and an alert.
 - **Proxy headers** count only from the proxies in front of the portal (`PORTAL_TRUSTED_PROXIES`, #336).
-- **Database account** (#337): the portal connects as `portal_app`, which owns no table. Row-level security is
-  #350.
+- **Database account** (#337): the portal connects as `portal_app`, which owns no table. Row-level security
+  followed (#350, below).
 - **Uploads:** pages counted in a child process with memory, CPU and time limits (#356).
 - **Rate limits per person** on downloads, exports and uploads (#357).
 - **Egress** (#361): the engine reaches the internet only through the AI gateway.
@@ -908,3 +908,12 @@ queue and talk it over with them.
   default); the pages are put back in order, so the result is the one a single process makes.
 - **Part 2:** the checks' reading of each page is shared out the same way.
 - If a process fails, the work is done in one process as before.
+
+## Row-level security (#350): done
+- Migration 0044 turns on row-level security for documents and their files, versions, drafts and review marks, the
+  page ledger, people, help requests and their messages and attachments, saved report views and the audit log.
+- The API sets, for each transaction, whose request it is: the person, their group and the groups they administer.
+  Sign-in sees only the account with that address.
+- Super admins, the portal worker, the status check and metrics bypass the policies, and the bypass is audited.
+- KEDA counts the waiting work through `portal_waiting_work()`.
+- The portal tests now connect as `portal_app`, so the policies apply to every test.

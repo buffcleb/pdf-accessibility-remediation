@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { post, type Job, type RemovalResult } from "../api";
 import { ErrorNotice, fmtNum } from "./ui";
 
@@ -21,8 +21,8 @@ function outcome(r: RemovalResult, did: string): string {
 }
 
 /** My documents: mark the selected documents done (their files go after the hold). */
-export function MarkDoneBar({ selected, holdHours, onDone }: {
-  selected: Set<string>; holdHours: number; onDone: (message: string) => void;
+export function MarkDoneBar({ selected, holdHours, onDone, extra }: {
+  selected: Set<string>; holdHours: number; onDone: (message: string) => void; extra?: ReactNode;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -49,6 +49,7 @@ export function MarkDoneBar({ selected, holdHours, onDone }: {
   return (
     <div className="selection-bar" role="region" aria-label="Selected documents">
       <span className="small">{fmtNum(n)} selected</span>
+      {extra}
       <button type="button" className="btn small" disabled={busy} onClick={() => void go()}>I'm done with these: remove the files</button>
       <button type="button" className="linkbtn small" onClick={() => onDone("")}>Clear selection</button>
       <ErrorNotice error={error} />
@@ -57,7 +58,8 @@ export function MarkDoneBar({ selected, holdHours, onDone }: {
 }
 
 /** Super admins: remove the selected documents' files now, or delete the documents. */
-export function AdminRemoveBar({ selected, onDone }: { selected: Set<string>; onDone: (message: string) => void }) {
+export function AdminRemoveBar({ selected, onDone, extra }: { selected: Set<string>; onDone: (message: string) => void;
+  extra?: ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [reason, setReason] = useState("");
   const [error, setError] = useState<unknown>(null);
@@ -88,6 +90,7 @@ export function AdminRemoveBar({ selected, onDone }: { selected: Set<string>; on
   return (
     <div className="selection-bar" role="region" aria-label="Selected documents">
       <span className="small">{docs} selected</span>
+      {extra}
       <label className="small" htmlFor="rm-reason">Reason</label>
       <input id="rm-reason" type="text" maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)}
         placeholder="Recorded in the audit log" aria-describedby="rm-reason-hint" />
@@ -96,6 +99,19 @@ export function AdminRemoveBar({ selected, onDone }: { selected: Set<string>; on
       <button type="button" className="btn secondary small danger-text" disabled={!ok} onClick={() => void go(true)}>Delete</button>
       <button type="button" className="linkbtn small" onClick={() => onDone("")}>Clear selection</button>
       <ErrorNotice error={error} />
+    </div>
+  );
+}
+
+/** Selected documents with nothing to do to them but download them (group admins). */
+export function SelectedBar({ selected, onDone, children }: { selected: Set<string>; onDone: (message: string) => void;
+  children: ReactNode }) {
+  if (selected.size === 0) return null;
+  return (
+    <div className="selection-bar" role="region" aria-label="Selected documents">
+      <span className="small">{fmtNum(selected.size)} selected</span>
+      {children}
+      <button type="button" className="linkbtn small" onClick={() => onDone("")}>Clear selection</button>
     </div>
   );
 }

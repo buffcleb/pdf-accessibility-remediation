@@ -10,9 +10,11 @@ import { Login } from "./pages/Login";
 import { MySettings } from "./pages/MySettings";
 import { Unsubscribe } from "./pages/Unsubscribe";
 import { lazy, Suspense } from "react";
+import { loadOrReload } from "./staleBuild";
 
 // The viewer bundles pdf.js, so it loads only when opened.
-const TagViewer = lazy(() => import("./viewer/TagViewer").then((m) => ({ default: m.TagViewer })));
+// After a deploy, a page loaded before it reloads once to fetch the new build's file (staleBuild.ts).
+const TagViewer = lazy(loadOrReload(() => import("./viewer/TagViewer").then((m) => ({ default: m.TagViewer }))));
 
 function RequireAuth({ children }: { children: ReactElement }) {
   const { me, loading } = useAuth();

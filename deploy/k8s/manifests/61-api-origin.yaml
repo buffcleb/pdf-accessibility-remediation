@@ -5,15 +5,13 @@ kind: Ingress
 metadata:
   name: api-origin
   namespace: ${NAMESPACE}
+  # The controller's own settings (INGRESS_CONTROLLER; scripts/deploy.sh), with its allow-list: only the proxies in
+  # front of it (Cloudflare's ranges), as anyone else could name themselves in its header (#336)
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "${MAX_UPLOAD_SIZE}"
-    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    # Only the proxies in front of it (Cloudflare's ranges): anyone else could name themselves in its header (#336)
-    nginx.ingress.kubernetes.io/whitelist-source-range: "${API_ORIGIN_ALLOWED_SOURCES}"
+    pdfrem/ingress-controller: "${INGRESS_CONTROLLER}"
+${API_ORIGIN_ANNOTATIONS}
 spec:
-  ingressClassName: nginx
+  ingressClassName: ${INGRESS_CLASS}
   rules:
     - host: ${API_ORIGIN_HOST}
       http:

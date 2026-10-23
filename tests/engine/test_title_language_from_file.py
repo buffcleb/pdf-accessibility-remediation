@@ -24,3 +24,26 @@ def test_a_language_from_the_file_must_be_a_language_tag():
     assert _pick_language(JobOptions(stem="doc"), _analysis(language="x" * 300), "en-US")[0] == "en-US"
     assert _pick_language(JobOptions(stem="doc", language="fr"), _analysis(language="de-CH"), "en-US")[0] == "fr"
     assert _pick_language(JobOptions(stem="doc"), _analysis(), "en-US")[0] == "en-US"
+
+
+def test_an_application_and_file_name_is_no_title():
+    """Word and PowerPoint write "Microsoft Word - syllabus.docx" when the author gave no title; a reader announced
+    it as the document's name. The first top-level heading is the title then."""
+    from app.pipeline.models import PageAnalysis, TextBlock
+    from app.pipeline.orchestrator import usable_title
+
+    for poor in ("Microsoft Word - syllabus_accessible.docx", "Microsoft PowerPoint - Lecture 3.pptx",
+                 "Microsoft Word - Document1", "Microsoft Word", "microsoft excel - grades.xlsx", "syllabus.docx",
+                 "Lab report final.PDF", "C:\\Users\\me\\Desktop\\notes.doc", "Untitled", "  ", None,
+                 "PowerPoint Presentation"):
+        assert not usable_title(poor), poor
+    for good in ("Introduction to Physics", "Using Microsoft Word for Theses", "Word Problems in Algebra",
+                 "Excel - The Basics", "Node.js in Practice", "Report v2.1"):
+        assert usable_title(good), good
+
+    page = PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792), blocks=[
+        TextBlock(id="b0", page=0, text="Introduction to Physics", bbox=(72, 72, 300, 90), font_size=18, role="H1")])
+    a = DocumentAnalysis(page_count=1, pages=[page], title="Microsoft Word - syllabus_accessible.docx",
+                         language=None, has_struct_tree=False, is_marked=False)
+    assert _pick_title(JobOptions(stem="syllabus"), a) == "Introduction to Physics"
+    assert _pick_title(JobOptions(stem="syllabus_v2"), _analysis(title="Microsoft Word - x.docx")) == "syllabus v2"

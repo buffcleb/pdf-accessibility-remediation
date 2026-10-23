@@ -6,7 +6,12 @@ The tag manager is where you check a remediated document's tags against its page
 the remediated file on the right, with its tags drawn over the pages, and that file's tag tree on the left. The
 left side can show another version instead (your original, say) to compare the two side by side.
 
-Open it with **Open in tag manager** on the document's page, or **Show** on an item in the review list.
+Open it with **Open in tag manager** on the document's page, or **Show** on an item in the review list, which
+highlights the area the item is about ([more](finding-your-way.md#an-item-from-the-review-list)).
+
+While a document opens, each side shows how far it has got: the document and its tags downloading (with how many
+megabytes have come), then reading the tags, then drawing the first page. A large document (over 100 pages or
+20 MB) can take a minute or two; refreshing the page starts it again from the beginning, so it's best to wait.
 
 ![The tag manager for a two-page parking guide. On the left, the original document, marked "111 failed checks".
 In the middle, the remediated version, marked "passes", with each tag outlined and labeled on the page: P, H1, H2,
@@ -34,9 +39,16 @@ type, read-aloud text and language fields.](../../../images/tag-manager/overview
 
 ## Who can edit
 
+> **Changed 22 October 2026:** a new tag made by an unsaved change (from an area, or by a split) can be chosen at
+> once, and its type or alt text changed before you save.
+
 You can edit your own documents, and group admins can edit their group's. Everyone else who can open a document,
 super admins included, sees it read-only. **Nothing is in the file until you save**: every change collects under
 **Unsaved changes**, where it can be undone, and saving makes a new version. The original results are never changed.
+Each change shows straight away, in the tag tree and on the page, the way it will be once saved, marked **not
+saved**: a new tag made from an area or by a split appears where it will be read, and content moved into a tag
+shows beside it while the tag it came from shrinks (or goes, if nothing is left in it). A new tag is chosen as soon
+as it's made, so you can change its type or alt text straight away ([The new tag](areas.md#the-new-tag-before-you-save)).
 
 ## A quick check, in five minutes
 

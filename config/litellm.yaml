@@ -70,6 +70,25 @@ model_list:
       model: openrouter/google/gemini-3.8-flash
       api_key: os.environ/OPENROUTER_API_KEY
   #
+  # --- AWS Bedrock -----------------------------------------------------------------------------------------------
+  # Through the gateway's AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION_NAME: the gateway's
+  # secret only), with "us." cross-region profiles: AWS may run a request in us-east-1, us-east-2 or us-west-2, never
+  # outside the US (a "global." profile could). Each model must be available to the AWS account: Bedrock's service
+  # quotas, and a first call from someone allowed to subscribe to it (docs/operations/ai-models.md#aws-bedrock).
+  # The prices are Bedrock's list prices, for the cost the portal reports (the gateway may not know these models).
+  #
+  # Trial writers (trial-a-vision, …): a model being compared against the chosen one; removed when the comparison is
+  # done.
+  - model_name: trial-a-vision            # Amazon's Nova Lite, on Bedrock: a different family from Claude and Gemma
+    litellm_params:
+      model: bedrock/converse/us.amazon.nova-lite-v1:0
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+      aws_region_name: os.environ/AWS_REGION_NAME
+    model_info:
+      input_cost_per_token: 0.00000006    # $0.06 per million (Bedrock, October 2026)
+      output_cost_per_token: 0.00000024   # $0.24 per million
+  #
   # Then in the portal (Administration > Services > Add an AI level), choose each level's writer and review
   # model, e.g. "Large AI" = open-large-vision + open-judge, "Commercial AI" = commercial-medium-vision + commercial-judge.
   # A level or kind of document that names a model no longer listed here must be pointed at one that is.

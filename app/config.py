@@ -16,7 +16,9 @@ class Settings(BaseSettings):
     celery_result_backend: str = ""  # empty -> redis_url
     data_dir: Path = Path("./data")
     public_base_url: str = ""  # prefix for download URLs; empty -> relative URLs
-    service_api_key: str = ""  # optional shared secret with the upstream service (X-API-Key)
+    service_api_key: str = ""  # the shared secret callers send as X-API-Key (the portal's PORTAL_ENGINE_API_KEY)
+    # Start without it: anyone who can reach the API may use it. For local development and tests only (#457)
+    allow_no_api_key: bool = False
     max_upload_mb: int = 200
     max_pages: int = 2000  # a document with more pages is refused at submission (0: no limit); the portal's own cap is 2,000
     job_ttl_hours: int = 24

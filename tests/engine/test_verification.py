@@ -271,6 +271,42 @@ def test_tounicode_gaps_are_filled_from_glyph_names(tmp_path):
     assert parse_tounicode(cm) == {0x12: "(", 0x58: "∑"}
 
 
+
+def test_winansi_and_macroman_fonts_get_a_map_of_their_encoding(tmp_path):
+    """A non-breaking space (WinAnsi 0xA0) in a TrueType font with no map: PAC can't map it. Non-symbolic fonts with
+    WinAnsi or MacRoman get a map from the encoding; a symbolic font, one with a map, and other encodings don't."""
+    import pikepdf
+    from pikepdf import Dictionary, Name
+
+    from app.tagging.font_unicode import add_missing_tounicode, parse_tounicode
+
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+
+    def font(base, enc, flags, **kw):
+        return pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.TrueType, BaseFont=Name(base), Encoding=enc,
+                                            FontDescriptor=Dictionary(Type=Name.FontDescriptor, Flags=flags), **kw))
+
+    fonts = Dictionary(F1=font("/Win", Name.WinAnsiEncoding, 32), F2=font("/Mac", Name.MacRomanEncoding, 32),
+                       F3=font("/Sym", Name.WinAnsiEncoding, 4),
+                       F4=font("/Mapped", Name.WinAnsiEncoding, 32, ToUnicode=pdf.make_stream(b"")),
+                       F5=font("/Std", Name.StandardEncoding, 32),
+                       F6=font("/Diff", pdf.make_indirect(Dictionary(Type=Name.Encoding,
+                                                                     BaseEncoding=Name.WinAnsiEncoding)), 32))
+    pdf.pages[0].Resources = Dictionary(Font=fonts)
+    src, dst = tmp_path / "f.pdf", tmp_path / "o.pdf"
+    pdf.save(src)
+    fixed = add_missing_tounicode(src, dst)
+    assert [f.split(" ")[0] for f in fixed] == ["Win", "Mac"]
+    with pikepdf.open(dst) as out:
+        f = out.pages[0].Resources.Font
+        win, mac = parse_tounicode(f.F1.ToUnicode.read_bytes()), parse_tounicode(f.F2.ToUnicode.read_bytes())
+        assert (win[0xA0], win[0xAD], win[0x93], win[0x41]) == ("\u00a0", "\u00ad", "\u201c", "A")
+        assert 0x81 not in win and 0x1F not in win  # a code WinAnsi leaves out; a control code
+        assert (mac[0xCA], mac[0xD2]) == ("\u00a0", "\u201c")
+        assert "/ToUnicode" not in f.F3 and "/ToUnicode" not in f.F5 and "/ToUnicode" not in f.F6
+        assert f.F4.ToUnicode.read_bytes() == b""
+
 def test_same_figure_in_two_outputs_is_judged_once(good, tmp_path, monkeypatch):
     """The visually exact and modified files share most figures: one verdict serves both."""
     import shutil

@@ -11,8 +11,12 @@ scripts/build.sh      # build the images (linux/amd64) and push them to your reg
 scripts/deploy.sh     # back up, migrate and roll out on the cluster
 ```
 
+> **Changed 22 October 2026:** the Ingress follows `INGRESS_CONTROLLER`; the pieces now list the portal's own Redis
+> and the egress proxy, and the engine's Redis holds only the queue.
+
 Everything runs in one namespace (`pdf-remediation` by default), reachable at one address (`APP_HOST`): through an
-Ingress (class `nginx`) or the optional Cloudflare tunnel, to the web app, which proxies `/api/` to the portal API.
+Ingress (for `INGRESS_CONTROLLER`, Traefik or ingress-nginx) or the optional Cloudflare tunnel, to the web app, which
+proxies `/api/` to the portal API.
 
 | Piece | Kind | Storage |
 |---|---|---|
@@ -23,13 +27,16 @@ Ingress (class `nginx`) or the optional Cloudflare tunnel, to the web app, which
 | `verapdf` (PDF/UA checks, kept running), `verapdf-restart` (restarts it every hour) | Deployment + Service, CronJob | – |
 | `engine-worker` scaling, `verapdf` and `litellm` autoscalers (with [scaling on](#scaling-with-the-queue)) | KEDA ScaledObject, HorizontalPodAutoscalers | – |
 | `music-reader` (optional: `MUSIC_READER=on`), `formula-reader` (optional: `FORMULA_READER=on`) | Deployments, KEDA ScaledObjects with scaling on | – |
+| `egress-proxy` (optional: `EGRESS_PROXY=log` or `enforce`): Squid, the way out for the portal, gateway, Adobe worker and ClamAV ([below](#outbound-traffic-the-egress-proxy)) | Deployment | – |
+| `clamav` (optional: `MALWARE_SCAN=clamav`): clamd and freshclam, scanning uploads ([malware scanning](../../docs/operations/malware-scanning.md)) | Deployment | `clamav-db` (`STORAGE_CLASS`, 2 GiB) |
 | `prometheus`, `grafana`, `kube-state-metrics`, Redis and Postgres exporters (with `MONITORING=on`) | Deployments | `MONITORING_STORAGE_CLASS` |
 | `backup` (optional: `BACKUPS=cronjob`) | CronJob | an NFS share |
 | `postgres` (portal and gateway databases) | StatefulSet | `STORAGE_CLASS` |
-| `redis` (engine queue on db 0, portal on db 1) | StatefulSet | `STORAGE_CLASS` |
+| `redis` (the engine's queue) | StatefulSet | `STORAGE_CLASS` |
+| `redis-portal` (the portal's rate limits, #472) | StatefulSet | – (nothing kept on disk) |
 | `seaweedfs` (S3 for stored files) | StatefulSet | `STORAGE_CLASS` |
 | `cloudflared` (optional: with `deploy/k8s/tunnel.env`) | Deployment, 2 replicas | – |
-| `api-origin` (optional: with `FRONTEND=worker`) | Ingress for the portal API | – |
+| `api-origin` (optional: with `FRONTEND=worker`) | Ingress for the portal API (with a Traefik middleware for its allow-list on Traefik) | – |
 
 ## Files
 
@@ -52,19 +59,30 @@ The two env files are split into five secrets (six with monitoring), so a pod ho
 
 | Secret | From | Holds | Read by |
 |---|---|---|---|
-| `pdfrem-engine-env` | `engine.env` | Everything but the gateway's keys (`LITELLM_*`, `UI_*`, `LOCAL_*`, `OPENROUTER_*`) and `ADOBE_CLIENT_*` | The engine's API, workers and scheduler; Redis, the music and formula readers and KEDA (`REDIS_PASSWORD`) |
+| `pdfrem-engine-env` | `engine.env` | Everything but the gateway's keys (`LITELLM_*`, `UI_*`, `LOCAL_*`, `OPENROUTER_*`, `AWS_*`) and `ADOBE_CLIENT_*` | The engine's API, workers and scheduler; Redis, the music and formula readers and KEDA (`REDIS_PASSWORD`) |
 | `pdfrem-gateway-env` | `engine.env` | Everything but the engine's own (`REDIS_PASSWORD`, `SERVICE_API_KEY`, `GATEWAY_API_KEY`, `LOCALAI_*`, `OLLAMA_*`, `ADOBE_*`) | The AI gateway |
 | `pdfrem-adobe-env` | `engine.env` | `ADOBE_CLIENT_ID`, `ADOBE_CLIENT_SECRET` | The Adobe workers only |
 | `pdfrem-db-env` | both | `POSTGRES_ADMIN_PASSWORD`, `PORTAL_DB_PASSWORD`, `LITELLM_DB_PASSWORD` | Postgres; the migration job |
-| `pdfrem-portal-env` | `portal.env` | Everything but `POSTGRES_ADMIN_PASSWORD`, `PORTAL_DB_PASSWORD` and monitoring's three | The portal's API and worker; SeaweedFS (the S3 keys) and KEDA (`PORTAL_APP_DB_PASSWORD`) |
+| `pdfrem-portal-env` | `portal.env` | Everything but `POSTGRES_ADMIN_PASSWORD`, `PORTAL_DB_PASSWORD` and monitoring's three | The portal's API and worker; the portal's Redis (`PORTAL_REDIS_PASSWORD`); SeaweedFS (the S3 keys) and KEDA (`PORTAL_APP_DB_PASSWORD`) |
 | `pdfrem-monitoring-env` | `portal.env` | `MONITORING_DB_PASSWORD`, `GRAFANA_ADMIN_PASSWORD`, `GRAFANA_SECRET_KEY` (with `MONITORING=on`) | The Postgres exporter; Grafana |
 
-An engine worker, the part that opens untrusted documents, no longer sees the gateway's master key, the
-OpenRouter key or the Adobe secret. (Its `GATEWAY_API_KEY` is the master key as `init` makes it; a key with
-less reach, made in the gateway's UI, can be put in its place.) The engine's own `OPENROUTER_API_KEY` setting
-is therefore empty on a cluster: cloud models go through the gateway, as the AI levels do.
+An engine worker, the part that opens untrusted documents, never sees the gateway's master key, the
+OpenRouter or AWS keys, or the Adobe secret. Its `GATEWAY_API_KEY` is a key of its own (#457): on each deploy,
+after the gateway is up, `deploy.sh` has the gateway make or update it from inside the gateway's pod
+(`deploy/k8s/gateway_key.py`), limited to the models in `config/litellm.yaml` and with no right to manage the
+gateway (keys, users, settings, spend logs), and keeps it in `engine.env`. The first deploy after `init` replaces
+the master key that `init` put there, and restarts the engine once. `scripts/deploy.sh --new-gateway-key` gives the
+engine a new one and revokes the old. `GATEWAY_ENGINE_BUDGET` in `deploy.env` caps what it may spend (USD per 30
+days). The engine's own `OPENROUTER_API_KEY` setting is therefore empty on a cluster: cloud models go through the
+gateway, as the AI levels do.
+
+The engine's API won't start without `SERVICE_API_KEY` (the portal's `PORTAL_ENGINE_API_KEY`, which `deploy.sh`
+makes and keeps the same).
 
 ### `deploy.env` at a glance
+
+> **Changed 22 October 2026:** the egress proxy's settings, `GATEWAY_ENGINE_BUDGET` and the pinned images of the
+> optional pieces added; `NODE_ENCRYPTION`'s default made clear.
 
 `deploy.env.example` says what each setting does. Grouped, with where the longer story is:
 
@@ -74,16 +92,23 @@ is therefore empty on a cluster: cloud models go through the gateway, as the AI 
 | `APP_HOST`, `FRONTEND`, `API_ORIGIN_HOST`, `API_ORIGIN_SOURCE_CIDR`, `API_ORIGIN_ALLOWED_SOURCES`, `WORKER_NAME` | The public address, and the [Worker front end](#optional-the-web-app-on-a-cloudflare-worker) |
 | `TRUSTED_PROXY_CIDRS`, `WEB_TRUSTED_PROXIES` | Who may name the caller ([below](#network-policies-and-the-redis-password)) |
 | `REGISTRY`, `ENGINE_TAG`, `PORTAL_TAG`, `WEB_TAG` (and `MUSIC_TAG`, `FORMULA_TAG`) | Where images come from; tags are taken from `.last-build` unless set |
-| `LITELLM_IMAGE`, `VERAPDF_IMAGE`, `CURL_IMAGE`, `CLOUDFLARED_IMAGE` | Outside images, pinned by digest: moving one is a choice |
+| `LITELLM_IMAGE`, `VERAPDF_IMAGE`, `CURL_IMAGE`, `CLOUDFLARED_IMAGE` | Outside images, pinned by digest: moving one is a choice. The optional pieces' (`CLAMAV_IMAGE`, `EGRESS_PROXY_IMAGE`, and monitoring's) are pinned in `scripts/deploy.sh` and can be set here too |
 | `GATEWAY_ADMIN_URL`, `GATEWAY_SHARED_LOGIN` | The AI gateway's admin UI ([AI models](../../docs/operations/ai-models.md)) |
+| `GATEWAY_ENGINE_BUDGET` | What the engine's own gateway key may spend, USD per 30 days ([above](#which-pod-sees-which-secret)); empty: no cap of its own |
 | `STORAGE_CLASS`, `SHARED_STORAGE_CLASS`, `DB_SIZE`, `REDIS_SIZE`, `FILES_SIZE`, `JOBDATA_SIZE` | Storage (required) and volume sizes (10, 1, 50 and 50 Gi) |
 | `ENGINE_WORKERS`, `WORKER_CONCURRENCY`, `WORKER_MEMORY_LIMIT`, `ADOBE_WORKERS` | Engine capacity ([sizing](#sizing)); Adobe workers stay at 0 until [Adobe](../../docs/operations/adobe-autotag.md) is set up |
 | `VERAPDF_HEAP`, `VERAPDF_MEMORY_LIMIT`, `VERAPDF_RESTART_SCHEDULE` | The [veraPDF service](../../docs/operations/configuration.md#verapdf-service) |
 | `AUTOSCALE`, `ENGINE_WORKERS_MAX`, `VERAPDF_MAX`, `LITELLM_MAX`, `SCALE_DOWN_SECONDS` | [Scaling with the queue](#scaling-with-the-queue) |
 | `MUSIC_*`, `FORMULA_*` | The optional [music](#music-notation-read-note-by-note) and [formula](#formulas-read-a-second-time-from-their-pictures) readers |
 | `MAX_UPLOAD_SIZE` | Largest upload through the web app and Ingress (`100m`) |
+| `ENGINE_NODES` | A node label, `key=value`: the pods that read uploaded documents (engine, Adobe worker, music and formula readers) run only on nodes with it, and tolerate the taint of the same name (#471). Empty: anywhere |
+| `INGRESS_CONTROLLER`, `INGRESS_CLASS` | The ingress controller: `traefik` (RKE2's default from v1.36; it needs [two cluster settings](../../docs/deployment/first-cluster/middleware.md#traefiks-settings-for-the-cluster)) or `nginx` (ingress-nginx); its class, when it isn't the controller's usual one |
+| `CERT_ISSUER`, `INGRESS_TLS_SECRET` | HTTPS at your own ingress controller: a cert-manager ClusterIssuer, or a certificate you supply as a Secret |
+| `NODE_ENCRYPTION` | Whether traffic between the nodes is encrypted, checked before each deploy (`scripts/check_cluster_encryption.sh`): `check` (the default) shows it, `require` stops a deploy without it, `off` doesn't check |
+| `EGRESS_PROXY`, `EGRESS_ALLOW`, `CLUSTER_CIDRS` | Outbound traffic: `off` (the default), `log` or `enforce`; more hosts to allow; the cluster's own ranges, kept out of the proxy's reach ([the egress proxy](#outbound-traffic-the-egress-proxy)) |
 | `BACKUPS`, `BACKUP_*` | [Nightly backups](../../docs/operations/backups-and-migrations.md#nightly-backups-on-the-cluster) |
 | `MONITORING`, `PROMETHEUS_*`, `GRAFANA_SIZE`, `MONITORING_STORAGE_CLASS` | [Prometheus and Grafana](../../docs/operations/monitoring.md#prometheus-and-grafana) |
+| `MALWARE_SCAN`, `CLAMAV_IMAGE`, `CLAMAV_MEMORY_REQUEST`, `CLAMAV_MEMORY_LIMIT` | [Malware scanning](../../docs/operations/malware-scanning.md): `off` (the default) or `clamav` |
 
 ## Before the first deploy (once)
 
@@ -93,7 +118,10 @@ is therefore empty on a cluster: cloud models go through the gateway, as the AI 
 2. **Registry access.** For GHCR, `gh auth refresh -s write:packages` (the build pushes with your `gh` token; the
    cluster pulls with a secret made from it, or from `GHCR_PULL_TOKEN`, a read-only token, if set). For another
    registry, set `GHCR_TOKEN` and `GHCR_PULL_TOKEN` to its credentials.
-3. **A way in:** an Ingress controller with DNS and TLS for `APP_HOST`, or the Cloudflare tunnel: in Cloudflare Zero
+3. **A way in:** an Ingress controller with DNS and TLS for `APP_HOST` (set `CERT_ISSUER` to a cert-manager
+   ClusterIssuer, or `INGRESS_TLS_SECRET` to a Secret holding your own certificate, and `INGRESS_CONTROLLER` to
+   `traefik` or `nginx`; [first cluster](../../docs/deployment/first-cluster/middleware.md#https-for-the-service)), or the
+   Cloudflare tunnel: in Cloudflare Zero
    Trust → Networks → Tunnels, create a tunnel, put its token in `deploy/k8s/tunnel.env` as `TUNNEL_TOKEN=…`, and add a
    public hostname `APP_HOST` → HTTP → `web.<namespace>.svc.cluster.local:8080`. Uploads through Cloudflare are capped
    by its plan (100 MB on Free and Pro), which `MAX_UPLOAD_SIZE` should match.
@@ -123,7 +151,10 @@ others keep their tags). Each pushed image is scanned with Trivy (#362): HIGH an
 have a fix are listed, and an image with a CRITICAL one is **held**, pushed but not recorded, so `deploy.sh` keeps
 deploying the last one (`build.sh` exits 3 and says which). Rebuild once the base image or package has the fix (a
 Dependabot pull request usually brings it), or record it anyway with `--accept-findings`; a finding judged not to
-apply goes in `.trivyignore` with the reason. `--no-scan` skips the scan.
+apply goes in `.trivyignore` with the reason and an expiry (`exp:YYYY-MM-DD`), after which the finding counts again.
+`--no-scan` skips the scan. Each build ends by listing what `.trivyignore` hides: the findings by reason, with the
+days each ignore has left, **DUE** in its last 3 days (a fix waiting out the two-week rule: bump the package then),
+**EXPIRED** once it has passed, and any with no end date to revisit (`scripts/trivyignore_status.py`).
 
 `build.sh` builds the engine, portal and web images, plus `music` with `MUSIC_READER=on` and `formula` with
 `FORMULA_READER=on` in `deploy.env`. Its other options: `--tag TAG`, `--no-push` (a build check),
@@ -140,11 +171,15 @@ checks each one answers.
 **The portal's database account** (#337). Migrations run as the database's owner (`portal`, `PORTAL_DB_PASSWORD`);
 the portal's pods and KEDA use `portal_app` (`PORTAL_APP_DB_PASSWORD`, made in `portal.env` by `deploy.sh`), which
 reads and writes rows but owns no table, so it can't alter a table or drop the triggers that keep the audit log and
-the page ledger append-only. `app-role.sql` makes it and grants it the tables on every deploy, after the
-migrations; after restoring a database, run `deploy.sh` once so the restored tables are granted again.
+the page ledger append-only. Row-level security binds it (#350); the owner isn't bound. `app-role.sql` makes it
+and grants it the tables on every deploy, after the migrations; after restoring a database, run `deploy.sh` once so
+the restored tables are granted again.
 
 Changing `engine.env`, `portal.env` or `tunnel.env` and rerunning `deploy.sh` restarts the pods that use them (their
-templates carry the file's checksum). `scripts/deploy.sh render` writes the manifests as they'd be applied to
+templates carry the file's checksum); Redis, the portal's Redis and SeaweedFS restart only when their own password
+changes. Rotating a secret is `scripts/rotate-secret.sh` ([rotating secrets](../../docs/operations/secret-rotation.md)),
+and going back a release is in [rolling back](../../docs/operations/rollback.md). Each deploy that finishes adds a line
+to `deploy/k8s/deploy-history` (the tags and the migration). `scripts/deploy.sh render` writes the manifests as they'd be applied to
 `deploy/k8s/.rendered/`, without touching the cluster.
 
 ## Optional: the web app on a Cloudflare Worker
@@ -186,15 +221,41 @@ The gateway's admin UI is then at http://localhost:4000/ui. `backup.sh --k8s --a
 looking at pods, logs, events, autoscalers and policies are listed with what each shows in
 [Monitoring → On the cluster](../../docs/operations/monitoring.md#on-the-cluster).
 
+## Pod security
+
+The namespace carries Kubernetes's Pod Security labels (`00-namespace.yaml`, #466): it **enforces "baseline"**, so a
+pod that is privileged, shares the node's network or processes, mounts a path on the node, or adds capabilities beyond
+the default set is refused there; and it **warns and audits on "restricted"**, the stricter standard. Every pod the
+deployment makes meets baseline, jobs and optional pieces included (`tests/engine/test_pod_security.py`). Two don't
+meet restricted, so applying them prints a warning:
+
+| Pod | Why |
+|---|---|
+| `postgres` | Its image starts as root to make the data directory postgres's own (mode 0700), with only the capabilities that step needs (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID`), then drops to the postgres user |
+| `litellm` | The gateway's image runs as root. All capabilities are dropped and it can't escalate; running it as another user hasn't been tried |
+
+A new pod short of restricted fails that test until it's fixed or added to the list with its reason.
+
+**No Kubernetes API token unless it's used** (#470). Kubernetes gives every pod a token for its API by default. Here
+only the three pods that use the API have one, each through a service account of its own with just the rights it
+needs: Prometheus (read pods, services and endpoints, and node metrics), kube-state-metrics (list the workloads) and
+the veraPDF restart job (restart veraPDF's deployment). Every other pod, and the namespace's default account, turns the
+token off, so a compromised pod has no credentials for the cluster at all.
+
 ## Network policies and the Redis password
 
-Everything inside the namespace is closed to pods that have no business with it (`manifests/80-network-policies.yaml`):
-Postgres takes connections from the portal, the gateway, the migration job, the nightly backup and KEDA; Redis
-from the engine, the portal, the music and formula readers and KEDA; SeaweedFS from the portal and the nightly
+> **Changed 22 October 2026:** who may reach ClamAV and the egress proxy.
+
+Everything inside the namespace is closed to pods that have no business with it (`manifests/80-network-policies.yaml`).
+Ingress is denied by default (`default-deny-ingress`), so a pod no policy names is closed, and `deploy.sh` applies the
+policies before any workload starts (#453):
+Postgres takes connections from the portal, the gateway, the migration job, the nightly backup and KEDA; the engine's
+Redis from the engine, the music and formula readers and KEDA; the portal's own Redis from the portal only (#472); SeaweedFS from the portal and the nightly
 backup, on its S3 port only (its master, filer and volume ports check nothing); veraPDF from the engine; the AI
 gateway from the engine and the portal; the engine's API from the portal; the portal's API from the web pod and
-cloudflared. The workers, the scheduler and the two readers answer no one but Prometheus. The web pod and
-cloudflared keep the cluster's default (open), as the way in.
+cloudflared; ClamAV (`27-clamav.yaml`) from the portal's API and worker, on 3310; the egress proxy
+(`26-egress-proxy.yaml`) from the portal, the gateway and the Adobe worker, on 3128. The workers, the scheduler and the two readers answer no one but Prometheus. The web pod is let in
+from anywhere on its port, as the way in; cloudflared and the jobs take no connections.
 
 With monitoring on (`MONITORING=on`, `manifests/95-monitoring.yaml`), Prometheus is also let in to the portal's,
 the engine's and the workers' metrics ports, its exporters to Postgres and Redis, the portal and Grafana to
@@ -206,15 +267,57 @@ by a crafted PDF can't send anything out (#361). Their AI calls all go through t
 `40-engine.yaml`: a provider named directly, such as the portal's fallback or the default judge, becomes the
 gateway's default or judge model, `GATEWAY_DEFAULT_MODEL` and `GATEWAY_JUDGE_MODEL` in engine.env), and the Jev
 classifier goes through the gateway's `/systemone` route, which adds the OpenRouter key. The gateway, the Adobe
-worker (Adobe's API) and the portal keep their internet access.
+worker (Adobe's API) and the portal reach the internet directly, unless the egress proxy is on (next).
+
+## Outbound traffic: the egress proxy
+
+The portal, the AI gateway, the Adobe worker and, with `MALWARE_SCAN=clamav`, ClamAV (its signature updates) need
+the internet: AI providers, Adobe, the mail service's API, the bot check, ClamAV's mirror. Network policies can't name
+hosts, only addresses, and those services sit behind large changing ranges. So with **`EGRESS_PROXY`** in
+`deploy.env` (#453) they reach the internet through a proxy in the namespace
+(`26-egress-proxy.yaml`: Squid, as its own unprivileged user), which can:
+
+| `EGRESS_PROXY` | What happens |
+|---|---|
+| `off` (default) | As before: they reach the internet directly |
+| `log` | They go through the proxy, which lets everything through and **records each destination** (host and port; never the content, which stays encrypted end to end) |
+| `enforce` | The proxy lets through **only the hosts this deployment uses**, and network policies (`82-egress-enforce.yaml`) leave them no way round it: the cluster's DNS, the pods in this namespace, the proxy, and for the portal its SMTP relay's port (`PORTAL_SMTP_PORT`) and, with `PORTAL_SIEM_MODE=syslog`, the SIEM collector's (`PORTAL_SIEM_SYSLOG_PORT`): neither goes through a web proxy |
+
+**The list of hosts** is worked out at each deploy from what's configured (`deploy/k8s/egress_hosts.py`):
+OpenRouter or Bedrock (in `AWS_REGION_NAME`) for the gateway's models, the Local AI server's address, Adobe's API and
+storage when Adobe is on, the mail service's API (Cloudflare, Plunk or SES) and the bot check when they're set up,
+`database.clamav.net` with `MALWARE_SCAN=clamav`, and anything in `EGRESS_ALLOW` (comma-separated `host` or `host:port`). `deploy.sh` prints the list before it asks to go
+ahead. The engine's own pods never reach the internet, proxy or not (#361).
+
+**Rolling it out:**
+
+1. `EGRESS_PROXY=log`, deploy, and use the service normally for a day or two: a document at each AI level, one through
+   Adobe if it's on, a sign-in email, a help request.
+2. See where it went:
+
+   ```bash
+   kubectl -n pdf-remediation logs deploy/egress-proxy --since=48h | grep -v transaction-end-before-headers | awk '$7 ~ /:/ {print $7}' | sort | uniq -c | sort -rn
+   ```
+
+   Each line is a destination (`host:port`) and how often. (The proxy's own readiness check, from the node every 5
+   seconds, opens a connection and closes it without a request: Squid logs it as
+   `error:transaction-end-before-headers`, which the command leaves out with its startup lines.) Compare it with the list `deploy.sh` printed; add anything
+   missing that should be allowed to `EGRESS_ALLOW` (Adobe's storage host is the one to check: it comes from Adobe's
+   answers, not our settings).
+3. `EGRESS_PROXY=enforce` and deploy. A refused request shows in the same log as `TCP_DENIED/403` with its host, and
+   in the service as that call failing (an AI call, Adobe, an email). To go back, set `log` and deploy.
+
+`CLUSTER_CIDRS` (default RKE2's `10.42.0.0/16,10.43.0.0/16`) are kept out of the proxy's reach, so it can't be used to
+get round the policies inside the cluster.
 The cluster's network plugin must enforce `NetworkPolicy` (RKE2's Canal does; `kubectl get networkpolicy -n
 <namespace>` lists what is applied).
 
-Redis also asks for a password now: `REDIS_PASSWORD` in `engine.env` and the same value as `PORTAL_REDIS_PASSWORD`
-in `portal.env`, which `deploy.sh` makes and keeps together (it also keeps `SERVICE_API_KEY` and
-`PORTAL_ENGINE_API_KEY` together, so the engine's API always has its key). A deployment made before these existed
-gets them on its next `deploy.sh`: the keys are added to the env files, Redis restarts with the password, and the
-pods that use it roll with their new address; between the two there can be a minute of queue errors in the logs.
+**Two Redis, two passwords** (#472). The engine's queue (`21-redis.yaml`) asks for `REDIS_PASSWORD` (`engine.env`);
+the portal's rate limits, its only use of Redis, are in a Redis of their own (`23-redis-portal.yaml`, nothing kept on
+disk) with `PORTAL_REDIS_PASSWORD` (`portal.env`). So a compromised engine can't touch the portal's counts, and the
+portal can't reach the engine's queue. `deploy.sh` makes both, and gives the portal a password of its own when an
+older deployment still has the shared one: the portal's pods then roll to the new Redis, and rate-limit counts start
+over. It also keeps `SERVICE_API_KEY` and `PORTAL_ENGINE_API_KEY` together, so the engine's API always has its key.
 
 **With the Worker front end** (`FRONTEND=worker`) the portal API is also let in from the ingress controller
 (`81-api-origin-policy.yaml`). RKE2's ingress controller runs in the nodes' own network, where its traffic is seen by
@@ -290,9 +393,11 @@ With [KEDA](https://keda.sh/docs/latest/deploy/) and metrics-server on the clust
   Cloud and commercial levels scale at the provider; the gateway's `max_budget` (`config/litellm.yaml`) and each
   level's page limits bound the cost.
 - KEDA reads the count as the portal's rows-only account, `portal_app` (`PORTAL_APP_DB_PASSWORD` in the
-  `pdfrem-portal-env` secret).
+  `pdfrem-portal-env` secret), through `portal_waiting_work()`: row-level security scopes the account's own reads
+  (#350).
 - `WORKER_GRACE_SECONDS` (3900, a little over `TASK_TIME_LIMIT_S`; not in `deploy.env.example`) is how long a
-  stopping worker pod may take to finish.
+  stopping worker pod may take to finish. While it does, its document keeps its place in the engine's count (by
+  the document's heartbeat: a stopping worker no longer answers), so new documents go to the new worker meanwhile.
 - `kubectl -n <namespace> get scaledobject,hpa` shows the current and wanted numbers.
 
 ### Music notation read note by note

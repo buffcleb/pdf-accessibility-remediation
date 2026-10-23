@@ -6,7 +6,11 @@
 when the deployment includes monitoring (`MONITORING=on`, the default; see
 [Operations › Monitoring](../../operations/monitoring.md#prometheus-and-grafana)); otherwise the page says so.
 
+It has three tabs: **Now**, **Over time** and **Audit export**. **Open Grafana** is beside them.
+
 ## Now
+
+### Documents and engine
 
 Eight figures, refreshed every minute:
 
@@ -21,7 +25,21 @@ Eight figures, refreshed every minute:
 | Restarts in the last hour | Pods restarted (a crash, a liveness probe, memory) |
 | Alerts firing | Problems Prometheus has found; shown red when there are any |
 
-## Pods
+### Capacity
+
+CPU and memory in use against what the nodes have, for example **7.2** of 24 cores:
+
+| Figure | What it is |
+|---|---|
+| CPU in use, all nodes | Everything running on the nodes, this service and anything else, against all their cores |
+| Memory in use, all nodes | The same for memory, in GiB |
+| This service's CPU | This service's own pods, against all the nodes' cores |
+| This service's memory | The same for memory |
+
+The gap between the first two and what the nodes have is the environment's headroom: what's left for the engine to
+scale into. If the nodes are busy with other things, the engine may not get room even below `ENGINE_WORKERS_MAX`.
+
+### Pods
 
 Every part of the service (each deployment and stateful set) has a row, refreshed every 15 seconds, with a box for
 each of its pods and an outline for each pod it could still have: from its minimum to its maximum when it scales
@@ -48,24 +66,52 @@ happened (`OOMKilled`: it ran out of memory), its liveness and readiness probe f
 and memory against its limits, and the documents it's working on. Two parts open when you choose them:
 
 - **About** the workload: what it does and what stops working without it, where it comes from (its upstream
-  project, or the file in this project that builds it), and the image it runs.
+  project, or the file in this project that builds it), and the image it runs, with its **version**, its
+  **digest** and whether it's the **pinned** one (below).
 - **kubectl commands** for that pod, with its real name and namespace, each with a **Copy** button: its log (as
   it's written, the last hour, the run before a restart), a look at it (describe, events, CPU and memory, its
   rollout and its autoscaler), and reaching it with `port-forward`. The commands that change something (restart,
   delete the pod, scale, a shell inside it) are listed apart. The portal runs none of them: they're for someone with
   `kubectl` access to the cluster.
 
+#### Versions
+
+> **New 22 October 2026:** each pod's version, digest and pin, and the **Versions** table.
+
+Under the rows, **Versions** lists every workload's release in one table, for checking against a security advisory
+at a glance (an advisory names a release, such as `litellm 1.107.0`, and often the images' digests). Each pod's
+**About** says the same for each of its containers, with the full digest.
+
+| Column | What it says |
+|---|---|
+| Release | The release, from the image's tag: **LiteLLM 1.105.0**, **ClamAV 1.5.4**. This service's own images (engine, portal, web, music and formula readers) say the **commit** they were built from (`scripts/build.sh` tags them with it). PostgreSQL and Redis, whose tags name only the major release (`postgres:16-alpine`), say the release **as they report it** to monitoring: **PostgreSQL 16.15 (as it reports)** |
+| Digest | The image as running, shortened (`sha256:` and 12 characters). The full digest is in the pod's **About** |
+| Pinned | Whether that's the digest the deployment pins (`scripts/deploy.sh` pins every image that isn't this service's own). **Not the pinned digest** is in bold: the pod runs something other than what was deployed |
+
+A workload part-way through a new release has a row for each release while both run, with the number of pods on
+each. Everything here comes from what Kubernetes and the exporters already tell Prometheus: the portal asks no
+program and no registry, so it can't say when a release was published.
+
 ## Over time
 
 Charts for the last **6 hours**, **day** or **week**: documents not finished (by status), documents finished per
 hour (completed and failed), the engine's documents in progress against its places, what's waiting in Redis (the
-engine's queue, Adobe's, the music reader's pages), CPU and memory by service, and the portal's requests per minute
-(by answer: 2xx, 4xx, 5xx). Each chart shows at most eight series, the busiest; the arrow keys read the values when
+engine's queue, Adobe's, the music reader's pages), CPU and memory by service, each node's CPU and memory in use
+(everything on it, as a share of its size), this service's CPU and memory by node, all the nodes together (CPU and
+memory as a share of their capacity), and the portal's requests per minute (by answer: 2xx, 4xx, 5xx). Each chart shows at most eight series, the busiest; the arrow keys read the values when
 a chart has focus.
 
 Reading them together: documents waiting while the engine's places are all in use means the engine is at its size
 (with scaling on, `ENGINE_WORKERS_MAX`); documents waiting with places free points at the engine or its queue. A
 service whose memory climbs to its limit is restarted, and shows in Restarts.
+
+A node near 100% is full: pods scheduled there wait or are moved, and the node's other workloads compete with this
+service's.
+
+## Audit export
+
+Where the audit log is sent (a SIEM, by syslog or HTTPS), how far it has got, and its last error if a send failed.
+When the export is off, the tab says so. Setting it up: [Operations › SIEM](../../operations/siem.md).
 
 ## Grafana
 

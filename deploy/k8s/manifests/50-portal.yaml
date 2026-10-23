@@ -27,6 +27,7 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: /metrics
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
@@ -36,13 +37,14 @@ spec:
           command: ["sh", "-c", "exec uvicorn portal.main:app --host 0.0.0.0 --port 8080 --no-proxy-headers"]
           envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
           env:
+${EGRESS_PROXY_ENV}
             # Its own account: rows only, no tables or triggers (#337, deploy/k8s/app-role.sql)
             - name: PORTAL_APP_DB_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_APP_DB_PASSWORD } }
             - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal_app:$(PORTAL_APP_DB_PASSWORD)@postgres:5432/portal" }
             - name: PORTAL_REDIS_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_REDIS_PASSWORD } }
-            - { name: PORTAL_REDIS_URL, value: "redis://:$(PORTAL_REDIS_PASSWORD)@redis:6379/1" }
+            - { name: PORTAL_REDIS_URL, value: "redis://:$(PORTAL_REDIS_PASSWORD)@redis-portal:6379/0" }
             - { name: PORTAL_APP_URL, value: "https://${APP_HOST}" }
             - { name: PORTAL_CORS_ORIGINS, value: "https://${APP_HOST}" }
             - { name: PORTAL_COOKIE_SECURE, value: "true" }
@@ -59,6 +61,8 @@ spec:
             # Monitoring (#397): its alerts and charts, and the link to Grafana; empty with MONITORING=off
             - { name: PORTAL_PROMETHEUS_URL, value: "${PORTAL_PROMETHEUS_URL}" }
             - { name: PORTAL_GRAFANA_URL, value: "${PORTAL_GRAFANA_URL}" }
+            # Malware scanning of uploads (#455): clamav with MALWARE_SCAN=clamav (27-clamav.yaml), else off
+            - { name: PORTAL_MALWARE_SCAN, value: "${MALWARE_SCAN}" }
           ports: [{ containerPort: 8080 }]
           readinessProbe:
             httpGet: { path: /api/v1/health, port: 8080 }
@@ -98,6 +102,7 @@ spec:
         prometheus.io/scrape: "true"  # its metrics port (#397)
         prometheus.io/port: "9464"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
@@ -116,13 +121,14 @@ spec:
             failureThreshold: 3
           envFrom: [{ secretRef: { name: pdfrem-portal-env } }]
           env:
+${EGRESS_PROXY_ENV}
             # Its own account: rows only, no tables or triggers (#337, deploy/k8s/app-role.sql)
             - name: PORTAL_APP_DB_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_APP_DB_PASSWORD } }
             - { name: PORTAL_DATABASE_URL, value: "postgresql+psycopg://portal_app:$(PORTAL_APP_DB_PASSWORD)@postgres:5432/portal" }
             - name: PORTAL_REDIS_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_REDIS_PASSWORD } }
-            - { name: PORTAL_REDIS_URL, value: "redis://:$(PORTAL_REDIS_PASSWORD)@redis:6379/1" }
+            - { name: PORTAL_REDIS_URL, value: "redis://:$(PORTAL_REDIS_PASSWORD)@redis-portal:6379/0" }
             - { name: PORTAL_APP_URL, value: "https://${APP_HOST}" }
             - { name: PORTAL_CORS_ORIGINS, value: "https://${APP_HOST}" }
             - { name: PORTAL_COOKIE_SECURE, value: "true" }
@@ -137,6 +143,8 @@ spec:
             # Monitoring (#397): its alerts and charts, and the link to Grafana; empty with MONITORING=off
             - { name: PORTAL_PROMETHEUS_URL, value: "${PORTAL_PROMETHEUS_URL}" }
             - { name: PORTAL_GRAFANA_URL, value: "${PORTAL_GRAFANA_URL}" }
+            # Malware scanning of uploads (#455): clamav with MALWARE_SCAN=clamav (27-clamav.yaml), else off
+            - { name: PORTAL_MALWARE_SCAN, value: "${MALWARE_SCAN}" }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 2Gi }

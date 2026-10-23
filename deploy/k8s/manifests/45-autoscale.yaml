@@ -45,11 +45,8 @@ spec:
         dbName: portal
         sslmode: disable
         targetQueryValue: "${WORKER_CONCURRENCY}"
-        query: >-
-          select (select count(*) from jobs where status in ('submitted','processing')
-          or (status = 'queued' and coalesce(progress->>'stage','') not in
-          ('paused','waiting_daily_cap','waiting_at_once')))
-          + (select count(*) from document_versions where status in ('queued','submitted','processing'))
+        # Counted by the table owner (migration 0044): portal_app's own reads are scoped by row-level security (#350)
+        query: select portal_waiting_work()
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

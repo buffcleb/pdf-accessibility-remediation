@@ -12,7 +12,7 @@
   --good-soft: #e3f3ea;
   --warn: #8a5a00;
   --warn-soft: #fbf0d9;
-  --bad: #b3261e;
+  --bad: #b3261e; --bad-fg: #ffffff;
   --bad-soft: #fbe6e4;
   --focus: #c25e00;
   --note: #6b4fa0;
@@ -30,7 +30,7 @@
     --bg: #10141a; --surface: #171d25; --fg: #e5e9ef; --muted: #9ca8b8; --line: #2b3542;
     --accent: #86b4ee; --accent-fg: #0e1a2b; --accent-soft: #1b2a3d;
     --good: #66cc93; --good-soft: #15291e; --warn: #e5ad4a; --warn-soft: #2d2412;
-    --bad: #f58b82; --bad-soft: #321a19; --focus: #ffb067; --note: #b9a2e8; --note-soft: #251e36; --idle: #5cc6cc;
+    --bad: #f58b82; --bad-fg: #2b0e0c; --bad-soft: #321a19; --focus: #ffb067; --note: #b9a2e8; --note-soft: #251e36; --idle: #5cc6cc;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
     --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
     color-scheme: dark;
@@ -103,9 +103,9 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .form-row > .field { flex: 1 1 200px; }
 .btn { font: inherit; font-weight: 600; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-fg); border-radius: 6px; padding: 8px 16px; cursor: pointer; text-decoration: none; display: inline-flex; gap: 6px; align-items: center; }
 .btn.secondary { background: transparent; color: var(--accent); }
-.btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+.btn.danger { background: var(--bad); border-color: var(--bad); color: var(--bad-fg); }
 .btn.small { padding: 4px 10px; font-size: 0.9rem; }
-.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
 .linkbtn { font: inherit; background: none; border: 0; padding: 0; color: var(--accent); text-decoration: underline; cursor: pointer; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
@@ -137,6 +137,7 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .upload-more[open] summary { margin-bottom: 8px; }
 .upload-actions { margin-top: 4px; }
 .upload-hint { margin: -6px 0 0; }
+.upload-wait { margin: 0; max-width: 70ch; }
 @media (max-width: 560px) {
   .upload-row { grid-template-columns: 1fr; }
   .upload-file-actions { margin-left: 0; }
@@ -159,6 +160,7 @@ th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color
 tr:last-child td { border-bottom: 0; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.num { white-space: nowrap; }
+td.when { white-space: nowrap; }  /* a date and time on one line: the wide columns give way (#545) */
 .empty { color: var(--muted); padding: 16px; }
 
 /* Status pills */
@@ -238,6 +240,25 @@ main.viewer { padding-top: 0; gap: 10px; }
 .pv-head > select { flex: 1 1 9rem; min-width: 0; max-width: max-content; }
 .pv-body { height: calc(100vh - var(--topbar-h) - var(--pv-top-h, 0px) - 110px); min-height: 420px; overflow: auto; background: var(--bg); position: relative; }
 .pv-msg { padding: 16px; }
+/* A long wait (#424, LoadProgress): a bar when the share done is known, a turning ring when not (a still ring with
+   reduced motion), and what is happening in words */
+.load-progress { display: flex; gap: 12px; align-items: flex-start; color: var(--fg); }
+.load-lines { display: grid; gap: 2px; min-width: 0; }
+.load-note { color: var(--muted); margin-top: 4px; }
+.load-spinner { flex: none; width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--line);
+  border-top-color: var(--accent); animation: load-turn 0.9s linear infinite; }
+@keyframes load-turn { to { transform: rotate(360deg); } }
+.load-bar { flex: none; width: 120px; height: 10px; margin-top: 7px; border-radius: 5px; background: var(--line);
+  overflow: hidden; }
+.load-bar-fill { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
+@media (prefers-reduced-motion: reduce) {
+  .load-spinner { animation: none; border-color: var(--accent); border-right-color: var(--line); }
+}
+.pv-loading { padding: 16px; }
+/* Over the first page while it's drawn, so the pages below keep their places */
+.pv-loading-over { position: absolute; top: 24px; left: 50%; transform: translateX(-50%); z-index: 5;
+  width: min(32rem, calc(100% - 32px)); background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); }
 /* Wide and tall enough for the three side by side: the viewer fills the window under the site's header and stays
    there; the tree, the pages and the editing panel each scroll inside themselves, and the window doesn't. Notices
    and the reader above the panes take their room from the panes. (Narrower, the panel goes under the panes and the
@@ -258,14 +279,20 @@ main.viewer { padding-top: 0; gap: 10px; }
 }
 .pv-pages { padding: 12px; display: flex; flex-direction: column; gap: 16px; align-items: center; }
 .pv-pages.zoomed { align-items: flex-start; width: max-content; }
-.pv-zoom { display: flex; gap: 4px; align-items: center; }
-.pv-zoom select { width: auto; }
 /* Viewing controls at the end of a pane's header row (they wrap under the version picker when the pane is narrow) */
 .pv-tools { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
 .pv-tools select { width: auto; max-width: 100%; }
 .pv-tools .check { margin: 0; white-space: nowrap; }
-.pv-zoom > span { white-space: nowrap; }
 .pv-tools .btn.small { padding-top: 2px; padding-bottom: 2px; }
+/* One-page view's page turning, laid out like a PDF viewer's: ^ | v, then the page number box and "of N" */
+.pv-pager { display: flex; gap: 4px; align-items: center; }
+.pv-pager > span { white-space: nowrap; }
+.pv-pager-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0;
+  border: 0; border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer; }
+.pv-pager-btn:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.pv-pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.pv-pager-divider { width: 1px; height: 20px; background: var(--line); }
+.pv-tools .pv-page-input { text-align: right; padding: 6px; margin-left: 4px; }  /* as tall as the selects beside it */
 .pv-parts { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
 .pv-parts li { display: flex; gap: 8px; align-items: center; border-left: 2px solid var(--line); padding-left: 8px; }
 .pv-page { position: relative; background: #fff; box-shadow: 0 1px 3px rgb(0 0 0 / 0.25); flex: none; }
@@ -379,7 +406,13 @@ main.viewer { padding-top: 0; gap: 10px; }
 .pv-menu-arrow { color: var(--muted); font-size: 1.1rem; line-height: 1; }
 .pv-menu.pv-submenu { z-index: 41; width: 300px; }
 .pv-actions-row { display: flex; align-items: center; gap: 10px; }
-.pv-pop { position: absolute; z-index: 10; width: 330px; max-width: 90%; background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 20px rgb(0 0 0 / 0.25); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; pointer-events: none; font-size: 0.9rem; }
+.pv-pop { position: absolute; z-index: 10; width: 330px; background: var(--surface); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 20px rgb(0 0 0 / 0.25); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px; pointer-events: none; font-size: 0.9rem;
+  overflow-y: auto; overflow-wrap: anywhere; }  /* placed and sized by PageView (#436) */
+/* Too tall for the pane (#436): it scrolls, so it takes the pointer (and the Tab key, see PageView) */
+.pv-pop.scrolls { pointer-events: auto; overscroll-behavior: contain; }
+.pv-pop:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .pv-pop-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .pv-finding { border-left: 3px solid var(--line); padding-left: 8px; display: flex; flex-direction: column; gap: 2px; }
 .pv-finding.sev-high { border-color: var(--bad); } .pv-finding.sev-review { border-color: var(--warn); } .pv-finding.sev-suggest { border-color: var(--accent); }
@@ -413,6 +446,45 @@ main.viewer { padding-top: 0; gap: 10px; }
 .pv-tree-row.veiled { opacity: 0.25; }
 .pv-veil { position: absolute; inset: 0; pointer-events: none; z-index: 6; }
 .pv-veil-fill { fill: var(--bg); opacity: 0.75; }
+/* A review item's area (#426): the page dimmed around it, a solid and a dashed outline (not color alone), a pulse
+   once (still for people who turn motion off), and a label naming the item */
+.pv-spot-veil .pv-veil-fill { opacity: 0.55; }
+.pv-spot-box { position: absolute; pointer-events: none; z-index: 7; border: 2px dashed var(--focus);
+  outline: 2px solid var(--surface); border-radius: 3px; animation: pv-spot-pulse 0.9s ease-out 1; }
+.pv-spot-box.whole { inset: 3px; }
+@keyframes pv-spot-pulse {
+  from { box-shadow: 0 0 0 0 rgb(194 94 0 / 0.6); }
+  to { box-shadow: 0 0 0 14px rgb(194 94 0 / 0); }
+}
+@media (prefers-reduced-motion: reduce) { .pv-spot-box { animation: none; } }
+.pv-spot-label { position: absolute; z-index: 8; display: flex; align-items: center; gap: 6px; padding: 3px 4px 3px 8px;
+  font-size: 12px; line-height: 1.3; background: var(--surface); color: var(--fg); border: 2px solid var(--focus);
+  border-radius: 4px; box-shadow: 0 2px 6px rgb(0 0 0 / 0.2); }
+.pv-spot-label:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pv-spot-close { border: 1px solid var(--line); background: var(--surface); color: var(--fg); border-radius: 3px;
+  font-size: 14px; line-height: 1; padding: 2px 6px; cursor: pointer; }
+.pv-spot-close:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.pv-pagenote-wrap { position: absolute; left: 4px; top: 4px; z-index: 9; }
+.pv-pagenote-wrap .pv-pagenote { position: static; cursor: pointer; font: inherit; font-size: 11px; }
+.pv-pagenotes { list-style: none; margin: 4px 0 0; padding: 4px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 2px 6px rgb(0 0 0 / 0.2); max-width: 320px; }
+.pv-pagenotes button { display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--fg);
+  font: inherit; font-size: 12px; padding: 4px 6px; border-radius: 3px; cursor: pointer; }
+.pv-pagenotes button:hover, .pv-pagenotes button:focus-visible { background: var(--accent-soft);
+  outline: 2px solid var(--focus); }
+/* A tag pending edits make, chosen before it's saved (#427): what it is, its type and alt text */
+.pv-newtag { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: flex-start;
+  text-align: left;
+  gap: 6px 12px; margin: 0 0 8px; padding: 6px 10px;
+  background: var(--note-soft); border: 1px solid var(--note); border-radius: 6px; }
+/* It stays in view below the viewer's heading while the new tag is worked on */
+@media (min-height: 480px) {
+  .pv-newtag { position: sticky; top: calc(var(--topbar-h) + var(--pv-top-h, 0px)); z-index: 25; }
+}
+.pv-newtag-h { font-size: 14px; margin: 0; }
+.pv-newtag-text { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-newtag-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.pv-newtag label { display: inline-flex; align-items: center; gap: 4px; }
 .pv-tree-row.selected { background: rgb(31 78 140 / 0.16); box-shadow: inset 3px 0 0 var(--focus); }
 .pv-tree-row.decorative .pv-tree-text { font-style: italic; color: var(--muted); }
 /* Tags that were in the document as uploaded: a light blue row and the word "original" (never color alone).
@@ -437,6 +509,7 @@ main.viewer { padding-top: 0; gap: 10px; }
 .pv-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; }
 .pv-dot.sev-high { background: #b3261e; } .pv-dot.sev-review { background: #c27a00; } .pv-dot.sev-suggest { background: #2f6fd0; }
 .pv-tree-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-tree-more { flex: none; white-space: nowrap; }  /* "Read all" by cut-off words (#436) */
 .pv-tree-page { flex: none; font-variant-numeric: tabular-nums; }
 .pv-tabs { display: flex; gap: 4px; align-items: center; border-bottom: 1px solid var(--line); margin: -4px 0 0; }
 /* The editing panel's tabs and Save stay at its top while the panel scrolls: inside the panel where it scrolls by
@@ -477,6 +550,11 @@ main.viewer { padding-top: 0; gap: 10px; }
 .swatch { display: inline-block; width: 1.4em; height: 1.4em; border-radius: 4px; border: 1px solid var(--line); vertical-align: middle; }
 
 .attention-list, .check-steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.attention-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.attention-acked { margin-top: 14px; }
+.attention-acked > summary { cursor: pointer; font-weight: 600; }
+.attention-acked-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 10px; }
+.attention-acked-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
 .check-steps li { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); }
 .check-steps li.fail { background: var(--bad-soft); border-color: var(--bad); }
 .check-steps li.note { background: var(--warn-soft); }
@@ -563,6 +641,22 @@ tr.row-panel td { background: var(--accent-soft); padding-top: 0; }
 .confirm-dialog .choices { max-height: none; overflow: visible; margin: 0; }
 .confirm-dialog:not([open]) { display: none; }
 .confirm-dialog::backdrop { background: rgb(0 0 0 / 0.45); }
+/* The admin area's edit dialog (#511): a form over the page */
+.confirm-dialog.admin-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px);
+  overflow-y: auto; }
+.confirm-dialog.admin-dialog.wide { width: min(820px, calc(100vw - 32px)); }
+.admin-dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.admin-dialog-head h2 { margin: 0; font-size: 1.15rem; overflow-wrap: anywhere; }
+.admin-dialog-close { font: inherit; font-size: 1.4rem; line-height: 1; width: 2rem; height: 2rem; flex: none; border: 1px solid transparent;
+  border-radius: 6px; background: none; color: var(--muted); cursor: pointer; }
+.admin-dialog-close:hover { border-color: var(--line); color: var(--fg); }
+.dialog-form { display: flex; flex-direction: column; gap: 12px; }
+.settings-subtabs { margin: 4px 0 14px; }
+.tok-files { padding-left: 1.6rem; display: flex; flex-direction: column; gap: 4px; }
+@media (max-width: 640px) { .confirm-dialog.admin-dialog { width: 100vw; max-height: 100vh; border-radius: 0; margin: 0; } }
+/* A table row's buttons: side by side, the same size, in the same place on every row */
+.row-actions { display: flex; flex-wrap: nowrap; gap: 6px; }
+.row-actions .btn { white-space: nowrap; }
 
 /* Help requests: the conversation and the request's facts side by side */
 .help-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); align-items: start; }
@@ -618,6 +712,8 @@ tr.row-panel td { background: var(--accent-soft); padding-top: 0; }
 .system-figures .stat-bad { border-color: var(--bad); background: var(--bad-soft); }
 .system-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
 .system-actions .report-pills { margin: 0; }
+.system-actions .tabs { flex: 1 1 auto; margin-bottom: 12px; }
+.system-of { font-size: 0.875rem; font-weight: 400; color: var(--muted); }
 /* Administration > System, pods (#398): one row per workload, a box per pod and per pod it could still have */
 .pod-legend { list-style: none; padding: 0; margin: 8px 0 12px; display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.9rem; }
 .pod-legend li { display: flex; align-items: center; gap: 6px; }
@@ -648,6 +744,7 @@ button.pod-box[aria-pressed="true"] { outline: 3px solid var(--fg); outline-offs
 .pod-about h4, .pod-commands h4 { margin: 10px 0 4px; font-size: 0.95em; }
 .pod-about ul, .pod-commands ul { margin: 0; padding-left: 0; list-style: none; }
 .pod-about li { margin: 2px 0; }
+.pod-digest { overflow-wrap: anywhere; }
 .pod-commands li { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
 .pod-command { display: flex; align-items: flex-start; gap: 8px; }
 .pod-command code { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; user-select: all; }
@@ -671,8 +768,6 @@ tfoot td { border-top: 2px solid var(--line); font-weight: 600; background: var(
 .live-report td.nowrap, .live-report .nowrap { white-space: nowrap; }
 .live-report td.date-cell { min-width: 7.5em; }
 .live-report td.date-cell .small { display: block; }
-.pager { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-.pager select { width: auto; }
 
 /* Report charts: thin marks, recessive grid, text in text colors */
 .report-chart { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
@@ -813,17 +908,25 @@ table.queues td:nth-child(6) { min-width: 170px; overflow-wrap: anywhere; }
 @media (max-width: 560px) { .allowance-details th, .allowance-details td { padding: 6px 8px; } }
 
 /* My documents: the list's count, sortable headings and pager */
-.documents-count { margin: 10px 0 6px; }
 th .sort-btn { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; text-transform: inherit;
   letter-spacing: inherit; }
 th .sort-btn:hover { color: var(--accent); }
-.pager { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
-.pager-size { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
-.pager-size select { width: auto; }
+/* One pager for every list (#514): First, Previous, where you are, Next, Last, above and below the list */
+.list-pager { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.list-pager-top { margin: 6px 0 10px; }
+.list-count { margin: 10px 0 6px; }
+.list-pager-bottom { margin-top: 12px; }
+.list-pager-where { padding: 0 4px; }
+.list-pager-size { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.list-pager-size select { width: auto; }
 
 /* Document page */
 .doc-page { display: flex; flex-direction: column; gap: 18px; }
 .doc-back { margin: 0; }
+/* Previous and Next, in the order of the list the document was opened from (#482) */
+.doc-topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; }
+.doc-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-left: auto; }
+@media (max-width: 640px) { .doc-nav { margin-left: 0; width: 100%; } }
 .doc-hero { display: flex; flex-wrap: wrap; gap: 18px 32px; align-items: center; padding: 22px 26px; background: var(--surface);
   border: 1px solid var(--line); border-radius: 14px; }
 .doc-hero-main { flex: 999 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -887,20 +990,36 @@ th .sort-btn:hover { color: var(--accent); }
 .doc-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; display: flex;
   flex-direction: column; gap: 10px; }
 .doc-card h2 { margin: 0; font-size: 1.05rem; }
-.doc-file { font: inherit; text-align: left; display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid var(--line);
-  border-radius: 10px; background: var(--surface); cursor: pointer; color: var(--fg); }
-.doc-file:hover { border-color: var(--accent); }
 .doc-file-name { font-weight: 700; color: var(--accent); }
 .doc-file-hint { font-size: 0.82rem; color: var(--muted); }
-.doc-file + .linkbtn { align-self: flex-start; }
 /* The human-reviewed file: first among the downloads, and marked out */
 .doc-reviewed { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 2px solid var(--accent); border-radius: 10px;
   background: var(--accent-soft); }
 .doc-reviewed select { max-width: 100%; }
 .doc-reviewed .btn { align-self: flex-start; }
 .doc-technical summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
+/* The Downloads card (#507): every file in one zip, then compact rows by group, each with a "?" for what it is */
+.doc-zip { align-self: flex-start; }
+.doc-files-each > summary { cursor: pointer; font-weight: 600; color: var(--accent); }
+.doc-files-each-body { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 8px; }
+.doc-files h3 { margin: 4px 0 2px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.doc-files ul { list-style: none; margin: 0; padding: 0; }
+.doc-file-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 3px 0; }
+.doc-file-get { text-align: left; }
+.doc-file-what { font: inherit; font-size: 0.75rem; font-weight: 700; width: 1.4rem; height: 1.4rem; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--surface); color: var(--muted); cursor: pointer; line-height: 1; padding: 0; }
+.doc-file-what:hover, .doc-file-what[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+.doc-file-row .doc-file-hint { flex-basis: 100%; margin: 2px 0 4px; }
+.doc-files-more { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; border-top: 1px solid var(--line);
+  padding-top: 10px; }
+.doc-files-more p { margin: 0; }
 .doc-technical ul { margin: 6px 0 0; padding-left: 18px; }
 th.select-col, td.select-col { width: 2.2rem; text-align: center; }
+/* Download as a zip (#481): what it will hold, then how much has arrived */
+.export-zip { flex-basis: 100%; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.export-zip p { margin: 4px 0; }
+.export-left-out { margin: 4px 0 6px; padding-left: 1.2em; }
+.export-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .selection-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; padding: 8px 12px;
   border-radius: 10px; background: var(--accent-soft); }
 .doc-removal { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; border-top: 1px solid var(--line); padding-top: 10px; }
@@ -965,7 +1084,6 @@ th.select-col, td.select-col { width: 2.2rem; text-align: center; }
 .pv-tree-row[data-drop="before-no"], .pv-tree-row[data-drop="after-no"] { box-shadow: inset 0 0 0 1px var(--bad, #b42318); cursor: no-drop; }
 .pv-tree-row[draggable="true"] { cursor: grab; }
 .pv-tree-note { margin: 0 0 4px; min-height: 1.2em; }
-.pv-page-input { width: 4.5em; }
 .pv-top .pv-reader { grid-column: 1 / -1; margin: 0; }
 .pv-reader-about summary { cursor: pointer; }
 .pv-reader { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 8px 12px; margin: 0 0 12px; }
@@ -984,3 +1102,8 @@ th.select-col, td.select-col { width: 2.2rem; text-align: center; }
 .run-facts div { display: flex; flex-direction: column; }
 .run-facts dt { color: var(--muted); font-size: 0.85rem; }
 .run-facts dd { margin: 0; overflow-wrap: anywhere; }
+.run-so-far .run-facts { grid-template-columns: 1fr; gap: 10px; }
+.run-so-far .run-facts dd { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.help-badge { text-decoration: none; white-space: nowrap; }
+.help-badge:hover .pill, .help-badge:focus-visible .pill { text-decoration: underline; }
+.app-error { max-width: 640px; margin: 48px auto; padding: 0 16px; }

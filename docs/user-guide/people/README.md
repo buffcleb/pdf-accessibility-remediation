@@ -11,8 +11,9 @@ document** below: it covers the whole trip in a few minutes. The pages that foll
    files when you're done
 4. [The tag manager](tag-manager/README.md): checking and fixing tags, side by side with the pages
 5. [Getting help](getting-help.md): asking support to look at a document
-6. [Email and settings](email-and-settings.md): notifications and email reports
-7. [Troubleshooting](troubleshooting.md): messages you might see, and what to do
+6. [Email and settings](email-and-settings.md): notifications, email reports and API tokens
+7. [Scripting](scripting.md): sending documents with an API token, and fetching the results
+8. [Troubleshooting](troubleshooting.md): messages you might see, and what to do
 
 See also the [glossary](../glossary.md).
 
@@ -24,7 +25,7 @@ See also the [glossary](../glossary.md).
    list shows what will be used: the processing option and the AI level. The defaults are fine for most
    documents. [More on submitting](submitting-documents.md).
 3. **Remediate.** Choose **Remediate**. The document appears under **Your documents** as *Waiting*, then
-   *In progress*. Most documents take under a minute; long or image-heavy ones take longer. You get an email
+   *Processing*. Most documents take under a minute; long or image-heavy ones take longer. You get an email
    when it's done, so you can close the page.
 4. **Open the result.** Click the document's name. The top of the page says whether it passes PDF/UA-1
    ("✓ Passes PDF/UA-1"), with **Download**. [More on your results](your-results.md).
@@ -34,6 +35,11 @@ See also the [glossary](../glossary.md).
 6. **Use the file.** Download it and publish it in place of the original.
 
 ### What to expect
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../images/diagrams/document-lifecycle-dark.svg">
+  <img src="../../images/diagrams/document-lifecycle.svg" alt="A document waits in the queue (after being held for confirmation, for options that ask first), is processed and is then done, or fails with its pages given back; held documents can be canceled; a done document can be marked done, with 24 hours to undo, after which its files are removed, as they also are when the retention period ends.">
+</picture>
 
 - **Your document looks exactly the same.** Tags are hidden structure; nothing on the page moves. The only
   exception is a document that can't pass without a visible change (usually a font problem). Then you get two

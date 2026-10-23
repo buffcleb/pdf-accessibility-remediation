@@ -251,7 +251,7 @@ def test_adobe_route_end_to_end(api, samples, fake_adobe, monkeypatch):
             fitz.open(stream=api.get(body["files"]["enhanced"]).content) as improved:
         made = len(improved.get_toc())
         assert adobe.get_toc() == [] and made >= 2
-    assert f"Changes: {made} bookmark(s) made from the headings." in body["reports"]["remediation_summary"]
+    assert f"{made} bookmark(s) made from the headings" in body["reports"]["remediation_summary"]
     xlsx = api.get(body["reports"]["adobe_reports"][0])
     assert xlsx.status_code == 200 and "spreadsheetml" in xlsx.headers["content-type"]
     md = api.get(f"/api/v1/jobs/{r.json()['job_id']}?format=markdown")

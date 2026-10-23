@@ -71,6 +71,8 @@ class PortalSettings(BaseSettings):
     rate_downloads_per_hour: int = 600
     rate_exports_per_hour: int = 120
     rate_uploads_per_hour: int = 200
+    # Zips of many documents' files (#481): one request each, however many files, with a limit of its own
+    rate_document_exports_per_hour: int = 20
     # Cloudflare Turnstile bot check on "Email me a code" (off unless both keys are set; see security/botcheck.py)
     turnstile_site_key: str = ""
     turnstile_secret_key: str = ""
@@ -80,6 +82,20 @@ class PortalSettings(BaseSettings):
     # Set by the deploy when the cluster runs the nightly backup (#333, BACKUPS=cronjob): only then is a backup that
     # hasn't finished for a while alerted. Off where backups are taken another way (the hosts' own, or none).
     backup_expected: bool = False
+    # The audit log to the campus SIEM (#456, portal/siem.py, docs/operations/siem.md): off, syslog (RFC 5424 over
+    # TCP, with TLS unless siem_syslog_tls is off) or https (JSON lines, or Splunk's HTTP Event Collector format, to
+    # an address with a token). The portal worker sends every event in order, from the first, and keeps its place.
+    siem_mode: str = "off"  # off | syslog | https
+    siem_syslog_host: str = ""
+    siem_syslog_port: int = 6514
+    siem_syslog_tls: bool = True
+    siem_syslog_ca: str = ""  # the collector's CA (PEM, \n for line breaks), when the system's CAs don't cover it
+    siem_https_url: str = ""
+    siem_https_token: str = ""
+    siem_https_format: str = "lines"  # lines (application/x-ndjson, Bearer token) | splunk (HEC, "Splunk" token)
+    siem_batch: int = 500
+    # For a SIEM that polls: GET /api/v1/admin/audit/export with this as a Bearer token (empty: no pull API)
+    siem_pull_token: str = ""
     # An upload's pages are counted in a child process with these limits (#356); past them the upload is refused
     pdfcheck_isolated: bool = True  # off only in tests
     pdfcheck_memory_mb: int = 1024
@@ -118,6 +134,13 @@ class PortalSettings(BaseSettings):
     # the System page and its alerts. Empty: not part of this deployment.
     grafana_url: str = ""
     prometheus_url: str = ""
+    # Malware scanning of uploads (#455; portal/malware.py): "clamav" with MALWARE_SCAN=clamav, which runs clamd
+    # (27-clamav.yaml); "off" scans nothing. A whole upload is streamed, so the timeout allows a large one.
+    malware_scan: str = "off"
+    clamd_host: str = "clamav"
+    clamd_port: int = 3310
+    clamd_timeout_seconds: float = 120.0
+    malware_signatures_days: int = 3  # older signatures are an alert: freshclam isn't getting updates
     engine_ai_model: str = ""
     # Jobs the portal keeps at the engine at once: at least this many, and as many as the engine's running workers
     # process at once when that's more (workers scaled with the queue), up to the ceiling

@@ -13,6 +13,7 @@ os.environ["ALLOW_MOCK_PROVIDER"] = "true"
 os.environ["REDIS_URL"] = "memory://"
 os.environ["CELERY_RESULT_BACKEND"] = "cache+memory://"
 os.environ["VERIFY_JUDGE_PROVIDER"] = "mock"  # never call a real model from tests
+os.environ.setdefault("ALLOW_NO_API_KEY", "true")  # the API's own key check is tested on its own (test_api_key.py)
 
 
 @pytest.fixture(scope="session")

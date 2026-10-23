@@ -36,6 +36,19 @@ Adobe doesn't publish its limits, so take them from your contract.
 by default. That needs an AI level the person can use, and it charges that level's pages, given back if the AI wasn't
 needed. The same AI reads specialist notation (math, chemistry) onto Adobe's tags in the improved copy.
 
+**The improved copy is the document people get** (#499): the main download, the verdict and tiles, Needs review and
+the tag manager are about it, and Adobe's file as it came back is a choice in the downloads and the tag manager.
+Documents finished before that change still show Adobe's file's verdict until they're brought up to date, once, after
+the deploy (`--dry-run` first to see how many):
+
+```bash
+kubectl -n pdf-remediation exec deploy/portal-api -- python -m portal.cli resummarize-improved --dry-run
+kubectl -n pdf-remediation exec deploy/portal-api -- python -m portal.cli resummarize-improved
+```
+
+It reads each document's JSON report from storage and changes only its verdict, failures, before-and-after counts
+and review items. Documents whose files were removed keep what they had.
+
 Each job records what it sent (`cost.adobe`: pages sent, parts, requests, retries, seconds at Adobe), shown to super
 admins. If Adobe says the account is out of transactions, jobs fail with "Adobe's usage limit…" and the pages are given
 back.

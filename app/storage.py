@@ -78,6 +78,14 @@ class JobStore:
     def read_result(self) -> dict | None:
         return self._read_json("result.json")
 
+    def write_partial(self, partial: dict) -> None:
+        """What a job can already give while it's still working (#428): an edit's file and tag map, before its
+        checks."""
+        self._write_json("partial.json", partial)
+
+    def read_partial(self) -> dict | None:
+        return self._read_json("partial.json")
+
     def write_error(self, error: dict) -> None:
         self._write_json("error.json", error)
 
@@ -123,6 +131,25 @@ class JobStore:
     def cleanup_work(self) -> None:
         shutil.rmtree(self.work_dir, ignore_errors=True)
         self.input_pdf.unlink(missing_ok=True)
+
+
+def running_job_ids(fresh_s: float, root: Path | None = None) -> set[str]:
+    """The jobs a worker is running now: not finished or stopped, with a heartbeat in the last fresh_s seconds."""
+    root = root or get_settings().jobs_dir
+    now, out = time.time(), set()
+    try:
+        dirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in dirs:
+        try:
+            store = JobStore(d.name, root)  # (a folder that isn't a job's is refused here)
+            beat = store.last_beat()
+            if beat is not None and now - beat < fresh_s and store.read_result() is None and store.read_error() is None:
+                out.add(d.name)
+        except (OSError, ValueError, AttributeError):
+            continue  # not a job's folder, or one being written or removed: not counted this time
+    return out
 
 
 def purge_expired_jobs(max_age_hours: int | None = None) -> int:

@@ -19,11 +19,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from portal import (
-    alerts, audit, email_reports, helpdesk, metrics, notifications, outbox, pool_alerts, prometheus, queues, quota,
-    removal, report_views, services, settings_store,
+    alerts, api_tokens, audit, email_reports, helpdesk, metrics, notifications, outbox, pool_alerts, prometheus, queues, quota,
+    removal, report_views, security_alerts, services, settings_store, siem,
 )
 from portal.config import get_portal_settings
-from portal.db import _sessionmaker
+from portal.db import system_session
 from portal.engine import AIChoice, EngineError, EngineUnavailable, get_engine_client
 from portal.mail import Mail
 from portal.models import (
@@ -84,7 +84,8 @@ def improved_label(resp: dict) -> str:
     """Name of the Adobe route's improved copy, from what was done to it."""
     imp = (resp.get("reports") or {}).get("improvements") or {}
     alt = bool(imp.get("alt_text") or imp.get("decorative"))
-    fixes = bool(imp.get("glyph_lists") or imp.get("unicode_maps") or imp.get("glyph_widths") or imp.get("bookmarks"))
+    fixes = any(imp.get(k) for k in ("glyph_lists", "unicode_maps", "glyph_widths", "bookmarks", "title",
+                                     "pdfua_identifier", "header_scope"))
     if alt and fixes:
         return "Adobe + AI alt text and fixes"
     return "Adobe + fixes" if fixes else "Adobe + AI alt text"
@@ -96,7 +97,16 @@ def summarize(resp: dict) -> dict:
     comp = reports.get("comparison") or {}
     before, after = comp.get("before") or {}, comp.get("after") or {}
     files = resp.get("files") or {}
-    tv = (reports.get("tag_verification") or {}).get("primary") or {}
+    verifications = reports.get("tag_verification") or {}
+    tv = verifications.get("primary") or {}
+    # The Adobe route's improved copy (Adobe's file with AI alt text and fixes) is the document people get (#499): the
+    # verdict, the tiles and Needs review are about it. Adobe's file as it came back is kept as a choice.
+    adobe_after = None
+    verdict_of = "primary"
+    if files.get("enhanced") and comp.get("after_enhanced"):
+        adobe_after, after = after, comp["after_enhanced"]
+        tv = verifications.get("enhanced") or tv
+        verdict_of = "enhanced"
     findings = tv.get("findings") or []
     severity_rank = {"high": 0, "review": 1, "suggest": 2}
     findings = sorted(findings, key=lambda f: (severity_rank.get(f.get("severity"), 3), f.get("page") or 0))
@@ -111,6 +121,8 @@ def summarize(resp: dict) -> dict:
         "tags_kept": bool((comp.get("existing_tags") or {}).get("present")
                           and not (comp.get("existing_tags") or {}).get("rebuilt_tree")),
         "compliant_after": after.get("compliant"),
+        "verdict_of": verdict_of,  # the version the verdict, tiles and review items describe
+        "adobe_file_compliant": adobe_after.get("compliant") if adobe_after is not None else None,
         "failed_checks_before": before.get("failed_checks"),
         "failed_checks_after": after.get("failed_checks"),
         "failed_rules_after": after.get("failed_rules"),
@@ -147,6 +159,40 @@ def summarize(resp: dict) -> dict:
         "improved_label": improved_label(resp) if files.get("enhanced") else None,
         "improvements": reports.get("improvements"),
     }
+
+
+# The parts of a summary that describe one file: what changed when the Adobe route's improved copy became the
+# document people get (#499)
+VERDICT_KEYS = ("pdfua_part", "compliant_after", "verdict_of", "adobe_file_compliant", "failed_checks_after",
+                "failed_rules_after", "remaining_failures", "before_after", "review")
+
+
+def resummarize_improved(db: Session, *, dry_run: bool = False) -> tuple[int, int]:
+    """Documents finished before #499 whose verdict was Adobe's file though they have an improved copy: their verdict,
+    tiles and review items recomputed from the engine's JSON report (kept with their files), the rest of their
+    summary as it was. Returns (updated, skipped: files removed or no report)."""
+    import json
+    updated = skipped = 0
+    for job in db.scalars(select(Job).where(Job.status == "completed", Job.files_deleted_at.is_(None))):
+        summary = job.result_summary or {}
+        kinds = {f.kind: f for f in job.files}
+        if summary.get("verdict_of") or "enhanced" not in kinds:
+            continue
+        report = kinds.get("report_json")
+        try:
+            resp = json.loads(b"".join(get_storage().get_stream(report.s3_key))) if report else None
+        except Exception:  # noqa: BLE001 - gone from the store: leave it as it is
+            resp = None
+        if not resp:
+            skipped += 1
+            continue
+        new = summarize(resp)
+        if not dry_run:
+            job.result_summary = {**summary, **{k: new.get(k) for k in VERDICT_KEYS}}
+        updated += 1
+    if not dry_run:
+        db.commit()
+    return updated, skipped
 
 
 def _engine_files(resp: dict) -> list[tuple[str, str]]:
@@ -256,7 +302,8 @@ def _smaller_since_last_large(db: Session, threshold: int) -> int | None:
     return db.scalar(select(func.count()).select_from(Job).where(Job.pages <= threshold, Job.submitted_at > last)) or 0
 
 
-def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) -> list[Job]:
+def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings, in_use: int = 0,
+                 places: int = 0) -> list[Job]:
     """Which waiting documents to start now, oldest first, within these limits:
 
     - nobody gets more than `max_concurrent_jobs_per_user` at the engine at once, so one batch doesn't hold up
@@ -265,7 +312,9 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
     - a service's "at once" limit (a local AI's GPUs can only serve so many) holds the rest back;
     - large documents (more than `large_doc_pages`) are mixed in: one after every `large_doc_every` smaller ones,
       no more than `large_doc_at_once` running, and one after another when nothing smaller is waiting. A super
-      admin's "process now" skips the large-document rules."""
+      admin's "process now" skips the large-document rules.
+
+    in_use, places: the engine's places in use and in all, for the note on what's left waiting for one (#530)."""
     per_user, threshold = rs.max_concurrent_jobs_per_user, rs.large_doc_pages
     active = (Job.status.in_(("submitted", "processing")))
     running = dict(db.execute(select(Job.user_id, func.count()).where(active).group_by(Job.user_id)).all())
@@ -345,8 +394,8 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
                 using[k] += 1
         running[job.user_id] = running.get(job.user_id, 0) + 1
         picked.append(job)
-    # Say why what's left is waiting: large documents wait their turn; anything else just waits for a free slot
-    # (clearing a note from a pause or limit that no longer holds it)
+    # Say why what's left is waiting: large documents wait their turn; the rest wait for the person's own documents
+    # at the engine, or for a free place there (#530: shown to super admins, with the numbers)
     for job in small + large:
         over = [k for k in job.charged_services or [] if k in caps and sent_today[k] + job.pages_charged > caps[k]]
         if over:
@@ -355,9 +404,39 @@ def _pick_queued(db: Session, slots: int, rs: settings_store.RuntimeSettings) ->
             note(job, {"stage": "waiting_at_once", "services": full(job)})
         elif job in large:
             note(job, {"stage": "waiting_large", "every": rs.large_doc_every})
-        elif (job.progress or {}).get("stage") in ("paused", "waiting_daily_cap", "waiting_large", "waiting_at_once"):
-            note(job, None)
+        elif running.get(job.user_id, 0) >= per_user:
+            note(job, {"stage": "waiting_per_person", "at_once": per_user})
+        else:
+            note(job, _no_place(in_use + len(picked), places))
     return picked
+
+
+def _no_place(in_use: int, places: int) -> dict:
+    """The note on a document waiting for a free place at the engine (#530)."""
+    return {"stage": "waiting_engine", "in_use": in_use, "places": places}
+
+
+def _note_no_place(db: Session, in_use: int, places: int) -> None:
+    """Every place at the engine is in use: the documents waiting only for one say so, with the numbers (#530).
+    Notes from a pause or a limit are left as they are: those still hold their documents back."""
+    for job in db.scalars(select(Job).where(Job.status == "queued").order_by(Job.created_at).limit(500)
+                          .with_for_update(skip_locked=True)):
+        if (job.progress or {}).get("stage") in (None, "", "waiting_engine", "waiting_per_person"):
+            value = _no_place(in_use, places)
+            if job.progress != value:
+                job.progress = value
+
+
+def _scanner() -> dict | None:
+    """The malware scanner as it answers now, for its alerts (#455); None with scanning off."""
+    from portal import malware
+    if not malware.enabled():
+        return None
+    try:
+        version, published = malware.signatures()
+    except malware.ScannerDown as e:
+        return {"error": str(e)}
+    return {"version": version, "signatures": published}
 
 
 _capacity: tuple[float, int | None] = (0.0, None)
@@ -376,11 +455,14 @@ def in_flight_limit() -> int:
 
 
 def submit_queued(db: Session) -> int:
-    slots = in_flight_limit() - _engine_in_flight(db)
+    places, in_use = in_flight_limit(), _engine_in_flight(db)
+    slots = places - in_use
     if slots <= 0:
+        _note_no_place(db, in_use, places)
+        db.commit()
         return 0
     rs = settings_store.load(db)
-    jobs = _pick_queued(db, slots, rs)
+    jobs = _pick_queued(db, slots, rs, in_use, places)
     engine, storage, sent = get_engine_client(), get_storage(), 0
     for job in jobs:
         src = next((f for f in job.files if f.kind == "input"), None)
@@ -724,7 +806,7 @@ def _engine_in_flight(db: Session) -> int:
     versions = db.scalar(select(func.count()).select_from(DocumentVersion).where(
         DocumentVersion.status.in_(("submitted", "processing"))))
     reviews = db.scalar(select(func.count()).select_from(DocumentVersion).where(
-        DocumentVersion.status == "ready", DocumentVersion.review_status == "running"))
+        DocumentVersion.status == "ready", (DocumentVersion.review_status == "running") | DocumentVersion.checking))
     return (jobs or 0) + (versions or 0) + (reviews or 0)
 
 
@@ -763,6 +845,15 @@ def purge_superseded(db: Session) -> int:
 
 def _fail_version(db: Session, v: DocumentVersion, code: str, detail: str | None) -> None:
     log.warning("version %s of job %s failed: %s %s", v.number, v.job_id, code, detail)
+    if v.checking:
+        # Opened early (#428): the file and its tags are good, only the checks after them didn't finish. It stays
+        # open, and says so
+        v.checking = False
+        v.summary = {**(v.summary or {}), "checks_unfinished": True}
+        v.error_code = code
+        v.error_message = "The checks of this version didn't finish. The file and its tags were saved."
+        v.finished_at = _now()
+        return
     v.status = "failed"
     _take_place(db, v)
     v.error_code = code
@@ -774,6 +865,21 @@ def _fail_version(db: Session, v: DocumentVersion, code: str, detail: str | None
         v.review_status, v.review_error = "failed", "The version wasn't saved, so it wasn't reviewed."
     audit.record(db, None, "version.failed", actor_email="system", target_type="job", target_id=v.job_id,
                  group_id=v.job.group_id, outcome="failure", details={"version": v.number, "code": code})
+
+
+def carried_ai_read(base: DocumentVersion | None) -> list[dict]:
+    """The AI's readings flagged on the version an edit is based on, for the engine to flag again on the result
+    (a reviewed version has no AI enrichment of its own): each finding's "ai_read", with its "readings" when two
+    readings disagreed, and the element it was on."""
+    out = []
+    for f in ((base.summary or {}).get("findings") or []) if base else []:
+        extra = f.get("extra") if isinstance(f, dict) else None
+        if not isinstance(extra, dict) or not extra.get("ai_read"):
+            continue
+        readings = {k: v for k, v in extra.items() if k != "ai_read"} if "readings" in extra else None
+        out.append({"ai_read": extra["ai_read"], "element": f.get("element"),
+                    **({"readings": readings} if readings else {})})
+    return out
 
 
 def submit_versions(db: Session) -> int:
@@ -803,7 +909,8 @@ def submit_versions(db: Session) -> int:
                                                                   review=v.review or "none",
                                                                   judge=_judge_for(db, v.job),
                                                                   reference=ref if v.source_file_id else None,
-                                                                  validator=validator_flags(settings_store.load(db)))
+                                                                  validator=validator_flags(settings_store.load(db)),
+                                                                  ai_read=carried_ai_read(base))
         except EngineUnavailable as e:
             log.warning("engine unavailable, version %s stays queued: %s", v.id, e)
             db.commit()
@@ -823,7 +930,8 @@ def submit_versions(db: Session) -> int:
 
 
 def poll_versions(db: Session) -> int:
-    versions = db.scalars(select(DocumentVersion).where(DocumentVersion.status.in_(("submitted", "processing")))
+    versions = db.scalars(select(DocumentVersion).where(DocumentVersion.status.in_(("submitted", "processing"))
+                                                        | DocumentVersion.checking)
                           .order_by(DocumentVersion.submitted_at).with_for_update(skip_locked=True)).all()
     done = 0
     for v in versions:
@@ -839,7 +947,13 @@ def poll_versions(db: Session) -> int:
         if status == "processing":
             if v.submitted_at and _now() - v.submitted_at > JOB_TIMEOUT:
                 _fail_version(db, v, "time_limit_exceeded", "no result in time")
-            else:
+            elif not v.checking and resp.get("partial") and v.replaces_id is None:
+                try:
+                    _open_early(db, v, resp["partial"])
+                except EngineUnavailable:
+                    db.rollback()
+                    continue
+            elif not v.checking:
                 v.status = "processing"
             db.commit()
         elif status == "failed":
@@ -857,6 +971,34 @@ def poll_versions(db: Session) -> int:
             done += 1
     db.commit()
     return done
+
+
+def _version_names(db: Session, v: DocumentVersion) -> tuple[str, str]:
+    """The version's PDF and tag map file names."""
+    job = v.job
+    stem = job.filename.rsplit(".", 1)[0]
+    pdf_name = f"{stem}_corrected_{v.number}.pdf" if v.kind == "corrected" else f"{stem}_human_reviewed_{v.number}.pdf"
+    return pdf_name, f"{stem}_tagmap_v{v.number}.json"
+
+
+def _open_early(db: Session, v: DocumentVersion, partial: dict) -> None:
+    """An edit job whose file and tag map are final, still checking (#428): the version can be opened now, and its
+    verdict and findings follow when the checks finish. A version saved into another waits for the end, as it takes
+    that one's place only then."""
+    job = v.job
+    prefix = job_prefix(job.group_id, job.user_id, job.id) + f"versions/{v.number}/"
+    pdf_name, map_name = _version_names(db, v)
+    pdf, tagmap = (partial.get("files") or {}).get("remediated_primary"), partial.get("tag_map")
+    if not (isinstance(pdf, str) and pdf.startswith("/api/v1/jobs/") and isinstance(tagmap, str)
+            and tagmap.startswith("/api/v1/jobs/")):
+        return
+    stored = [_store_engine_file(db, job, kind, path, name, prefix)
+              for kind, path, name in (("reviewed_pdf", pdf, pdf_name), ("reviewed_tagmap", tagmap, map_name))]
+    db.flush()
+    v.pdf_file_id, v.tagmap_file_id = stored[0].id, stored[1].id
+    v.status, v.checking = "ready", True
+    audit.record(db, None, "version.open_early", actor_email="system", target_type="job", target_id=job.id,
+                 group_id=job.group_id, details={"version": v.number})
 
 
 def _collect_version(db: Session, v: DocumentVersion, resp: dict) -> None:
@@ -877,13 +1019,19 @@ def _collect_version(db: Session, v: DocumentVersion, resp: dict) -> None:
         ("reviewed_verapdf", (reports.get("verapdf_after") or {}).get("primary"),
          f"{stem}_verapdf_v{v.number}_ua{ua}.xml"),
     ]
+    # Opened early (#428): its file and tag map are already stored, and haven't changed since
+    have = {"reviewed_pdf": v.pdf_file_id, "reviewed_tagmap": v.tagmap_file_id} if v.checking else {}
     files = {}
     for kind, path, name in wanted:
+        if have.get(kind):
+            continue
         if isinstance(path, str) and path.startswith("/api/v1/jobs/") and name:
             files[kind] = _store_engine_file(db, job, kind, path, name, prefix)
     db.flush()
-    v.pdf_file_id = files["reviewed_pdf"].id if "reviewed_pdf" in files else None
-    v.tagmap_file_id = files["reviewed_tagmap"].id if "reviewed_tagmap" in files else None
+    v.pdf_file_id = have.get("reviewed_pdf") or (files["reviewed_pdf"].id if "reviewed_pdf" in files else None)
+    v.tagmap_file_id = have.get("reviewed_tagmap") or (
+        files["reviewed_tagmap"].id if "reviewed_tagmap" in files else None)
+    v.checking = False
     v.verapdf_file_id = files["reviewed_verapdf"].id if "reviewed_verapdf" in files else None
     v.summary = version_summary(resp, "reviewed")
     v.status = "ready" if v.pdf_file_id else "failed"
@@ -1062,13 +1210,13 @@ def run_forever() -> None:
     log.info("portal worker started; engine %s", s.engine_url)
     if s.metrics_enabled:
         metrics.serve_worker(s.worker_metrics_port)
-    last_sweep = last_reports = last_beat = last_alerts = 0.0
+    last_sweep = last_reports = last_beat = last_alerts = last_siem = 0.0
     while not _stop:
         started = time.monotonic()
         metrics.WORKER_BUSY.set(1)
         outcome = "ok"
         try:
-            with _sessionmaker()() as db:
+            with system_session("worker") as db:
                 submit_queued(db)
                 poll_active(db)
                 submit_versions(db)
@@ -1085,6 +1233,7 @@ def run_forever() -> None:
                 if time.monotonic() - last_sweep > s.worker_sweep_minutes * 60:
                     counts = sweep(db)
                     counts.update(helpdesk.remind_and_close(db))
+                    counts.update(api_tokens.sweep(db))
                     counts["versions_replaced"] = purge_superseded(db)
                     last_sweep = time.monotonic()
                     if any(counts.values()):
@@ -1113,14 +1262,24 @@ def run_forever() -> None:
                         firing = prom.firing()
                     except prometheus.Unreachable as e:
                         log.warning("Prometheus not reached: %s", e)
-                with _sessionmaker()() as db:
+                with system_session("worker alerts") as db:
                     alerts.evaluate(db, engine_asked=asked, engine_workers=engine.capacity() if asked else None,
-                                    prom_asked=prom is not None, prom_firing=firing)
+                                    prom_asked=prom is not None, prom_firing=firing, scanner=_scanner())
                     pool_alerts.check(db)  # groups whose pool just ran low: their admins are told (#358)
+                    security_alerts.evaluate(db)  # patterns in the audit log (#456)
                     db.commit()
                     outbox.send_queued(db)
             except Exception:  # noqa: BLE001
                 log.exception("alert check failed")
+        # The audit log to the campus SIEM (#456), in a step of its own: a collector that's slow or away never holds up
+        # documents; it's retried with backoff and alerted when it falls an hour behind
+        if siem.mode() != "off" and time.monotonic() - last_siem > 30:
+            last_siem = time.monotonic()
+            try:
+                with system_session("worker siem") as db:
+                    siem.export(db)
+            except Exception:  # noqa: BLE001
+                log.exception("SIEM export failed")
         time.sleep(s.worker_poll_seconds)
     log.info("portal worker stopped")
 

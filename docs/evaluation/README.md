@@ -4,6 +4,9 @@ How the proof of concept was tested, what it achieved, and what it costs to run.
 up in [test reports](test-reports/README.md), and reviews of the code in [reviews](#reports-and-reviews). Each report
 is a record of its day; later changes are noted in it only as "fixed since".
 
+**Updated 22 October 2026:** later changes to a report or review are now marked **Updated** with their date, at the
+finding they update; on this page, every paragraph or row brought up to date carries the same marker.
+
 ## Contents
 
 - [Test method](#test-method)
@@ -25,11 +28,16 @@ Each document goes through the harness (`harness/run_harness.py`). For each outp
 - the "Needs human review" items;
 - time, AI calls, tokens and cost.
 
+**Updated 22 October 2026:** the outputs are also checked in PAC 2026 (PDF/UA-1), by hand on a Windows machine, since
+PAC found problems veraPDF passed ([test report](test-reports/2026-10-22-pac-regression-set.md)). The harness itself
+still checks veraPDF only.
+
 | Set | Files | Pages | What it covers |
 |---|---|---|---|
 | Synthetic (`harness/make_samples.py`) | 9 | about 40 | Untagged, partly tagged with broken tags, scanned, two-column, tables, a Quartz text export, unembedded fonts |
 | Real documents | 13 | 431 | arXiv and journal papers (LaTeX), a dissertation, a thesis, a college accessibility plan (original and "compliant" versions), a catalog, a brochure, a policy, a math formula sheet, sheet music, image-heavy files |
 | Further real documents | 30 | – | The above plus fillable forms, scans and more formula sheets, used for the classifier comparison and regression checks |
+| **Updated 22 October 2026:** the regression set | 30 | 330 (quick set), 1,931 (full set) | The 30 documents above, shortened (quick set) and at full length (full set): reports, datasheets, textbooks, exams, forms, scans, music, chemistry and math. Checked with veraPDF and PAC |
 
 The real documents aren't in the repository.
 
@@ -56,6 +64,20 @@ The real documents aren't in the repository.
 
 Two documents labeled "COMPLIANT" (presumably from earlier remediation) still had 689 and 984 failed checks before
 this engine processed them.
+
+### PAC 2026 on the regression set (30 documents)
+
+**Updated 22 October 2026:** checked through the deployed service, existing tags kept, Local AI, without full figure
+review ([test report](test-reports/2026-10-22-pac-regression-set.md)):
+
+| Route and set | First check | After the fixes |
+|---|---|---|
+| Engine, quick set (20 October) | 26 of 30 pass PAC | 30 of 30 (#483, #484, #486) |
+| Engine, full set (21 October) | 28 of 30 pass PAC; both failures had passed veraPDF | 30 of 30 (#526, #528), re-checked 22 October |
+| Adobe route, quick set (20 October) | 35,976 failures and 826 warnings, traced to Adobe's own tagging | The service's improved copy adds no PAC findings |
+
+So the engine's output for all 30 documents now passes both veraPDF and PAC (PDF/UA-1). Not checked in PAC: PDF/UA-2,
+"Ignore existing tags", the paid AI levels, full figure review, and the Adobe route on the full set.
 
 ### Synthetic set (9 files)
 
@@ -98,6 +120,9 @@ veraPDF checks the machine-verifiable rules of PDF/UA-1. It can't tell whether a
 are the right ones, or whether the reading order makes sense. That's why the engine adds its own checks, an AI review
 and a human review list. The same applies to any other remediation tool's output.
 
+**Updated 22 October 2026:** the same holds for PAC, which adds checks of whether the structure makes sense (Parts
+nested in Parts, content directly in a grouping element) but can't judge alt text or reading order either.
+
 ## Known limitations
 
 - **Specialist notation:** tested on 19 real chemistry, medical and engineering documents
@@ -126,6 +151,9 @@ and a human review list. The same applies to any other remediation tool's output
   (ReadWriteMany) volume, or an object-storage backend behind `app/storage.py`.
 - **Not built yet:** SAML sign-in (designed, on hold), bounce handling for email, a classifier for AI levels (not
   just kinds), and further fixes on top of Adobe's tags beyond alt text, notation and fonts.
+  **Updated 22 October 2026:** Adobe's improved copy also gets the PDF/UA identifier, a usable title and Scope on
+  header cells (#446), and is the copy people get by default (#500); Adobe's tags are otherwise left as they are.
+  PDF/UA-2 as an option for PDF 1.x files is open (#445).
 
 ## Comparing with another remediation service
 
@@ -150,9 +178,25 @@ its Adobe route) needs a side-by-side test, which hasn't been done yet. A propos
 4. Have reviewers score blind, without knowing which service produced which file.
 5. Decide the bar in advance, for example a total within 80% of the other service's with no category below 60%.
 
+**Updated 22 October 2026:** one measure of this has been taken: PAC on the quick set through both routes (see
+[PAC 2026 on the regression set](#pac-2026-on-the-regression-set-30-documents)). The engine's output passed after the
+fixes; the Adobe route's findings were traced to Adobe's own tagging. The human-rated measures (alt text, headings, reading order) and
+blind scoring haven't been done, so the full comparison is still to do.
+
 ## Cost model
 
 All prices are as of October 2026. The assumptions are stated so the numbers can be redone.
+
+### AI levels in use
+
+**Updated 22 October 2026:** on the pilot service the paid level is Claude Haiku 5.5 writing, reviewed by Gemma 4
+31B (`commercial-small-vision` with `open-judge`, both through OpenRouter); the Cloud Qwen, Sonnet and Opus levels
+are switched off, not deleted. It was chosen on 13 October from paid runs on the 17-page math paper with every figure
+reviewed: about $0.04 for the paper, against $1.00 for Sonnet with Gemini reviewing, with the Claude models alike on
+that paper. That was one document with no figures, tables or scans; a figure-heavy and a scanned document should be
+run before it's settled. The figures in the tables below are from earlier runs and don't cover this pairing. For an
+organization on AWS, the same levels move to Bedrock (#463, open): a Bedrock trial writer (Amazon Nova Lite) is
+configured for comparison, and Haiku on Bedrock waits on an account that allows it.
 
 ### AI fees per page, ordinary documents
 
@@ -218,11 +262,15 @@ per-page cost, decide the business case.
 | 2026-10-07 | [AI-assisted OCR correction on damaged scans](test-reports/2026-10-07-ocr-ai-correction.md) |
 | 2026-10-09 | [Lighter PDF/UA checkers compared with veraPDF](test-reports/2026-10-09-lighter-validators.md) |
 | 2026-10-11 | [Chemistry, medical and engineering notation on real documents (Local AI)](test-reports/2026-10-11-notation-real-documents.md) |
+| 2026-10-22 | **Updated 22 October 2026:** [PAC 2026 on the regression set](test-reports/2026-10-22-pac-regression-set.md) |
 
 The [test reports index](test-reports/README.md) has a summary of each, and how to write one.
 
 ### Reviews
 
-Internal reviews of the tagging process and of security (12 October 2026), and a feature assessment (16 October
-2026), are kept with the private working copy: they name weaknesses before they're fixed, so they aren't part of
+Internal reviews of the tagging process and of security (12 October 2026), a feature assessment (16 October
+2026), and a CISO briefing for a campus deployment (19 October 2026), are kept with the private working copy: they name weaknesses before they're fixed, so they aren't part of
 the public snapshot. What they led to is in the [build log](../design/build-log.md).
+
+**Updated 22 October 2026:** a note on what a compromised pod would get after the hardening (20 October 2026) is kept
+the same way. The security reviews' open items now carry dated **Updated** notes where they've changed since.

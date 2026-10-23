@@ -34,6 +34,7 @@ from portal.engine import set_engine_client  # noqa: E402
 from portal.models import Job, User  # noqa: E402
 from portal.security.ratelimit import RateLimiter, get_rate_limiter  # noqa: E402
 from tests.portal.test_ai_tiers import _tier  # noqa: E402
+from tests.portal.test_adobe import _improved_with_findings, _send  # noqa: E402
 from tests.portal.test_jobs import API, FakeEngine, pdf_bytes, run_worker, topup  # noqa: E402
 
 get_portal_settings.cache_clear()
@@ -47,6 +48,7 @@ class CannedPrometheus:
     KEDA, the portal's API, and the database."""
 
     NS = "pdf-remediation"
+    DIGEST = "sha256:" + "4e61d15fd359" * 5 + "4e61"  # invented: one digest for every image
     PODS = {"engine-worker-5d9f7-abcde": "engine-worker", "engine-worker-5d9f7-fghij": "engine-worker",
             "portal-api-7c4b8-klmno": "portal-api", "postgres-0": "postgres"}
 
@@ -70,7 +72,8 @@ class CannedPrometheus:
             "kube_pod_labels": [v(1, pod=pod, label_app=app) for pod, app in self.PODS.items()],
             "kube_pod_info": [v(1, pod=pod, node="node-1", namespace=ns, created_by_kind="ReplicaSet")
                               for pod in self.PODS],
-            "kube_pod_container_info": [v(1, pod=pod, container=app, image_spec=f"example/{app}:1.0")
+            "kube_pod_container_info": [v(1, pod=pod, container=app, image_spec=f"example/{app}:1.0@{self.DIGEST}",
+                                          image_id=f"example/{app}@{self.DIGEST}")
                                         for pod, app in self.PODS.items()],
             "kube_pod_start_time": [v(self.now - 7200, pod=pod) for pod in self.PODS],
             "kube_pod_status_phase == 1": [v(1, pod=pod, phase="Running") for pod in self.PODS],
@@ -80,6 +83,11 @@ class CannedPrometheus:
             "max by (pod) (engine_worker_places)": [v(2, pod="engine-worker-5d9f7-abcde"),
                                                     v(2, pod="engine-worker-5d9f7-fghij")],
         }
+        if q.startswith("sum(machine_"):  # the capacity figures (#522): 24 cores, 94.2 GiB (the query divides)
+            return [v(24 if "cpu" in q else 94.2)]
+        if q.startswith("sum(") and ('id="/"' in q or 'container!=""' in q):
+            mine = 'container!=""' in q
+            return [v((1.9 if mine else 7.234) if "cpu" in q else (9.37 if mine else 41.6))]
         return answers.get(q, [])
 
     def query_range(self, promql: str, start: float, end: float, step: float) -> list[dict]:
@@ -133,6 +141,8 @@ class CannedEngine(FakeEngine):
              "text": "https://transportation.northfield.example/permits", "action": "describe the destination"},
             {"severity": "suggest", "page": 1, "issue": "possible heading tagged as a paragraph", "role": "P",
              "text": "Where to park"},
+            {"severity": "high", "page": 1, "issue": "text in the body of the page is marked as an artifact",
+             "detail": "52 characters hidden from assistive technology", "boxes": [[72.0, 300.0, 420.0, 330.0]]},
         ]
 
 
@@ -181,8 +191,24 @@ def main() -> None:
                         data={"ai_tier": tier})
         jobs["processing"] = r.json()[0]["job"]["id"]
         run_worker(db)
+        # One that couldn't be processed: Needs attention's item, with its link and Acknowledge (#538)
+        r = person.post(f"{API}/jobs", files=[("files", ("Old_Scanned_Flyer.pdf", pdf_bytes(1), "application/pdf"))],
+                        data={"ai_tier": tier})
+        run_worker(db)
+        engine.fail(db.get(Job, uuid.UUID(r.json()[0]["job"]["id"])).engine_job_id, "engine_rejected")
+        run_worker(db)
         person.post(f"{API}/jobs/{jobs['Lab_Safety_Checklist.pdf']}/help",
                     data={"body": "The checklist's table reads in the wrong order.", "kind": "tables"})
+        # Tagged by Adobe, with the improved copy (AI alt text and fixes) as the document people get (#499)
+        # (the migrations made the service, switched off: switched on for the group, with pages)
+        assert sup.patch(f"{API}/admin/services/adobe", json={"enabled": True}).status_code == 200
+        assert admin.patch(f"{API}/groups/{g.id}/services/adobe", json={"enabled": True, "all_users": True}).status_code == 200
+        topup({"c": {"super": sup}}, g.id, 50, service="adobe")
+        r = _send(person, ("Course_Catalog_Adobe.pdf", pdf_bytes(2)), ai_tier=tier)
+        jobs["adobe"] = r.json()[0]["job"]["id"]
+        run_worker(db)
+        _improved_with_findings(engine, db.get(Job, uuid.UUID(jobs["adobe"])).engine_job_id)
+        run_worker(db)
         for c in clients.values():
             c.__exit__(None, None, None)
 
@@ -192,7 +218,8 @@ def main() -> None:
 
     # What the checks open: the documents, and the group
     Path(os.environ.get("A11Y_SEED_OUT", "a11y-seed.json")).write_text(json.dumps(
-        {"done": jobs["Campus_Parking_Guide_2026.pdf"], "processing": jobs["processing"], "group": str(g.id)}))
+        {"done": jobs["Campus_Parking_Guide_2026.pdf"], "processing": jobs["processing"], "adobe": jobs["adobe"],
+         "group": str(g.id)}))
     print("ready", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
 

@@ -138,6 +138,8 @@ export type UploadOptions = {
   ai_kind: string | null;
   /** Mark the options that send documents to an outside provider. */
   show_external: boolean;
+  /** Uploads are scanned for malware before they're accepted (#455), so the form can say so while it waits (#560). */
+  malware_scan?: boolean;
 };
 
 /** A file's own AI level and kind, instead of the batch's. */
@@ -228,6 +230,8 @@ export type Group = {
   ai_kind: string | null;
   /** Mark the upload options that send documents to an outside provider. */
   show_external: boolean;
+  /** Its people may make API tokens for scripts (#518) */
+  api_tokens_enabled: boolean;
   /** "Describe with AI" for the group's people; null follows the service default. */
   ai_describe?: boolean | null;
   pending_members: number;
@@ -251,6 +255,7 @@ export type Finding = {
   confidence?: number;
   suggested_alt?: string;
   key?: string; // what the item is about, for its status (#366); missing on findings a client made itself
+  boxes?: [number, number, number, number][]; // where on the page, for an item no tag holds (#426)
 };
 
 /** A review item signed off on a document (#366), kept by the item's key so it stays with it in later versions. */
@@ -266,6 +271,10 @@ export type JobResult = {
   failed_checks_before: number | null;
   failed_checks_after: number | null;
   visual_file_compliant: boolean | null;
+  // #499: the version the verdict, tiles and review items describe ("enhanced": the Adobe route's improved copy),
+  // and then Adobe's file as it came back
+  verdict_of?: string;
+  adobe_file_compliant?: boolean | null;
   two_files: boolean;
   destructive_pages: number[];
   fonts_embedded: string[];
@@ -330,7 +339,9 @@ export type Job = {
   } | null;
   /** Super admins only (#313): the engine's job id, and when the document was sent to the engine. */
   staff?: { engine_job_id: string | null; submitted_at: string | null } | null;
-  rerun_of?: string | null;  // a super admin's re-run (#323): the document it re-ran
+  rerun_of?: string | null;
+  /** The API token's name, when a script sent it (#518) */
+  sent_by_script?: string | null;  // a super admin's re-run (#323): the document it re-ran
   reruns?: string[];  // and, on the document's own page, its re-runs
   status: "held" | "queued" | "submitted" | "processing" | "completed" | "failed" | "canceled";
   progress: Record<string, unknown> | null;
@@ -417,6 +428,12 @@ export type RuntimeSettings = {
   max_file_mb: number;
   max_pages_per_document: number;
   max_files_per_upload: number;
+  max_export_documents: number;
+  api_tokens_enabled: boolean;
+  api_token_days: number;
+  api_token_max_days: number;
+  api_tokens_per_person: number;
+  api_token_idle_days: number;
   max_concurrent_jobs_per_user: number;
   max_queued_jobs_per_user: number;
   large_doc_pages: number;
@@ -449,6 +466,14 @@ export type RuntimeSettings = {
   alert_backup_hours: number;
   low_pool_percent: number;
   low_pool_pages: number;
+  /** Security alerts (#456): patterns in the audit log, emailed to super admins and shown on Attention. */
+  security_alerts: boolean;
+  security_window_minutes: number;
+  security_failed_codes: number;
+  security_ip_addresses: number;
+  security_ip_refused: number;
+  security_unknown_per_hour: number;
+  security_downloads_per_hour: number;
   /** veraPDF: its running service (falls back to the command line), or the command line in the engine. */
   verapdf_mode: "service" | "command_line";
   /** Also check PDF/UA-2, shown for information. */
@@ -607,9 +632,58 @@ async function send(path: string, init: RequestInit = {}, retry = true): Promise
   return r;
 }
 
-export async function get<T>(path: string): Promise<T> {
-  return (await send(path)).json();
+/** One page of a list (#514), as the paged list endpoints return it. */
+export type Paged<T> = { items: T[]; total: number; page: number; page_size: number };
+
+/** Bytes received so far, and the full size when the server said it (null when it didn't). */
+export type OnProgress = (received: number, total: number | null) => void;
+
+/** A response's body, read a chunk at a time to tell onProgress how far it has got (#424). The size is
+ *  Content-Length, unless the body is compressed: the bytes read are then the unpacked ones, which it doesn't count. */
+async function readBody(r: Response, onProgress: OnProgress): Promise<Uint8Array<ArrayBuffer>> {
+  const length = Number(r.headers.get("Content-Length"));
+  const encoded = (r.headers.get("Content-Encoding") ?? "identity") !== "identity";
+  const total = length > 0 && !encoded ? length : null;
+  onProgress(0, total);
+  if (!r.body) {
+    const all = new Uint8Array(await r.arrayBuffer());
+    onProgress(all.length, total);
+    return all;
+  }
+  const reader = r.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    onProgress(received, total);
+  }
+  const all = new Uint8Array(received);
+  let at = 0;
+  for (const c of chunks) {
+    all.set(c, at);
+    at += c.length;
+  }
+  return all;
 }
+
+export async function get<T>(path: string, onProgress?: OnProgress): Promise<T> {
+  const r = await send(path);
+  if (!onProgress) return r.json();
+  return JSON.parse(new TextDecoder().decode(await readBody(r, onProgress)));
+}
+
+/** What sending several held documents did, or would do in a dry run (#494): POST /jobs/confirm. */
+export type ConfirmMany = {
+  sent: string[];
+  held: string[];
+  needed_pages: number;
+  sent_pages: number;
+  remaining_pages: number | null;
+  message: string | null;
+};
 
 export async function post<T>(path: string, body?: unknown): Promise<T> {
   const r = await send(path, {
@@ -670,9 +744,32 @@ export async function postForm<T>(path: string, form: FormData): Promise<T> {
 /** Fetch a file with the access token and hand it to the browser as a download. */
 export async function download(path: string, fallbackName: string) {
   const r = await send(path);
-  const disposition = r.headers.get("Content-Disposition") ?? "";
-  const match = /filename="([^"]+)"/.exec(disposition);
-  const blob = await r.blob();
+  save(await r.blob(), r, fallbackName);
+}
+
+/** A file made by a POST, such as a zip of many documents (#481), with the bytes received so far for onProgress (its
+ *  size isn't known until it ends). The pieces become the file as they are, never copied into one buffer. */
+export async function downloadPost(path: string, body: unknown, fallbackName: string, onProgress?: (received: number) => void) {
+  const r = await send(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const parts: BlobPart[] = [];
+  const reader = r.body?.getReader();
+  if (!reader) {
+    parts.push(await r.blob());
+  } else {
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      received += value.length;
+      onProgress?.(received);
+    }
+  }
+  save(new Blob(parts, { type: r.headers.get("Content-Type") ?? "application/octet-stream" }), r, fallbackName);
+}
+
+function save(blob: Blob, r: Response, fallbackName: string) {
+  const match = /filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") ?? "");
   const href = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = href;
@@ -683,12 +780,14 @@ export async function download(path: string, fallbackName: string) {
   window.setTimeout(() => URL.revokeObjectURL(href), 10_000);
 }
 
-export async function getText(path: string): Promise<string> {
-  return (await send(path)).text();
+export async function getText(path: string, onProgress?: OnProgress): Promise<string> {
+  const r = await send(path);
+  return onProgress ? new TextDecoder().decode(await readBody(r, onProgress)) : r.text();
 }
 
-export async function getBytes(path: string): Promise<ArrayBuffer> {
-  return (await send(path)).arrayBuffer();
+export async function getBytes(path: string, onProgress?: OnProgress): Promise<ArrayBuffer> {
+  const r = await send(path);
+  return onProgress ? (await readBody(r, onProgress)).buffer : r.arrayBuffer();
 }
 
 // --- tag manager -------------------------------------------------------------------------------
@@ -736,6 +835,7 @@ export type TagMap = {
 
 export type VersionSummary = {
   pdfua_part?: 1 | 2;
+  checks_unfinished?: boolean; // opened before its checks, which then didn't finish (#428)
   compliant: boolean | null;
   failed_checks: number | null;
   failed_rules: number | null;
@@ -759,6 +859,7 @@ export type DocVersion = {
   summary: VersionSummary | null;
   error_message: string | null;
   has_tagmap: boolean;
+  checking?: boolean; // open, but its checks are still running: its verdict and findings follow (#428)
   pdf_file_id: string | null;
   pdf_name: string | null;
   pdf_size: number | null;
@@ -787,7 +888,8 @@ export type TagEdit =
   | { op: "set_cell"; element: number; expect_role: string; role: "TH" | "TD"; scope?: string }
   | { op: "move"; element: number; expect_role: string; target: number; expect_target_role: string; position: "before" | "after" }
   | { op: "merge"; element: number; expect_role: string; absorb: number[] }
-  | { op: "split"; element: number; expect_role: string; at: number; char?: number }
+  // role: the new part's own type (#427)
+  | { op: "split"; element: number; expect_role: string; at: number; char?: number; role?: string }
   | { op: "delete"; element: number; expect_role: string; children: "lift" | "delete" }
   | { op: "assign"; element: number; expect_role: string; pieces: { page: number; mcid: number }[] }
   | { op: "tag_artifacts"; element: number; expect_role: string; position: "before" | "after"; page: number; sections: number[]; role: string; alt?: string }
@@ -847,6 +949,16 @@ export type AttentionItem = {
   service_key?: string;
   count?: number;
   fix?: string;
+  link?: string;  // what it's about (#538): the document, its help request, or the list of them
+  link_label?: string;
+  key: string;
+  ackable?: boolean;  // a summary or notice, not a live problem: it can be acknowledged
+  earlier?: number;  // how many were acknowledged before (the item counts only what's new)
+};
+
+/** An item someone acknowledged (#538): what it said, who and when, and how many of its things are still there. */
+export type AttentionAck = {
+  key: string; title: string; detail: string; acked_by: string; acked_at: string; count: number; still: number;
 };
 
 export type AccessCheck = {

@@ -11,7 +11,7 @@ from app.config import get_settings
 from app.verification.ai_review import FigureItem, OrderItem, ReviewPlan, review
 from app.verification import contrast
 from app.verification.integrity import check_integrity
-from app.verification.model import Finding, VerificationReport
+from app.verification.model import Finding, VerificationReport, area_boxes
 from app.verification.semantic import SemanticChecker
 from app.tagging.metadata import document_info
 from app.verification.tagmap import annotation_places, artifact_sections, page_sizes, tagmap_from
@@ -62,6 +62,10 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
             if ov >= 0.5 * area and ov > best_overlap:
                 best, best_overlap = e, ov
         snippet = str(spoken)[:160]
+        where = area_boxes([bbox]) if bbox else None  # the block itself, for when no tag holds it
+        # What the finding came from, so a reviewed version (an edit job, which has no AI enrichment) can place it
+        # again on its own file: the portal sends it back with the edits
+        carry = [page, list(bbox) if bbox else None, kind, str(spoken)[:2000]]
         if readings:
             # The readings that say other numbers or letters than the AI's: by rule from its LaTeX, from the picture
             other = {r["source"]: str(r["text"])[:160] for r in readings["readings"]}
@@ -76,7 +80,7 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
                 detail=f"the AI reads it as \u201c{snippet}\u201d; " + "; ".join(said)
                        + (", which say" if len(said) > 1 else ", which says") + " other numbers or letters",
                 action="Choose the reading that matches what's printed in Edit tag, or write your own",
-                extra=readings))
+                extra={**readings, "ai_read": carry}, boxes=where))
             continue
         if kind == "ocr-correct":
             issue, detail = "OCR text corrected by AI", f"words OCR was unsure of, corrected by AI: \u201c{snippet}\u201d"
@@ -88,7 +92,23 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
         out.append(Finding(
             layer="ai", severity="review", issue=issue,
             page=page + 1, role=best.role if best else None, element=best.index if best else None,
-            detail=detail, action="Check it matches what's printed; correct it in the tag manager if not"))
+            detail=detail, action="Check it matches what's printed; correct it in the tag manager if not",
+            extra={"ai_read": carry}, boxes=where))
+    return out
+
+
+def carried_ai_read(items: list, ops: list[dict]) -> list:
+    """The AI's readings a reviewed version carries over from the version it's based on (the portal sends each
+    finding's "ai_read", with "readings" when two readings disagreed, and the "element" it was on): those whose
+    element the edits didn't give new text, as VerifyOptions.ai_read takes them. A person who wrote or chose the
+    text has checked it."""
+    written = {op.get("element") for op in ops if op.get("op") in ("set_alt", "set_actual_text")}
+    out = []
+    for it in items:
+        if it.get("element") is not None and it["element"] in written:
+            continue
+        page, bbox, kind, spoken = it["ai_read"]
+        out.append((page, bbox, kind, spoken) + ((it["readings"],) if it.get("readings") else ()))
     return out
 
 

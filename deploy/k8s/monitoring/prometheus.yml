@@ -4,8 +4,10 @@
 # - This namespace's pods that ask to be read (the prometheus.io/* annotations on their templates): the portal's API
 #   and worker, the engine's API and workers, the music reader, and the exporters for Postgres, Redis and the
 #   cluster's view of the pods (kube-state-metrics).
-# - Each node's kubelet, for the CPU, memory and volume use of this namespace's containers and their probes' results
-#   only; everything else on the nodes is dropped as it's read.
+# - Each node's kubelet, for the CPU, memory and volume use of this namespace's containers and their probes' results,
+#   and each node's own totals: its whole CPU and memory use (the root cgroup) and its size (#522), so
+#   Administration > System shows headroom by node and for the whole environment. Those carry the node's name and
+#   nothing about other namespaces' pods; everything else on the nodes is dropped as it's read.
 #
 # There is no Alertmanager: the portal's worker reads the firing alerts and tells super admins (portal/alerts.py).
 global:
@@ -46,7 +48,8 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_namespace]
         target_label: namespace
 
-  # Containers' CPU, memory and network (the kubelet's cAdvisor), this namespace's only
+  # Containers' CPU, memory and network (the kubelet's cAdvisor), this namespace's only; and each node's whole CPU and
+  # memory use (id="/", no namespace) and its size (machine_*), for headroom by node and in all (#522)
   - job_name: cadvisor
     scheme: https
     metrics_path: /metrics/cadvisor
@@ -57,15 +60,17 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_node_name]
         target_label: node
     metric_relabel_configs:
-      - source_labels: [namespace]
-        regex: ${NAMESPACE}
+      # This namespace's series; the node's root cgroup (its whole use); the node's size
+      - source_labels: [namespace, id, __name__]
+        regex: ${NAMESPACE};.*;.*|;/;container_(cpu_usage_seconds_total|memory_working_set_bytes)|;;machine_(cpu_cores|memory_bytes)
         action: keep
       - source_labels: [__name__]
-        regex: container_(cpu_usage_seconds_total|cpu_cfs_.+|memory_working_set_bytes|network_.+_bytes_total|oom_events_total)
+        regex: container_(cpu_usage_seconds_total|cpu_cfs_.+|memory_working_set_bytes|network_.+_bytes_total|oom_events_total)|machine_(cpu_cores|memory_bytes)
         action: keep
-      # CPU and memory by container, not the pod's totals or its pause container (network is only counted by pod)
-      - source_labels: [__name__, container]
-        regex: container_(cpu|memory|oom)_.+;(|POD)
+      # CPU and memory by container, not the pod's totals or its pause container (network is only counted by pod); the
+      # node's root cgroup has no container either, and is kept
+      - source_labels: [__name__, container, namespace]
+        regex: container_(cpu|memory|oom)_.+;(|POD);.+
         action: drop
 
   # Liveness and readiness probes, each result counted (Administration > System's pods, #398)

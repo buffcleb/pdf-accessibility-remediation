@@ -40,12 +40,17 @@ on them.
 
 ## The audit log
 
+> **Changed 22 October 2026:** the list includes API tokens and uploads refused by the malware check, and the log can
+> also be sent to a SIEM.
+
 The **Audit log** report records every change: to pages, limits, grants and services; sign-ins and code requests;
-uploads and downloads of other people's files; settings; queues; help requests; tag edits; report exports. Each event
+uploads and downloads of other people's files; uploads the malware check refused (`upload.blocked`, with what it
+found); API tokens made and revoked; settings; queues; help requests; tag edits; report exports. Each event
 has who, when, from where, the group, and the details.
 
 Group admins see their own group's part, including changes super admins made there. Records are kept for the
-**records** retention period set in Settings → Sign-in and data.
+**records** retention period set in Settings → Sign-in and data. Where it's set up, the log is also sent to your SIEM
+as it's written: [System › Audit export](system.md#audit-export) shows how far it has got.
 
 ## The AI gateway
 

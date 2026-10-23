@@ -1,0 +1,77 @@
+# The egress proxy (#453): the portal, the AI gateway and the Adobe worker reach the internet through it
+# (HTTPS_PROXY), with EGRESS_PROXY=log or enforce in deploy.env. Its configuration (squid.conf) is made by deploy.sh
+# from the hosts this deployment uses (deploy/k8s/egress_hosts.py): in log mode it lets everything through and
+# records each destination (host and port only, never the content) in its log; in enforce mode only those hosts, and
+# 82-egress-enforce.yaml stops the three going round it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-proxy
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: egress-proxy }
+  ports: [{ name: proxy, port: 3128 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-proxy
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: egress-proxy }
+  template:
+    metadata:
+      labels: { app: egress-proxy }
+      annotations:
+        checksum/config: "${EGRESS_PROXY_CONFIG_SHA}"
+    spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+      # Squid as its own unprivileged user (proxy, 13), not through the image's entrypoint, which starts as root
+      securityContext: { runAsUser: 13, runAsGroup: 13, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: squid
+          image: ${EGRESS_PROXY_IMAGE}
+          command: ["squid", "-f", "/etc/squid/squid.conf", "-NYC"]
+          ports: [{ containerPort: 3128 }]
+          readinessProbe:
+            tcpSocket: { port: 3128 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi, ephemeral-storage: 64Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/squid/squid.conf, subPath: squid.conf, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+            - { name: run, mountPath: /var/run }
+      volumes:
+        - name: config
+          configMap: { name: egress-proxy-config }
+        - { name: tmp, emptyDir: { sizeLimit: 32Mi } }
+        - { name: run, emptyDir: { sizeLimit: 1Mi } }
+---
+# Who may use the proxy, and where the proxy may go: anywhere outside the cluster (its own configuration decides
+# which hosts), and DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-proxy
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: egress-proxy } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+        - podSelector: { matchLabels: { app: litellm } }
+        - podSelector: { matchLabels: { app: engine-adobe-worker } }
+        - podSelector: { matchLabels: { app: clamav } }  # freshclam's signature updates (#455)
+      ports: [{ port: 3128 }]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } },
+             podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: ${CLUSTER_CIDRS} } }]

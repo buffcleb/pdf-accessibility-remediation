@@ -44,10 +44,18 @@ with Standard and Local AI uses 10 Standard pages and 10 Local AI pages. Some op
      *Local AI* or *Premium AI · Math and science*. Under it, a short description of the level.
 3. Choose **Remediate**, or **Check only** (below).
 
-![My documents for a person in Northfield University: Standard and Commercial AI pages left at the top; the Submit PDFs box with Choose PDFs, the AI line (Commercial AI, 292 pages left), More options, and the Remediate and Check only buttons; then Your documents, a list of five documents with their pages, status (Done, or Processing) and result (Passes PDF/UA-1).](../../images/my-documents.png)
+> **New 22 October 2026:** what the form says while a large upload is checked, and that a file is sent only once.
 
-The documents appear under **Your documents** straight away, as *Waiting*, then *In progress* with the current
-step. You get an email when each is done, so you don't need to keep the page open.
+Each file is checked before it's accepted: its pages are counted and, where the service does it, it's scanned for
+malware. A large document can take half a minute or more. If the button still says *Uploading…* after a few
+seconds, the form says what it's waiting for. If you leave or refresh the page meanwhile, a file the service has
+already received carries on: look in **Your documents** before sending it again. Sending the same file again, with
+the same choices, while the first is still waiting or in progress is refused, and uses no pages.
+
+![My documents for a person in Northfield University: Standard, Adobe Autotag and Commercial AI pages left at the top; the Submit PDFs box with Processing set to Standard and the AI level Commercial AI; and Your documents with a search box, a status choice and Filters, above five documents: three Done and passing PDF/UA-1, one Processing, and one Failed, two of them with a Help: Received badge](../../images/my-documents.png)
+
+The documents appear under **Your documents** straight away, as *Waiting*, then *Processing*; the document's page
+shows the current step. You get an email when each is done, so you don't need to keep the page open.
 
 ## Choosing the AI
 
@@ -102,7 +110,8 @@ If your administrators offer it, *Adobe Autotag* sends documents to Adobe PDF Se
   ticked by default: you also get an **improved copy**, looking exactly the same, with AI descriptions of its
   images, read-aloud text for math and chemistry the PDF's own text can't voice, any font fixes that don't change how
   pages look, and bookmarks made from its headings. It's named for what it contains, for example *Adobe + AI alt
-  text*. It uses pages of the AI level you pick, given back if the AI wasn't needed.
+  text*. That copy is the one you get: the main download, the result and the review are about it, and Adobe's own file
+  stays in the downloads. It uses pages of the AI level you pick, given back if the AI wasn't needed.
 - Check only never goes to Adobe: checks are always made by this service.
 
 ## Confirming before sending
@@ -110,6 +119,13 @@ If your administrators offer it, *Adobe Autotag* sends documents to Adobe PDF Se
 Some options ask you to confirm before anything is sent, typically ones that send documents outside. The upload
 then lists each document with its page count and **Send** and **Cancel** buttons; nothing is sent and no pages
 are used until you choose Send. You can also confirm from the document's page.
+
+With several documents waiting, the list says whether they fit in the pages you have left:
+
+- **They fit:** **Send all** sends every one.
+- **They don't:** it says how many pages they need and how many you have left, and offers **Send the first N that
+  fit**, in the order you uploaded them. The rest keep waiting until you have more pages, or you cancel them.
+  Nothing is sent part way without you choosing it.
 
 ## Waiting
 
@@ -135,7 +151,13 @@ The message says why, naming the option and where the limit is:
 - **Not available to you:** your group keeps documents on its own servers (local-only), or you haven't been
   given that option. Choose another, or ask your group admin.
 - **Too large, too many pages, password-protected, not a PDF, a dynamic XFA form:** fix the file and upload it again.
+- **Already in Your documents:** the same file, with the same choices, is already waiting or in progress, so it
+  wasn't sent again. The same file with another AI level, say, goes ahead.
 - **Too many uploads in an hour:** each person has an hourly limit on uploads (and on downloads and report
   exports), set by the people who run the service. Wait a while and try again.
+- **The malware check found something harmful:** where the service checks uploads for malware, a file it finds
+  something in isn't uploaded or kept, and the message names what was found. Check the file with your own
+  antivirus, or ask for help if you think it's a mistake. Help-request attachments are checked the same way.
+- **The malware check isn't working just now:** nothing is uploaded unchecked. Try again in a few minutes.
 
 See [Troubleshooting](troubleshooting.md) for more.

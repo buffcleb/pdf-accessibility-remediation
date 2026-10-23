@@ -8,7 +8,12 @@ export type Pod = {
   liveness_failures_1h: number; readiness_failures_1h: number;
   cpu_cores: number | null; cpu_limit: number | null; memory_bytes: number | null; memory_limit: number | null;
   busy: number | null; places: number | null;
-  namespace: string | null; containers: { name: string; image: string }[];
+  namespace: string | null; containers: Container[];
+};
+/** A container's image and the release it carries (portal/workloads.py image_release, #541). */
+export type Container = {
+  name: string; image: string; product: string; release: string | null; source: "tag" | "reported" | "build" | null;
+  digest: string | null; pinned: string | null; matches: boolean | null;
 };
 /** What a workload is and where it comes from (portal/workload_catalog.py, #419). */
 export type About = {
@@ -77,4 +82,39 @@ export function rowNote(w: Workload) {
   if (w.state === "waiting") bits.push("at its maximum with work waiting");
   else if (w.state === "scaling") bits.push("starting pods");
   return bits.join(" · ");
+}
+
+/** The release in words (#541): "LiteLLM 1.105.0", "PostgreSQL 16.15 (as it reports)", "Commit 6b57d727b0". */
+export function release(c: Container) {
+  if (c.source === "build") return `Commit ${c.release}`;
+  if (!c.release) return `${c.product} (its tag doesn't say)`;
+  return `${c.product} ${c.release}${c.source === "reported" ? " (as it reports)" : ""}`;
+}
+
+/** Whether the image running is the one the manifests pin. */
+export function pin(c: Container) {
+  if (c.matches === true) return "Matches the pinned digest";
+  if (c.matches === false) return "Not the pinned digest";
+  if (!c.pinned) return c.source === "build" ? "Not pinned: tagged with its commit" : "Not pinned by digest";
+  return "Not known yet";
+}
+
+/** sha256:9f5cf065c7ca: enough to tell images apart in a table. */
+export const shortDigest = (d: string | null) => (d ? d.slice(0, 19) : "–");
+
+/** Every workload's containers and their releases, one row each; a workload part-way through a new release (or one
+ *  whose pods run different images) gets a row for each. */
+export function versionRows(ws: Workload[]) {
+  const rows: { workload: string; container: Container; pods: number }[] = [];
+  for (const w of ws) {
+    for (const p of w.pods) {
+      for (const c of p.containers) {
+        const same = rows.find((r) => r.workload === w.name && r.container.name === c.name
+          && r.container.digest === c.digest && r.container.image === c.image);
+        if (same) same.pods += 1;
+        else rows.push({ workload: w.name, container: c, pods: 1 });
+      }
+    }
+  }
+  return rows;
 }

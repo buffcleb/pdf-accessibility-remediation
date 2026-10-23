@@ -79,6 +79,23 @@ CATALOG: dict[str, dict] = {
         "description": "The engine's queue and the readers' request lists. Without it, no document moves.",
         "sources": [_gh("redis/redis", "Redis"), _gh("docker-library/redis", "its image")], "port": 6379,
         "shell": True},
+    "egress-proxy": {
+        "description": "The proxy the portal, the AI gateway and the Adobe worker reach the internet through, with "
+                       "EGRESS_PROXY on: in log mode it records each destination, in enforce mode it lets through "
+                       "only the hosts this deployment uses. Without it, AI calls, Adobe and mail by API stop.",
+        "sources": [_gh("squid-cache/squid", "Squid"), _ours("deploy/k8s/egress_hosts.py")], "port": 3128,
+        "shell": True},
+    "redis-portal": {
+        "description": "The portal's own Redis, for its rate limits only, apart from the engine's queue. Without it, "
+                       "sign-in and uploads fail until it's back; it keeps nothing, so its counts start over.",
+        "sources": [_gh("redis/redis", "Redis"), _ours("deploy/k8s/manifests/23-redis-portal.yaml")], "port": 6379,
+        "shell": True},
+    "clamav": {
+        "description": "ClamAV, with MALWARE_SCAN=clamav: clamd checks every upload and help-desk attachment for "
+                       "malware before it's stored, and freshclam keeps its signatures up to date. Without it, every "
+                       "upload is refused until it's back.",
+        "sources": [_gh("Cisco-Talos/clamav", "ClamAV"), _ours("deploy/k8s/manifests/27-clamav.yaml")], "port": 3310,
+        "shell": True},
     "seaweedfs": {
         "description": "File storage (S3-compatible): uploads, results and saved versions. Without it, nothing can "
                        "be uploaded or downloaded.",

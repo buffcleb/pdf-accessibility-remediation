@@ -2,6 +2,7 @@
 
     python -m portal.cli genkeys                     print a new JWT signing key and secret for .env
     python -m portal.cli migrate                     apply database migrations
+    python -m portal.cli downgrade REVISION          take the database back to that migration (a rollback)
     python -m portal.cli sign-in-code EMAIL --operator WHO [--reason TEXT]
                                                      issue a sign-in code and print it (when mail isn't working)
     python -m portal.cli export-files [--prefix P]   write stored files as a tar stream to stdout
@@ -12,6 +13,9 @@
     python -m portal.cli prune-backups DIR --daily N --weekly N [--dry-run]
                                                      keep the newest N backups and one a week for N weeks
     python -m portal.cli backup-done                 record that the nightly backup finished (for its alert)
+    python -m portal.cli resummarize-improved [--dry-run]
+                                                     Adobe documents finished before #499: their verdict and review
+                                                     items about the improved copy, not Adobe's file (once)
 
 The file and backup commands are used by scripts/backup.sh and scripts/restore.sh.
 """
@@ -38,6 +42,31 @@ def migrate(_args=None) -> None:
     command.upgrade(cfg, "head")
 
 
+def downgrade(args) -> int:
+    """Back to an earlier migration (docs/operations/rollback.md): each one undone drops what it added, and with it
+    whatever was written there since. Only to an earlier revision: one that isn't, or that doesn't exist, is refused."""
+    from alembic import command
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import create_engine, text
+
+    from portal.config import get_portal_settings
+    cfg = Config(str(Path(__file__).with_name("alembic.ini")))
+    cfg.set_main_option("script_location", str(Path(__file__).with_name("migrations")))
+    revisions = [r.revision for r in ScriptDirectory.from_config(cfg).walk_revisions()]
+    with create_engine(get_portal_settings().database_url).connect() as conn:
+        current = conn.execute(text("select version_num from alembic_version")).scalar()
+    if args.revision not in revisions:
+        print(f"no migration {args.revision!r}", file=sys.stderr)
+        return 2
+    if current not in revisions or revisions.index(args.revision) <= revisions.index(current):
+        print(f"the database is at {current}: {args.revision} isn't before it", file=sys.stderr)
+        return 2
+    command.downgrade(cfg, args.revision)
+    print(f"database taken back from {current} to {args.revision}")
+    return 0
+
+
 def _sign_in_code(args) -> int:
     """Issue a sign-in code for someone and print it, for when email isn't arriving. The same checks as the sign-in
     page (the address must be allowed, the account not disabled); recorded in the audit log, never the code."""
@@ -48,6 +77,8 @@ def _sign_in_code(args) -> int:
     from portal.config import get_portal_settings
     email = normalize_email(args.email)
     with _sessionmaker()() as db:
+        from portal import rls
+        rls.identify(db, email=email)  # only this address's own account, as on the sign-in page (#350)
         elig = eligibility(db, email)
         if not elig.allowed:
             print(f"{email} can't sign in here: no account, and neither the address nor its domain is on a group.",
@@ -104,12 +135,24 @@ def _backup_done(_args) -> None:
     record_backup()
 
 
+def _resummarize(args) -> None:
+    from portal.db import system_session
+    from portal.worker import resummarize_improved
+    with system_session("resummarize improved copies (#499)") as db:
+        updated, skipped = resummarize_improved(db, dry_run=args.dry_run)
+    verb = "would update" if args.dry_run else "updated"
+    print(f"{verb} {updated} documents; {skipped} skipped (no JSON report to read)", file=sys.stderr)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="python -m portal.cli", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("genkeys").set_defaults(fn=genkeys)
     sub.add_parser("migrate").set_defaults(fn=migrate)
+    p = sub.add_parser("downgrade")
+    p.add_argument("revision", help="the migration to go back to, e.g. 0043")
+    p.set_defaults(fn=downgrade)
     p = sub.add_parser("sign-in-code")
     p.add_argument("email")
     p.add_argument("--operator", required=True, help="who is issuing it (recorded in the audit log)")
@@ -138,6 +181,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=_prune)
     sub.add_parser("backup-done").set_defaults(fn=_backup_done)
+    p = sub.add_parser("resummarize-improved")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=_resummarize)
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
         ap.print_help()

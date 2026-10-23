@@ -39,6 +39,7 @@ spec:
     metadata:
       labels: { app: postgres }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       # The image starts as root to make the data directory postgres's own (uid 70, mode 0700; the volume root is
       # that directory) and then drops to postgres. Running it as 70 from the start would leave the mode fsGroup
       # gives the volume, which postgres refuses, so root keeps the five capabilities that step needs and no other

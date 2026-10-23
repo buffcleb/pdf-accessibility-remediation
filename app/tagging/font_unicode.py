@@ -6,6 +6,11 @@ Modern and AMS fonts above all) the glyph names are known, either from the font 
 standard Adobe glyph names directly, TeX-specific names (summationdisplay, parenleftBig,
 bracelefttp, ...) through the table and size-suffix rules below. Codes whose glyph name cannot be
 resolved are left unmapped rather than guessed.
+
+A simple font (Type1 or TrueType) with WinAnsi or MacRoman encoding and no map can be read through its encoding, but
+not every code: the non-breaking space (WinAnsi 0xA0, MacRoman 0xCA) and the soft hyphen are named only in a footnote
+of the standard's encoding table, and PAC reports them as characters it can't map (12 on a datasheet's distributor
+cover page). These fonts get a map of every printable code, from the encoding itself (cp1252, Mac Roman).
 """
 from __future__ import annotations
 
@@ -20,6 +25,8 @@ from pikepdf import Array, Dictionary, Name
 log = logging.getLogger(__name__)
 
 _STD_ENC = {Name.WinAnsiEncoding, Name.MacRomanEncoding, Name.StandardEncoding}
+_CODECS = {Name.WinAnsiEncoding: "cp1252", Name.MacRomanEncoding: "mac_roman"}
+_SYMBOLIC, _NONSYMBOLIC = 4, 32  # FontDescriptor /Flags bits
 _DUP = re.compile(rb"dup\s+(\d+)\s*/([^\s/]+)\s+put")
 _SIZE_SUFFIX = re.compile(r"(?:big|Big|bigg|Bigg|text|display|small|Small)$")
 
@@ -158,12 +165,40 @@ def _cmap(mapping: dict[int, str]) -> bytes:
     return "\n".join(lines).encode()
 
 
+def _encoding_map(font: Dictionary) -> dict[int, str]:
+    """Code -> text for every printable code of a non-symbolic font with WinAnsi or MacRoman encoding, from the
+    encoding itself; empty for any other font."""
+    enc = font.get("/Encoding")
+    codec = _CODECS.get(enc) if isinstance(enc, Name) else None  # (an encoding dictionary can't be a dict key)
+    fd = font.get("/FontDescriptor")
+    try:
+        flags = int(fd.get("/Flags", 0)) if isinstance(fd, Dictionary) else 0
+    except (TypeError, ValueError):
+        flags = 0
+    if codec is None or (flags & _SYMBOLIC and not flags & _NONSYMBOLIC):
+        return {}  # a symbolic font's codes name its own glyphs, whatever the encoding says
+    out = {}
+    for code in range(0x20, 0x100):
+        try:
+            text = bytes([code]).decode(codec)
+        except UnicodeDecodeError:
+            continue  # codes the encoding leaves out (WinAnsi 0x81, 0x8D, 0x8F, 0x90, 0x9D)
+        if text.isprintable() or text in ("\u00a0", "\u00ad"):
+            out[code] = text
+    return out
+
+
 def add_missing_tounicode(src: Path, dst: Path) -> list[str]:
     """Write dst with ToUnicode maps added where they can be derived. Returns the fonts fixed."""
     fixed: list[str] = []
     with pikepdf.open(src) as pdf:
         for obj in pdf.objects:
             if not isinstance(obj, Dictionary) or obj.get("/Type") != Name.Font:
+                continue
+            if "/ToUnicode" not in obj and (mapping := _encoding_map(obj)):
+                obj.ToUnicode = pdf.make_stream(_cmap(mapping))
+                fixed.append(f"{str(obj.get('/BaseFont', '/?'))[1:]} (its {str(obj.Encoding)[1:]}, "
+                             f"{len(mapping)} codes)")
                 continue
             if obj.get("/Subtype") not in (Name.Type1, Name.MMType1):
                 continue

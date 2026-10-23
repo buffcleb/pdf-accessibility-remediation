@@ -100,6 +100,17 @@ class RuntimeSettings(BaseModel):
     max_concurrent_jobs_per_user: int = Field(5, ge=1, le=1000)
     # Documents one user can have waiting or in progress; uploads beyond this are refused
     max_queued_jobs_per_user: int = Field(200, ge=1, le=100000)
+    # Documents in one zip export from a list of documents (#481)
+    max_export_documents: int = Field(25, ge=1, le=1000)
+
+    # Personal API tokens for scripts (#518): switched on here first, then by each group's admins. A new token lasts
+    # api_token_days unless the person picks another length up to api_token_max_days; one unused for
+    # api_token_idle_days stops working (0: never)
+    api_tokens_enabled: bool = False
+    api_token_days: int = Field(90, ge=1, le=3650)
+    api_token_max_days: int = Field(365, ge=1, le=3650)
+    api_tokens_per_person: int = Field(5, ge=1, le=100)
+    api_token_idle_days: int = Field(90, ge=0, le=3650)
     # Large documents: more pages than this (0 = off) are mixed in after every `large_doc_every` smaller ones, and
     # only `large_doc_at_once` run at a time; with nothing smaller waiting they go one after another
     large_doc_pages: int = Field(200, ge=0, le=100000)
@@ -147,6 +158,17 @@ class RuntimeSettings(BaseModel):
     # Attention, and its group's admins are emailed once when it drops below (#358)
     low_pool_percent: int = Field(10, ge=0, le=100)
     low_pool_pages: int = Field(20, ge=0, le=1_000_000)
+    # Security alerts (#456, portal/security_alerts.py): patterns in the audit log, emailed to super admins, shown on
+    # Attention and recorded (so they reach the SIEM). Wrong codes for one address, and addresses or refused requests
+    # from one IP, within `security_window_minutes`; codes asked for unknown addresses, and one person downloading
+    # other people's documents, within an hour
+    security_alerts: bool = True
+    security_window_minutes: int = Field(15, ge=5, le=1440)
+    security_failed_codes: int = Field(5, ge=2, le=1000)
+    security_ip_addresses: int = Field(10, ge=2, le=10000)
+    security_ip_refused: int = Field(10, ge=2, le=10000)
+    security_unknown_per_hour: int = Field(20, ge=2, le=100000)
+    security_downloads_per_hour: int = Field(25, ge=2, le=100000)
 
     # PDF/UA validation (veraPDF): its running service (fast; the engine falls back to the command line when the
     # service doesn't answer) or the command line in the engine (Java started for every check); and whether to
@@ -212,6 +234,12 @@ class RuntimeSettingsUpdate(BaseModel):
     max_files_per_upload: int | None = Field(None, ge=1, le=500)
     max_concurrent_jobs_per_user: int | None = Field(None, ge=1, le=1000)
     max_queued_jobs_per_user: int | None = Field(None, ge=1, le=100000)
+    max_export_documents: int | None = Field(None, ge=1, le=1000)
+    api_tokens_enabled: bool | None = None
+    api_token_days: int | None = Field(None, ge=1, le=3650)
+    api_token_max_days: int | None = Field(None, ge=1, le=3650)
+    api_tokens_per_person: int | None = Field(None, ge=1, le=100)
+    api_token_idle_days: int | None = Field(None, ge=0, le=3650)
     large_doc_pages: int | None = Field(None, ge=0, le=100000)
     large_doc_every: int | None = Field(None, ge=1, le=1000)
     large_doc_at_once: int | None = Field(None, ge=1, le=100)
@@ -238,6 +266,13 @@ class RuntimeSettingsUpdate(BaseModel):
     alert_backup_hours: int | None = Field(None, ge=2, le=720)
     low_pool_percent: int | None = Field(None, ge=0, le=100)
     low_pool_pages: int | None = Field(None, ge=0, le=1_000_000)
+    security_alerts: bool | None = None
+    security_window_minutes: int | None = Field(None, ge=5, le=1440)
+    security_failed_codes: int | None = Field(None, ge=2, le=1000)
+    security_ip_addresses: int | None = Field(None, ge=2, le=10000)
+    security_ip_refused: int | None = Field(None, ge=2, le=10000)
+    security_unknown_per_hour: int | None = Field(None, ge=2, le=100000)
+    security_downloads_per_hour: int | None = Field(None, ge=2, le=100000)
     verapdf_mode: str | None = Field(None, pattern="^(service|command_line)$")
     verapdf_ua2: bool | None = None
     help_on_failure: bool | None = None

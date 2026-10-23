@@ -17,6 +17,13 @@ Configuring and running the service once it's installed. Installing it is covere
    what happens past it
 8. [CI on your own runners](ci-runners.md): running the tests on a machine of your own, not on GitHub's billed
    minutes (and why not on the service's cluster); which jobs run for which files
+9. [Incident response](incident-response.md): who to call, containing, keeping the evidence, finding the extent,
+   recovering, notifying
+10. [Rotating secrets](secret-rotation.md): every password and key, `rotate-secret.sh`, a schedule
+11. [Rolling back](rollback.md): the earlier images, the database with them, checking afterwards
+12. [The audit log to a SIEM](siem.md): syslog over TLS, HTTPS or a pull API; what's sent; what the pods log
+13. [Malware scanning](malware-scanning.md): optional ClamAV for uploads and help-desk attachments; what's refused,
+    what runs, turning it on, the risk when it's off
 
 ## At a glance
 
@@ -28,4 +35,5 @@ Configuring and running the service once it's installed. Installing it is covere
 | Things super admins change in the app | Branding, messages, limits, retention, services, AI levels: stored in the database, audited |
 | Health | `GET /api/v1/health` on the engine and on the portal |
 | Backups | `scripts/backup.sh` (add `--k8s` for Kubernetes) |
+| Something wrong | [Incident response](incident-response.md), [rotating secrets](secret-rotation.md), [rolling back](rollback.md) |
 | Tests | [tests/README.md](../../tests/README.md) |

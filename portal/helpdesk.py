@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import UploadFile
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from portal import outbox, settings_store
@@ -23,6 +23,14 @@ from portal.config import get_portal_settings
 from portal.errors import ApiError
 from portal.mail import Mail
 from portal.models import HelpAttachment, HelpMessage, HelpRequest, RoleAssignment, User
+
+# A request waiting for support: new, or in progress with the person's last word unanswered. And since when it's
+# waited (the help queue's "needs us", and Needs attention's item, #538)
+NEEDS_STAFF = or_(HelpRequest.status == "open", and_(
+    HelpRequest.status == "in_progress", HelpRequest.person_wrote_at.is_not(None),
+    or_(HelpRequest.staff_wrote_at.is_(None), HelpRequest.person_wrote_at > HelpRequest.staff_wrote_at)))
+WAITING_SINCE = case((NEEDS_STAFF, func.greatest(HelpRequest.person_wrote_at, HelpRequest.created_at)),
+                     else_=func.coalesce(HelpRequest.status_changed_at, HelpRequest.updated_at))
 from portal.storage import get_storage, safe_name
 
 log = logging.getLogger(__name__)

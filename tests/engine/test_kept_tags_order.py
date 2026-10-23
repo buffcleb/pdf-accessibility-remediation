@@ -136,6 +136,25 @@ def test_a_label_hidden_under_a_shape_drawn_over_it_is_not_read(tmp_path):
         assert not [f for f in check_integrity(pdf)[0] if f.severity == "error"]
 
 
+def test_kept_tags_on_content_drawn_off_the_page_are_not_read(tmp_path):
+    """#438: PAC's "content in a possibly inadmissible location": tagged text drawn wholly outside the page (to the
+    left of it, and below it) is seen by no one, so its tags go; text partly on the page stays."""
+    pieces = _slide_pieces(540) + [
+        (_text(-400, 300, "Left of the page"), "P"),
+        (_text(100, -80, "Below the page"), "P"),
+        (_text(900, 300, "Running off the right edge of the slide"), "P"),
+    ]
+    src = _tagged(tmp_path, "offpage", (960, 540), pieces, order=[0, 1, 2, 3, 4, 5])
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    texts = [e.get("text") or "" for e in build_tagmap(out)["elements"] if e.get("own")]
+    assert res.off_page_artifacted == 2
+    assert not any("Left of" in t or "Below" in t for t in texts)
+    assert any(t.startswith("Running off") for t in texts)
+    with pikepdf.open(out) as pdf:
+        assert not [f for f in check_integrity(pdf)[0] if f.severity == "error"]
+
+
 def test_marks_explained_by_a_legend_get_its_label_and_sit_before_their_item(tmp_path):
     """A slide's legend ("▲ Beta  ◆ Select") explains the marks beside items: each mark's alt text is the label (no
     AI, which would call a small triangle decorative), and it's read just before its item."""

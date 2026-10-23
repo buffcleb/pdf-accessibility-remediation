@@ -1,5 +1,7 @@
+import { useState } from "react";
 import type { Job } from "../api";
-import { fmtDate, fmtNum } from "./ui";
+import { copyText } from "./copy";
+import { LiveRegion, fmtDate, fmtNum } from "./ui";
 
 /** What a document's run took and where it fell short, for super admins (#313): AI cost and use, pages, the limits it
  * reached, notation and why readings were refused, time by stage, and the engine's side. Everything here is already
@@ -164,5 +166,46 @@ export function RunDetails({ job: j }: { job: Job }) {
         </>
       )}
     </div>
+  );
+}
+
+/** Why a document that isn't finished is where it is, for super admins (#530): its ids (the engine's names its folder
+ * on the engine), what it's waiting for, with the numbers, and since when. The full Run details come when it's done. */
+export function RunSoFar({ job: j }: { job: Job }) {
+  const [copied, setCopied] = useState("");
+  const p = (j.progress ?? {}) as Record<string, unknown>;
+  const engineId = j.staff?.engine_job_id ?? null;
+  const copy = async (what: string, text: string) => {
+    setCopied(await copyText(text) ? `Copied the ${what}` : "Couldn't copy: select the id and copy it yourself.");
+  };
+  const services = (Array.isArray(p.services) ? p.services : []).join(", ");
+  const why: Record<string, string> = {
+    waiting_engine: `Waiting for a place at the engine: ${num(p.in_use)} of ${num(p.places)} in use`,
+    waiting_per_person: `Waiting for this person's other documents: ${num(p.at_once)} at once at most`,
+    waiting_at_once: `Waiting for a place on ${services}: as many documents as it takes at once`,
+    waiting_daily_cap: `Waiting for tomorrow: today's page limit is reached on ${services}`,
+    paused: `Paused: ${services}`,
+    waiting_large: `Large document: it starts after every ${num(p.every)} smaller ones, or when nothing smaller waits`,
+  };
+  const stage = String(p.stage ?? "");
+  const waiting = j.status === "held" ? "Waiting for the person to confirm sending it"
+    : j.status === "queued" ? (why[stage] ?? "Waiting its turn") : null;
+  return (
+    <section className="doc-card run-so-far" aria-labelledby="run-so-far-h">
+      <h2 id="run-so-far-h">Run details</h2>
+      <dl className="run-facts">
+        <div><dt>Document</dt><dd><code>{j.id}</code>{" "}
+          <button type="button" className="btn secondary small" aria-label="Copy the document id"
+            onClick={() => void copy("document id", j.id)}>Copy</button></dd></div>
+        <div><dt>Engine job</dt><dd>{engineId
+          ? <><code>{engineId}</code>{" "}<button type="button" className="btn secondary small"
+            aria-label="Copy the engine job id" onClick={() => void copy("engine job id", engineId)}>Copy</button></>
+          : <span className="muted">Not sent to the engine yet</span>}</dd></div>
+        {waiting && <div><dt>Why it's waiting</dt><dd>{waiting}</dd></div>}
+        <div><dt>Added</dt><dd>{fmtDate(j.created_at)}</dd></div>
+        {j.staff?.submitted_at && <div><dt>Sent to the engine</dt><dd>{fmtDate(j.staff.submitted_at)}</dd></div>}
+      </dl>
+      <LiveRegion message={copied} />
+    </section>
   );
 }

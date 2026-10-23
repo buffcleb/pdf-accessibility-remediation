@@ -216,11 +216,51 @@ def _snapshot(audit: dict, vera: dict[str, VeraResult]) -> dict:
     return snap
 
 
-def _visual_fidelity(a: Path, b: Path, dpi: int = 50) -> dict:
+def _drawing(path: Path) -> list[str]:
+    """Each page's drawing instructions, as a fingerprint: its content streams and the Form XObjects it draws (and the
+    forms they draw), byte for byte. Two pages with the same fingerprint, in a file and the file the tag editor made
+    from it (which changes only content streams and the tag tree), draw the same."""
+    import hashlib
+
+    import pikepdf
+
+    out = []
+    with pikepdf.open(path) as pdf:
+        for page in pdf.pages:
+            h = hashlib.sha1()
+            try:
+                h.update(page.obj.Contents.read_bytes() if isinstance(page.obj.get("/Contents"), pikepdf.Stream)
+                         else b"".join(c.read_bytes() for c in page.obj.get("/Contents") or []))
+                seen, todo = set(), [page.obj.get("/Resources")]
+                while todo:
+                    res = todo.pop()
+                    xo = res.get("/XObject") if isinstance(res, pikepdf.Dictionary) else None
+                    for name in sorted(xo.keys()) if isinstance(xo, pikepdf.Dictionary) else []:
+                        x = xo[name]
+                        if not isinstance(x, pikepdf.Stream) or x.get("/Subtype") != "/Form" or x.objgen in seen:
+                            continue
+                        seen.add(x.objgen)
+                        h.update(name.encode() + x.read_raw_bytes())
+                        todo.append(x.get("/Resources"))
+                out.append(h.hexdigest())
+            except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
+                out.append(f"unreadable-{len(out)}")  # never the same as another file's: it's drawn and compared
+    return out
+
+
+def _visual_fidelity(a: Path, b: Path, dpi: int = 50, edited: bool = False) -> dict:
+    """Whether every page of b draws the same as a's, compared at a low resolution. edited: b is the tag editor's
+    output of a, so a page whose drawing instructions are unchanged draws the same and isn't drawn to compare (#428)."""
+    same = []
+    if edited:
+        fa, fb = _drawing(a), _drawing(b)
+        same = [len(fa) == len(fb) and x == y for x, y in zip(fa, fb)]
     da, db = fitz.open(a), fitz.open(b)
     try:
         differing = []
         for i in range(min(da.page_count, db.page_count)):
+            if i < len(same) and same[i]:
+                continue
             d = capped_dpi(da[i], dpi)  # the same for both: the pages are the same size
             if da[i].get_pixmap(dpi=d, alpha=False).samples != db[i].get_pixmap(dpi=d, alpha=False).samples:
                 differing.append(i + 1)
@@ -238,11 +278,27 @@ TITLE_MAX = 1000  # a title from the file's own metadata is its producer's to wr
 _LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$")
 
 
+# What a producer writes when the author gave no title: the application and the file's name ("Microsoft Word -
+# syllabus.docx", "Microsoft PowerPoint - Lecture 3.pptx"), or the name alone. A reader announces it as the title.
+_APP_PREFIX = re.compile(r"^microsoft\s+(?:office\s+)?(?:word|powerpoint|excel|publisher|visio|outlook)(?:\s*-.*)?$",
+                         re.I | re.S)
+_FILE_NAME = re.compile(r"^[^\n]{0,250}\.(?:docx?|docm|dotx?|pptx?|ppsx?|xlsx?|xlsm|rtf|odt|odp|ods|pages|key|"
+                        r"numbers|pdf|txt|html?|tex|indd|pub|vsdx?|ps|eps|qxp)$", re.I)
+_NO_TITLE = {"untitled", "untitled document", "document", "no title", "title", "powerpoint presentation"}
+
+
+def usable_title(title: str | None) -> bool:
+    """Whether a title from the file's own metadata says what the document is: not empty, not a placeholder, not an
+    application's name with the file's name ("Microsoft Word - x.docx"), not a file name."""
+    t = (title or "").strip()
+    return bool(t) and t.lower() not in _NO_TITLE and not _APP_PREFIX.match(t) and not _FILE_NAME.match(t)
+
+
 def _pick_title(opts: JobOptions, analysis: DocumentAnalysis) -> str:
     if opts.title:
         return opts.title
-    if analysis.title and analysis.title.lower() not in ("untitled", "document", "microsoft word"):
-        return analysis.title[:TITLE_MAX]
+    if usable_title(analysis.title):
+        return analysis.title.strip()[:TITLE_MAX]
     for p in analysis.pages:
         for b in p.blocks:
             if b.role == "H1":
@@ -1090,7 +1146,12 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
                          f"{et.get('artifacted', 0)} decorative figure(s) made artifacts; "
                          f"{tv.orphans_retagged} orphaned content item(s) re-tagged."
                          + (f" {tv.empty_spans_removed} empty span(s) folded into the tag they were in."
-                            if tv.empty_spans_removed else ""))
+                            if tv.empty_spans_removed else "")
+                         + (f" {tv.form_pages_retagged} figure tag(s) holding a whole page of text drawn as one "
+                            "picture: that text tagged afresh from the page's layout."
+                            if tv.form_pages_retagged else "")
+                         + (f" {tv.groupings_artifacted} grouping tag(s) holding only lines or shapes made "
+                            "decoration." if tv.groupings_artifacted else ""))
             if tv.added_placed:
                 lines.append(f"Added to the existing tags: {tv.added_placed} tag(s) (content the old tags left out, "
                              "untagged form fields and links) placed beside the tags they follow on their page"

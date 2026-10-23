@@ -5,6 +5,8 @@
 #   scripts/deploy.sh               deploy or update everything (backs up the database before migrations)
 #   scripts/deploy.sh status        what's running
 #   scripts/deploy.sh render        write the manifests as they'd be applied to deploy/k8s/.rendered/
+#   scripts/deploy.sh downgrade REV take the database back to migration REV, with the portal image that's running
+#                                   (a rollback: docs/operations/rollback.md); backs up first
 #
 # What `deploy` does, in order: checks the cluster and its storage; makes the namespace, the registry pull secret
 # and the secrets (from deploy/k8s/engine.env and portal.env, split by who reads what); starts Postgres, Redis and SeaweedFS; backs up
@@ -14,7 +16,11 @@
 # Options:
 #   -y, --yes            don't ask before changing the cluster
 #   --skip-backup        don't back up the database before migrations (not recommended)
+#   --new-gateway-key    give the engine a new AI gateway key and revoke its old one (rotation, or after a leak)
 #   -h, --help
+#
+# Each deploy that finishes adds a line to deploy/k8s/deploy-history: when, the image tags and the database's
+# migration, so a rollback knows what ran before.
 #
 # Settings: deploy/k8s/deploy.env (see deploy/k8s/deploy.env.example). Image tags come from deploy/k8s/.last-build
 # (written by scripts/build.sh) unless deploy.env sets them. The registry pull secret uses GHCR_PULL_TOKEN, else
@@ -28,12 +34,15 @@ die() { echo "deploy: $*" >&2; exit 1; }
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 usage() { sed -n '2,/^set -Eeuo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
-CMD=deploy YES=0 BACKUP=1
+CMD=deploy YES=0 BACKUP=1 NEW_GATEWAY_KEY=0 DOWNGRADE_TO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     init|deploy|status|render) CMD="$1" ;;
+    downgrade) CMD=downgrade; DOWNGRADE_TO="${2:-}"; [ $# -gt 1 ] && shift
+      [[ "$DOWNGRADE_TO" =~ ^[0-9]{4}$ ]] || die "downgrade needs the migration to go back to, e.g. 0043" ;;
     -y|--yes) YES=1 ;;
     --skip-backup) BACKUP=0 ;;
+    --new-gateway-key) NEW_GATEWAY_KEY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
@@ -42,8 +51,8 @@ done
 
 rand() { openssl rand -hex "${1:-24}"; }
 
-# A value the two secrets must agree on: the Redis password (REDIS_PASSWORD in engine.env, PORTAL_REDIS_PASSWORD
-# in portal.env) and the engine's API key (SERVICE_API_KEY, PORTAL_ENGINE_API_KEY). Made and written to both files
+# A value the two secrets must agree on: the engine's API key (SERVICE_API_KEY in engine.env, PORTAL_ENGINE_API_KEY in
+# portal.env). Made and written to both files
 # when neither has it, copied when one has it; two different values are left for you to settle. Run at init and
 # before every deploy, so a deployment made before these existed gets them.
 shared_key() {
@@ -63,7 +72,17 @@ shared_key() {
   fi
 }
 shared_keys() {
-  shared_key REDIS_PASSWORD PORTAL_REDIS_PASSWORD
+  # Two Redis, two passwords (#472): the engine's queue (REDIS_PASSWORD) and the portal's rate limits
+  # (PORTAL_REDIS_PASSWORD). A deployment from before has the same value in both: the portal's gets a new one
+  grep -q '^REDIS_PASSWORD=.' "$K8S/engine.env" || { echo "REDIS_PASSWORD=$(rand 24)" >> "$K8S/engine.env"; log "made REDIS_PASSWORD (engine.env)"; }
+  local engine_redis portal_redis
+  engine_redis="$(sed -n 's/^REDIS_PASSWORD=//p' "$K8S/engine.env" | head -1)"
+  portal_redis="$(sed -n 's/^PORTAL_REDIS_PASSWORD=//p' "$K8S/portal.env" | head -1)"
+  if [ -z "$portal_redis" ] || [ "$portal_redis" = "$engine_redis" ]; then
+    sed -i.bak '/^PORTAL_REDIS_PASSWORD=/d' "$K8S/portal.env" && rm -f "$K8S/portal.env.bak"
+    echo "PORTAL_REDIS_PASSWORD=$(rand 24)" >> "$K8S/portal.env"
+    log "made PORTAL_REDIS_PASSWORD (portal.env): the portal's own Redis, apart from the engine's"
+  fi
   shared_key SERVICE_API_KEY PORTAL_ENGINE_API_KEY
   # The portal's own database account (#337, deploy/k8s/app-role.sql), made once
   if ! grep -q '^PORTAL_APP_DB_PASSWORD=' "$K8S/portal.env"; then
@@ -212,6 +231,83 @@ export LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.105.0@sha256:6
 # Proxies in front of the web app whose X-Forwarded-For is believed (an ingress controller's pod range); not
 # needed behind Cloudflare, which is read from its own header
 export WEB_TRUSTED_PROXIES="${WEB_TRUSTED_PROXIES:-}"
+# The pods that read uploaded documents (the engine's API, workers and scheduler, the Adobe worker, the music and
+# formula readers) on nodes of their own (#471): ENGINE_NODES is a node label, key=value; those pods get it as a node
+# selector and tolerate the taint of the same name (key=value:NoSchedule), which keeps everything else off those
+# nodes. Empty: they run anywhere, as before.
+ENGINE_NODES="${ENGINE_NODES:-}"
+export ENGINE_PLACEMENT=""
+if [ -n "$ENGINE_NODES" ]; then
+  [[ "$ENGINE_NODES" =~ ^([A-Za-z0-9./_-]+)=([A-Za-z0-9._-]+)$ ]] || die "ENGINE_NODES is a node label, key=value (pdfrem/role=engine)"
+  ENGINE_PLACEMENT="      nodeSelector: { \"${BASH_REMATCH[1]}\": \"${BASH_REMATCH[2]}\" }
+      tolerations: [{ key: \"${BASH_REMATCH[1]}\", operator: Equal, value: \"${BASH_REMATCH[2]}\", effect: NoSchedule }]"
+fi
+# Outbound traffic from the portal, the AI gateway, the Adobe worker and ClamAV (#453, #455): off (as before), log
+# (through the egress proxy, which lets everything through and records each destination) or enforce (only the hosts
+# this deployment uses, deploy/k8s/egress_hosts.py, and network policies so they can't go round the proxy). CLUSTER_CIDRS: the pod and
+# service ranges, which the proxy is kept out of.
+export EGRESS_PROXY="${EGRESS_PROXY:-off}" EGRESS_ALLOW="${EGRESS_ALLOW:-}"
+case "$EGRESS_PROXY" in off|log|enforce) ;; *) die "EGRESS_PROXY is off, log or enforce" ;; esac
+export EGRESS_PROXY_IMAGE="${EGRESS_PROXY_IMAGE:-ubuntu/squid:6.6-24.04_edge@sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c}"
+CLUSTER_CIDRS="${CLUSTER_CIDRS:-10.42.0.0/16,10.43.0.0/16}"
+# As a YAML list for the policies: ["10.42.0.0/16","10.43.0.0/16"]
+IFS=, read -r -a cidrs <<< "$CLUSTER_CIDRS"
+CLUSTER_CIDRS="[$(printf '"%s",' "${cidrs[@]}")"; CLUSTER_CIDRS="${CLUSTER_CIDRS%,}]"; export CLUSTER_CIDRS
+export EGRESS_PROXY_ENV="" EGRESS_PROXY_CONFIG_SHA=none
+if [ "$EGRESS_PROXY" != off ]; then
+  no_proxy="localhost,127.0.0.1,.svc,.cluster.local,postgres,redis,redis-portal,seaweedfs,engine,litellm,verapdf,prometheus,grafana,web,clamav"
+  EGRESS_PROXY_ENV=""
+  for v in HTTPS_PROXY HTTP_PROXY https_proxy http_proxy; do
+    EGRESS_PROXY_ENV+="            - { name: $v, value: \"http://egress-proxy:3128\" }"$'\n'
+  done
+  EGRESS_PROXY_ENV+="            - { name: NO_PROXY, value: \"$no_proxy\" }"$'\n'
+  EGRESS_PROXY_ENV+="            - { name: no_proxy, value: \"$no_proxy\" }"$'\n'
+  # LiteLLM's aiohttp transport doesn't read the proxy settings; its httpx one does
+  EGRESS_PROXY_ENV+="            - { name: DISABLE_AIOHTTP_TRANSPORT, value: \"True\" }"
+fi
+# The ports the portal reaches directly (82-egress-enforce.yaml): its SMTP relay's, and the SIEM's syslog collector's
+# with PORTAL_SIEM_MODE=syslog (#456)
+portal_setting() { sed -n "s/^$1=//p" "$K8S/portal.env" 2>/dev/null | head -1 | tr -d '"'"'"; }
+PORTAL_DIRECT_PORTS="[{ port: $(portal_setting PORTAL_SMTP_PORT | grep -E '^[0-9]+$' || echo 587) }"
+if [ "$(portal_setting PORTAL_SIEM_MODE | tr '[:upper:]' '[:lower:]')" = syslog ]; then
+  PORTAL_DIRECT_PORTS+=", { port: $(portal_setting PORTAL_SIEM_SYSLOG_PORT | grep -E '^[0-9]+$' || echo 6514) }"
+fi
+export PORTAL_DIRECT_PORTS="$PORTAL_DIRECT_PORTS]"
+# HTTPS at the cluster's own ingress controller (not needed behind the Cloudflare tunnel, which ends TLS itself): the
+# Secret with APP_HOST's certificate, made by cert-manager when CERT_ISSUER names a ClusterIssuer (web-tls unless
+# INGRESS_TLS_SECRET names it), or put there by you. With TLS on, the controller sends plain HTTP on to HTTPS.
+# The ingress controller (#460): Traefik (RKE2's default from v1.36; ingress-nginx is retired upstream) or
+# ingress-nginx. Each Ingress gets that controller's own settings; INGRESS_CLASS defaults to its usual class name.
+export INGRESS_CONTROLLER="${INGRESS_CONTROLLER:-nginx}"
+case "$INGRESS_CONTROLLER" in nginx|traefik) ;; *) die "INGRESS_CONTROLLER must be nginx or traefik" ;; esac
+export INGRESS_CLASS="${INGRESS_CLASS:-$INGRESS_CONTROLLER}"
+INGRESS_TLS_SECRET="${INGRESS_TLS_SECRET:-}" CERT_ISSUER="${CERT_ISSUER:-}"
+[ -n "$CERT_ISSUER" ] && [ -z "$INGRESS_TLS_SECRET" ] && INGRESS_TLS_SECRET=web-tls
+export INGRESS_TLS="" INGRESS_ISSUER=""
+if [ -n "$INGRESS_TLS_SECRET" ]; then
+  INGRESS_TLS="  tls:
+    - hosts: [\"$APP_HOST\"]
+      secretName: $INGRESS_TLS_SECRET"
+fi
+[ -n "$CERT_ISSUER" ] && INGRESS_ISSUER="    cert-manager.io/cluster-issuer: \"$CERT_ISSUER\""
+# What each controller needs told per Ingress. ingress-nginx: the upload size, no buffering of uploads, and 5 minutes
+# for the portal to answer. Traefik doesn't buffer and has no answer timeout by default, and the web pod's own nginx
+# limits the upload size; its entry points' timeouts are the cluster's (docs/deployment/first-cluster/middleware.md).
+# The API origin's allow-list is a Traefik middleware (62-traefik-api-origin.yaml).
+export INGRESS_ANNOTATIONS="" API_ORIGIN_ANNOTATIONS="" API_ORIGIN_SOURCE_LIST=""
+if [ "$INGRESS_CONTROLLER" = nginx ]; then
+  [ -n "${MAX_UPLOAD_SIZE:-}" ] || die "MAX_UPLOAD_SIZE isn't set in deploy/k8s/deploy.env"
+  INGRESS_ANNOTATIONS="    nginx.ingress.kubernetes.io/proxy-body-size: \"$MAX_UPLOAD_SIZE\"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: \"off\"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: \"300\"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: \"300\""
+  API_ORIGIN_ANNOTATIONS="$INGRESS_ANNOTATIONS
+    nginx.ingress.kubernetes.io/whitelist-source-range: \"$API_ORIGIN_ALLOWED_SOURCES\""
+else
+  API_ORIGIN_ANNOTATIONS="    traefik.ingress.kubernetes.io/router.middlewares: \"$NAMESPACE-api-origin-sources@kubernetescrd\""
+fi
+# The same allow-list as a YAML list, for Traefik's middleware
+API_ORIGIN_SOURCE_LIST="[$(printf '%s' "$API_ORIGIN_ALLOWED_SOURCES" | tr -d ' ' | sed 's/[^,][^,]*/"&"/g')]"
 # The link to the AI gateway's admin UI in Administration; empty (how to reach it is shown instead) unless the UI
 # has an address of its own
 export GATEWAY_ADMIN_URL="${GATEWAY_ADMIN_URL:-}"
@@ -244,6 +340,27 @@ case "$MUSIC_READER" in
   off) export OMR_ENABLED=false ;;
   *) die "MUSIC_READER is on or off" ;;
 esac
+# Malware scanning of uploads (#455, 27-clamav.yaml): off (nothing scanned, nothing extra runs), or clamav: a ClamAV
+# pod (about 2 GB of memory) that every upload is streamed to before it's stored; uploads are refused while it's down
+export MALWARE_SCAN="${MALWARE_SCAN:-off}"
+case "$MALWARE_SCAN" in off|clamav) ;; *) die "MALWARE_SCAN is off or clamav" ;; esac
+export CLAMAV_IMAGE="${CLAMAV_IMAGE:-clamav/clamav:1.5.4@sha256:e19130cdebaeacc71fa46eab3ed6f69941f2f22aa5e08d55e9197f8edf43ce5e}"
+export CLAMAV_MEMORY_REQUEST="${CLAMAV_MEMORY_REQUEST:-1536Mi}" CLAMAV_MEMORY_LIMIT="${CLAMAV_MEMORY_LIMIT:-2560Mi}"
+# clamd's longest stream: the largest upload (MAX_UPLOAD_SIZE, nginx's "100m"; clamd has K and M, no G)
+upload_size="$(printf '%s' "${MAX_UPLOAD_SIZE:-100m}" | tr '[:upper:]' '[:lower:]')"
+case "$upload_size" in
+  *g) CLAMD_MAX_SIZE="$(( ${upload_size%g} * 1024 ))M" ;;
+  *m|*k) CLAMD_MAX_SIZE="$(printf '%s' "$upload_size" | tr '[:lower:]' '[:upper:]')" ;;
+  *) CLAMD_MAX_SIZE="$upload_size" ;;
+esac
+export CLAMD_MAX_SIZE
+# freshclam reads no proxy variables: its config names the egress proxy, when there is one
+export FRESHCLAM_PROXY=""
+[ "$EGRESS_PROXY" != off ] && FRESHCLAM_PROXY="    HTTPProxyServer egress-proxy
+    HTTPProxyPort 3128"
+CLAMAV_CONFIG_SHA="$(printf '%s|%s|%s' "$CLAMD_MAX_SIZE" "$FRESHCLAM_PROXY" "$(sed -n '/^data:/,/^---/p' "$K8S/manifests/27-clamav.yaml")" \
+  | shasum -a 256 | cut -c1-16)"
+export CLAMAV_CONFIG_SHA
 # The formula reading service (37-formula.yaml, #403): off, or on (needs its image: scripts/build.sh --only formula).
 # It reads each formula the AI read again from its picture, to check the AI's reading against
 export FORMULA_READER="${FORMULA_READER:-off}" FORMULA_MAX="${FORMULA_MAX:-2}" FORMULA_PER_POD="${FORMULA_PER_POD:-20}"
@@ -314,7 +431,7 @@ set_replicas() {
   fi
 }
 export LITELLM_CONFIG_SHA RUN_ID ENGINE_ENV_SHA PORTAL_ENV_SHA TUNNEL_ENV_SHA VERAPDF_CONFIG_SHA PROMETHEUS_CONFIG_SHA
-export GRAFANA_DASHBOARDS_SHA
+export GRAFANA_DASHBOARDS_SHA REDIS_KEY_SHA PORTAL_REDIS_KEY_SHA S3_KEY_SHA
 # The gateway's shared admin login (UI_USERNAME and UI_PASSWORD in engine.env): on, or off once every admin has an
 # account of their own in the gateway's UI
 export GATEWAY_SHARED_LOGIN="${GATEWAY_SHARED_LOGIN:-on}"
@@ -330,6 +447,9 @@ litellm_config() {
 }
 LITELLM_CONFIG_SHA="$(litellm_config | shasum -a 256 | cut -c1-16)"
 VERAPDF_CONFIG_SHA="$(shasum -a 256 deploy/verapdf/validator.xml | cut -c1-16)"
+if [ "$EGRESS_PROXY" != off ]; then
+  EGRESS_PROXY_CONFIG_SHA="$(python3 deploy/k8s/egress_hosts.py squid config/litellm.yaml "$K8S/engine.env" "$K8S/portal.env" | shasum -a 256 | cut -c1-16)"
+fi
 MON="$K8S/monitoring"
 PROMETHEUS_CONFIG_SHA="$(cat "$MON/prometheus.yml" "$MON/rules.yml" | shasum -a 256 | cut -c1-16)"
 GRAFANA_DASHBOARDS_SHA="$(cat "$MON"/dashboards/*.json | shasum -a 256 | cut -c1-16)"
@@ -338,6 +458,12 @@ sha_of() { if [ -f "$1" ]; then shasum -a 256 "$1" | cut -c1-16; else echo none;
 ENGINE_ENV_SHA="$(sha_of "$K8S/engine.env")"
 PORTAL_ENV_SHA="$(sha_of "$K8S/portal.env")"
 TUNNEL_ENV_SHA="$(sha_of "$K8S/tunnel.env")"
+# Redis, the portal's Redis and SeaweedFS read their password only when they start: restarted when it changes (a
+# rotation, docs/operations/secret-rotation.md), and not for other settings
+key_sha() { local k; for k in "${@:2}"; do sed -n "s/^$k=//p" "$1" 2>/dev/null | head -1; done | shasum -a 256 | cut -c1-16; }
+REDIS_KEY_SHA="$(key_sha "$K8S/engine.env" REDIS_PASSWORD)"
+PORTAL_REDIS_KEY_SHA="$(key_sha "$K8S/portal.env" PORTAL_REDIS_PASSWORD)"
+S3_KEY_SHA="$(key_sha "$K8S/portal.env" PORTAL_S3_ACCESS_KEY PORTAL_S3_SECRET_KEY)"
 RUN_ID="$(date +%Y%m%d%H%M%S)"
 
 export KUBECONFIG="${KUBECONFIG_PATH:-${KUBECONFIG:-$HOME/.kube/config}}"
@@ -355,16 +481,20 @@ render_all() {
   rm -rf "$out" && mkdir -p "$out"
   for f in "$K8S"/manifests/*.yaml "$K8S"/migrate-job.yaml; do
     # The web pod and its Ingress, or the API origin the Cloudflare Worker forwards to
-    case "$FRONTEND:$(basename "$f")" in cluster:61-*|cluster:81-*|worker:60-*) continue ;; esac
+    case "$FRONTEND:$(basename "$f")" in cluster:61-*|cluster:62-*|cluster:81-*|worker:60-*) continue ;; esac
+    case "$INGRESS_CONTROLLER:$(basename "$f")" in nginx:62-*) continue ;; esac  # Traefik's own objects
     [ "$(basename "$f")" = 70-cloudflared.yaml ] && [ ! -f "$K8S/tunnel.env" ] && [ "${RENDER_ALL:-0}" = 0 ] && continue
     [ "$(basename "$f")" = 45-autoscale.yaml ] && [ "$AUTOSCALE" != on ] && continue
     case "$(basename "$f")" in
       36-music.yaml) [ "$MUSIC_READER" = on ] || continue ;;
+      27-clamav.yaml) [ "$MALWARE_SCAN" = clamav ] || continue ;;
       46-music-autoscale.yaml) if [ "$MUSIC_READER" != on ] || [ "$AUTOSCALE" != on ]; then continue; fi ;;
       37-formula.yaml) [ "$FORMULA_READER" = on ] || continue ;;
       47-formula-autoscale.yaml) if [ "$FORMULA_READER" != on ] || [ "$AUTOSCALE" != on ]; then continue; fi ;;
       90-backup.yaml) [ "$BACKUPS" = cronjob ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
       95-monitoring.yaml) [ "$MONITORING" = on ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
+      26-egress-proxy.yaml) [ "$EGRESS_PROXY" != off ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
+      82-egress-enforce.yaml) [ "$EGRESS_PROXY" = enforce ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
     esac
     render_file "$f" > "$out/$(basename "$f")" || die "$(basename "$f") uses a setting that isn't set"
   done
@@ -389,6 +519,40 @@ if [ "$CMD" = status ]; then
   exit 0
 fi
 
+# The database back to an earlier migration (docs/operations/rollback.md), before the earlier release is deployed:
+# that release's image doesn't know the later migrations, so the image that's running does it. Backed up first.
+if [ "$CMD" = downgrade ]; then
+  running="$("${KC[@]}" "${NS[@]}" get deployment/portal-api -o jsonpath='{.spec.template.spec.containers[0].image}')" \
+    || die "the portal isn't deployed, so there's nothing to take back"
+  current="$("${KC[@]}" "${NS[@]}" exec statefulset/postgres -- psql -U portal -d portal -tAc \
+    "select version_num from alembic_version")" || die "couldn't read the database's migration"
+  log "the database is at migration $current; going back to $DOWNGRADE_TO with $running"
+  log "each migration undone drops what it added, and whatever was written there since (docs/operations/rollback.md)"
+  if [ "$YES" != 1 ]; then
+    read -r -p "Take the database back to $DOWNGRADE_TO? [y/N] " answer
+    [[ "$answer" =~ ^[Yy] ]] || die "stopped"
+  fi
+  if [ "$BACKUP" = 1 ]; then
+    log "backing up the database first"
+    K8S_NAMESPACE="$NAMESPACE" scripts/backup.sh || die "the backup failed, so nothing was changed"
+  fi
+  WORK="$(mktemp -d)"
+  trap 'rm -rf "$WORK"' EXIT
+  export PORTAL_TAG="${running##*:}"
+  render_file "$K8S/migrate-job.yaml" | sed -e "s/portal-migrate-$RUN_ID/portal-downgrade-$RUN_ID/" \
+    -e "s/\"portal.cli\", \"migrate\"\]/\"portal.cli\", \"downgrade\", \"$DOWNGRADE_TO\"]/" > "$WORK/downgrade.yaml"
+  grep -q '"downgrade"' "$WORK/downgrade.yaml" || die "couldn't make the downgrade job from migrate-job.yaml"
+  "${KC[@]}" apply -f "$WORK/downgrade.yaml" >/dev/null
+  if ! "${KC[@]}" "${NS[@]}" wait --for=condition=complete "job/portal-downgrade-$RUN_ID" --timeout=300s \
+      >/dev/null; then
+    "${KC[@]}" "${NS[@]}" logs "job/portal-downgrade-$RUN_ID" --tail=50 >&2 || true
+    die "the downgrade failed (the backup from just before is in ./backups)"
+  fi
+  "${KC[@]}" "${NS[@]}" logs "job/portal-downgrade-$RUN_ID" --tail=5 >&2 || true
+  log "now deploy the earlier release: its tags in deploy/k8s/deploy.env, then scripts/deploy.sh"
+  exit 0
+fi
+
 # Scaling needs KEDA (workers follow the queue) and metrics-server (veraPDF and the gateway follow their CPU)
 has_keda=0; "${KC[@]}" get crd scaledobjects.keda.sh >/dev/null 2>&1 && has_keda=1
 has_metrics=0; "${KC[@]}" get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1 && has_metrics=1
@@ -400,6 +564,20 @@ elif [ "$AUTOSCALE" = on ]; then
 fi
 set_replicas
 
+# Traffic between the nodes (#452): checked (scripts/check_cluster_encryption.sh, read-only) and shown before
+# deploying. require: stop when it isn't encrypted, or can't be told; off: not checked
+export NODE_ENCRYPTION="${NODE_ENCRYPTION:-check}"
+case "$NODE_ENCRYPTION" in check|require|off) ;; *) die "NODE_ENCRYPTION is check, require or off" ;; esac
+encryption="not checked (NODE_ENCRYPTION=off)"
+if [ "$NODE_ENCRYPTION" != off ]; then
+  ctx=(); [ -n "${KUBE_CONTEXT:-}" ] && ctx=(--context "$KUBE_CONTEXT")
+  enc_rc=0; encryption="$("$ROOT/scripts/check_cluster_encryption.sh" ${ctx[@]+"${ctx[@]}"} 2>&1)" || enc_rc=$?
+  encryption="$(printf '%s\n' "$encryption" | tail -n 1)"
+  if [ "$enc_rc" != 0 ] && [ "$NODE_ENCRYPTION" = require ]; then
+    die "traffic between the nodes: $encryption (NODE_ENCRYPTION=require)"
+  fi
+fi
+
 # --- deploy ------------------------------------------------------------------------------------------
 if [ ! -f "$K8S/engine.env" ] || [ ! -f "$K8S/portal.env" ]; then
   die "missing deploy/k8s/engine.env or portal.env: run scripts/deploy.sh init"
@@ -407,6 +585,10 @@ fi
 shared_keys
 url_safe_passwords
 classes=("$STORAGE_CLASS" "$SHARED_STORAGE_CLASS"); [ "$MONITORING" = on ] && classes+=("$MONITORING_STORAGE_CLASS")
+if [ -n "$ENGINE_NODES" ]; then
+  [ -n "$("${KC[@]}" get nodes -l "$ENGINE_NODES" -o name 2>/dev/null)" ] \
+    || die "no node has the label $ENGINE_NODES (ENGINE_NODES): label the engine's nodes first, or the engine can't start"
+fi
 for sc in "${classes[@]}"; do
   "${KC[@]}" get storageclass "$sc" >/dev/null 2>&1 \
     || die "the cluster has no StorageClass '$sc' (install one, or change it in deploy/k8s/deploy.env)"
@@ -416,10 +598,22 @@ TUNNEL=0; [ -f "$K8S/tunnel.env" ] && grep -q '^TUNNEL_TOKEN=.' "$K8S/tunnel.env
 echo "Deploying to $SERVER, namespace $NAMESPACE, as https://$APP_HOST (web app: $FRONTEND)"
 echo "  engine $ENGINE_TAG, portal $PORTAL_TAG, web $WEB_TAG; storage $STORAGE_CLASS and $SHARED_STORAGE_CLASS;"
 echo "  Cloudflare tunnel: $([ "$TUNNEL" = 1 ] && echo "yes (deploy/k8s/tunnel.env)" || echo "no")"
+case "$EGRESS_PROXY" in
+  off) echo "  outbound: the portal, the AI gateway and the Adobe worker$([ "$MALWARE_SCAN" = clamav ] && echo " and ClamAV") reach the internet directly (EGRESS_PROXY=off)" ;;
+  log) echo "  outbound: through the egress proxy, everything let through and recorded (EGRESS_PROXY=log)" ;;
+  enforce) echo "  outbound: through the egress proxy, only these hosts (EGRESS_PROXY=enforce):"
+    python3 deploy/k8s/egress_hosts.py hosts config/litellm.yaml "$K8S/engine.env" "$K8S/portal.env" | sed 's/^/    /' ;;
+esac
+echo "  traffic between nodes: $encryption"
 if [ "$AUTOSCALE" = on ]; then
   echo "  scaling with the queue: $ENGINE_WORKERS to $ENGINE_WORKERS_MAX workers ($WORKER_CONCURRENCY documents each), veraPDF up to $VERAPDF_MAX, AI gateway up to $LITELLM_MAX"
 else
   echo "  fixed size: $ENGINE_WORKERS worker(s) ($WORKER_CONCURRENCY documents each); scaling is off$([ "$has_keda" = 0 ] && echo " (no KEDA on the cluster)")"
+fi
+if [ "$MALWARE_SCAN" = clamav ]; then
+  echo "  malware scanning: ClamAV, every upload before it's stored; uploads are refused while it's down"
+else
+  echo "  malware scanning: off (MALWARE_SCAN=off)"
 fi
 if [ "$MONITORING" = on ]; then
   echo "  monitoring: Prometheus ($PROMETHEUS_RETENTION of history, $PROMETHEUS_SIZE on $MONITORING_STORAGE_CLASS)"
@@ -447,6 +641,45 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 render_all "$WORK"
 apply() { "${KC[@]}" apply -f "$WORK/$1" >/dev/null && log "applied $1"; }
+# The engine's own key for the AI gateway (#457): limited to the models in config/litellm.yaml, with no right to
+# manage the gateway, instead of the master key. Made by the gateway from inside its pod (deploy/k8s/gateway_key.py:
+# the master key never leaves it), kept in engine.env as GATEWAY_API_KEY, and its models kept in step with the config
+# on each deploy. A new one (the first time, when the gateway no longer knows the old one, or --new-gateway-key)
+# restarts the engine's pods, and the old one is revoked once they use it. GATEWAY_ENGINE_BUDGET (USD per 30 days)
+# caps what the key may spend, on top of the gateway's overall budget.
+gateway_key() {
+  "${KC[@]}" "${NS[@]}" exec -i deploy/litellm -c litellm -- python3 -c "$(cat "$K8S/gateway_key.py")" "$1"
+}
+engine_gateway_key() {
+  local master key models limits new
+  master="$(sed -n 's/^LITELLM_MASTER_KEY=//p' "$K8S/engine.env" | head -1)"
+  key="$(sed -n 's/^GATEWAY_API_KEY=//p' "$K8S/engine.env" | head -1)"
+  models="$(python3 -c 'import json, re, sys; print(json.dumps(re.findall(r"^\s*- model_name:\s*(\S+)", open(sys.argv[1]).read(), re.M)))' config/litellm.yaml)"
+  limits="\"models\": $models$([ -n "${GATEWAY_ENGINE_BUDGET:-}" ] && echo ", \"max_budget\": $GATEWAY_ENGINE_BUDGET")"
+  if [ -n "$key" ] && [ "$key" != "$master" ] && [ "$NEW_GATEWAY_KEY" = 0 ] \
+      && printf '{"key": "%s"}' "$key" | gateway_key check; then
+    printf '{"key": "%s", %s}' "$key" "$limits" | gateway_key update || die "the AI gateway didn't update the engine's key"
+    log "engine's gateway key: limited to $(echo "$models" | tr -d '[]"' | tr ',' ' ')"
+    return
+  fi
+  new="$(printf '{%s}' "$limits" | gateway_key generate)" || die "the AI gateway didn't make a key for the engine"
+  [ -n "$new" ] || die "the AI gateway made an empty key for the engine"
+  if grep -q '^GATEWAY_API_KEY=' "$K8S/engine.env"; then
+    sed -i.bak "s|^GATEWAY_API_KEY=.*|GATEWAY_API_KEY=$new|" "$K8S/engine.env" && rm -f "$K8S/engine.env.bak"
+  else
+    echo "GATEWAY_API_KEY=$new" >> "$K8S/engine.env"
+  fi
+  secret pdfrem-engine-env "$NAMESPACE" "$K8S/engine.env" --drop "$GATEWAY_ONLY|^ADOBE_CLIENT_"
+  local d; for d in engine-api engine-worker engine-beat engine-adobe-worker; do
+    "${KC[@]}" "${NS[@]}" rollout restart "deployment/$d" >/dev/null 2>&1 || true
+  done
+  wait_rollout deployment/engine-api
+  wait_rollout deployment/engine-worker
+  if [ -n "$key" ] && [ "$key" != "$master" ]; then
+    printf '{"key": "%s"}' "$key" | gateway_key delete >/dev/null || log "the old engine key couldn't be revoked: revoke it in the gateway's UI"
+  fi
+  log "the engine has its own gateway key now (limited to its models), in deploy/k8s/engine.env"
+}
 wait_rollout() { "${KC[@]}" "${NS[@]}" rollout status "$1" --timeout="${2:-300s}" >/dev/null || die "$1 didn't become ready (scripts/deploy.sh status; kubectl -n $NAMESPACE logs $1)"; log "$1 ready"; }
 
 apply 00-namespace.yaml
@@ -462,7 +695,7 @@ reg_user="${REGISTRY#*/}"; reg_user="${reg_user%%/*}"
 # without the gateway's keys and Adobe's; the gateway's without the engine's; Adobe's two for its worker alone;
 # the database passwords for Postgres; the portal's without the admin password
 ENGINE_ONLY='^(REDIS_PASSWORD|SERVICE_API_KEY|GATEWAY_API_KEY|LOCALAI_|OLLAMA_|ADOBE_)'
-GATEWAY_ONLY='^(LITELLM_|UI_|LOCAL_|OPENROUTER_)'
+GATEWAY_ONLY='^(LITELLM_|UI_|LOCAL_|OPENROUTER_|AWS_)'
 # Replaced whole, not applied: an apply with stringData adds and updates keys but never removes one that has gone,
 # so a key moved out of a secret would stay in it
 secret() {
@@ -498,13 +731,46 @@ litellm_config > "$WORK/litellm.yaml"
   --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
 
 log "storage, database, queues and file store"
+# First, before any workload starts: what may reach what (see the README, "Network policies and the Redis password"),
+# so on a fresh install no pod runs a moment without them (#453)
+apply 80-network-policies.yaml
+if [ "$FRONTEND" = worker ]; then
+  apply 81-api-origin-policy.yaml
+else
+  "${KC[@]}" "${NS[@]}" delete networkpolicy/portal-api-origin --ignore-not-found >/dev/null
+fi
 apply 10-jobdata.yaml
 apply 20-postgres.yaml
 apply 21-redis.yaml
 apply 22-seaweedfs.yaml
+apply 23-redis-portal.yaml
 wait_rollout statefulset/postgres
 wait_rollout statefulset/redis
+wait_rollout deployment/redis-portal
 wait_rollout statefulset/seaweedfs
+if [ "$EGRESS_PROXY" != off ]; then
+  python3 deploy/k8s/egress_hosts.py squid config/litellm.yaml "$K8S/engine.env" "$K8S/portal.env" > "$WORK/squid.conf"
+  "${KC[@]}" "${NS[@]}" create configmap egress-proxy-config --from-file=squid.conf="$WORK/squid.conf" \
+    --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
+  apply 26-egress-proxy.yaml
+  wait_rollout deployment/egress-proxy
+fi
+# The malware scanner (#455), before the portal's new pods start scanning with it; its signatures' volume is kept
+# when it's turned off
+if [ "$MALWARE_SCAN" = clamav ]; then
+  apply 27-clamav.yaml
+  wait_rollout deployment/clamav 420s
+else
+  "${KC[@]}" "${NS[@]}" delete deployment/clamav service/clamav configmap/clamav-config networkpolicy/clamav \
+    --ignore-not-found >/dev/null
+fi
+# Once the proxy is up: the portal, the gateway and the Adobe worker reach the internet only through it
+if [ "$EGRESS_PROXY" = enforce ]; then
+  apply 82-egress-enforce.yaml
+else
+  "${KC[@]}" "${NS[@]}" delete networkpolicy/outbound-through-proxy networkpolicy/portal-outbound-through-proxy \
+    --ignore-not-found >/dev/null
+fi
 
 if "${KC[@]}" "${NS[@]}" exec statefulset/postgres -- psql -U portal -d portal -tAc \
     "select 1 from information_schema.tables where table_name='alembic_version'" 2>/dev/null | grep -q 1; then
@@ -599,20 +865,15 @@ else
     --ignore-not-found >/dev/null
 fi
 if [ "$FRONTEND" = worker ]; then
+  [ "$INGRESS_CONTROLLER" = traefik ] && apply 62-traefik-api-origin.yaml
   apply 61-api-origin.yaml
   "${KC[@]}" "${NS[@]}" delete ingress/web deployment/web service/web --ignore-not-found >/dev/null
 else
   apply 60-web.yaml
   "${KC[@]}" "${NS[@]}" delete ingress/api-origin --ignore-not-found >/dev/null
 fi
-# Last, once every service is up: what may reach what (see the README, "Network policies and the Redis password")
-apply 80-network-policies.yaml
-if [ "$FRONTEND" = worker ]; then
-  apply 81-api-origin-policy.yaml
-else
-  "${KC[@]}" "${NS[@]}" delete networkpolicy/portal-api-origin --ignore-not-found >/dev/null
-fi
 wait_rollout deployment/litellm 420s
+engine_gateway_key
 wait_rollout deployment/verapdf 300s
 wait_rollout deployment/engine-api
 wait_rollout deployment/engine-worker
@@ -620,6 +881,11 @@ wait_rollout deployment/engine-beat
 [ "${ADOBE_WORKERS:-0}" -gt 0 ] && wait_rollout deployment/engine-adobe-worker
 wait_rollout deployment/portal-api
 wait_rollout deployment/portal-worker
+# The proxy turned off: removed once the pods that used it have rolled without it
+if [ "$EGRESS_PROXY" = off ]; then
+  "${KC[@]}" "${NS[@]}" delete deployment/egress-proxy service/egress-proxy configmap/egress-proxy-config \
+    networkpolicy/egress-proxy --ignore-not-found >/dev/null
+fi
 if [ "$MONITORING" = on ]; then
   wait_rollout deployment/prometheus
   wait_rollout deployment/grafana
@@ -640,6 +906,13 @@ if '$FRONTEND' == 'cluster': checks.append(('web', 'http://web:8080/'))
 for name, url in checks:
     u.urlopen(url, timeout=10).read(); print('  ok:', name)
 " || die "a service didn't answer (scripts/deploy.sh status)"
+
+# What ran, for a rollback (docs/operations/rollback.md)
+migration="$("${KC[@]}" "${NS[@]}" exec statefulset/postgres -- psql -U portal -d portal -tAc \
+  "select version_num from alembic_version" 2>/dev/null || echo unknown)"
+ran="$(date '+%Y-%m-%d %H:%M:%S %z')"
+for v in ENGINE_TAG PORTAL_TAG WEB_TAG MUSIC_TAG FORMULA_TAG; do if [ -n "${!v}" ]; then ran+=" $v=${!v}"; fi; done
+echo "$ran migration=$migration" >> "$K8S/deploy-history"
 
 if [ "$FRONTEND" = worker ]; then
   log "deployed the cluster side; the API origin is https://$API_ORIGIN_HOST (route it through the tunnel and protect"

@@ -25,6 +25,7 @@ _FIGURE_CAPTION = re.compile(r"^\s*(figure|fig\.|chart|image)", re.I)
 
 
 def assign_roles(doc: DocumentAnalysis) -> None:
+    _mark_drawn_lines(doc)
     _mark_running_artifacts(doc)
     _mark_repeated_images(doc)
     _assign_headings(doc)
@@ -137,6 +138,23 @@ def _attach_list_continuations(doc: DocumentAnalysis) -> None:
                     absorbed.add(id(b))
         if absorbed:
             p.blocks = [b for b in p.blocks if id(b) not in absorbed]
+
+
+_DRAWN = set("-‐‑‒–—―_.·…=~*")
+
+
+def _mark_drawn_lines(doc: DocumentAnalysis) -> None:
+    """A line drawn with characters (a dashed box border typed as a row of hyphens, a rule of underscores or dots) is
+    decoration: an artifact, not a paragraph, a heading or a formula (a row of dashes with a dot in it was taken for a
+    formula, #438). Table of contents leaders aren't: their lines have words."""
+    for p in doc.pages:
+        for b in p.blocks:
+            if b.role in ("Artifact", "Formula"):
+                continue
+            seen = [c for c in b.text if not c.isspace()]
+            if len(seen) >= 8 and sum(c in _DRAWN for c in seen) >= 0.8 * len(seen):
+                b.role = "Artifact"
+                b.artifact_type = "Layout"
 
 
 _MATH_CHARS = set("=×÷±≤≥<>+−√∑∫∞≈≠·^")

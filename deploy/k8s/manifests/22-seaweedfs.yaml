@@ -21,7 +21,10 @@ spec:
   template:
     metadata:
       labels: { app: seaweedfs }
+      # Restarted when its password changes (scripts/deploy.sh)
+      annotations: { checksum/password: "${S3_KEY_SHA}" }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       # weed needs nothing root can do; fsGroup makes the data volume (made by root before this) writable to it
       securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, fsGroupChangePolicy: OnRootMismatch, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:

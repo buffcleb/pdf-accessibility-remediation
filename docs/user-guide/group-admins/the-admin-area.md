@@ -15,18 +15,31 @@ waiting. The choice is remembered.
 
 A badge on **Administration** counts what's waiting for you, such as people waiting for approval.
 
-![A group admin's view of Northfield University: tabs for Overview, Services and pages, People, Help requests, Documents, Reports and Group settings; Needs attention showing All clear; 492 of 500 Standard pages and 292 of 300 Commercial AI pages left; the access check; and the page ledger.](../../images/group-admin.png)
+![A group admin's view of Northfield University: tabs for Overview, Services and pages, People, Help requests (2), Documents, Reports and Group settings; Needs attention with 1 document failed in the last 7 days (reason: the engine refused it), a link to its help request and Acknowledge, and an Acknowledged section; Standard, Adobe Autotag and Commercial AI pages left; the access check; and the start of the page ledger](../../images/group-admin.png)
 
 ## Attention
 
-The first page: what needs action, most serious first, each with what to do about it.
+> **Changed 22 October 2026:** every item links to what it's about, failures give their reasons in words, and
+> summaries and notices can be acknowledged.
+
+The first page: what needs action, most serious first, each with what to do about it and a link to what it's
+about. One document opens it (or its help request, when one is open); several open the group's documents, filtered
+to them.
+
+**Acknowledge** a summary or notice you've dealt with (documents that failed, held or lost their engine worker, the
+AI not being available). It's hidden for all the group's admins, and the audit log records who and when. It comes
+back when something new happens, counting only what's new ("not counting 2 acknowledged earlier"). **Acknowledged**,
+below the list, shows what was acknowledged, by whom and when, with **Show again**. Problems that need fixing (an
+empty pool, people waiting for approval) can't be acknowledged: they go when they're fixed.
 
 - **People waiting for approval.**
 - **Pools that are empty or running low.** You're also emailed once when one drops below the service's threshold
   (10% of the pool or 20 pages, whichever is larger, unless your administrators set otherwise), so you can request
   more in time. With an empty pool, everyone sees 0 pages left, whatever their own limit.
 - **Personal limits larger than what's left in the pool**, which can't actually be used.
-- **Documents** held for confirmation, waiting for a daily limit, stuck or failing.
+- **Documents** held for confirmation for over a day, waiting for a daily limit, large ones waiting over 2 hours, or
+  processing for over 2 hours.
+- **Documents that failed** in the last 7 days, with the most common reasons in words.
 - **Documents whose engine worker was lost** partway through (it ran out of memory or its pod restarted). The
   document's page says when the engine will try it again, or that it won't.
 - **Documents where the AI wasn't available.**
@@ -62,5 +75,11 @@ The first failing check is shown with its fix. It's the quickest way to answer "
 
 ## Unsaved changes
 
+> **Changed 22 October 2026:** forms in a dialog ask before closing with changes not saved.
+
 If you've changed something and not saved it, the portal asks before you leave the page: **Stay on this page** or
 **Leave without saving**. Forms show "Unsaved changes" next to their Save button.
+
+Most edit forms (a service's settings, top-ups, adding things) open in a dialog over the page. Escape, **×** or a
+click outside it closes it at once when nothing has changed; with changes, it asks first: **Save**, **Keep editing**
+or **Discard changes**.

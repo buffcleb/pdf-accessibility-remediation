@@ -15,7 +15,7 @@ log.
 - **Logo:** PNG, JPEG or WebP, up to 512 KB, with its alt text. (SVG isn't accepted, because an SVG served from the
   app could carry script.)
 
-![Administration, Settings, Branding tab: service name, organization name and email sender name; the accent color with its contrast note; and the logo upload with its alt text.](../../images/admin-settings.png)
+![Administration, Settings, Branding tab, beside the tabs Help and messages, Email, Uploads and limits, and Sign-in and data: service name, organization name and email sender name; the accent color with its default; the logo, with Upload a logo and its alt text; and Save branding](../../images/admin-settings.png)
 
 ## Help and messages
 
@@ -33,7 +33,26 @@ log.
 
 ## Uploads and limits
 
+> **Changed 22 October 2026:** **Alerts** now lists the malware scanner's two alerts and the SIEM export's alert,
+> for services that use them.
+
+One sub-tab per topic, each with its own **Save**; moving to another with unsaved changes asks first:
+
+| Sub-tab | Settings |
+|---|---|
+| **Uploads and queues** | Each upload, each person's queue, large documents |
+| **Downloads and scripts** | Downloading as a zip, API tokens for scripts |
+| **AI** | AI in the tag manager, Let AI decide the kind of document |
+| **Checks** | PDF/UA validation (veraPDF) |
+| **Help** | Help requests |
+| **Alerts** | Alerts, security alerts |
+
 - **Each upload:** the largest file, the most pages per document, the most files per upload.
+- **Downloading as a zip:** the most documents in one zip download from a list of documents (25 by default).
+- **API tokens for scripts:** whether groups may use tokens at all (off by default; each group's admins then switch
+  them on for their group), how long a new token lasts (90 days) and the longest it may (365), how many one person
+  may have (5), and after how long unused a token stops (90 days; 0 never). Switching tokens off stops every one at
+  once.
 - **Each person's queue:** how many of one person's documents are processed at once, and how many can be waiting
   (uploads beyond that are refused).
 - **Large documents:** documents over a page count (200 by default; 0 turns it off) are mixed in, one after every
@@ -69,8 +88,21 @@ log.
     (or the super admins, if it has none) get one email when a pool drops below; topping it up re-arms it. Attention
     uses the same threshold.
   - **Remind every** (4 hours): while a problem lasts.
+  - Where uploads are checked for malware (`MALWARE_SCAN=clamav`, set on the server): **the malware scanner isn't
+    answering** (every upload is refused while it's down; told after the same wait as the engine's), and **its
+    signatures are out of date** (more than 3 days old, told after an hour, so a scanner that has just started
+    doesn't alert). See [Operations › Malware scanning](../../operations/malware-scanning.md).
+  - Where the audit log goes to a SIEM: **the audit log isn't reaching the SIEM**, when events have waited more than
+    an hour to be sent ([System › Audit export](system.md#audit-export) shows how far it has got).
   - When the portal itself is down it can't email anyone: point an outside uptime check at `/api/v1/status`, which
     answers with an error (503) while there's a problem.
+- **Security alerts**: patterns in the audit log someone should look at, emailed to every super admin, shown on
+  **Attention** for a day and recorded in the audit log. **Security alerts on** turns them all off or on. The
+  numbers: wrong codes for one address (5), addresses tried from one IP (10) and refused requests from one IP (10),
+  each within **Sign-in patterns counted over** (15 minutes); codes asked for unknown addresses (20 an hour); other
+  people's files downloaded by one person (25 an hour). A new super admin, a group allowed to send documents outside,
+  shortened retention and a reused session cookie are told every time. The list, with what to do about each, is in
+  [monitoring](../../operations/monitoring.md#security-alerts).
 - **PDF/UA validation (veraPDF)**: how the checks run. The results are the same either way.
   - **As a service kept running** (the default): faster. If the service doesn't answer, the engine runs that check
     from the command line instead.

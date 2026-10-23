@@ -1,8 +1,10 @@
-import { useId, useRef, useState, type DragEvent } from "react";
+import { useEffect, useId, useRef, useState, type DragEvent } from "react";
 import {
-  get, heldFor, post, uploadFiles, type FileChoice, type Job, type ServiceChoice, type UploadOptions, type UploadResult,
+  get, heldFor, post, uploadFiles, type ConfirmMany, type FileChoice, type Job, type ServiceChoice, type UploadOptions,
+  type UploadResult,
 } from "../api";
 import { ErrorNotice, LiveRegion, Notice, fmtBytes, fmtNum, useLoad } from "./ui";
+import { SLOW_UPLOAD_SECONDS, uploadWait } from "./uploadWait";
 
 type Picked = { file: File; choice: FileChoice | null; open: boolean };
 
@@ -12,6 +14,7 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   const options = useLoad(() => get<UploadOptions>("/upload-options"), []);
   const [files, setFiles] = useState<Picked[]>([]);
   const [busy, setBusy] = useState<"" | "remediate" | "check">("");
+  const [slow, setSlow] = useState(false);  // still waiting after a few seconds: say why (#560)
   const [results, setResults] = useState<UploadResult[] | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [over, setOver] = useState(false);
@@ -24,6 +27,23 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   const [fullReview, setFullReview] = useState(false);
   const [ignoreTags, setIgnoreTags] = useState(false);  // #396: the documents' own tags are poor
   const [held, setHeld] = useState<Job[]>([]);
+  // Whether the held documents fit the pages left, as the server judges it (a dry run of sending them, #494)
+  const [fit, setFit] = useState<ConfirmMany | null>(null);
+  const heldKey = held.map((j) => j.id).join(",");
+  useEffect(() => {
+    if (!busy) { setSlow(false); return; }
+    const t = window.setTimeout(() => setSlow(true), SLOW_UPLOAD_SECONDS * 1000);
+    return () => window.clearTimeout(t);
+  }, [busy]);
+  useEffect(() => {
+    setFit(null);
+    if (held.length < 2) return;
+    let live = true;
+    post<ConfirmMany>("/jobs/confirm", { job_ids: held.map((j) => j.id), dry_run: true })
+      .then((r) => { if (live) setFit(r); })
+      .catch(() => { if (live) setFit(null); });
+    return () => { live = false; };
+  }, [heldKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const ids = useId();
 
   const opts = options.data;
@@ -56,6 +76,22 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
       await post(`/jobs/${job.id}/${send ? "confirm" : "cancel"}`);
       setHeld((h) => h.filter((x) => x.id !== job.id));
       setAnnounce(send ? `${job.filename} sent.` : `${job.filename} canceled.`);
+      await onChanged();
+    } catch (e) {
+      setError(e);
+    }
+  }
+
+  /** Send held documents together: all of them, or those that fit in upload order (#494). */
+  async function sendMany(mode: "all" | "fit") {
+    setError(null);
+    try {
+      const r = await post<ConfirmMany>("/jobs/confirm", { job_ids: held.map((j) => j.id), mode });
+      setHeld((h) => h.filter((x) => !r.sent.includes(x.id)));
+      setAnnounce(r.held.length
+        ? `${r.sent.length} sent (${fmtNum(r.sent_pages)} pages). ${r.held.length} still waiting: `
+          + "not enough pages left."
+        : `All ${r.sent.length} sent (${fmtNum(r.sent_pages)} pages).`);
       await onChanged();
     } catch (e) {
       setError(e);
@@ -203,8 +239,9 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
           <input type="checkbox" checked={altText} onChange={(e) => setAltText(e.target.checked)} />
           <span>
             Write alt text for images with AI. <span className="muted">{chosen?.label} doesn't describe images. You get
-            its file as it is, plus an improved copy with the AI alt text (and any font fixes and bookmarks, which never
-            change how the pages look). Uses pages of the AI level, given back if no image needed describing.</span>
+            its file as it is, plus an improved copy with the AI alt text (and any font fixes, bookmarks and document
+            fixes, which never change how the pages look). Uses pages of the AI level, given back if no image needed
+            describing.</span>
           </span>
         </label>
       )}
@@ -246,6 +283,9 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
           {busy === "check" ? "Uploading…" : "Check only"}
         </button>
       </div>
+      <p className="small upload-wait" role="status">
+        {busy && slow ? uploadWait(files.length, !!opts?.malware_scan) : ""}
+      </p>
       <p id={`${ids}-check`} className="muted small upload-hint">
         Remediate uses one page of your limit for each page. Check only reports problems without changing the
         files{checkCost(level, chosen)}.
@@ -274,10 +314,23 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
               </li>
             ))}
           </ul>
-          {held.length > 1 && (
-            <button className="btn small" style={{ alignSelf: "flex-start" }}
-              onClick={() => void Promise.all(held.map((j) => decide(j, true)))}>
-              Send all {held.length} ({fmtNum(held.reduce((n, j) => n + j.pages, 0))} pages)
+          {held.length > 1 && fit && fit.held.length > 0 && (
+            <span>
+              <strong>These {held.length} files are {fmtNum(fit.needed_pages)} pages, and you have{" "}
+                {fmtNum(fit.remaining_pages ?? 0)} {chosen?.label ?? ""} pages left.</strong>{" "}
+              {fit.sent.length > 0
+                ? `The first ${fit.sent.length} fit; the rest would wait here until you have more pages or cancel them.`
+                : "None of them fits: cancel some, or ask for more pages."}
+            </span>
+          )}
+          {held.length > 1 && fit && fit.held.length === 0 && (
+            <button className="btn small" style={{ alignSelf: "flex-start" }} onClick={() => void sendMany("all")}>
+              Send all {held.length} ({fmtNum(fit.needed_pages)} pages)
+            </button>
+          )}
+          {held.length > 1 && fit && fit.held.length > 0 && fit.sent.length > 0 && (
+            <button className="btn small" style={{ alignSelf: "flex-start" }} onClick={() => void sendMany("fit")}>
+              Send the first {fit.sent.length} that fit ({fmtNum(fit.sent_pages)} pages)
             </button>
           )}
         </Notice>

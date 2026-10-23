@@ -20,6 +20,8 @@ spec:
         prometheus.io/scrape: "true"  # busy or idle, pictures read (#397)
         prometheus.io/port: "9464"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+${ENGINE_PLACEMENT}
       terminationGracePeriodSeconds: 180
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }

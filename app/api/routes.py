@@ -132,15 +132,28 @@ async def ai_models():
 
 def worker_capacity(timeout: float = 1.0) -> dict:
     """The workers answering now and how many documents they process at once between them (None when none answer,
-    or the queue can't be reached)."""
+    or the queue can't be reached).
+
+    A worker told to stop (a new release, scaling down) finishes its document but no longer answers (#531), while the
+    portal still counts that document as at the engine: so its place is counted too, as long as the document's
+    heartbeat is fresh and no answering worker has it. Otherwise, during a deploy, new documents would wait for it
+    with the new worker idle."""
+    from app.storage import running_job_ids
     from app.worker.celery_app import celery_app
+    from app.worker.tasks import HEARTBEAT_STALE_S
 
     try:
-        stats = celery_app.control.inspect(timeout=timeout).stats() or {}
+        inspect = celery_app.control.inspect(timeout=timeout)
+        stats = inspect.stats() or {}
+        active = (inspect.active() or {}) if stats else {}
     except Exception:  # noqa: BLE001 - the queue being down mustn't break the caller
-        return {"workers": None, "documents_at_once": None}
+        return {"workers": None, "documents_at_once": None, "documents_on_stopping_workers": 0}
     at_once = sum(int((s.get("pool") or {}).get("max-concurrency") or 0) for s in stats.values())
-    return {"workers": len(stats), "documents_at_once": at_once or None}
+    answering = {str(task["args"][0]) for tasks in active.values() for task in (tasks or [])
+                 if isinstance(task, dict) and task.get("args")}
+    stopping = len(running_job_ids(HEARTBEAT_STALE_S) - answering)
+    return {"workers": len(stats), "documents_at_once": (at_once + stopping) or None,
+            "documents_on_stopping_workers": stopping}
 
 
 @router.get("/capacity", dependencies=[Depends(require_api_key)])
@@ -150,14 +163,43 @@ async def capacity():
     return await run_in_threadpool(worker_capacity)
 
 
+def _ai_read_items(raw: str) -> list[dict]:
+    """The carried AI readings of an edit, checked for shape and size: 422 for anything else."""
+    bad = HTTPException(status_code=422, detail="ai_read must be a list of the AI readings' findings")
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        raise bad
+    if not isinstance(items, list) or len(items) > 5000:
+        raise bad
+    out = []
+    for it in items:
+        read = it.get("ai_read") if isinstance(it, dict) else None
+        if not (isinstance(read, list) and len(read) == 4 and isinstance(read[0], int) and read[0] >= 0
+                and isinstance(read[1], list) and len(read[1]) == 4
+                and all(isinstance(v, (int, float)) for v in read[1])
+                and isinstance(read[2], str) and len(read[2]) <= 40 and isinstance(read[3], str)
+                and len(read[3]) <= 2000):
+            raise bad
+        element = it.get("element")
+        readings = it.get("readings")
+        two = isinstance(readings, dict) and isinstance(readings.get("readings"), list)
+        if (element is not None and not isinstance(element, int)) or (readings is not None and not two):
+            raise bad
+        out.append({"ai_read": read, "element": element, **({"readings": readings} if readings else {})})
+    return out
+
+
 @router.post("/edit", response_model=SubmitResponse, status_code=202, dependencies=[Depends(require_api_key)])
 async def submit_edit(file: UploadFile = File(...), edits: str = Form(...), verify_ai: bool = Form(True),
                       review: str = Form("none", pattern="^(none|sampled|full)$"),
                       judge_model: str | None = Form(None, max_length=200),
                       reference: UploadFile | None = File(None),
                       validator: str | None = Form(None, pattern="^(service|command_line)$"),
-                      verapdf_ua2: bool = Form(True)):
+                      verapdf_ua2: bool = Form(True), ai_read: str = Form("[]", max_length=2_000_000)):
     """Apply tag edits to a remediated PDF and validate the result (the portal's tag manager).
+    ai_read: the AI's readings flagged on the version this one is based on (each finding's "ai_read", "readings"
+    and "element"), placed again on the result so they stay flagged for a person to check.
     review=sampled also runs the AI tag review (flagged items plus a sample) over the whole result, and
     review=full reviews every figure;
     with no edits that re-reviews the file as it is.
@@ -172,6 +214,7 @@ async def submit_edit(file: UploadFile = File(...), edits: str = Form(...), veri
         raise HTTPException(status_code=422, detail="edits must be a JSON list")
     except EditError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    carried = _ai_read_items(ai_read)
     job_id = str(uuid.uuid4())
     store = JobStore(job_id)
     store.create()
@@ -181,7 +224,7 @@ async def submit_edit(file: UploadFile = File(...), edits: str = Form(...), veri
     store.write_meta({"job_id": job_id, "kind": "edit", "filename": file.filename,
                       "stem": safe_stem(file.filename or "document.pdf"), "size_bytes": size,
                       "edits": ops, "verify_ai": verify_ai, "review": review, "judge_model": judge_model,
-                      "reference": reference is not None, "submitted_at": time.time(),
+                      "reference": reference is not None, "submitted_at": time.time(), "ai_read": carried,
                       "flags": {**({"validator": validator} if validator else {}), "verapdf_ua2": verapdf_ua2}})
     from app.worker.tasks import edit_tags
 
@@ -248,7 +291,13 @@ async def get_job(job_id: str, format: str = Query("json", pattern="^(json|markd
         if ended is not None:
             store.write_error(ended)
             return JobResponse(job_id=job_id, status="failed", error=ended)
-        return JobResponse(job_id=job_id, status="processing", progress=_lost(store) or _progress(job_id))
+        partial = store.read_partial()
+        if partial:
+            ref0 = lambda name: store.render_file_ref(name, False)  # noqa: E731
+            partial = {"files": {k: ref0(v) for k, v in (partial.get("files") or {}).items()},
+                       "tag_map": ref0(partial.get("tag_map"))}
+        return JobResponse(job_id=job_id, status="processing", progress=_lost(store) or _progress(job_id),
+                           **({"partial": partial} if partial else {}))
 
     b64 = bool(meta.get("flags", {}).get("return_base64"))
     ref = lambda name: store.render_file_ref(name, b64)  # noqa: E731

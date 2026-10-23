@@ -93,6 +93,8 @@ class StructTreeBuilder:
         self.key_elems: dict[str, pikepdf.Object] = {}  # leaf key -> element (for annotation placement)
         self.key_page: dict[str, int] = {}
         self.inserted: list[pikepdf.Object] = []  # elements added under the document tag (kept trees place them)
+        # Figures and formulas made here, by element: (page, box in visual space), for their bounding box (#437)
+        self.boxes: dict[tuple, tuple[int, tuple]] = {}
         self.ids: set[bytes] | None = None  # element IDs in the tree, gathered when the first is made
 
     # ------------------------------------------------------------------ entry
@@ -370,6 +372,7 @@ class StructTreeBuilder:
                 if role == "Formula":
                     # Math written as text: the spoken form ("10 to the power of 4 = 10 000") is its alt text
                     e.Alt = String(el.actual_text or el.text)
+                    self.boxes[e.objgen] = (page.number, el.bbox)
                 elif el.actual_text:
                     e.ActualText = String(el.actual_text)
                 if role != "Formula":
@@ -470,6 +473,7 @@ class StructTreeBuilder:
     def _figure(self, img: ImageRegion, doc) -> list[pikepdf.Object]:
         role = "Formula" if img.kind == "formula" else "Figure"
         e = self._elem(role, doc, img.page)
+        self.boxes[e.objgen] = (img.page, img.bbox)
         if not self._attach_refs(e, img.id, img.page):
             return []
         if img.alt:

@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from fastapi import Request
+from sqlalchemy import insert
 from sqlalchemy.orm import Session
 
 from portal.config import get_portal_settings
@@ -75,7 +76,9 @@ def record(
     group_id: uuid.UUID | None = None,
     details: dict | None = None,
 ) -> None:
-    db.add(AuditEvent(
+    # Written at once, without reading the row back (no RETURNING): row-level security lets anyone add to the log, but
+    # read only their groups' entries (#350), and an entry may belong to no group or another one.
+    db.execute(insert(AuditEvent.__table__).inline().values(
         actor_id=actor.id if actor else None,
         actor_email=actor.email if actor else actor_email,
         action=action,

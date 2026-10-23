@@ -1,0 +1,50 @@
+# The portal's own Redis (#472), for its rate limits (portal/security/ratelimit.py), its only use of Redis: apart from
+# the engine's queue (21-redis.yaml), with its own password (PORTAL_REDIS_PASSWORD in portal.env), and reachable from
+# the portal's API and worker only (80-network-policies.yaml). It keeps nothing on disk: counts start over after a
+# restart, which only means a few more attempts are allowed in that window.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-portal
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: redis-portal }
+  ports: [{ name: redis, port: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-portal
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis-portal }
+  template:
+    metadata:
+      labels: { app: redis-portal }
+      # Restarted when its password changes (scripts/deploy.sh)
+      annotations: { checksum/password: "${PORTAL_REDIS_KEY_SHA}" }
+    spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+      securityContext: { runAsUser: 999, runAsGroup: 999, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: redis
+          image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+          # Counts only, each with an expiry: nothing saved, and the oldest dropped first if it ever filled up
+          args: ["--save", "", "--appendonly", "no", "--dir", "/data", "--requirepass", "$(PORTAL_REDIS_PASSWORD)",
+                 "--maxmemory", "32mb", "--maxmemory-policy", "volatile-lru"]
+          env:
+            - name: PORTAL_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: pdfrem-portal-env, key: PORTAL_REDIS_PASSWORD } }
+          ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: ["sh", "-c", "redis-cli --no-auth-warning -a \"$PORTAL_REDIS_PASSWORD\" ping | grep -q PONG"] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 96Mi, ephemeral-storage: 64Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - { name: data, emptyDir: { sizeLimit: 16Mi } }

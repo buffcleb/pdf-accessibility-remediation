@@ -24,7 +24,7 @@ export function SettingsArea() {
         <Route index element={<BrandingSettings />} />
         <Route path="help" element={<HelpSettings />} />
         <Route path="email" element={<MailSettings />} />
-        <Route path="limits" element={<LimitSettings />} />
+        <Route path="limits/*" element={<LimitSettings />} />
         <Route path="sign-in" element={<SignInSettings />} />
         <Route path="*" element={<Navigate to="/admin/settings" replace />} />
       </Routes>
@@ -235,146 +235,281 @@ function HelpSettings() {
   );
 }
 
+// --- uploads and limits: one sub-tab per topic (#521), each its own address and its own Save -------------------
+
+const LIMIT_TABS: [string, string][] = [["uploads", "Uploads and queues"], ["downloads", "Downloads and scripts"], ["ai", "AI"], ["checks", "Checks"], ["help", "Help"], ["alerts", "Alerts"]];
+
 function LimitSettings() {
+  return (
+    <>
+      <nav className="report-pills settings-subtabs" aria-label="Uploads and limits: topics">
+        {LIMIT_TABS.map(([key, label]) => (
+          <NavLink key={key} className="pill-link" to={`/admin/settings/limits/${key}`}>{label}</NavLink>
+        ))}
+      </nav>
+      <Routes>
+        <Route index element={<Navigate to="uploads" replace />} />
+        <Route path="uploads" element={<LimitsUploads />} />
+        <Route path="downloads" element={<LimitsDownloads />} />
+        <Route path="ai" element={<LimitsAi />} />
+        <Route path="checks" element={<LimitsChecks />} />
+        <Route path="help" element={<LimitsHelp />} />
+        <Route path="alerts" element={<LimitsAlerts />} />
+        <Route path="*" element={<Navigate to="/admin/settings/limits/uploads" replace />} />
+      </Routes>
+    </>
+  );
+}
+
+/** One sub-tab of Uploads and limits: the settings loaded, a draft of this tab's changes, Save for them only. Going to
+ * another sub-tab with changes asks first (the page's unsaved-changes question). */
+function LimitTab({ label, children }: {
+  label: string; children: (s: RuntimeSettings, set: (p: Partial<RuntimeSettings>) => void) => ReactNode;
+}) {
   const { settings, s, set, save, dirty, error, saved } = useSettingsDraft();
-  const models = useLoad(() => get<{ models: string[] }>("/admin/ai-models").catch(() => ({ models: [] })), []);
   if (settings.loading && !settings.data) return <Loading />;
   if (!s) return <ErrorNotice error={settings.error} />;
   return (
-    <form className="panel" onSubmit={(e) => void save(e)} aria-label="Uploads and limits">
-      <Section title="Each upload" intro="Services can set a lower page limit of their own.">
-        <div className="grid">
-          <NumberField id="l-mb" label="Largest file" unit="MB" value={s.max_file_mb} onChange={(n) => set({ max_file_mb: n })} />
-          <NumberField id="l-pages" label="Most pages per document" unit="pages" value={s.max_pages_per_document}
-            onChange={(n) => set({ max_pages_per_document: n })} />
-          <NumberField id="l-files" label="Most files per upload" unit="files" value={s.max_files_per_upload}
-            onChange={(n) => set({ max_files_per_upload: n })} />
-        </div>
-      </Section>
-      <Section title="Help requests" intro="Files people and support attach, and how long someone can reopen a finished request.">
-        <div className="grid">
-          <NumberField id="l-hfile" label="Largest attached file" unit="MB" value={s.help_max_file_mb}
-            onChange={(n) => set({ help_max_file_mb: n })} />
-          <NumberField id="l-hreq" label="All files on one request" unit="MB" value={s.help_max_request_mb}
-            onChange={(n) => set({ help_max_request_mb: n })} />
-          <NumberField id="l-hreopen" label="Reopen within" unit="days" hint="After it's resolved or closed."
-            value={s.help_reopen_days} onChange={(n) => set({ help_reopen_days: n })} />
-        </div>
-        <label className="check">
-          <input type="checkbox" checked={s.help_on_failure} onChange={(e) => set({ help_on_failure: e.target.checked })} />
-          <span>Open a help request when a document fails <span className="muted small">(so every failure is looked at;
-            a known limitation can be closed with a note. Off: people can still ask for help with a failed document
-            themselves. Documents someone stopped don't get one)</span></span>
-        </label>
-      </Section>
-      <Section title="AI in the tag manager" intro="Each use is one AI call at the document's AI level, recorded on its cost.">
-        <label className="check">
-          <input type="checkbox" checked={s.ai_describe_default} onChange={(e) => set({ ai_describe_default: e.target.checked })} />
-          <span><strong>Describe with AI</strong>, for everyone <span className="muted small">(alt text for an area of a
-            figure, written by the AI. A group, and each person in it, can be set otherwise by their group admins
-            or a super admin)</span></span>
-        </label>
-      </Section>
-      <Section title="Each person's queue" intro="So one big batch doesn't hold everyone else up.">
-        <div className="grid">
-          <NumberField id="l-conc" label="Processed at once" unit="documents" hint="The rest wait their turn."
-            value={s.max_concurrent_jobs_per_user} onChange={(n) => set({ max_concurrent_jobs_per_user: n })} />
-          <NumberField id="l-queue" label="Waiting at most" unit="documents" hint="Uploads beyond this are refused."
-            value={s.max_queued_jobs_per_user} onChange={(n) => set({ max_queued_jobs_per_user: n })} />
-        </div>
-      </Section>
-      <Section title="Large documents" intro={"So a few very long documents don't jam the queue during the day. Large ones are " +
-        "mixed in between smaller ones, and go one after another when nothing smaller is waiting. Super admins can " +
-        "use Process now in Queues when one is urgent."}>
-        <div className="grid">
-          <NumberField id="l-large" label="Large means more than" unit="pages" min={0} hint="0 turns this off."
-            value={s.large_doc_pages} onChange={(n) => set({ large_doc_pages: n })} />
-          <NumberField id="l-every" label="Start one large document after every" unit="smaller ones"
-            value={s.large_doc_every} onChange={(n) => set({ large_doc_every: n })} />
-          <NumberField id="l-once" label="Large documents processed at once" unit="documents"
-            value={s.large_doc_at_once} onChange={(n) => set({ large_doc_at_once: n })} />
-        </div>
-      </Section>
-      <Section title="Kind of document: Let AI decide" intro={"Offers \"Let AI decide\" among an AI level's kinds of " +
-        "document. The first pages' text (never images) is read to pick the kind before the document is sent; General " +
-        "is used when it isn't sure."}>
-        <label className="check">
-          <input type="checkbox" checked={s.classifier_jev} onChange={(e) => set({ classifier_jev: e.target.checked })} />
-          <span>Use Jev through OpenRouter <span className="muted small">(an outside service, about $0.0001 per
-            document; never for local-only groups; needs the engine's OpenRouter key)</span></span>
-        </label>
-        <div className="grid">
-          <div className="field">
-            <label htmlFor="l-cmodel">Local model</label>
-            <select id="l-cmodel" value={s.classifier_local_model} aria-describedby="l-cmodel-hint"
-              onChange={(e) => set({ classifier_local_model: e.target.value })}>
-              <option value="">None</option>
-              {[...new Set([...(models.data?.models ?? []), s.classifier_local_model].filter(Boolean))].map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-            <span id="l-cmodel-hint" className="hint">A gateway model on your own servers, for local-only groups (and for
-              everyone when Jev is off).</span>
-          </div>
-          <NumberField id="l-cthresh" label="Use the kind when at least" unit="% sure" min={0}
-            hint="Below this, General is used." value={Math.round(s.classifier_threshold * 100)}
-            onChange={(n) => set({ classifier_threshold: Math.max(0, Math.min(100, n)) / 100 })} />
-          <NumberField id="l-cpages" label="Pages read" unit="pages" hint="The first ones, and more spread through long documents."
-            value={s.classifier_pages} onChange={(n) => set({ classifier_pages: n })} />
-        </div>
-      </Section>
-      <Section title="Alerts" intro={"Problems the service notices about itself are emailed to every super admin and " +
-        "shown on Attention: one email when one starts, a reminder while it lasts, and one when it clears. When the " +
-        "portal itself is down it can't email: point an outside uptime check at /api/v1/status, which answers 503 " +
-        "while there's a problem."}>
-        <div className="grid">
-          <NumberField id="l-aqueue" label="Queue not moving after" unit="minutes" min={5}
-            hint="Documents are waiting and none has started or finished for this long. A busy queue that's moving never counts."
-            value={s.alert_queue_minutes} onChange={(n) => set({ alert_queue_minutes: n })} />
-          <NumberField id="l-aworker" label="Background worker stopped after" unit="minutes" min={5}
-            hint="The portal's worker hasn't completed a pass (documents, saves, emails) for this long."
-            value={s.alert_worker_minutes} onChange={(n) => set({ alert_worker_minutes: n })} />
-          <NumberField id="l-aengine" label="Engine without workers after" unit="minutes" min={2}
-            hint="The engine reports no workers, or can't be reached, for this long."
-            value={s.alert_engine_minutes} onChange={(n) => set({ alert_engine_minutes: n })} />
-          <NumberField id="l-abackup" label="Backup not finished after" unit="hours" min={2}
-            hint="Only where the cluster runs the nightly backup (BACKUPS=cronjob); never with the hosts' own backups."
-            value={s.alert_backup_hours} onChange={(n) => set({ alert_backup_hours: n })} />
-          <NumberField id="l-lowpct" label="A group's pool is running low below" unit="% of its size" min={0}
-            hint="Or below the number of pages next to it, whichever is larger. Its admins are emailed once when it drops below; Attention shows it."
-            value={s.low_pool_percent} onChange={(n) => set({ low_pool_percent: n })} />
-          <NumberField id="l-lowpages" label="…or below" unit="pages" min={0}
-            value={s.low_pool_pages} onChange={(n) => set({ low_pool_pages: n })} />
-          <NumberField id="l-arepeat" label="Remind every" unit="hours" min={1}
-            hint="While a problem lasts."
-            value={s.alert_repeat_hours} onChange={(n) => set({ alert_repeat_hours: n })} />
-        </div>
-      </Section>
-      <Section title="PDF/UA validation (veraPDF)" intro={"veraPDF checks every document before and after remediation, " +
-        "and every saved version. The results are the same either way; only the speed and memory differ."}>
-        <fieldset className="choices">
-          <legend className="small">Run veraPDF</legend>
-          <label className="check">
-            <input type="radio" name="l-vera" checked={s.verapdf_mode === "service"} onChange={() => set({ verapdf_mode: "service" })} />
-            <span>As a service kept running <span className="muted small">(faster: Java isn't started for every check;
-              if the service doesn't answer, the engine uses the command line for that check)</span></span>
-          </label>
-          <label className="check">
-            <input type="radio" name="l-vera" checked={s.verapdf_mode === "command_line"} onChange={() => set({ verapdf_mode: "command_line" })} />
-            <span>From the command line in the engine <span className="muted small">(Java started for each check,
-              about a second more each)</span></span>
-          </label>
-        </fieldset>
-        <label className="check">
-          <input type="checkbox" checked={s.verapdf_ua2} onChange={(e) => set({ verapdf_ua2: e.target.checked })} />
-          <span>Also check PDF/UA-2 <span className="muted small">(shown in reports for information; the verdict is
-            PDF/UA-1, except for a PDF 2.0 document, which can only be PDF/UA-2 and is always checked against it. Off
-            halves the number of checks)</span></span>
-        </label>
-      </Section>
+    <form className="panel" onSubmit={(e) => void save(e)} aria-label={label}>
+      {children(s, set)}
       <ErrorNotice error={error} />
       <SaveBar dirty={dirty} saved={saved} />
     </form>
+  );
+}
+
+function LimitsUploads() {
+  return (
+    <LimitTab label="Uploads and queues">
+      {(s, set) => <>
+          <Section title="Each upload" intro="Services can set a lower page limit of their own.">
+            <div className="grid">
+              <NumberField id="l-mb" label="Largest file" unit="MB" value={s.max_file_mb} onChange={(n) => set({ max_file_mb: n })} />
+              <NumberField id="l-pages" label="Most pages per document" unit="pages" value={s.max_pages_per_document}
+                onChange={(n) => set({ max_pages_per_document: n })} />
+              <NumberField id="l-files" label="Most files per upload" unit="files" value={s.max_files_per_upload}
+                onChange={(n) => set({ max_files_per_upload: n })} />
+            </div>
+          </Section>
+          <Section title="Each person's queue" intro="So one big batch doesn't hold everyone else up.">
+            <div className="grid">
+              <NumberField id="l-conc" label="Processed at once" unit="documents" hint="The rest wait their turn."
+                value={s.max_concurrent_jobs_per_user} onChange={(n) => set({ max_concurrent_jobs_per_user: n })} />
+              <NumberField id="l-queue" label="Waiting at most" unit="documents" hint="Uploads beyond this are refused."
+                value={s.max_queued_jobs_per_user} onChange={(n) => set({ max_queued_jobs_per_user: n })} />
+            </div>
+          </Section>
+          <Section title="Large documents" intro={"So a few very long documents don't jam the queue during the day. Large ones are " +
+            "mixed in between smaller ones, and go one after another when nothing smaller is waiting. Super admins can " +
+            "use Process now in Queues when one is urgent."}>
+            <div className="grid">
+              <NumberField id="l-large" label="Large means more than" unit="pages" min={0} hint="0 turns this off."
+                value={s.large_doc_pages} onChange={(n) => set({ large_doc_pages: n })} />
+              <NumberField id="l-every" label="Start one large document after every" unit="smaller ones"
+                value={s.large_doc_every} onChange={(n) => set({ large_doc_every: n })} />
+              <NumberField id="l-once" label="Large documents processed at once" unit="documents"
+                value={s.large_doc_at_once} onChange={(n) => set({ large_doc_at_once: n })} />
+            </div>
+          </Section>
+      </>}
+    </LimitTab>
+  );
+}
+
+function LimitsDownloads() {
+  return (
+    <LimitTab label="Downloads and scripts">
+      {(s, set) => <>
+          <Section title="Downloading as a zip" intro="People download many documents' files at once from their list, and admins from a group's documents. The zip is made as it's sent.">
+            <div className="grid">
+              <NumberField id="l-export" label="Most documents in one zip" unit="documents" value={s.max_export_documents}
+                onChange={(n) => set({ max_export_documents: n })} />
+            </div>
+          </Section>
+          <Section title="API tokens for scripts" intro={"People make personal tokens for scripts that send documents (and, if they choose, fetch the results), " +
+            "each tied to one processing option and AI level. Switch them on here first; then each group's admins switch them on for their group. " +
+            "Switching off stops every token at once."}>
+            <label className="check">
+              <input type="checkbox" checked={s.api_tokens_enabled} onChange={(e) => set({ api_tokens_enabled: e.target.checked })} />
+              <span>Let groups use API tokens</span>
+            </label>
+            <div className="grid">
+              <NumberField id="l-tok-days" label="A new token lasts" unit="days" value={s.api_token_days}
+                onChange={(n) => set({ api_token_days: n })} />
+              <NumberField id="l-tok-max" label="Longest a token can last" unit="days" value={s.api_token_max_days}
+                onChange={(n) => set({ api_token_max_days: n })} />
+              <NumberField id="l-tok-n" label="Tokens per person" unit="tokens" value={s.api_tokens_per_person}
+                onChange={(n) => set({ api_tokens_per_person: n })} />
+              <NumberField id="l-tok-idle" label="Unused tokens stop after" unit="days" hint="0: never." value={s.api_token_idle_days}
+                onChange={(n) => set({ api_token_idle_days: n })} />
+            </div>
+          </Section>
+      </>}
+    </LimitTab>
+  );
+}
+
+function LimitsAi() {
+  const models = useLoad(() => get<{ models: string[] }>("/admin/ai-models").catch(() => ({ models: [] })), []);
+  return (
+    <LimitTab label="AI">
+      {(s, set) => <>
+          <Section title="AI in the tag manager" intro="Each use is one AI call at the document's AI level, recorded on its cost.">
+            <label className="check">
+              <input type="checkbox" checked={s.ai_describe_default} onChange={(e) => set({ ai_describe_default: e.target.checked })} />
+              <span><strong>Describe with AI</strong>, for everyone <span className="muted small">(alt text for an area of a
+                figure, written by the AI. A group, and each person in it, can be set otherwise by their group admins
+                or a super admin)</span></span>
+            </label>
+          </Section>
+          <Section title="Kind of document: Let AI decide" intro={"Offers \"Let AI decide\" among an AI level's kinds of " +
+            "document. The first pages' text (never images) is read to pick the kind before the document is sent; General " +
+            "is used when it isn't sure."}>
+            <label className="check">
+              <input type="checkbox" checked={s.classifier_jev} onChange={(e) => set({ classifier_jev: e.target.checked })} />
+              <span>Use Jev through OpenRouter <span className="muted small">(an outside service, about $0.0001 per
+                document; never for local-only groups; needs the engine's OpenRouter key)</span></span>
+            </label>
+            <div className="grid">
+              <div className="field">
+                <label htmlFor="l-cmodel">Local model</label>
+                <select id="l-cmodel" value={s.classifier_local_model} aria-describedby="l-cmodel-hint"
+                  onChange={(e) => set({ classifier_local_model: e.target.value })}>
+                  <option value="">None</option>
+                  {[...new Set([...(models.data?.models ?? []), s.classifier_local_model].filter(Boolean))].map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+                <span id="l-cmodel-hint" className="hint">A gateway model on your own servers, for local-only groups (and for
+                  everyone when Jev is off).</span>
+              </div>
+              <NumberField id="l-cthresh" label="Use the kind when at least" unit="% sure" min={0}
+                hint="Below this, General is used." value={Math.round(s.classifier_threshold * 100)}
+                onChange={(n) => set({ classifier_threshold: Math.max(0, Math.min(100, n)) / 100 })} />
+              <NumberField id="l-cpages" label="Pages read" unit="pages" hint="The first ones, and more spread through long documents."
+                value={s.classifier_pages} onChange={(n) => set({ classifier_pages: n })} />
+            </div>
+          </Section>
+      </>}
+    </LimitTab>
+  );
+}
+
+function LimitsChecks() {
+  return (
+    <LimitTab label="Checks">
+      {(s, set) => <>
+          <Section title="PDF/UA validation (veraPDF)" intro={"veraPDF checks every document before and after remediation, " +
+            "and every saved version. The results are the same either way; only the speed and memory differ."}>
+            <fieldset className="choices">
+              <legend className="small">Run veraPDF</legend>
+              <label className="check">
+                <input type="radio" name="l-vera" checked={s.verapdf_mode === "service"} onChange={() => set({ verapdf_mode: "service" })} />
+                <span>As a service kept running <span className="muted small">(faster: Java isn't started for every check;
+                  if the service doesn't answer, the engine uses the command line for that check)</span></span>
+              </label>
+              <label className="check">
+                <input type="radio" name="l-vera" checked={s.verapdf_mode === "command_line"} onChange={() => set({ verapdf_mode: "command_line" })} />
+                <span>From the command line in the engine <span className="muted small">(Java started for each check,
+                  about a second more each)</span></span>
+              </label>
+            </fieldset>
+            <label className="check">
+              <input type="checkbox" checked={s.verapdf_ua2} onChange={(e) => set({ verapdf_ua2: e.target.checked })} />
+              <span>Also check PDF/UA-2 <span className="muted small">(shown in reports for information; the verdict is
+                PDF/UA-1, except for a PDF 2.0 document, which can only be PDF/UA-2 and is always checked against it. Off
+                halves the number of checks)</span></span>
+            </label>
+          </Section>
+      </>}
+    </LimitTab>
+  );
+}
+
+function LimitsHelp() {
+  return (
+    <LimitTab label="Help">
+      {(s, set) => <>
+          <Section title="Help requests" intro="Files people and support attach, and how long someone can reopen a finished request.">
+            <div className="grid">
+              <NumberField id="l-hfile" label="Largest attached file" unit="MB" value={s.help_max_file_mb}
+                onChange={(n) => set({ help_max_file_mb: n })} />
+              <NumberField id="l-hreq" label="All files on one request" unit="MB" value={s.help_max_request_mb}
+                onChange={(n) => set({ help_max_request_mb: n })} />
+              <NumberField id="l-hreopen" label="Reopen within" unit="days" hint="After it's resolved or closed."
+                value={s.help_reopen_days} onChange={(n) => set({ help_reopen_days: n })} />
+            </div>
+            <label className="check">
+              <input type="checkbox" checked={s.help_on_failure} onChange={(e) => set({ help_on_failure: e.target.checked })} />
+              <span>Open a help request when a document fails <span className="muted small">(so every failure is looked at;
+                a known limitation can be closed with a note. Off: people can still ask for help with a failed document
+                themselves. Documents someone stopped don't get one)</span></span>
+            </label>
+          </Section>
+      </>}
+    </LimitTab>
+  );
+}
+
+function LimitsAlerts() {
+  return (
+    <LimitTab label="Alerts">
+      {(s, set) => <>
+          <Section title="Alerts" intro={"Problems the service notices about itself are emailed to every super admin and " +
+            "shown on Attention: one email when one starts, a reminder while it lasts, and one when it clears. When the " +
+            "portal itself is down it can't email: point an outside uptime check at /api/v1/status, which answers 503 " +
+            "while there's a problem."}>
+            <div className="grid">
+              <NumberField id="l-aqueue" label="Queue not moving after" unit="minutes" min={5}
+                hint="Documents are waiting and none has started or finished for this long. A busy queue that's moving never counts."
+                value={s.alert_queue_minutes} onChange={(n) => set({ alert_queue_minutes: n })} />
+              <NumberField id="l-aworker" label="Background worker stopped after" unit="minutes" min={5}
+                hint="The portal's worker hasn't completed a pass (documents, saves, emails) for this long."
+                value={s.alert_worker_minutes} onChange={(n) => set({ alert_worker_minutes: n })} />
+              <NumberField id="l-aengine" label="Engine without workers after" unit="minutes" min={2}
+                hint="The engine reports no workers, or can't be reached, for this long."
+                value={s.alert_engine_minutes} onChange={(n) => set({ alert_engine_minutes: n })} />
+              <NumberField id="l-abackup" label="Backup not finished after" unit="hours" min={2}
+                hint="Only where the cluster runs the nightly backup (BACKUPS=cronjob); never with the hosts' own backups."
+                value={s.alert_backup_hours} onChange={(n) => set({ alert_backup_hours: n })} />
+              <NumberField id="l-lowpct" label="A group's pool is running low below" unit="% of its size" min={0}
+                hint="Or below the number of pages next to it, whichever is larger. Its admins are emailed once when it drops below; Attention shows it."
+                value={s.low_pool_percent} onChange={(n) => set({ low_pool_percent: n })} />
+              <NumberField id="l-lowpages" label="…or below" unit="pages" min={0}
+                value={s.low_pool_pages} onChange={(n) => set({ low_pool_pages: n })} />
+              <NumberField id="l-arepeat" label="Remind every" unit="hours" min={1}
+                hint="While a problem lasts."
+                value={s.alert_repeat_hours} onChange={(n) => set({ alert_repeat_hours: n })} />
+            </div>
+          </Section>
+          <Section title="Security alerts" intro={"Patterns in the audit log someone should look at: emailed to every " +
+            "super admin, shown on Attention for a day, and recorded in the audit log (so the campus SIEM gets them). " +
+            "Each fires once per address, IP or person in its period, not at every check. A new super admin, a group " +
+            "allowed to send documents outside, shortened retention and a reused session cookie are told every time."}>
+            <label className="check">
+              <input type="checkbox" checked={s.security_alerts} onChange={(e) => set({ security_alerts: e.target.checked })} />
+              <span>Security alerts on</span>
+            </label>
+            <div className="grid">
+              <NumberField id="l-swindow" label="Sign-in patterns counted over" unit="minutes" min={5}
+                hint="For the three below."
+                value={s.security_window_minutes} onChange={(n) => set({ security_window_minutes: n })} />
+              <NumberField id="l-scodes" label="Wrong codes for one address" unit="codes" min={2}
+                value={s.security_failed_codes} onChange={(n) => set({ security_failed_codes: n })} />
+              <NumberField id="l-sips" label="Addresses tried from one IP" unit="addresses" min={2}
+                value={s.security_ip_addresses} onChange={(n) => set({ security_ip_addresses: n })} />
+              <NumberField id="l-srefused" label="Refused requests from one IP" unit="requests" min={2}
+                hint="Turned away by the rate limit or the bot check."
+                value={s.security_ip_refused} onChange={(n) => set({ security_ip_refused: n })} />
+              <NumberField id="l-sunknown" label="Codes asked for unknown addresses" unit="an hour" min={2}
+                hint="Across the service: someone finding out which addresses have accounts."
+                value={s.security_unknown_per_hour} onChange={(n) => set({ security_unknown_per_hour: n })} />
+              <NumberField id="l-sdownloads" label="Other people's files downloaded by one person" unit="an hour" min={2}
+                value={s.security_downloads_per_hour} onChange={(n) => set({ security_downloads_per_hour: n })} />
+            </div>
+          </Section>
+      </>}
+    </LimitTab>
   );
 }
 

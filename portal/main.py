@@ -18,7 +18,8 @@ from portal import metrics
 from portal.config import get_portal_settings
 from portal.db import get_engine
 from portal.routers import (
-    admin, auth, branding, email_reports, groups, help, jobs, me, monitoring, queues, reports, versions,
+    admin, api_tokens, audit_export, auth, branding, email_reports, groups, help, jobs, me, monitoring, queues, reports,
+    versions,
 )
 from portal.security.tokens import check_config
 
@@ -153,7 +154,8 @@ def create_app() -> FastAPI:
             "error": "server_error", "message": "Something went wrong. Try again later."}})
 
     for r in (auth.router, me.router, jobs.router, versions.router, groups.router, reports.router, admin.router,
-              branding.router, help.router, queues.router, email_reports.router, monitoring.router):
+              branding.router, help.router, queues.router, email_reports.router, monitoring.router,
+              audit_export.router, api_tokens.router):
         app.include_router(r, prefix=API_PREFIX)
 
     @app.get("/metrics", include_in_schema=False)
@@ -161,10 +163,10 @@ def create_app() -> FastAPI:
         """For the deployment's Prometheus (#397). Outside /api/: the web app's nginx and the API-origin Ingress don't
         pass it on, and the network policies let only Prometheus reach the API's port directly."""
         from starlette.responses import Response
-        from portal.db import _sessionmaker
+        from portal.db import system_session
         if not get_portal_settings().metrics_enabled:
             return Response(status_code=404)
-        return Response(metrics.render(_sessionmaker()), media_type=metrics.CONTENT_TYPE)
+        return Response(metrics.render(lambda: system_session("metrics")), media_type=metrics.CONTENT_TYPE)
 
     @app.get(f"{API_PREFIX}/live", tags=["health"])
     def live():
@@ -178,9 +180,9 @@ def create_app() -> FastAPI:
         portal worker has stopped completing passes (when it's down, nothing else can email). Only the problems'
         keys are given; Attention has the rest."""
         from portal import alerts
-        from portal.db import _sessionmaker
+        from portal.db import system_session
         try:
-            with _sessionmaker()() as db:
+            with system_session("status check") as db:
                 # The queue and the worker as they are now; the engine (which the API doesn't ask) as last found
                 problems = sorted(set(alerts.conditions(db)) | {r.key for r in alerts.active(db) if r.key in alerts.ASKED_BY_WORKER})
         except Exception:  # noqa: BLE001

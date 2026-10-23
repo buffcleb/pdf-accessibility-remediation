@@ -8,6 +8,11 @@ on each.
 
 ## Where pages come from
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../images/diagrams/service-access-dark.svg">
+  <img src="../../images/diagrams/service-access.svg" alt="A service is used only after a super admin switches it on, a group admin enables it for the group (never an external one for a local-only group), it is given to everyone or person by person, and the person picks it; then pages are reserved on every service the document uses, from the global pool, the group pool and the person's limit at once; if any is short the upload is refused, naming it, otherwise it is queued.">
+</picture>
+
 For each service, three levels must all have pages for an upload to go ahead:
 
 1. **The service's global pool** (if a super admin set one): shared by every group.
@@ -29,20 +34,26 @@ One row per service:
 | **Default per person** | The limit for people without their own |
 | **Own limits** | How many people have a limit of their own |
 
-**Edit** on a row changes:
+> **Changed 22 October 2026:** **Edit** and **Request pages** open in the admin area's standard dialog.
+
+**Edit** on a row opens a dialog that changes:
 
 - whether the service is **on for the group**;
 - **who has it**: everyone, or chosen people (then give it to people in the People tab);
 - the **default limit per person**;
 - whether it's **preselected at upload** (the group's default processing option or AI level).
 
+**Save** applies the changes. Closing the dialog with changes not saved asks first: **Save**, **Keep editing** or
+**Discard changes**.
+
 Services that send documents to an outside provider are marked. If your group is **local-only**, they can't be
 turned on.
 
 ## Getting more pages
 
-Group admins can't add pages to the pool; super admins do, usually against a ticket. **Request pages** opens the
-help link or email your service uses for this. Say how many pages, for which service, and why.
+Group admins can't add pages to the pool; super admins do, usually against a ticket. **Request pages** on the
+service's row opens a short dialog with your service's link for this (**Request pages**) or its help email. Say the
+group, the service, how many pages, and why.
 
 Every change to your group's pages (top-ups, corrections, documents charged and refunded) is in the **page
 ledger** on the Overview tab and in the **Page ledger** report.

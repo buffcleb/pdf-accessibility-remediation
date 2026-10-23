@@ -60,15 +60,21 @@ export function UnsavedChangesProvider({ children }: { children: ReactNode }) {
   );
 }
 
-/** Mark this form as holding unsaved edits while `dirty` is true. */
+/** The admin edit dialog a form is in (#511): it asks before closing while any form in it holds edits. */
+export const DialogEdits = createContext<{ add: (id: string) => void; remove: (id: string) => void } | null>(null);
+
+/** Mark this form as holding unsaved edits while `dirty` is true (for leaving the page, and for closing the dialog
+ * it's in). */
 export function useUnsavedChanges(dirty: boolean) {
   const registry = useContext(Ctx);
+  const dialog = useContext(DialogEdits);
   const id = useId();
   useEffect(() => {
-    if (!dirty || !registry) return;
-    registry.add(id);
-    return () => registry.remove(id);
-  }, [dirty, registry, id]);
+    if (!dirty) return;
+    registry?.add(id);
+    dialog?.add(id);
+    return () => { registry?.remove(id); dialog?.remove(id); };
+  }, [dirty, registry, dialog, id]);
 }
 
 /** For actions that leave the page without navigating first (signing out): resolves true to go ahead. */

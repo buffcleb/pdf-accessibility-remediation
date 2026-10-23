@@ -35,7 +35,9 @@ panel, nothing else.
 ## Following it
 
 - The request shows on the document's page: its status, the conversation, and a box to reply and add files.
-- **My documents** shows its status next to the document, and a badge counts replies you haven't read.
+- **My documents** shows its status next to the document (**Help: Received**, **Help: Being looked at**, **Help: We
+  need something from you**…), with a dot when there's a reply you haven't read. Choose it to go straight to the
+  request. While a request is open, the document can't be marked done, so its files stay while support looks.
 - You get an email when someone replies or the status changes. Several replies within a few minutes arrive as one
   email. (If you have the request open in the portal at the time, you can choose to skip those emails: see
   [Email and settings](email-and-settings.md).)

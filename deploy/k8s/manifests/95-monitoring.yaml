@@ -214,6 +214,7 @@ spec:
       labels: { app: redis-exporter }
       annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9121" }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       securityContext: { runAsUser: 59000, runAsGroup: 59000, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: redis-exporter
@@ -244,6 +245,7 @@ spec:
       labels: { app: postgres-exporter }
       annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9187" }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       securityContext: { runAsUser: 65534, runAsGroup: 65534, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: postgres-exporter
@@ -320,6 +322,7 @@ spec:
       annotations:
         checksum/dashboards: "${GRAFANA_DASHBOARDS_SHA}"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       securityContext: { runAsUser: 472, runAsGroup: 472, fsGroup: 472, runAsNonRoot: true,
                          seccompProfile: { type: RuntimeDefault } }
       containers:

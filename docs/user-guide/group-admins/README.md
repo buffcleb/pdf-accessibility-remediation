@@ -18,10 +18,13 @@ you too.
 
 ## Common tasks
 
+> **Changed 22 October 2026:** a person's own limit is set in the **Limit** column of the People tab, not in
+> **Manage**.
+
 | I want to… | Where |
 |---|---|
 | Let a new person in | **Administration → My group → People → Waiting for approval → Approve** ([more](people-and-approval.md#approving-new-members)) |
-| Give someone more pages than the default | **People** tab, pick the service, **Manage** → their own limit ([more](people-and-approval.md#personal-limits)) |
+| Give someone more pages than the default | **People** tab, pick the service, type their limit in the **Limit** column → **Save** ([more](people-and-approval.md#personal-limits)) |
 | Find out why someone can't upload | **Attention → Why can't this person use a service?** ([more](the-admin-area.md#why-cant-this-person-use-a-service)) |
 | Get more pages for the group | **Services and pages → Request pages** ([more](services-and-pages.md#getting-more-pages)) |
 | Make everyone use one AI level | **Group settings → AI for uploads → One level for everything** ([more](group-settings.md#ai-for-uploads)) |

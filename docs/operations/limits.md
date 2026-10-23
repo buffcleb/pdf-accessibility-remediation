@@ -61,6 +61,7 @@ reasoning, not measured on a 1,000-page document.
 | Size of one file | 100 MB | Settings: Each upload | The upload is refused |
 | Pages in one document | 2,000 | Settings: Each upload (a service can set less) | The upload is refused |
 | Files in one upload | 20 | Settings: Each upload | The upload is refused |
+| Documents in one zip download | 25 | Settings: Downloading as a zip | Refused, saying how many were chosen; choose fewer or narrow the list |
 | Size the engine accepts | 200 MB | Engine: `MAX_UPLOAD_MB` | The engine refuses the file; keep it at or above the portal's |
 | Pages the engine accepts | 2,000 | Engine: `MAX_PAGES` (0: no limit) | The engine refuses the document; keep it at or above the portal's, so the portal's own message is the one people see |
 | Pages a person or group may process | Their allowance | Groups and allowances | The document waits, or is refused, as the group is set up |
@@ -167,6 +168,8 @@ With `FORMULA_READER=on` on a cluster (#403):
 
 ## Reports, files and sign-in
 
+> **Changed 22 October 2026:** personal API tokens' limits (#518) added.
+
 | Limit | Default | Change | Past it |
 |---|---|---|---|
 | How long files are kept | 30 days | Settings: How long things are kept | Files are deleted; the record stays |
@@ -179,3 +182,8 @@ With `FORMULA_READER=on` on a cluster (#403):
 | Sign-in codes asked for | 5 per address, 30 per IP address, every 15 minutes | Portal: `PORTAL_RATE_OTP_PER_EMAIL`, `PORTAL_RATE_OTP_PER_IP`, `PORTAL_RATE_WINDOW_SECONDS` | Refused until the window has passed |
 | Sign-in codes checked | 50 per IP address, every 15 minutes | Portal: `PORTAL_RATE_VERIFY_PER_IP` | The same |
 | Files downloaded, and exports, by one person | 600 and 120 an hour | Portal: `PORTAL_RATE_DOWNLOADS_PER_HOUR`, `PORTAL_RATE_EXPORTS_PER_HOUR` (0: off) | A plain 429; it clears within the hour |
+| Zips of many documents (#481), by one person | 20 an hour (one each, however many files) | Portal: `PORTAL_RATE_DOCUMENT_EXPORTS_PER_HOUR` (0: off) | A plain 429; it clears within the hour |
+| API tokens for scripts (#518), per person | 5 | Settings: API tokens for scripts | Refused; revoke one first |
+| How long a new API token lasts, and at most | 90 days, 365 days | Settings: API tokens for scripts | The token stops working (401); its owner is emailed before |
+| An API token not used for | 90 days (0: never) | Settings: API tokens for scripts | It stops working; its owner is told |
+| Requests made with a token | The same per-person limits as the web app (uploads, downloads) | As above | A plain 429 |

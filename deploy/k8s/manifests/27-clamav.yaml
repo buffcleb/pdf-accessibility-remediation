@@ -1,0 +1,142 @@
+# Only with MALWARE_SCAN=clamav (#455): ClamAV, which the portal's API streams every upload to before it's stored
+# (portal/malware.py), and its worker asks once a minute whether it answers and how old its signatures are.
+# - clamd answers on 3310, to the portal only (the policy below). It takes about a minute, and up to 2 GB of memory,
+#   to load its signatures after a start; uploads are refused until it answers.
+# - freshclam, beside it, fetches new signatures from database.clamav.net every 2 hours (through the egress proxy
+#   when there is one), and tells clamd to load them as soon as they pass its test (clamd also looks every 10 minutes).
+# - The signatures are kept on a small volume, so a restart doesn't download them again (ClamAV's mirror refuses a
+#   client that downloads too often). The first start copies the ones the image was built with.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clamav-config
+  namespace: ${NAMESPACE}
+data:
+  clamd.conf: |
+    # Its log is the container's: clamd refuses /dev/stdout as a log file (a symlink), and writes to it without one
+    Foreground yes
+    LogTime yes
+    DatabaseDirectory /var/lib/clamav
+    TemporaryDirectory /tmp
+    TCPSocket 3310
+    TCPAddr 0.0.0.0
+    # The largest upload (MAX_UPLOAD_SIZE): a longer stream is cut off, and the upload refused
+    StreamMaxLength ${CLAMD_MAX_SIZE}
+    MaxFileSize ${CLAMD_MAX_SIZE}
+    MaxThreads 4
+    # Reload new signatures in place: no second copy in memory while it does (scans wait for it, seconds)
+    ConcurrentDatabaseReload no
+    SelfCheck 600
+  freshclam.conf: |
+    Foreground yes
+    LogTime yes
+    DatabaseDirectory /var/lib/clamav
+    DatabaseMirror database.clamav.net
+    Checks 12
+    # clamd loads new signatures as soon as they pass the test, not at its next look: right after a start, the ones
+    # the image was built with are usually days old
+    NotifyClamd /etc/clamav-config/clamd-notify.conf
+${FRESHCLAM_PROXY}
+  # Where freshclam finds clamd to tell it (the same pod, so localhost)
+  clamd-notify.conf: |
+    TCPSocket 3310
+    TCPAddr 127.0.0.1
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clamav-db
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ${STORAGE_CLASS}
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clamav
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: clamav }
+  ports: [{ name: clamd, port: 3310 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clamav
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }  # one volume, one pod
+  selector:
+    matchLabels: { app: clamav }
+  template:
+    metadata:
+      labels: { app: clamav }
+      annotations: { checksum/config: "${CLAMAV_CONFIG_SHA}" }
+    spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+      securityContext: { runAsUser: 100, runAsGroup: 101, fsGroup: 101, runAsNonRoot: true,
+                         seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        # The first start: the signatures the image was built with, so clamd starts without waiting for a download
+        - name: seed
+          image: ${CLAMAV_IMAGE}
+          command: ["sh", "-c", "ls /db/daily.c?d >/dev/null 2>&1 || cp /var/lib/clamav/* /db/"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 200m, memory: 64Mi, ephemeral-storage: 16Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: db, mountPath: /db }]
+      containers:
+        - name: clamd
+          image: ${CLAMAV_IMAGE}
+          command: ["clamd", "--foreground", "--config-file=/etc/clamav-config/clamd.conf"]
+          ports: [{ containerPort: 3310 }]
+          # Loading the signatures takes a minute or two: up to 5 minutes before it's counted as failing
+          startupProbe: { tcpSocket: { port: 3310 }, periodSeconds: 10, failureThreshold: 30 }
+          readinessProbe: { tcpSocket: { port: 3310 }, periodSeconds: 10 }
+          livenessProbe: { tcpSocket: { port: 3310 }, periodSeconds: 30, failureThreshold: 4 }
+          resources:
+            requests: { cpu: 100m, memory: ${CLAMAV_MEMORY_REQUEST} }
+            limits: { cpu: "1", memory: ${CLAMAV_MEMORY_LIMIT}, ephemeral-storage: 1Gi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: db, mountPath: /var/lib/clamav, readOnly: true }
+            - { name: config, mountPath: /etc/clamav-config, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+        - name: freshclam
+          image: ${CLAMAV_IMAGE}
+          # (through the egress proxy, when there is one: freshclam.conf names it, as freshclam reads no proxy variables)
+          command: ["freshclam", "--daemon", "--foreground", "--config-file=/etc/clamav-config/freshclam.conf"]
+          # It loads each new database to test it before clamd gets it: about 700 MB for the daily one (measured with
+          # 1.5.4), about as much as clamd's own for the main one. Only during an update, every 2 hours at most
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 1280Mi, ephemeral-storage: 64Mi }
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: db, mountPath: /var/lib/clamav }
+            - { name: config, mountPath: /etc/clamav-config, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: db, persistentVolumeClaim: { claimName: clamav-db } }
+        - { name: config, configMap: { name: clamav-config } }
+        # Each scan's temporary files (an upload up to MAX_UPLOAD_SIZE, unpacked)
+        - { name: tmp, emptyDir: { sizeLimit: 1Gi } }
+---
+# The portal's API (each upload) and worker (its once-a-minute check) only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clamav
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: clamav } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
+      ports: [{ port: 3310 }]

@@ -4,13 +4,19 @@
 
 ## Finding your documents
 
+> **Changed 22 October 2026:** the filters can also show only the documents a script sent, or only those sent in the
+> web app.
+
 **Your documents**, at the bottom of **My documents**, lists everything you've submitted, newest first:
 
 - **Search** by file name, and pick a **status** (waiting, in progress, done, failed and so on).
 - **Filters** adds more: the result (passes, needs work, items to review, an open help request), processing
-  option or AI level, remediated or checked only, and a date range. Filters in use show as chips you can remove.
-- Click **Document**, **Submitted**, **Pages** or **Result** to sort. Show 25, 50, 100 or 200 at a time, with
-  **Previous** and **Next**.
+  option or AI level, remediated or checked only, how it was sent (by a script with an API token, or in the web app)
+  and a date range. Filters in use show as chips you can remove;
+  **Clear search and filters** starts afresh.
+- Click **Document**, **Submitted**, **Pages** or **Result** to sort. With more than one page, **First**,
+  **Previous**, **Next** and **Last** are above and below the list, with where you are ("Page 2 of 13"); choose 25,
+  50, 100 or 200 at a time below it. Every list and report in the service pages the same way.
 - The list updates by itself while documents are being processed. The view is kept in the page's address, so
   Back from a document, and a bookmark, return to it.
 
@@ -18,20 +24,37 @@ Files are kept for a set time (30 days by default), shown on each document; afte
 stays but its files are removed. You can have them removed sooner: see [When you're done with a
 document](#when-youre-done-with-a-document).
 
+### Downloading many at once
+
+Tick the documents you want (the box in the list's heading ticks every one on the page) and use **Download as a
+zip** in the bar that appears. First you see what the zip will hold: how many documents and files, and how big. Then it downloads, one
+folder per document named from its date and file name (for example `2026-10-21 syllabus`), with the same files
+the document's page offers you, and the newest saved version from the tag manager beside them. Documents whose files
+have been removed are left out and listed in `README.txt` in the zip. One zip holds at most 25 documents (your
+service may set another number).
+
 ## The document page
 
 Click a document's name to open its page.
 
-![A document's page for Campus_Parking_Guide_2026.pdf: Passes PDF/UA-1, failed checks 111 to 0, Download Remediated PDF and Open in tag manager; notes about the two files and the external AI; three tiles (Fixed 111, To review 2, Still failing 0); the Needs review tab with two items, a passage in French and a link described only by its URL, each with Show; and on the side, the downloads and Ask for help.](../../images/document-page.png)
+![A document's page for Campus_Parking_Guide_2026.pdf, opened from My documents: Back to My documents and Previous (5 of 5) at the top; Passes PDF/UA-1 with failed checks 120 to 0, Download Remediated PDF and Open in tag manager; the Fixed 120, To review 4 and Still failing 0 tiles; the Needs review tab with four items, each with Show and a Not looked at choice; and on the side, Downloads with Download everything (zip) and One file at a time, and Need help with this document?](../../images/document-page.png)
 
 ### At the top
 
-- The name, page count and when it was submitted.
+> **Changed 22 October 2026:** the line under the name also says when a script sent the document, and a document
+> still waiting can be canceled from here.
+
+- The name, page count and when it was submitted, then the AI level, "audit only", "existing tags ignored" or
+  "sent by script" (with the token's name) when they apply.
 - **One verdict**, for example **✓ Passes PDF/UA-1**, with "Failed checks: 120 → 0". A PDF 2.0 document (as
   LaTeX's tagging and other recent tools write them) can only be PDF/UA-2, so its verdict says **PDF/UA-2**.
 - **Download** for the main file and **Open in tag manager**.
+- Opened from your list, **Previous** and **Next** (named by the document they open) go to the documents either
+  side of it, in the list's order and with its search and filters, on to the list's next page too; "2 of 41" says
+  where you are. **Back to My documents** returns to the page of the list that holds the document you're on.
 - While it's being processed, a row of steps shows how far it's got: Waiting, Checking the original, Tagging,
   Alt text and tables, Checking the result.
+- While it's still waiting its turn, **Cancel** takes it out of the queue; no pages are charged.
 
 ### Notes
 
@@ -60,17 +83,23 @@ The chosen tab and section are in the page's address, so a link opens on them.
 
 ### On the side
 
-- **Downloads:** each file with a line on when to use it, the **Report (PDF)**, your original, and the technical
-  files (folded away).
+> **Changed 22 October 2026:** the files under **One file at a time** are grouped under **Files**, **Music**, **Math**
+> and **Report**, with shorter names (**Formula list**, **Nemeth braille** and so on).
+
+- **Downloads:** **Download everything (zip)** gives every file you can download for the document in one zip, named
+  from its date and file name (for example `2026-10-21_syllabus.zip`). **One file at a time**, folded under it, has
+  the other files by group (**Files** for the other PDFs, then **Music**, **Math** and **Report**), each with its size
+  and a **?** that says what it is, then your original and the technical files. The main file is the big **Download**
+  button at the top of the page, so it isn't listed again.
   Once the document has a **human-reviewed** version, that file comes first, marked out: the newest one,
   with a list to pick an earlier one. Every version stays under the **Versions** tab.
-  Sheet music also has **Music: the whole piece**: the piece as one MusicXML file, the one to open first.
-  A document with music notation, where the music reading service is on, also has **music files**: a zip
-  with one MusicXML file per music example, as read by software. Open them in notation software (MuseScore
+  Sheet music also has, under **Music**, **The whole piece (MusicXML)**: the piece as one file, the one to open first.
+  A document with music notation, where the music reading service is on, also has **Every line, and the whole piece
+  (zip)**: one MusicXML file per music example, as read by software. Open them in notation software (MuseScore
   is free) to see and play each example: the quickest way to check a reading against the page, and what a
   musician who is blind would use in place of the picture.
-  A document with formulas has **Math: every formula** (a web page) and **Math: every formula (MathML files,
-  zip)**, and where they could be read by rule, **Math in braille: Nemeth** and **UEB**: every formula in braille
+  A document with formulas has, under **Math**, a **Formula list (web page)** and **MathML files (zip)**, and where
+  they could be read by rule, **Nemeth braille (BRF)** and **UEB braille (BRF)**: every formula in braille
   (BRF files, 40 cells to a line, for a braille display or an embosser), under a heading with its page. Open the
   web page in a browser: it shows each formula by page with how the accessible PDF reads it
   aloud, and a screen reader can move through each formula part by part (with NVDA, MathCAT gives the most
@@ -92,7 +121,7 @@ of the retention period. It keeps your list tidy and keeps fewer copies of your 
 - **One document:** on its page, under **Downloads**, choose **I'm done with it: remove the files**.
 - **Several:** in **Your documents**, tick the boxes next to them (or the box in the heading for every one shown),
   then **I'm done with these: remove the files**. Documents still waiting or in progress, already removed, or with an
-  open help request can't be ticked.
+  open help request are skipped, and the message says why.
 
 The files aren't removed at once: there's a short hold (24 hours by default, set by your administrators) so a
 mistake can be undone. Until then the document's page says **Marked done** and when the files go, with **Keep the
@@ -114,6 +143,11 @@ text. Then you get **two**:
 
 The report says exactly what changed in the modified file, and on which pages.
 
+**Tagged by Adobe**, with AI alt text (the default): use the **improved copy**, for example *Adobe + AI alt text*. It's
+Adobe's file, looking exactly the same, with the alt text and fixes Adobe leaves out. It's the big **Download** button,
+and the result at the top, Needs review and the tag manager are all about it. **Adobe tagged PDF**, in the downloads,
+is Adobe's file exactly as it came back, if you want to compare; you can also pick it as a version in the tag manager.
+
 ## The review list (Needs review)
 
 The machine checks rules; it can't always tell whether something is *right*. The review list is what it wasn't
@@ -128,9 +162,16 @@ sure about:
 Each item gives the page, the tag, the problem and a suggested action. For alt text, the suggestion includes a
 proposed rewrite.
 
-- With more than a few items: buttons for All, High, Review and Suggestions (with counts), a search (or a page
-  number), and 25 at a time.
-- **Show** opens the item in the tag manager, where you can fix it. **Back** there returns to the same item.
+> **Changed 22 October 2026:** every item with a page has **Show**, which highlights the area the item is about in the
+> tag manager, and a long list has the same pager as the other lists.
+
+- With more than 8 items: buttons for All, High, Review and Suggestions (with counts), **Still to check**, and a
+  search (or a page number). The list shows 25 items at a time, with **First**, **Previous**, **Next** and **Last**
+  above and below it.
+- **Show** opens the item in the tag manager, where you can fix it: on every item with a page, including ones no tag
+  holds (hidden text, a passage too faint to read, an AI reading). The tag manager selects the item's tag when it has
+  one, outlines the area the item is about and dims the rest of the page ([more](tag-manager/finding-your-way.md#an-item-from-the-review-list)).
+  **Back** there returns to the same item.
 
 **Signing items off.** Each item has a status: **Not looked at**, **Checked** (looked at, and fine), **Fixed** or
 **Not an issue**, with an optional note. The list says how many are signed off, and **Still to check** shows only the

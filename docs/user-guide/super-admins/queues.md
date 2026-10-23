@@ -25,7 +25,8 @@ Use it when a provider is having problems, or before maintenance.
 
 ## Single items
 
-Open a queue to see its items: **Waiting**, **In progress** and **Failed** (last 7 days).
+Open a queue to see its items: **Waiting**, **In progress** and **Failed** (last 7 days), a page at a time, with a
+search by document or person (or an email's subject or address).
 
 - **Cancel** a waiting item. A canceled document gives the person's pages back, and they're emailed.
 - **Stop** an item that's in progress: a document that's stuck or was sent by mistake, a save being checked, a
@@ -82,3 +83,21 @@ whose tags turned out poor. It starts as the original was run, ticked or not.
 
 The document page also has a **Run details** tab for super admins: what the run cost and used, the limits it
 reached, time by stage, and the engine's side (its job ID, route, error and warnings).
+
+Before a document is done (waiting, processing, or waiting for its owner to confirm), its page has a short **Run
+details** card for super admins instead:
+- **Document:** its ID in the portal.
+- **Engine job:** the engine's ID, which names the document's folder on the engine, or "not sent to the engine yet".
+  Each ID has a **Copy** button.
+- **Why it's waiting**, while it's in the queue:
+  - every place at the engine is in use, with how many of how many;
+  - the owner already has the most documents at the engine at once (Settings › Uploads and limits, **Each person's
+    queue** › **Processed at once**);
+  - a service's own limit on documents at once;
+  - today's page limit;
+  - a paused queue;
+  - a large document waiting its turn;
+  - waiting for the owner to confirm.
+- **When it was added**, and **when it was sent to the engine**.
+
+The same reasons show in the queues' lists.

@@ -75,6 +75,8 @@ class JobResponse(BaseModel):
     job_id: str
     status: Literal["processing", "completed", "failed"]
     progress: dict[str, Any] | None = None
+    # While an edit job is still checking: its file and tag map, already final (#428)
+    partial: dict[str, Any] | None = None
     files: Files | None = None
     metrics: Metrics | None = None
     reports: Reports | None = None

@@ -12,6 +12,12 @@ export function howProcessed(j: Job): string {
   return parts.length ? parts.join(" · ") : "Standard";
 }
 
+/** A document's page, keeping the list it was opened from in its address: Back returns there, and Previous and Next
+ * follow it, after a reload too (#482). */
+function docLink(id: string, back?: BackState): string {
+  return back?.back ? `/jobs/${id}?from=${encodeURIComponent(back.back)}` : `/jobs/${id}`;
+}
+
 /** Rows that can be selected, and what's selected (by id). */
 export type Selection = { can: (j: Job) => boolean; selected: Set<string>; onChange: (next: Set<string>) => void };
 
@@ -65,8 +71,11 @@ export function JobsTable({ jobs, showUser = false, showService = false, sort, o
               {selection && <td className="select-col">
                 {selection.can(j) && <input type="checkbox" aria-label={`Select ${j.filename}`} checked={selection.selected.has(j.id)}
                   onChange={(e) => toggle([j.id], e.target.checked)} />}</td>}
-              <td><Link to={`/jobs/${j.id}`} state={back}>{j.filename}</Link>
-                {j.help && <> <HelpStatusPill status={j.help.status} forPerson />{j.help.unread && <span className="dot" title="New reply"><span className="visually-hidden"> (new reply)</span></span>}</>}
+              <td><Link to={docLink(j.id, back)} state={back}>{j.filename}</Link>
+                {j.help && <> <Link to={`${docLink(j.id, back)}#doc-help`} state={back} className="help-badge">
+                  <HelpStatusPill status={j.help.status} forPerson prefix="Help:" />
+                  {j.help.unread && <span className="dot" title="New reply"><span className="visually-hidden"> (new reply)</span></span>}
+                </Link></>}
                 {j.files_deleted ? <div className="muted small">Files removed</div>
                   : j.removal_at ? <div className="muted small">Files go {fmtDate(j.removal_at)}</div> : null}</td>
               {showUser && <td>{j.user_email}</td>}

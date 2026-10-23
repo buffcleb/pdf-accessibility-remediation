@@ -5,16 +5,24 @@ Start one with:
         -e POSTGRES_DB=portal -p 55432:5432 postgres:16-alpine
 or point PORTAL_TEST_DATABASE_URL at another empty database. Tests are skipped if none is reachable, unless
 PORTAL_TEST_DATABASE_REQUIRED is set (as in CI), when they fail.
+
+As on the cluster, the migrations run as the database's owner and the app as its own account, portal_app
+(deploy/k8s/app-role.sql), which row-level security binds (#350). The tests' own `db` session is the owner's: it sets
+things up and looks at the results, whatever the policies say.
 """
 from __future__ import annotations
 
 import os
 import re
+import secrets
+from pathlib import Path
 
 import pytest
 
 TEST_DB = os.environ.get("PORTAL_TEST_DATABASE_URL", "postgresql+psycopg://portal:test@localhost:55432/portal")
 ORIGIN = "http://app.test"
+APP_PASSWORD = secrets.token_urlsafe(16)  # a throwaway for the test database's portal_app
+APP_ROLE_SQL = Path(__file__).resolve().parents[2] / "deploy" / "k8s" / "app-role.sql"
 
 from portal.security.tokens import generate_private_key_pem  # noqa: E402  (no settings needed)
 
@@ -38,9 +46,13 @@ import email_validator  # noqa: E402
 import fakeredis  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
+from portal import rls  # noqa: E402
 from portal.cli import migrate  # noqa: E402
+from portal.config import get_portal_settings  # noqa: E402
+from portal.db import _sessionmaker, get_engine, system_session  # noqa: E402
 from portal.mail import get_mailer  # noqa: E402
 from portal.main import create_app  # noqa: E402
 from portal.models import Group, GroupDomain, RoleAssignment, User  # noqa: E402
@@ -65,6 +77,13 @@ def engine():
     with eng.begin() as c:
         c.execute(text("drop schema public cascade; create schema public"))
     migrate()
+    # From here the app connects as portal_app, which owns no table, so the row-level security policies apply to it
+    with eng.begin() as c:
+        c.execute(text(APP_ROLE_SQL.read_text().replace("__APP_PASSWORD__", APP_PASSWORD)))
+    os.environ["PORTAL_DATABASE_URL"] = make_url(TEST_DB).set(username="portal_app", password=APP_PASSWORD) \
+        .render_as_string(hide_password=False)
+    for cached in (get_portal_settings, get_engine, _sessionmaker):
+        cached.cache_clear()
     yield eng
     eng.dispose()
 
@@ -83,6 +102,12 @@ def db(engine):
         c.execute(text(STANDARD_SERVICE))  # as the migration seeds it
     with Session(engine, expire_on_commit=False) as s:
         yield s
+
+
+@pytest.fixture(autouse=True)
+def audit_bypass_afresh():
+    """Each test sees its own audit entries for row-level security bypasses (they're recorded once per process)."""
+    rls.forget_audited()
 
 
 @pytest.fixture(autouse=True)
@@ -125,8 +150,7 @@ def make_client(app):
 def sent_mail() -> list:
     """Send what's in the outbox (as the worker would) and return everything sent so far."""
     from portal import outbox
-    from portal.db import _sessionmaker
-    with _sessionmaker()() as s:
+    with system_session("tests") as s:  # as the worker sends it
         outbox.send_queued(s)
     return get_mailer().outbox
 

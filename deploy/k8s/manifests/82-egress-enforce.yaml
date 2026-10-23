@@ -1,0 +1,37 @@
+# With EGRESS_PROXY=enforce (#453): the portal, the AI gateway, the Adobe worker and ClamAV (#455) reach only the
+# cluster's DNS and the pods in this namespace (each of which lets in only its own clients), so the internet only
+# through the egress proxy (26-egress-proxy.yaml) and its list of hosts. The portal also sends mail straight to its SMTP relay, and the
+# audit log to the campus SIEM's syslog collector (#456), on those ports only (neither goes through a web proxy).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: outbound-through-proxy
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [litellm, engine-adobe-worker, clamav] }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } },
+             podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ podSelector: {} }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: portal-outbound-through-proxy
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [portal-api, portal-worker] }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } },
+             podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ podSelector: {} }]
+    - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: ${CLUSTER_CIDRS} } }]
+      ports: ${PORTAL_DIRECT_PORTS}

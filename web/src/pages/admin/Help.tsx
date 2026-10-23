@@ -2,14 +2,15 @@ import { useState } from "react";
 import { useSeen } from "../../components/seen";
 
 const always = () => true;
-import { Link, useLocation, useParams } from "react-router-dom";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import {
-  get, post, postForm, type DocVersion, type Group, type HelpKind, type HelpRequest, type HelpStatus, type HelpSummary, type Versions,
+  get, post, postForm, type DocVersion, type Group, type HelpRequest, type HelpStatus, type HelpSummary, type Paged, type Versions,
 } from "../../api";
 import { useAuth } from "../../auth";
 import { HELP_KINDS, HelpOutcome, HelpStatusPill, HelpThread, kindLabel } from "../../components/help";
 import { ErrorNotice, Loading, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
+import { ListBar, ListPager, SortHeading, type Chip } from "../../components/lists";
 
 /** How long something has been waiting, short: "45 min", "3 h", "2 d". */
 function age(since: string) {
@@ -25,20 +26,19 @@ const SHOW: [Show, string][] = [
   ["waiting", "Waiting on the person"], ["resolved", "Resolved"], ["closed", "Closed"], ["all", "Everything"],
 ];
 
-function matches(r: HelpSummary, show: Show) {
-  if (show === "all") return true;
-  if (show === "needs_us") return r.needs_staff;
-  if (show === "active") return r.status === "open" || r.status === "in_progress" || r.status === "waiting";
-  return r.status === show;
-}
+type HelpPage = Paged<HelpSummary> & { needs_us: number };
 
-export function HelpTable({ rows, showGroup = true }: { rows: HelpSummary[]; showGroup?: boolean }) {
+export function HelpTable({ rows, showGroup = true, sort, onSort }: {
+  rows: HelpSummary[]; showGroup?: boolean; sort: string; onSort: (sort: string) => void;
+}) {
   if (rows.length === 0) return <p className="empty">No help requests here.</p>;
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th scope="col">Document</th><th scope="col">Person{showGroup ? " · group" : ""}</th><th scope="col">Kind</th>
-          <th scope="col">Status</th><th scope="col">Handled by</th><th scope="col" className="num">Waiting</th></tr></thead>
+        <thead><tr><SortHeading label="Document" sortKey="document" sort={sort} onSort={onSort} />
+          <th scope="col">Person{showGroup ? " · group" : ""}</th><th scope="col">Kind</th>
+          <th scope="col">Status</th><th scope="col">Handled by</th>
+          <SortHeading label="Waiting" sortKey="waiting" sort={sort} onSort={onSort} className="num" /></tr></thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.id}>
@@ -57,53 +57,81 @@ export function HelpTable({ rows, showGroup = true }: { rows: HelpSummary[]; sho
   );
 }
 
-/** Super admins: every help request, oldest wait first. */
+/** The view of a list of help requests in the page's address (#514): search, filters, sort, page. */
+function useHelpList(base: string, defaults: Record<string, string>) {
+  const [params, setParams] = useSearchParams();
+  const get_ = (k: string) => params.get(k) ?? defaults[k] ?? "";
+  const page = Number(params.get("page")) || 1;
+  const size = Number(params.get("size")) || 25;
+  const api = new URLSearchParams();
+  for (const [k, a] of [["saved", "saved"], ["show", "show"], ["kind", "kind"], ["group", "group_id"], ["q", "q"], ["sort", "sort"]]) {
+    if (get_(k)) api.set(a, get_(k));
+  }
+  api.set("page", String(page));
+  api.set("page_size", String(size));
+  const list = useLoad(() => get<HelpPage>(`${base}?${api}`), [base, api.toString()], always, 30000);
+  const update = (changes: Record<string, string | null>, keepPage = false) => {
+    const next = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(changes)) { if (v === null || v === "" || v === defaults[k]) next.delete(k); else next.set(k, v); }
+    if (!keepPage) next.delete("page");
+    setParams(next, { replace: true });
+  };
+  const clear = (keep: string[]) => {
+    const next = new URLSearchParams();
+    for (const k of ["size", "sort", ...keep]) if (params.get(k)) next.set(k, params.get(k)!);
+    setParams(next, { replace: true });
+  };
+  const pager = (where: "top" | "bottom", topId: string) => list.data && (
+    <ListPager page={page} pageSize={list.data.page_size} total={list.data.total} noun={["request", "requests"]} where={where}
+      topId={topId} onPage={(n) => update({ page: n > 1 ? String(n) : null }, true)}
+      onSize={(n) => update({ size: n === 25 ? null : String(n) })} />
+  );
+  return { params, value: get_, list, update, clear, pager };
+}
+
+/** Super admins: every help request, a page at a time, the longest wait first. */
 export function HelpQueue() {
   useTitle("Help requests");
-  const [saved, setSaved] = useState(false);
-  const [show, setShow] = useState<Show>("needs_us");
-  const [kind, setKind] = useState<HelpKind | "">("");
-  const [group, setGroup] = useState("");
-  const [q, setQ] = useState("");
-  const list = useLoad(() => get<HelpSummary[]>(`/admin/help?saved=${saved}`), [saved], always, 30000);
+  const { value, list, update, clear, pager } = useHelpList("/admin/help/list", { show: "needs_us", sort: "waiting" });
   const groups = useLoad(() => get<Group[]>("/admin/groups"), []);
-  if (list.loading && !list.data) return <Loading />;
-  if (!list.data) return <ErrorNotice error={list.error} />;
-  const needle = q.trim().toLowerCase();
-  const rows = list.data
-    .filter((r) => saved || matches(r, show))
-    .filter((r) => !kind || r.kind === kind)
-    .filter((r) => !group || r.group_id === group)
-    .filter((r) => !needle || r.filename.toLowerCase().includes(needle) || r.user_email.includes(needle))
-    .sort((a, b) => a.waiting_since.localeCompare(b.waiting_since));
-  const needs = list.data.filter((r) => r.needs_staff).length;
+  const saved = value("saved") === "true";
+  const groupName = (groups.data ?? []).find((g) => g.id === value("group"))?.name;
+  const chips: Chip[] = value("group") ? [{ key: "group", text: groupName ?? "Group" }] : [];
   return (
     <>
       <h1>Help requests</h1>
       <div className="tabs" role="tablist" aria-label="Help request views">
-        <button className="tab" role="tab" aria-selected={!saved} onClick={() => setSaved(false)}>Active</button>
-        <button className="tab" role="tab" aria-selected={saved} onClick={() => setSaved(true)}>Saved</button>
+        <button className="tab" role="tab" aria-selected={!saved} onClick={() => update({ saved: null })}>Active</button>
+        <button className="tab" role="tab" aria-selected={saved} onClick={() => update({ saved: "true", show: null })}>Saved</button>
       </div>
-      <div className="form-row" role="tabpanel">
-        {!saved && <div className="field"><label htmlFor="hq-show">Show</label>
-          <select id="hq-show" value={show} onChange={(e) => setShow(e.target.value as Show)}>
-            {SHOW.map(([k, l]) => <option key={k} value={k}>{l}{k === "needs_us" ? ` (${needs})` : ""}</option>)}
-          </select></div>}
-        <div className="field"><label htmlFor="hq-kind">Kind</label>
-          <select id="hq-kind" value={kind} onChange={(e) => setKind(e.target.value as HelpKind | "")}>
-            <option value="">Any</option>
+      <div role="tabpanel">
+        <ListBar label="Search and filter help requests" searchId="hq-q" query={value("q")} placeholder="Search by document or person"
+          onQuery={(q) => update({ q: q || null })} chips={chips} active={!!value("kind") || (!saved && value("show") !== "needs_us")}
+          onRemove={(k) => update({ [k]: null })} onClear={() => clear(["saved"])}
+          more={<div className="field"><label htmlFor="hq-group">Group</label>
+            <select id="hq-group" value={value("group")} onChange={(e) => update({ group: e.target.value })}>
+              <option value="">Any</option>
+              {(groups.data ?? []).map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select></div>}>
+          {!saved && <>
+            <label htmlFor="hq-show" className="visually-hidden">Show</label>
+            <select id="hq-show" className="report-select" value={value("show")} onChange={(e) => update({ show: e.target.value })}>
+              {SHOW.map(([k, l]) => <option key={k} value={k}>{l}{k === "needs_us" && list.data ? ` (${list.data.needs_us})` : ""}</option>)}
+            </select>
+          </>}
+          <label htmlFor="hq-kind" className="visually-hidden">Kind</label>
+          <select id="hq-kind" className="report-select" value={value("kind")} onChange={(e) => update({ kind: e.target.value })}>
+            <option value="">Any kind</option>
             {HELP_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-          </select></div>
-        <div className="field"><label htmlFor="hq-group">Group</label>
-          <select id="hq-group" value={group} onChange={(e) => setGroup(e.target.value)}>
-            <option value="">Any</option>
-            {(groups.data ?? []).map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
-          </select></div>
-        <div className="field"><label htmlFor="hq-q">Search</label>
-          <input id="hq-q" type="search" placeholder="Document or person" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+          </select>
+        </ListBar>
+        {saved && <p className="muted small">Saved requests are kept past the documents' retention.</p>}
+        {list.loading && !list.data ? <Loading /> : !list.data ? <ErrorNotice error={list.error} /> : <>
+          <div id="hq-top">{pager("top", "hq-top")}</div>
+          <HelpTable rows={list.data.items} sort={value("sort")} onSort={(v) => update({ sort: v }, true)} />
+          {pager("bottom", "hq-top")}
+        </>}
       </div>
-      {saved && <p className="muted small">Saved requests are kept past the documents' retention.</p>}
-      <HelpTable rows={rows} />
     </>
   );
 }
@@ -202,14 +230,29 @@ export function HelpDetail() {
 
 /** A group's help requests, for its admins (and super admins). */
 export function GroupHelp({ group }: { group: Group }) {
-  const list = useLoad(() => get<HelpSummary[]>(`/groups/${group.id}/help`), [group.id], always, 30000);
-  if (list.loading && !list.data) return <Loading />;
-  if (!list.data) return <ErrorNotice error={list.error} />;
+  const { value, list, update, clear, pager } = useHelpList(`/groups/${group.id}/help/list`, { show: "all", sort: "-updated" });
   return (
     <section className="panel" aria-labelledby="ghelp-h">
       <h2 id="ghelp-h">Help requests</h2>
       <p className="muted small">People in {group.name} asking for help with their documents. You can read and reply; super admins handle them.</p>
-      <HelpTable rows={list.data} showGroup={false} />
+      <ListBar label="Search and filter the group's help requests" searchId="gh-q" query={value("q")} placeholder="Search by document or person"
+        onQuery={(q) => update({ q: q || null })} chips={[]} active={!!value("kind") || value("show") !== "all"}
+        onRemove={() => {}} onClear={() => clear([])}>
+        <label htmlFor="gh-show" className="visually-hidden">Show</label>
+        <select id="gh-show" className="report-select" value={value("show")} onChange={(e) => update({ show: e.target.value })}>
+          {[...SHOW.filter(([k]) => k !== "all"), ["all", "Everything"] as [Show, string]].map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+        <label htmlFor="gh-kind" className="visually-hidden">Kind</label>
+        <select id="gh-kind" className="report-select" value={value("kind")} onChange={(e) => update({ kind: e.target.value })}>
+          <option value="">Any kind</option>
+          {HELP_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+      </ListBar>
+      {list.loading && !list.data ? <Loading /> : !list.data ? <ErrorNotice error={list.error} /> : <>
+        <div id="gh-top">{pager("top", "gh-top")}</div>
+        <HelpTable rows={list.data.items} showGroup={false} sort={value("sort")} onSort={(v) => update({ sort: v }, true)} />
+        {pager("bottom", "gh-top")}
+      </>}
     </section>
   );
 }

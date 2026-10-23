@@ -9,40 +9,12 @@ separate GPU server, and a Cloudflare Tunnel as the only way in. Everything here
 > [!NOTE]
 > Tested. This is the setup the service runs on today.
 
-```mermaid
-flowchart LR
-  U["People<br/>(browser)"] -- "HTTPS" --> CF["Cloudflare<br/>edge (TLS, WAF)"]
-  CF -- "Cloudflare Tunnel<br/>(outbound only, no open ports)" --> CFD
-  MAIL["Cloudflare Email<br/>Service (SMTP)"]
-  subgraph K8S ["RKE2 cluster: 3 nodes, namespace pdf-remediation"]
-    CFD["cloudflared<br/>×2"] --> WEB["web<br/>nginx + app"]
-    WEB -- "/api/" --> PAPI["portal-api"]
-    PAPI --> PG[("postgres")]
-    PAPI --> RD[("redis")]
-    PAPI --> SW[("seaweedfs<br/>S3")]
-    PW["portal-worker"] --> PG
-    PW --> SW
-    PW --> EAPI["engine-api"]
-    EAPI --> RD
-    EW["engine-worker<br/>engine-beat"] --> RD
-    EAPI --- JD[("jobdata<br/>shared folder")]
-    EW --- JD
-    EW --> GW["litellm<br/>AI gateway"]
-    GW --> PG
-  end
-  PW -- "sign-in codes,<br/>notifications" --> MAIL
-  GW -- "LAN" --> GPU["GPU server<br/>LocalAI<br/>(vision + review models)"]
-  GW -. "opt-in levels" .-> OR["Cloud models<br/>(OpenRouter)"]
-  subgraph NAS ["NAS"]
-    ISCSI["iSCSI LUNs<br/>(block)"]
-    NFS["NFS share<br/>(ReadWriteMany)"]
-  end
-  PG -.- ISCSI
-  RD -.- ISCSI
-  SW -.- ISCSI
-  JD -.- NFS
-  REG["GHCR<br/>(private images)"] -. "pull" .-> K8S
-```
+> **Changed 22 October 2026:** the portal's rate limits are in a Redis of their own (#472), drawn as `redis-portal`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/reference-rke2-dark.svg">
+  <img src="../images/diagrams/reference-rke2.svg" alt="People reach Cloudflare's edge, which passes traffic through an outbound-only tunnel to cloudflared in a three-node RKE2 cluster; the portal and engine run there with their data on the NAS, block storage over iSCSI and a shared NFS folder; the AI gateway reaches a GPU server on the LAN and, for opt-in levels, OpenRouter; mail goes out through Cloudflare's email service, and images come from GHCR.">
+</picture>
 
 ## The pieces
 
@@ -51,6 +23,7 @@ flowchart LR
 | Cluster | RKE2 (three combined control-plane and worker nodes, 4 CPUs and 16 GB each), managed with Rancher | Highly available control plane on modest hardware |
 | Block storage | The Synology CSI driver, iSCSI LUNs on the NAS (`synology-iscsi`, Retain) | Databases need block storage with proper fsync semantics; Retain keeps a database's volume if its claim is deleted |
 | Shared storage | nfs-subdir-external-provisioner on an NFS share of the NAS (`synology-nfs`, ReadWriteMany) | The engine's API and workers share one job folder. The share maps all users to admin, so the engine's UID 10001 can write |
+| Encryption between nodes | WireGuard in Canal (`flannel.backend: wireguard`, set with a HelmChartConfig) | Every connection inside the cluster encrypted with no keys to manage; checked by `scripts/check_cluster_encryption.sh` and on each deploy |
 | Storage network | The nodes reach the NAS on a dedicated storage network (a second NIC) | Keeps storage traffic off the service network. NFS exports and iSCSI must allow the storage network's addresses, not the nodes' cluster addresses |
 | Way in | A Cloudflare Tunnel, run as `cloudflared` in the namespace (token-managed in Cloudflare Zero Trust) | No inbound ports or public IP; TLS and edge protection from Cloudflare |
 | Images | Private on GHCR, pushed by `scripts/build.sh`, pulled with a secret made by `scripts/deploy.sh` | Nothing to host; tagged by commit |

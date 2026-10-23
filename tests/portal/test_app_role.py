@@ -3,9 +3,6 @@ rows, but can't change a table, drop the triggers that keep the audit log and pa
 migrations' bookkeeping. This runs the same file the deploy runs against the test database."""
 from __future__ import annotations
 
-import secrets
-from pathlib import Path
-
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -13,10 +10,9 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from portal import audit
+from tests.portal.conftest import APP_PASSWORD as PASSWORD
+from tests.portal.conftest import APP_ROLE_SQL as SQL
 from tests.portal.conftest import TEST_DB
-
-SQL = Path(__file__).resolve().parents[2] / "deploy" / "k8s" / "app-role.sql"
-PASSWORD = secrets.token_urlsafe(16)  # a throwaway for the test database's portal_app
 
 
 @pytest.fixture
@@ -26,13 +22,12 @@ def app_engine(db, engine):
         c.execute(text("select 1"))
     app = create_engine(make_url(TEST_DB).set(username="portal_app", password=PASSWORD))
     yield app
-    app.dispose()
-    with engine.begin() as c:
-        c.execute(text("drop owned by portal_app; drop role portal_app"))
+    app.dispose()  # the role stays: the app's own connections use it (conftest.py)
 
 
 def _refused(app, sql: str) -> str:
     with app.connect() as c, pytest.raises(DBAPIError) as err:
+        c.execute(text("select set_config('portal.bypass', 'on', true)"))  # every row in reach (#350)
         c.execute(text(sql))
         c.commit()
     return str(err.value.orig)
@@ -44,6 +39,8 @@ def test_the_app_account_works_with_rows_only(app_engine):
         s.execute(text("select count(*) from users")).scalar()
         audit.record(s, None, "test.app_account", actor_email="system")
         s.commit()
+        # Reading it back takes a scope, as row-level security binds this account (#350): here the bypass
+        s.execute(text("select set_config('portal.bypass', 'on', true)"))
         assert s.execute(text("select count(*) from audit_events where action = 'test.app_account'")).scalar() == 1
     # ...but not the tables themselves, the append-only triggers, or the migrations' bookkeeping
     assert "owner" in _refused(app_engine, "drop trigger audit_events_no_update on audit_events")

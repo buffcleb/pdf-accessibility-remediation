@@ -15,6 +15,8 @@
 
 ## Uploading
 
+> **Changed 22 October 2026:** two new rows, for services that check uploads for malware.
+
 | What you see | What it means | What to do |
 |---|---|---|
 | "Your group has 12 Standard pages left and this document needs 40" (or "You have…") | The option named has run out: your own limit, your group's pool, or the whole service's | The message links to how to get more; usually ask your group admin |
@@ -26,6 +28,8 @@
 | "Letting AI decide the kind isn't available here" | That choice was switched off since the page loaded | Reload the page and choose a kind |
 | "This PDF has no pages" / "This PDF couldn't be checked…" | The file is empty, damaged, or too large or complex to open safely | Export it to PDF again, or split it |
 | "That's a lot of uploads in an hour" (or downloads, or exports) | Each person has an hourly limit on these | Wait a while and try again, or ask your administrator |
+| "… wasn't uploaded: the malware check found something harmful in it" | The service checks uploads for malware, and found something in this file. It isn't kept | Check the file with your own antivirus. If you think it's a mistake, ask for help |
+| "Uploads are checked for malware, and the check isn't working just now" | The malware check is down; nothing is uploaded unchecked | Try again in a few minutes |
 | A signed PDF waits with **Send** and **Cancel** | Making it accessible removes the signature's validity | Choose **Send** (and sign the copy again), or **Cancel** |
 
 ## Waiting and processing
@@ -50,5 +54,14 @@
 | Alt text that's wrong | AI-written descriptions are drafts | Fix it in the [tag manager](tag-manager/figures.md), or ask for help |
 | The files are gone | Files are kept for a set time (shown on the document), then removed; or the document was [marked done](your-results.md#when-youre-done-with-a-document) | Upload the document again if you still need it |
 | I marked a document done by mistake | The files are kept for a short hold first | On its page, choose **Keep the files** before the time shown |
+
+## After the service is updated
+
+> **New 22 October 2026:** what happens to a page you opened before an update.
+
+A page you opened before the service was updated reloads itself once, to fetch the new version, the first time it
+needs part of the app it hasn't loaded yet (opening the tag manager, say). If that doesn't help, it says **The service
+was updated**, with **Reload**. Nothing you saved is lost; unsaved changes in the tag manager are kept for you
+([Saving](tag-manager/saving.md#unsaved-changes-are-kept-for-you)).
 
 Still stuck? [Ask for help](getting-help.md) on the document's page.

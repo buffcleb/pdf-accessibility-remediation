@@ -2,10 +2,15 @@
 
 [Architecture](README.md) › The Adobe route
 
+> **Changed 22 October 2026:** the improved copy is the document people get (#499); dates and links that point to
+> themselves are fixed on it too (#483, #484); the Adobe worker can go out through the egress proxy.
+
 The "Adobe Autotag" service uses the engine's `adobe` route: Adobe PDF Services tags the document instead of this
 engine's tagger. Adobe's file is always kept exactly as Adobe returned it. Improvements go into a **separate copy**,
 named after what was done ("Adobe + AI alt text", "Adobe + fixes", or both), which must render identically to
-Adobe's file:
+Adobe's file. **The improved copy is the document people get** (#499): the main download, the verdict, the review
+list and the tag manager are about it, and Adobe's file as it came back is a choice in the downloads
+([operations](../operations/adobe-autotag.md)). What goes into it:
 
 - **AI alt text** (on by default; people can untick it at upload): an AI level describes every figure Adobe left
   without alt text, applied with the same tag edits as the tag editor. If the AI wasn't needed, the AI level's pages
@@ -20,39 +25,20 @@ Adobe's file:
   (a list item: its label and body). A reading whose text Adobe divided differently stays out, and the report says how
   many. The AI's readings are listed for review on the improved copy. Readings with LaTeX get their MathML, MathCAT's
   check and the math downloads, as on the standard route (#403).
+- **Document fixes PDF/UA asks for and Adobe leaves out:** the PDF/UA identifier (5-1); a title from the first
+  heading when the file's own is only the application and file name ("Microsoft Word - syllabus.docx") or a
+  placeholder; and Scope on header cells that have none, where the row says it (7.5-1): a row of header cells (or a
+  THead row) heads columns, the first header cell of a row of data heads its row. Other header cells are left as
+  Adobe tagged them, and so is a table whose cells name their headers. Its dates are made readable and links that
+  point to themselves removed, as on the standard route.
 - **Font fixes that never change rendering:** missing ToUnicode maps, incomplete glyph lists in font descriptors
   (7.21.4.2), and glyph width mismatches (7.21.5, only if the pages stay pixel-identical). These are the same fixes
   the standard route applies to its visually exact file.
 
-```mermaid
-sequenceDiagram
-  participant W as Portal worker
-  participant E as Engine API
-  participant A as Adobe worker
-  participant L as Rate limiter (Redis)
-  participant X as Adobe PDF Services
-  W->>E: submit, route = adobe
-  E->>A: queue "adobe"
-  A->>A: veraPDF and audit of the original
-  A->>A: split if over the pages or size per request
-  loop each part, at most ADOBE_MAX_CONCURRENT at once
-    A->>L: slot and request budget
-    A->>X: token (cached), create asset, upload
-    A->>X: start Autotag
-    loop until done or failed
-      A->>X: status
-    end
-    A->>X: download tagged PDF and Adobe's report
-    A->>X: delete the assets
-  end
-  A->>A: merge the parts onto the original
-  A->>A: veraPDF, tag integrity, tag map (Adobe's file)
-  opt AI alt text (on by default)
-    A->>A: describe figures without alt text (AI gateway)
-  end
-  A->>A: improved copy: alt text, lossless font fixes, bookmarks, veraPDF, integrity, AI review
-  W->>E: poll, then fetch files
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/adobe-route-dark.svg">
+  <img src="../images/diagrams/adobe-route.svg" alt="The engine queues an Adobe job; the Adobe worker checks the original, splits it if needed, and for each part, a few at a time, takes a rate-limit slot, uploads it to Adobe PDF Services, starts Autotag and waits, downloads the tagged PDF and report, and deletes the files at Adobe; it then merges the parts, checks Adobe's file, adds AI alt text and writes the improved copy, which the portal worker fetches.">
+</picture>
 
 - **Its own queue.** Jobs run on the Celery queue `adobe` (the `adobe-worker` service), so Adobe's pace never holds up
   the standard route.
@@ -69,14 +55,15 @@ sequenceDiagram
   tags are reported, not fatal: the file is Adobe's.
 - **Signed and restricted PDFs** are handled as on the standard route (#339): a restricted file's restrictions are put
   back on every output after veraPDF has checked it, and the report notes a signature the copy no longer carries.
-- **Egress.** Unlike the engine's other pods, the Adobe worker keeps its internet access, for Adobe's API;
-  its AI calls still go through the gateway.
+- **Egress.** Unlike the engine's other pods, the Adobe worker keeps its internet access, for Adobe's API: directly,
+  or with `EGRESS_PROXY` on through the egress proxy, which in `enforce` mode lets it reach only Adobe's hosts. Its AI
+  calls still go through the gateway.
 - **Cost guards** are the portal's, as for any service: off until switched on, most pages per document, most pages
   per day, and confirm before sending (on by default for Adobe).
 - **Testing without Adobe.** `app/adobe/fake.py` speaks Adobe's REST protocol and tags with this engine's own tagger
   (it can also throttle, run out of transactions or fail on request). The tests use it in-process; `docker compose
   --profile fake-adobe` runs it as a server.
 
-Not yet on this route: further fixes on top of Adobe's tags beyond alt text, notation and fonts.
+Not yet on this route: further fixes on top of Adobe's tags beyond alt text, notation, the document fixes and fonts.
 
 Setting it up: [Operations → Adobe Autotag](../operations/adobe-autotag.md).

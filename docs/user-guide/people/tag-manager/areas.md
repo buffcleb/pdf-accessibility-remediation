@@ -38,6 +38,22 @@ afterwards if needed.
 An item that extends outside the box, or sits inside another untagged item, can't be tagged on its own; draw a larger
 box.
 
+## The new tag, before you save
+
+> **New 22 October 2026:** a new tag can be chosen and changed before it's saved.
+
+A tag made by **Tag checked items**, or the new part of a [split](merge-split-delete.md#splitting), is chosen as soon
+as it's made. A bar above the pages, **New tag (not saved)**, shows its type and words, with:
+
+- **Type:** pick another, then **Change**;
+- **Alt text,** for a figure or formula: it needs some before the change applies;
+- **Take back:** the new tag goes, as if you hadn't made it;
+- **New tag:** with several new tags, move to another one.
+
+**Close** (or Escape) closes the bar; click the new tag in the tag tree or on the page to choose it again. Each change
+is part of the edit that made the tag, so **Undo** takes it back like any other change. A figure's new parts, from
+[splitting a figure](figures.md#splitting-a-figure), can't be chosen this way yet: change them after saving.
+
 ## Part of a figure
 
 Drawing an area over part of a figure offers **Make them a figure of their own…** for the pieces inside it. See

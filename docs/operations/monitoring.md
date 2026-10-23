@@ -16,6 +16,9 @@ In the portal, **Attention** and **Queues** (super admins) show what's waiting, 
 
 ### Alerts
 
+> **Changed 22 October 2026:** two alerts for the optional malware scanner; on **Attention**, alerts can't be
+> acknowledged away (summaries and notices can, #538).
+
 The portal checks itself about once a minute and emails every super admin when something is wrong, with a reminder
 while it lasts and a note when it clears; **Attention** shows the same. The times are in **Settings › Alerts**
 ([settings](../user-guide/super-admins/settings.md)):
@@ -27,10 +30,44 @@ while it lasts and a note when it clears; **Attention** shows the same. The time
 | The engine has no workers | The engine reports none, or can't be reached, for 10 minutes |
 | The nightly backup hasn't finished | None has for 26 hours; only with `BACKUPS=cronjob` ([backups](backups-and-migrations.md#nightly-backups-on-the-cluster)) |
 | Monitoring (Prometheus) isn't answering | With [monitoring](#prometheus-and-grafana) on: Prometheus hasn't answered for 10 minutes |
+| The audit log isn't reaching the SIEM | With the [SIEM export](siem.md) on: an event has waited more than an hour to be sent |
+| The malware scanner isn't answering: uploads are refused | With [malware scanning](malware-scanning.md) on: clamd hasn't answered the worker's once-a-minute check for 10 minutes. Every upload is refused meanwhile |
+| The malware scanner's signatures are out of date | With malware scanning on: its signatures are more than `PORTAL_MALWARE_SIGNATURES_DAYS` (3) days old, for an hour |
 
 With monitoring on, Prometheus's own alerts (a pod crashing, a volume filling, memory near a limit and so on) come
 the same way, each with what to do; [the super admins' guide](../user-guide/super-admins/system.md#alerts) lists
 them.
+
+**Attention** also lets a super admin (and a group's admins, on their own list) **acknowledge** a summary or notice
+they've dealt with, for everyone who sees that list, until something new joins it (#538, migration 0047). The
+service's alerts and help requests waiting can't be acknowledged: they go when they're fixed or answered.
+
+### Security alerts
+
+> **Changed 22 October 2026:** an upload refused by the malware scanner is a security alert too (#455).
+
+The same check looks at the audit log for patterns someone should look at (#456). Each is emailed to every super
+admin (several found at once come in one email), shown on **Attention** for a day, and recorded in the audit log as
+`security.alert`, so a SIEM reading the log gets it too ([the SIEM export](siem.md)). The email says what happened, when and from where, what to
+do, and links to the audit log searched for it. The numbers are in **Settings › Security alerts**:
+
+| Alert | Default |
+|---|---|
+| Repeated wrong sign-in codes for one address | 5 in 15 minutes |
+| Sign-in attempts for many addresses from one IP | 10 addresses in 15 minutes |
+| Many refused sign-in requests from one IP | 10 in 15 minutes, refused by the rate limit or the bot check |
+| Sign-in codes asked for many unknown addresses | 20 in an hour, across the service |
+| One person downloading many of other people's documents | 25 files in an hour |
+| A stolen session cookie may have been used | Every time a refresh token is used twice (the session is ended at once) |
+| A new super admin | Every time |
+| Documents from a group may now leave the service | An AI level or Adobe turned on for a group, or its local-only turned off |
+| Documents or records are kept for less time | Either retention period shortened |
+| An upload was refused: the malware scanner found something in it | Every time ([malware scanning](malware-scanning.md)) |
+
+A counted alert fires once per address, IP or person in its period, not at every check. Codes typed after the
+code check's own rate limit has cut in aren't recorded, so they don't count; the limit stops them. When one looks
+like an incident:
+[incident response](incident-response.md).
 
 When the portal itself is down it can't email anyone, so point an outside uptime check at
 **`https://APP_HOST/api/v1/status`**. It needs no sign-in and answers **200** with `{"status": "ok"}`, or **503**
@@ -41,20 +78,24 @@ which would take the portal out of service.
 
 ## Prometheus and Grafana
 
+> **Changed 22 October 2026:** the System page's tabs and its node CPU and memory figures (#522).
+
 On the cluster, `MONITORING=on` in `deploy/k8s/deploy.env` (the default) adds monitoring to the deployment
 (`deploy/k8s/manifests/95-monitoring.yaml`, #397):
 
 - **Prometheus** reads the service's metrics every 30 seconds and keeps `PROMETHEUS_RETENTION` of them (15 days by
   default; also cut to 85% of its volume, `PROMETHEUS_SIZE`, 20 GiB). Its alerts go to super admins through the
   portal, with the portal's own ([above](#alerts)): there's no Alertmanager to set up.
-- **Administration → System** (super admins) shows the main figures and charts from it, and every workload's
-  pods: working, idle, starting or failing, and the room each has to scale
-  ([guide](../user-guide/super-admins/system.md)). The portal reads all of it from Prometheus, so it has no access
+- **Administration → System** (super admins) shows what Prometheus knows, on three tabs (#522): **Now** (the main
+  figures; CPU and memory in use against what the nodes have, for all the nodes and for this service; and every
+  workload's pods: working, idle, starting or failing, and the room each has to scale), **Over time** (the charts)
+  and **Audit export** (the [SIEM export](siem.md)'s state) ([guide](../user-guide/super-admins/system.md)). The portal reads all of it from Prometheus, so it has no access
   to the Kubernetes API itself.
 - **Grafana** at `https://APP_HOST/grafana/`, for super admins only, opened from the System page. There are no
   Grafana logins: the web app's nginx asks the portal about every request, and passes the super admin's email to
   Grafana as the user (its auth proxy). It comes with a **PDF Remediation** dashboard
-  (`deploy/k8s/monitoring/dashboards/`). With the Cloudflare Worker front end (`FRONTEND=worker`) there's no web
+  (`deploy/k8s/monitoring/dashboards/`). **Changed 22 October 2026:** its Portal row also shows how long malware
+  scans of uploads take, with `MALWARE_SCAN=clamav` (`portal_malware_scan_seconds`). With the Cloudflare Worker front end (`FRONTEND=worker`) there's no web
   pod, so no Grafana; Prometheus, its alerts and the System page are the same.
 
 `MONITORING=off` removes them on the next deploy and keeps their volumes (`prometheus-data`, `grafana-data`).
@@ -66,6 +107,8 @@ kubectl -n NS delete pvc prometheus-data grafana-data
 
 ### What's read
 
+> **Changed 22 October 2026:** the kubelet row says why each node's root cgroup is kept (#522).
+
 | From | What |
 |---|---|
 | portal-api, `/metrics` (port 8080, outside `/api/`, so not reachable from outside) | Requests by route and answer, and their times; documents by status, the oldest waiting, documents finished, pages charged, the worker's last pass, open alerts, queued email |
@@ -76,7 +119,7 @@ kubectl -n NS delete pvc prometheus-data grafana-data
 | formula-reader, port 9464 | The same, for the formula reader (#403) |
 | kube-state-metrics | This namespace's pods (ready, restarts, why waiting, their `app` label), deployments, autoscalers and volumes, as the cluster sees them |
 | Redis and Postgres exporters | Redis's memory, clients and lists; Postgres's connections, transactions and size (through an account that reads no table, `deploy/k8s/monitoring-role.sql`) |
-| Each node's kubelet | CPU, memory and network of this namespace's containers, its volumes' use, and each liveness and readiness probe's results; everything else on the nodes is dropped as it's read |
+| Each node's kubelet | CPU, memory and network of this namespace's containers, its volumes' use, and each liveness and readiness probe's results; and each node's total CPU and memory in use and its size (its root cgroup, `id="/"`, and `machine_*`), for the System page's capacity figures: everything on the node, this service or not. Everything else on the nodes is dropped as it's read |
 
 A pod is read when its template asks (`prometheus.io/scrape`, `prometheus.io/port`, `prometheus.io/path`
 annotations). The network policies let Prometheus reach those ports, the exporters reach Postgres and Redis,
@@ -156,6 +199,9 @@ there are started again. Replicas and disruption budgets are for production.
 
 ## On the cluster
 
+> **Changed 22 October 2026:** the log names of the newer pods, and the number of network policies now that ingress
+> is denied by default and the portal's Redis, the egress proxy and ClamAV have their own.
+
 The commands you need on a Kubernetes deployment, each with what it shows. `NS` is the namespace from
 `deploy/k8s/deploy.env` (`pdf-remediation` in the reference deployment); the `KUBECONFIG` is the one `deploy.env`
 names. None of these changes anything.
@@ -172,7 +218,8 @@ kubectl -n NS logs deploy/engine-worker --since=30m
 ```
 
 A pod's recent output; `-f` follows it, and `deploy/portal-worker`, `deploy/portal-api`, `deploy/engine-api`,
-`statefulset/redis`, `deploy/litellm` name the others. Jobs stuck *processing* are explained by the engine worker's
+`statefulset/redis`, `statefulset/redis-portal`, `deploy/litellm`, `deploy/egress-proxy` and `deploy/clamav` (with
+`-c clamd` or `-c freshclam`) name the others. Jobs stuck *processing* are explained by the engine worker's
 log (a document whose worker was lost shows as "Worker lost: waiting to be retried" on Queues and Attention); the portal worker's log says what it sent to the engine and which emails failed.
 
 ```bash
@@ -202,7 +249,8 @@ kubectl -n NS get networkpolicy
 ```
 
 Who may talk to what. The policies are listed in [the deploy README](../../deploy/k8s/README.md#network-policies-and-the-redis-password);
-ten with the tunnel front end, eleven with the Worker front end, and three more with monitoring.
+thirteen with the tunnel front end (one of them `default-deny-ingress`), fourteen with the Worker front end; three
+more with monitoring, one with the egress proxy (`EGRESS_PROXY=log`; three with `enforce`) and one with ClamAV.
 
 ```bash
 kubectl -n NS port-forward svc/litellm 4000

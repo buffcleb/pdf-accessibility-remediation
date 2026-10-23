@@ -72,7 +72,7 @@ export function Admin() {
               <Route path="services/:key" element={<ServiceDetail />} />
               <Route path="people" element={<PeopleAll />} />
               <Route path="queues" element={<QueuesPage />} />
-              <Route path="system" element={<SystemPage />} />
+              <Route path="system/*" element={<SystemPage />} />
               <Route path="users" element={<Navigate to="/admin/people" replace />} />
               <Route path="reports" element={<><h1>Reports</h1><LiveReports />
                 <details className="panel">

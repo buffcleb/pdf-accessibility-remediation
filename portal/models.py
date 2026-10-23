@@ -51,6 +51,8 @@ class Group(Base):
     show_external: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # "Describe with AI" for the group's people: True/False, or None to follow the service default
     ai_describe: Mapped[bool | None] = mapped_column(nullable=True)
+    # The group's admins let its people make API tokens for scripts (#518), once super admins allow them
+    api_tokens_enabled: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = _created()
 
     domains: Mapped[list[GroupDomain]] = relationship(back_populates="group", cascade="all, delete-orphan",
@@ -299,6 +301,47 @@ class OtpChallenge(Base):
     created_at: Mapped[datetime] = _created()
 
 
+class ApiToken(Base):
+    """A personal API token for a script (#518). Tied to one processing service, AI level and kind; may submit, and if
+    the person chose, check status and download (everything as the zip, or chosen files). Only a keyed hash is kept:
+    the token is shown once, when it's made."""
+    __tablename__ = "api_tokens"
+
+    id: Mapped[uuid.UUID] = _id()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    group_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("groups.id", ondelete="CASCADE"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(16), nullable=False)  # its first characters, to tell tokens apart
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    can_submit: Mapped[bool] = mapped_column(nullable=False, default=True)
+    can_status: Mapped[bool] = mapped_column(nullable=False, default=False)
+    download: Mapped[str | None] = mapped_column(String(16), nullable=True)  # None | "all" (the zip) | "files"
+    download_kinds: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    processing: Mapped[str] = mapped_column(String(64), nullable=False)
+    ai_tier: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ai_kind: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    auto_confirm: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = _created()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    revoked_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)  # owner | group_admin | unused
+    expiry_warned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # told: expires soon
+    idle_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # told: stopped unused
+
+    user: Mapped[User] = relationship()
+
+
+class ApiTokenDownload(Base):
+    """A finished document a token has downloaded: a polling job asks only for the ones it hasn't (#518)."""
+    __tablename__ = "api_token_downloads"
+
+    token_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("api_tokens.id", ondelete="CASCADE"), primary_key=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
+    downloaded_at: Mapped[datetime] = _created()
+
+
 class AuthSession(Base):
     """A signed-in session. The refresh token rotates on every use; only its hash is stored.
 
@@ -410,6 +453,9 @@ class Job(Base):
     # A super admin's re-run is a new document: the one it re-ran (#323)
     rerun_of: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True,
                                                        index=True)
+    # Sent by a script with this API token (#518)
+    api_token_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("api_tokens.id", ondelete="SET NULL"), nullable=True)
+    api_token: Mapped[ApiToken | None] = relationship()
     files_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # "I'm done with it": the files go once the hold (early_removal_hold_hours) ends, not at the end of retention
     removal_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -537,6 +583,9 @@ class DocumentVersion(Base):
                                                           nullable=True)
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Ready to open, but its checks (veraPDF, the pixel comparison) are still running: its verdict and findings come
+    # when they finish (#428)
+    checking: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # AI tag review: requested when saving ("sampled"), or later for a saved version. It re-checks the
     # same file and replaces the version's review findings; the file itself never changes.
     review: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -755,6 +804,25 @@ class AlertState(Base):
     detail: Mapped[str] = mapped_column(Text, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AttentionAck(Base):
+    """A Needs attention item someone acknowledged (#538), for everyone who sees that list: super admins' (scope
+    "all") or one group's admins' (scope: the group's id). It holds the things the item was about then (documents,
+    emails, an alert); the item comes back when something new joins them, counting only what's new."""
+    __tablename__ = "attention_acks"
+    __table_args__ = (UniqueConstraint("scope", "key", name="uq_attention_ack"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope: Mapped[str] = mapped_column(String(40), nullable=False)
+    group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"),
+                                                       nullable=True)
+    key: Mapped[str] = mapped_column(String(200), nullable=False)
+    ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    acked_by: Mapped[str] = mapped_column(String(320), nullable=False)
+    acked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 # held: waiting for the person's daily summary; combined: went out in one; seen: not sent, they saw it in the portal

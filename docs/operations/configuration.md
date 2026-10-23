@@ -9,11 +9,14 @@ to change, with comments.
 
 ## The engine
 
+> **Changed 22 October 2026:** `PORTAL_MALWARE_SCAN` moved to [the portal's table](#the-portal), where it's read.
+
 | Setting | Default | |
 |---|---|---|
 | `REDIS_URL` | set by the compose file or manifests | The job queue |
 | `DATA_DIR` | `/data` in the image | The shared job folder: the API and every worker must see the same one |
-| `SERVICE_API_KEY` | empty | Required `X-API-Key` for every call (set it in any shared deployment) |
+| `SERVICE_API_KEY` | empty | Required `X-API-Key` for every call; the portal's `PORTAL_ENGINE_API_KEY` is the same. The API won't start without it (#457) |
+| `ALLOW_NO_API_KEY` | `false` | `true` lets the API start without `SERVICE_API_KEY`, open to anyone who can reach it: local development only |
 | `PUBLIC_BASE_URL` | empty | Prefix for download URLs in the engine's answers; empty gives relative URLs |
 | `MAX_UPLOAD_MB`, `JOB_TTL_HOURS`, `TASK_TIME_LIMIT_S` | 200, 24, 3600 | Upload size; how long job folders are kept (hours); the longest a job may run (seconds) |
 | `MAX_PAGES` | 2000 | Documents with more pages are refused (0: no limit); keep it at or above the portal's |
@@ -45,9 +48,12 @@ to change, with comments.
 
 ## The portal
 
+> **Changed 22 October 2026:** the malware-scanning settings are listed here (they're the portal's), and the
+> portal's own Redis on a cluster is named.
+
 | Setting | |
 |---|---|
-| `PORTAL_DATABASE_URL`, `PORTAL_REDIS_URL` | PostgreSQL and Redis. On Kubernetes the portal connects as its own rows-only account, `portal_app` (`PORTAL_APP_DB_PASSWORD`); migrations run as the owner (`PORTAL_DB_PASSWORD`) |
+| `PORTAL_DATABASE_URL`, `PORTAL_REDIS_URL` | PostgreSQL and Redis. On Kubernetes the portal connects as its own rows-only account, `portal_app` (`PORTAL_APP_DB_PASSWORD`); migrations run as the owner (`PORTAL_DB_PASSWORD`). Its Redis is its own, `redis-portal` (`PORTAL_REDIS_PASSWORD`), holding only the rate limits, apart from the engine's queue (#472) |
 | `PORTAL_JWT_PRIVATE_KEYS`, `PORTAL_SECRET_KEY` | Signing keys; generate with `python -m portal.cli genkeys` |
 | `PORTAL_APP_URL`, `PORTAL_CORS_ORIGINS`, `PORTAL_COOKIE_SECURE` | The address people use; HTTPS cookies |
 | `PORTAL_TRUST_PROXY_HEADERS`, `PORTAL_CLIENT_IP_HEADER` | Behind a proxy: which header holds the caller's address (`cf-connecting-ip` behind Cloudflare; `x-client-ip` behind the optional Cloudflare Worker; `x-forwarded-for` behind any other proxy or load balancer) |
@@ -61,13 +67,37 @@ to change, with comments.
 | `PORTAL_BOOTSTRAP_SUPER_ADMINS` | Email addresses that become super admins at their first sign-in |
 | `PORTAL_TURNSTILE_SITE_KEY`, `PORTAL_TURNSTILE_SECRET_KEY`, `PORTAL_TURNSTILE_FAIL_OPEN` | Cloudflare Turnstile, a bot check on "Email me a code" ([details](../deployment/cloudflare.md#a-bot-check-on-sign-in)). Off unless both keys are set. If Cloudflare can't be reached, sign-in is allowed (the rate limits still apply) unless `FAIL_OPEN` is `false` |
 | `PORTAL_RATE_OTP_PER_EMAIL`, `PORTAL_RATE_OTP_PER_IP`, `PORTAL_RATE_VERIFY_PER_IP`, `PORTAL_RATE_WINDOW_SECONDS` | Rate limits on sign-in codes: 5 requests per address and 30 per IP address, and 50 code checks per IP address, every 15 minutes |
-| `PORTAL_RATE_DOWNLOADS_PER_HOUR`, `PORTAL_RATE_EXPORTS_PER_HOUR`, `PORTAL_RATE_UPLOADS_PER_HOUR` | Per person, per hour: files downloaded (600), report and person-data exports (120), upload requests (200; one can hold several files). Past one, a plain 429. 0 turns it off |
+| `PORTAL_RATE_DOWNLOADS_PER_HOUR`, `PORTAL_RATE_EXPORTS_PER_HOUR`, `PORTAL_RATE_UPLOADS_PER_HOUR`, `PORTAL_RATE_DOCUMENT_EXPORTS_PER_HOUR` | Per person, per hour: files downloaded (600), report and person-data exports (120), upload requests (200; one can hold several files), zips of many documents (20; one each, however many files). Past one, a plain 429. 0 turns it off |
 | `PORTAL_ENGINE_AI_PROVIDER`, `PORTAL_ENGINE_AI_MODEL` | The portal's fallback AI, for a document sent without an AI level (`localai`; empty model: the provider's default) |
 | `PORTAL_REVIEW_FINDINGS_MAX` | Review items kept with a document (300; [limits](limits.md#checking-the-result)) |
 | `PORTAL_ENABLE_DOCS` | Interactive API docs at `/api/v1/docs`; leave off in production |
 | `PORTAL_PROMETHEUS_URL`, `PORTAL_GRAFANA_URL`, `PORTAL_METRICS_ENABLED` | Monitoring: where the portal reads Prometheus for alerts and Administration › System, Grafana's link, and the portal's own `/metrics` (on). Set by the Kubernetes deploy from `MONITORING` ([monitoring](monitoring.md#prometheus-and-grafana)) |
+| `PORTAL_SIEM_MODE`, `PORTAL_SIEM_SYSLOG_*`, `PORTAL_SIEM_HTTPS_*`, `PORTAL_SIEM_PULL_TOKEN` | The audit log to the campus SIEM: by syslog over TLS, by HTTPS, or a pull API ([details](siem.md)). Off by default |
 | `PORTAL_BACKUP_EXPECTED` | Alert when no nightly backup has finished. Set by the Kubernetes deploy from `BACKUPS=cronjob` |
+| `PORTAL_MALWARE_SCAN`, `PORTAL_CLAMD_HOST`, `PORTAL_CLAMD_PORT`, `PORTAL_CLAMD_TIMEOUT_SECONDS`, `PORTAL_MALWARE_SIGNATURES_DAYS` | Uploads and help-desk attachments scanned by ClamAV before they're stored: `off` (the default) or `clamav`, at `clamav:3310`; signatures older than 3 days are an alert ([malware scanning](malware-scanning.md)). On a cluster, set by `MALWARE_SCAN` in `deploy.env` |
 | `PORTAL_GATEWAY_ADMIN_URL` | The AI gateway's admin UI, linked for super admins. Empty (the default) shows them how to reach it by port-forward instead of a link; set it only to an address their browsers can reach |
+
+## On a cluster: `deploy.env`
+
+> **New 22 October 2026:** the cluster-wide settings an operator is most likely to look for, with where each is
+> explained.
+
+On Kubernetes, `deploy/k8s/deploy.env` holds the deployment's own settings (no secrets): the cluster, sizes, storage
+and the optional pieces. `scripts/deploy.sh` sets the engine's and portal's settings above from it where they
+overlap. Every one is in `deploy/k8s/deploy.env.example`, grouped in
+[`deploy.env` at a glance](../../deploy/k8s/README.md#deployenv-at-a-glance). The ones that change what runs, or
+what can leave the cluster:
+
+| Setting | Default | |
+|---|---|---|
+| `INGRESS_CONTROLLER`, `INGRESS_CLASS` | `nginx`, empty | `traefik` or `nginx` (ingress-nginx): the Ingresses get that controller's own settings ([Traefik's settings](../deployment/first-cluster/middleware.md#traefiks-settings-for-the-cluster)) |
+| `CERT_ISSUER`, `INGRESS_TLS_SECRET` | empty | HTTPS at your own ingress controller: a cert-manager ClusterIssuer, or a Secret with your certificate |
+| `EGRESS_PROXY`, `EGRESS_ALLOW`, `CLUSTER_CIDRS` | `off` | Outbound traffic from the portal, the AI gateway, the Adobe worker and ClamAV: direct (`off`), through the egress proxy recording each host (`log`), or only to the hosts this deployment uses (`enforce`) ([the egress proxy](../../deploy/k8s/README.md#outbound-traffic-the-egress-proxy)) |
+| `MALWARE_SCAN` | `off` | `clamav` runs ClamAV and scans every upload ([malware scanning](malware-scanning.md)) |
+| `NODE_ENCRYPTION` | `check` | Whether traffic between the nodes is encrypted, checked before each deploy: `check` shows it, `require` stops a deploy without it, `off` doesn't look |
+| `ENGINE_NODES` | empty | A node label, `key=value`: the pods that open uploaded documents run only on those nodes ([scaling](../deployment/first-cluster/scaling.md#4-the-pdf-engine-on-its-own-nodes)) |
+| `GATEWAY_ENGINE_BUDGET` | empty | What the engine's own gateway key may spend, USD per 30 days |
+| `MONITORING`, `BACKUPS`, `AUTOSCALE` | `on`, `external`, `auto` | [Monitoring](monitoring.md#prometheus-and-grafana), [nightly backups](backups-and-migrations.md#nightly-backups-on-the-cluster), [scaling with the queue](#scaling-with-the-queue) |
 
 ## Changed in the app, not in settings
 

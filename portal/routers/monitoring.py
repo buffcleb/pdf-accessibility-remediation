@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from portal import audit, prometheus, workloads
+from portal import audit, prometheus, rls, workloads
 from portal.config import get_portal_settings
 from portal.db import get_db
 from portal.deps import Principal, require_super_admin
@@ -48,6 +48,7 @@ def grafana_user(db: Session, token: str | None, now: float | None = None) -> Us
             return None
         if int(expires) < (now or time.time()):
             return None
+        rls.identify(db, user_id=uuid.UUID(uid))  # row-level security (#350): the signature says whose it is
         user = db.get(User, uuid.UUID(uid))
     except (ValueError, TypeError):
         return None
@@ -97,6 +98,18 @@ NOW = [
     ("restarts", "Restarts in the last hour", "sum(increase(kube_pod_container_status_restarts_total[1h]))", ""),
     ("alerts", "Alerts firing", 'count(ALERTS{alertstate="firing"})', ""),
 ]
+# This service's containers, and each node's own totals (the root cgroup, id="/") and size (#522)
+_SVC_CPU = 'rate(container_cpu_usage_seconds_total{container!=""}[5m])'
+_SVC_MEM = 'container_memory_working_set_bytes{container!=""}'
+_NODE_CPU = 'rate(container_cpu_usage_seconds_total{id="/"}[5m])'
+_NODE_MEM = 'container_memory_working_set_bytes{id="/"}'
+# Use against capacity, for the whole environment (every node) and this service: (key, label, query, of, unit)
+NOW_OF = [
+    ("env_cpu", "CPU in use, all nodes", f"sum({_NODE_CPU})", "sum(machine_cpu_cores)", "cores"),
+    ("env_memory", "Memory in use, all nodes", f"sum({_NODE_MEM}) / 2^30", "sum(machine_memory_bytes) / 2^30", "GiB"),
+    ("svc_cpu", "This service's CPU", f"sum({_SVC_CPU})", "sum(machine_cpu_cores)", "cores"),
+    ("svc_memory", "This service's memory", f"sum({_SVC_MEM}) / 2^30", "sum(machine_memory_bytes) / 2^30", "GiB"),
+]
 # (key, title, unit, [(query, the series' name: None for the label the query sums by)])
 CHARTS = [
     ("documents", "Documents not finished", "", [("sum by (status) (portal_documents)", None)]),
@@ -106,9 +119,20 @@ CHARTS = [
      [("sum(engine_worker_busy)", "In progress"), ("sum(engine_worker_places)", "Places")]),
     ("queues", "Waiting in Redis", "", [("max by (queue) (engine_queue_length)", None)]),
     ("cpu", "CPU by service (cores)", "",
-     [("sum by (app) (" + _BY_SERVICE.format(q="rate(container_cpu_usage_seconds_total[5m])") + ")", None)]),
+     [("sum by (app) (" + _BY_SERVICE.format(q=_SVC_CPU) + ")", None)]),
     ("memory", "Memory by service (GiB)", "",
-     [("sum by (app) (" + _BY_SERVICE.format(q="container_memory_working_set_bytes") + ") / 2^30", None)]),
+     [("sum by (app) (" + _BY_SERVICE.format(q=_SVC_MEM) + ") / 2^30", None)]),
+    # By node and in all (#522): each node's whole use against its size, this service's share of each node, and the
+    # environment's use against its capacity
+    ("node_cpu", "CPU by node, whole node (% of the node)", "%",
+     [(f"100 * sum by (node) ({_NODE_CPU}) / sum by (node) (machine_cpu_cores)", None)]),
+    ("node_memory", "Memory by node, whole node (% of the node)", "%",
+     [(f"100 * sum by (node) ({_NODE_MEM}) / sum by (node) (machine_memory_bytes)", None)]),
+    ("svc_node_cpu", "This service's CPU by node (cores)", "", [(f"sum by (node) ({_SVC_CPU})", None)]),
+    ("svc_node_memory", "This service's memory by node (GiB)", "", [(f"sum by (node) ({_SVC_MEM}) / 2^30", None)]),
+    ("env", "All nodes: CPU and memory in use (% of capacity)", "%",
+     [(f"100 * sum({_NODE_CPU}) / sum(machine_cpu_cores)", "CPU"),
+      (f"100 * sum({_NODE_MEM}) / sum(machine_memory_bytes)", "Memory")]),
     ("requests", "Portal requests per minute", "",
      [('sum by (class) (label_replace(rate(portal_http_requests_total[5m]), "class", "${1}xx", "status", '
        '"([0-9]).."))  * 60', None)]),
@@ -122,6 +146,7 @@ class Figure(BaseModel):
     label: str
     value: float | None
     unit: str
+    of: float | None = None  # what it's out of: "7.2 of 24 cores" (#522)
 
 
 class SystemChart(BaseModel):
@@ -189,6 +214,8 @@ def system(range_: Literal["6h", "24h", "7d"] = Query("6h", alias="range"),
     end = time.time()
     try:
         out.now = [Figure(key=k, label=label, value=_value(prom.query(q)), unit=unit) for k, label, q, unit in NOW]
+        out.now += [Figure(key=k, label=label, value=_value(prom.query(q)), of=_value(prom.query(of)), unit=unit)
+                    for k, label, q, of, unit in NOW_OF]
         out.charts = [SystemChart(key=k, title=title, chart=_chart(prom, title, unit, qs, end - span, end, step))
                       for k, title, unit, qs in CHARTS]
         out.reachable = True

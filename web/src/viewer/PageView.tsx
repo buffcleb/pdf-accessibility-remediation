@@ -1,7 +1,10 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { PDFDoc } from "./pdf";
 import { ROLE_NAMES, roleClass } from "./draft";
+import { CARD_W, cardWidth, placeCard, tagText, type CardPlace } from "./fullText";
 import type { Finding, TagElement } from "../api";
+import { PageNotes, SpotLayer } from "./SpotLayer";
+import type { Spot } from "./spot";
 
 export type OverlayItem = {
   el: TagElement;
@@ -15,6 +18,8 @@ export type OverlayItem = {
   highlighted?: boolean;
   text?: string;     // its own words, when they aren't the tag's (a row of a list built from it)
   pending?: boolean; // part of an unsaved change: drawn as it will be once saved
+  made?: number; // a tag a pending edit makes (#427): the place of that edit, which stands for it until it's saved
+  madeSelected?: boolean;
 };
 
 const SEV_RANK: Record<string, number> = { high: 0, review: 1, suggest: 2 };
@@ -48,11 +53,17 @@ type Props = {
   // (`menu`), the selected tag when it is there, so a right-click acts on what was chosen
   hitAt?: (page: number, x: number, y: number, menu?: boolean) => number | null;
   veil?: [number, number, number, number][] | null; // a tag is isolated: the page is veiled except these boxes
+  spot?: Spot | null; // a review item's area on this page, highlighted (#426)
+  onSpot?: (f: Finding) => void; // one of the page's own items chosen in its list
+  onSpotClose?: () => void;
+  onDrawn?: () => void; // the page has been drawn (or couldn't be): the pane stops showing its progress (#424)
+  onPendingSelect?: (op: number) => void; // a tag pending edits make, chosen (#427)
 };
 
 /** One page: the rendered canvas (only while near the viewport) with tag boxes drawn over it. */
 export const PageView = memo(function PageView({ pdf, index, size, scale, items, pageFindings, showLabels, selected, onSelect, onPage,
-  areaMode = false, area = null, onArea, picked, onPick, onMenu, onPageMenu, hitAt, veil = null }: Props) {
+  areaMode = false, area = null, onArea, picked, onPick, onMenu, onPageMenu, hitAt, veil = null,
+  onDrawn, spot = null, onSpot, onSpotClose, onPendingSelect }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   // A pointer event's place on this page, in page units
   const at = (e: { clientX: number; clientY: number }) => {
@@ -81,17 +92,23 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
     let canceled = false;
     let task: { cancel: () => void; promise: Promise<void> } | null = null;
     (async () => {
-      const page = await pdf.getPage(index + 1);
-      if (canceled || !canvasRef.current) return;
-      const base = page.getViewport({ scale: 1 });
-      // Sharp on high-DPI screens, but capped so a zoomed page doesn't need an enormous canvas
-      const dpr = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(12e6 / Math.max(1, w * h)));
-      const viewport = page.getViewport({ scale: (w / base.width) * dpr });
-      const canvas = canvasRef.current;
-      canvas.width = Math.floor(viewport.width);
-      canvas.height = Math.floor(viewport.height);
-      task = page.render({ canvas, viewport });
-      await task.promise.catch(() => {});
+      try {
+        const page = await pdf.getPage(index + 1);
+        if (canceled || !canvasRef.current) return;
+        const base = page.getViewport({ scale: 1 });
+        // Sharp on high-DPI screens, but capped so a zoomed page doesn't need an enormous canvas
+        const dpr = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(12e6 / Math.max(1, w * h)));
+        const viewport = page.getViewport({ scale: (w / base.width) * dpr });
+        const canvas = canvasRef.current;
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        task = page.render({ canvas, viewport });
+        await task.promise.catch(() => {});
+      } catch {
+        // a page pdf.js can't read stays blank
+      } finally {
+        if (!canceled) onDrawn?.();  // drawn or not, the wait is over: the progress mustn't stay up
+      }
     })();
     return () => {
       canceled = true;
@@ -101,6 +118,8 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
 
   const shown = items.find((it) => it.el.i === hover) ?? (popHidden ? undefined
     : items.find((it) => it.highlighted && hover === null) ?? items.find((it) => it.el.i === selected && hover === null));
+  const popId = useId();
+  const card = shown && !areaMode ? shown : undefined;
   return (
     <div className="pv-page" ref={wrapRef} style={{ width: w, height: h }} data-page={index + 1}
       onMouseLeave={() => setHover(null)}
@@ -116,27 +135,29 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
       }}>
       {near ? <canvas ref={canvasRef} className="pv-canvas" style={{ width: w, height: h }} aria-hidden="true" /> : null}
       <span className="pv-pageno" aria-hidden="true">{index + 1}</span>
-      {pageFindings.length > 0 && (
-        <div className="pv-pagenote" title={pageFindings.map((f) => f.issue).join("; ")}>
-          {pageFindings.length} page-level note{pageFindings.length > 1 ? "s" : ""}
-        </div>
-      )}
+      {pageFindings.length > 0 && <PageNotes notes={pageFindings} onShow={onSpot} />}
       {items.map((it) => {
         const [x0, y0, x1, y1] = it.bbox;
         const sev = worstSeverity(it.findings);
         const name = ROLE_NAMES[it.role] ?? it.role;
         const words = it.text ?? it.el.text ?? it.el.name;
-        const label = `${name}${it.pending ? " (not saved)" : ""}${it.findings.length ? `: ${it.findings[0].issue}` : ""}${words ? ` — ${words.slice(0, 60)}` : ""}`;
+        // The chip drawn on it (its type, or its place in the reading order) starts its name: what's seen is what's said
+        const chip = showLabels || it.orderNo !== undefined ? (it.orderNo !== undefined ? `${it.orderNo}` : it.role) : null;
+        const label = `${chip !== null ? `${chip}, ` : ""}${name}${it.pending ? " (not saved)" : ""}`
+          + `${it.findings.length ? `: ${it.findings[0].issue}` : ""}${words ? ` — ${words.slice(0, 60)}` : ""}`;
         return (
-          <button key={`${it.el.i}-${it.role}-${x0}-${y0}`} type="button"
-            className={`pv-box ${roleClass(it.role)}${it.pending ? " pending" : ""}${sev ? ` sev-${sev}` : ""}${selected === it.el.i || picked?.includes(it.el.i) ? " selected" : ""}${it.decorative ? " decorative" : ""}${it.highlighted ? " hl" : ""}`}
+          <Fragment key={`${it.el.i}-${it.role}-${x0}-${y0}`}>
+          <button type="button"
+            className={`pv-box ${roleClass(it.role)}${it.pending ? " pending" : ""}${sev ? ` sev-${sev}` : ""}${(it.made === undefined ? selected === it.el.i || picked?.includes(it.el.i) : it.madeSelected) ? " selected" : ""}${it.decorative ? " decorative" : ""}${it.highlighted ? " hl" : ""}`}
             style={{ left: x0 * scale, top: y0 * scale, width: Math.max(4, (x1 - x0) * scale), height: Math.max(4, (y1 - y0) * scale) }}
             tabIndex={sev || selected === it.el.i ? 0 : -1}
-            aria-label={label}
+            aria-label={label} aria-describedby={it === card ? popId : undefined}
             onMouseEnter={() => { setHover(it.el.i); setPopHidden(false); }}
             onFocus={() => setHover(it.el.i)}
-            onBlur={() => setHover(null)}
+            // Tabbing on into the card (when it scrolls) keeps it open
+            onBlur={(e) => { if (!(e.relatedTarget as Element | null)?.closest?.(".pv-pop")) setHover(null); }}
             onClick={(e) => {
+              if (it.made !== undefined && onPendingSelect) { onPendingSelect(it.made); return; } // not saved yet
               const p = at(e);
               const i = (p && hitAt?.(index + 1, p.x, p.y)) ?? it.el.i;
               if ((e.ctrlKey || e.metaKey) && onPick) onPick(i);
@@ -154,13 +175,13 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
               const box = e.currentTarget.getBoundingClientRect();
               onMenu(it.el.i, box.left + 12, box.bottom, null);
             }}>
-            {(showLabels || it.orderNo !== undefined) && (
-              <span className="pv-chip">{it.orderNo !== undefined ? `${it.orderNo}` : it.role}</span>
-            )}
+            {chip !== null && <span className="pv-chip">{chip}</span>}
           </button>
+          {/* Straight after its tag, so the Tab key goes on into it when it scrolls */}
+          {it === card && <Popover id={popId} item={it} scale={scale} onLeave={() => setHover(null)} />}
+          </Fragment>
         );
       })}
-      {shown && !areaMode && <Popover item={shown} scale={scale} pageH={h} pageW={w} />}
       {veil && (
         // Everything but the isolated tag is veiled. It lets clicks through: the rest can still be chosen
         <svg className="pv-veil" aria-hidden="true" width={w} height={h}>
@@ -173,6 +194,7 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
           <rect className="pv-veil-fill" width={w} height={h} mask={`url(#pv-veil-${index})`} />
         </svg>
       )}
+      {spot && onSpotClose && <SpotLayer spot={spot} index={index} scale={scale} w={w} h={h} onClose={onSpotClose} />}
       {area && <div className="pv-area" aria-hidden="true" style={{ left: area[0] * scale, top: area[1] * scale,
         width: (area[2] - area[0]) * scale, height: (area[3] - area[1]) * scale }} />}
       {areaMode && onArea && <AreaDraw scale={scale} size={size} onArea={(b) => onArea(index + 1, b)} />}
@@ -180,15 +202,54 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
   );
 });
 
-function Popover({ item, scale, pageH, pageW }: { item: OverlayItem; scale: number; pageH: number; pageW: number }) {
-  const [x0, y0, , y1] = item.bbox;
-  const below = y1 * scale + 8 + 160 < pageH;
-  const style = {
-    left: Math.min(Math.max(0, x0 * scale), Math.max(0, pageW - 340)),
-    ...(below ? { top: y1 * scale + 6 } : { bottom: pageH - y0 * scale + 6 }),
-  };
+/** The card with a tag's details, in full (#436). It's placed by placeCard once drawn, as it has to be measured: inside
+ * the part of the pane that can be seen, and placed again as the pane scrolls. Too tall, it scrolls: then it takes the
+ * pointer and the Tab key, so it can be scrolled. */
+function Popover({ id, item, scale, onLeave }: { id: string; item: OverlayItem; scale: number; onLeave: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [place, setPlace] = useState<(CardPlace & { scrolls: boolean }) | null>(null);
+  const [x0, y0, x1, y1] = item.bbox;
+  const words = tagText(item.el);
+  useLayoutEffect(() => {
+    const card = ref.current;
+    const page = card?.parentElement;
+    if (!card || !page) return;
+    const body = page.closest<HTMLElement>(".pv-body");
+    const fit = () => {
+      const p = page.getBoundingClientRect();
+      // What can be seen of the pane (inside its scroll bars) and of the window, in the page's pixels
+      const b = body ? body.getBoundingClientRect() : p;
+      const l = b.left + (body?.clientLeft ?? 0), t = b.top + (body?.clientTop ?? 0);
+      const view = {
+        left: Math.max(0, l) - p.left,
+        top: Math.max(0, t) - p.top,
+        right: Math.min(window.innerWidth, body ? l + body.clientWidth : p.right) - p.left,
+        bottom: Math.min(window.innerHeight, body ? t + body.clientHeight : p.bottom) - p.top,
+      };
+      // Its height at the width it will have, with nothing cut
+      const was = { width: card.style.width, maxHeight: card.style.maxHeight };
+      card.style.width = `${cardWidth(view)}px`;
+      card.style.maxHeight = "none";
+      const size = { w: CARD_W, h: card.offsetHeight };
+      Object.assign(card.style, was);
+      const outline = { left: x0 * scale, top: y0 * scale, right: x1 * scale, bottom: y1 * scale };
+      const at = { ...placeCard(outline, size, view), scrolls: false };
+      at.scrolls = size.h > at.maxHeight;
+      setPlace((o) => (o && (Object.keys(at) as (keyof typeof at)[]).every((k) => o[k] === at[k]) ? o : at));
+    };
+    fit();
+    body?.addEventListener("scroll", fit, { passive: true });
+    window.addEventListener("resize", fit);
+    return () => { body?.removeEventListener("scroll", fit); window.removeEventListener("resize", fit); };
+  }, [item, scale, x0, y0, x1, y1]);
+  // Hidden until placed (before it's painted), and while its tag is scrolled out of sight
+  const style = { left: place?.left ?? 0, top: place?.top ?? 0, width: place?.width, maxHeight: place?.maxHeight,
+    ...(!place || place.side === "off" ? { visibility: "hidden" as const } : {}) };
   return (
-    <div className="pv-pop" style={style} role="tooltip">
+    <div id={id} ref={ref} className={`pv-pop${place?.scrolls ? " scrolls" : ""}`} style={style} role="tooltip"
+      data-side={place?.side} tabIndex={place?.scrolls ? 0 : undefined}
+      onClick={(e) => e.stopPropagation()} // the page would take a click on it for one on blank page, and hide it
+      onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) onLeave(); }}>
       <div className="pv-pop-head">
         <strong>{ROLE_NAMES[item.role] ?? item.role}</strong> <span className="mono muted">{item.role}</span>
         {item.decorative && <span className="pill muted">decorative (pending)</span>}
@@ -196,12 +257,14 @@ function Popover({ item, scale, pageH, pageW }: { item: OverlayItem; scale: numb
       </div>
       {item.el.actual_text && !item.el.alt ? (
         <>
-          <p className="small"><span className="muted">Read aloud as:</span> “{item.el.actual_text.slice(0, 160)}{item.el.actual_text.length > 160 ? "…" : ""}”</p>
-          {item.el.text && <p className="small muted">Drawn text: “{item.el.text.slice(0, 100)}{item.el.text.length > 100 ? "…" : ""}”</p>}
+          <p className="small"><span className="muted">Read aloud as:</span> “{item.el.actual_text}”</p>
+          {words && <p className="small muted">Drawn text: “{words}”</p>}
         </>
-      ) : item.text !== undefined ? (item.text && <p className="small">“{item.text.slice(0, 160)}{item.text.length > 160 ? "…" : ""}”</p>)
-        : item.el.text && <p className="small">“{item.el.text.slice(0, 160)}{item.el.text.length > 160 ? "…" : ""}”</p>}
-      {item.el.name && !item.el.text && <p className="small"><span className="muted">Announced as:</span> “{item.el.name.slice(0, 160)}”</p>}
+      ) : item.text !== undefined ? (item.text && <p className="small">“{item.text}”</p>)
+        : words && <p className="small">“{words}”</p>}
+      {item.el.name && !item.el.text && (
+        <p className="small"><span className="muted">Announced as:</span> “{item.el.name}”</p>
+      )}
       {(item.alt ?? item.el.alt) && <p className="small"><strong>Alt:</strong> {item.alt ?? item.el.alt}</p>}
       {(item.lang ?? item.el.lang) && <p className="small"><strong>Language:</strong> {item.lang ?? item.el.lang}</p>}
       {item.el.scope && <p className="small"><strong>Scope:</strong> {item.el.scope}</p>}

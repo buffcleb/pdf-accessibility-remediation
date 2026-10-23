@@ -75,9 +75,10 @@ def _pieces(index: TagIndex, checker: SemanticChecker | None) -> list[dict]:
         box = c.boxes[0]
         for b in c.boxes[1:]:
             box = _union(box, b)
-        kind = "text" if c.text else "image" if c.images else "drawing"
+        text = c.text_upto(PART_CHARS)
+        kind = "text" if text else "image" if c.images else "drawing"
         out.append({"page": page + 1, "mcid": mcid, "el": users[0], "bbox": [round(v, 2) for v in box], "kind": kind,
-                    **({"text": c.text[:PART_CHARS]} if c.text else {})})
+                    **({"text": text} if text else {})})
     return out
 
 
@@ -181,7 +182,7 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
         has_own = bool(own[e.index])
         text = None
         if checker is not None:
-            text = checker.subtree(e).text[:TEXT_CHARS] or None
+            text = checker.subtree(e).text_upto(TEXT_CHARS) or None
         page = e.page if e.page is not None else (min(subtree[e.index]) if subtree[e.index] else None)
         item = {
             "i": e.index,
@@ -207,7 +208,7 @@ def tagmap_from(pages: list[dict], index: TagIndex, checker: SemanticChecker | N
             "parts": _parts(e, index, checker),
         }
         if has_own and checker is not None:
-            say = checker.own[e.index].text[:SAY_CHARS] if e.index in checker.own else ""
+            say = checker.own[e.index].text_upto(SAY_CHARS) if e.index in checker.own else ""
             if say != (text or ""):
                 item["say"] = say  # empty when all its text is in child tags
         if has_own:
@@ -239,7 +240,10 @@ def _parts(e, index: TagIndex, checker: SemanticChecker | None) -> list[dict] | 
             page = e.page
             if not isinstance(item, int) and item.get("/Pg") is not None:
                 page = page_of.get(item.Pg.objgen, page)
-            piece = checker.by_mcid.get((page, mcid)) if checker is not None and page is not None else None
+            stm = item.get("/Stm") if not isinstance(item, int) else None
+            form = stm.objgen if isinstance(stm, pikepdf.Object) and stm.is_indirect else None
+            piece = (None if checker is None or page is None else
+                     checker.by_form_mcid.get((page, form, mcid)) if form else checker.by_mcid.get((page, mcid)))
             part = {"k": k, "kind": "content", "page": page + 1 if page is not None else None}
             if piece is not None:
                 if piece.bbox:

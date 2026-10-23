@@ -18,25 +18,10 @@ What happens to one document inside the engine, step by step, and the rules each
 
 ## Overview
 
-```mermaid
-flowchart TD
-  A[Upload] --> B[1. Validate original<br/>veraPDF + audit = 'before']
-  B --> C[2. Fix font Unicode maps<br/>no visual change]
-  C --> D["3. Analyze layout<br/>text with superscripts, subscripts and stacked fractions,<br/>headings, lists, tables, images, columns"]
-  D --> E{Scanned pages?}
-  E -- yes --> F[OCR invisible text layer<br/>AI corrects unsure words<br/>figures found in the scan]
-  E -- no --> G
-  F --> G["4. AI enrichment through the gateway<br/>alt text, tables, reading order,<br/>notation the rules can't read"]
-  G --> H["5. Tag non-destructively<br/>nested lists, consistent heading levels,<br/>read-aloud text for math"]
-  H --> I[6. Validate + fix glyph widths<br/>only if pixel-identical]
-  I --> J{Still failing for<br/>font reasons?}
-  J -- yes --> K[7. Modified file<br/>embed font substitutes,<br/>flatten failing pages if needed]
-  J -- no --> L
-  K --> L[8. Verify every output<br/>integrity, semantics, AI review<br/>+ tag map for the viewer]
-  L --> M{Integrity OK?}
-  M -- no --> X[Job fails:<br/>tag_integrity_failed]
-  M -- yes --> N[9. Reports<br/>before/after, review list,<br/>Markdown, JSON and PDF]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/engine-pipeline-dark.svg">
+  <img src="../images/diagrams/engine-pipeline.svg" alt="Each document is validated, has its font maps fixed and its layout analyzed; scanned pages get an OCR text layer; the AI adds alt text, tables, reading order and notation; it is tagged without changing how it looks and validated, with a modified file only if fonts still fail; every output is verified, and an integrity failure fails the job; otherwise the reports are written.">
+</picture>
 
 ## The steps
 
@@ -110,6 +95,9 @@ long makes the step run in one process as before. `PAGE_WORKERS=1` turns it off.
 
 ## Non-destructive tagging
 
+> **Changed 22 October 2026:** usable titles (#446), dates PAC can read (#483), links that point to themselves removed (#484), and a Part
+> anywhere but straight in the Document made a Sect (#526).
+
 The tagger walks each content stream, tracking the transformation and text matrices and rectangle clips. It works out
 where every text-showing operator, image and painted path lands on the page, then wraps it in `BDC … EMC` with an
 MCID, or marks it as an `/Artifact`. **Only marked-content operators are added**, so every page renders
@@ -157,6 +145,14 @@ XMP `pdfuaid:part` and `/Tabs /S`. The part is 1 for a PDF 1.x file (`PDFUA_PART
 and 2 for a PDF 2.0 file, with `pdfuaid:rev` 2024 (#409): PDF/UA-1 requires PDF 1.x, so a PDF 2.0 file is
 labelled and judged by PDF/UA-2, with PDF/UA-1 still run for the font repairs.
 
+A title that's only an application and file name ("Microsoft Word - syllabus.docx"), a bare file name or a
+placeholder counts as no title: the first H1 is used instead (#446, on both routes). The document's dates are made readable (`fix_dates` in `app/tagging/metadata.py`, #483, on
+both routes): ModDate becomes the time of remediation, and every other date (CreationDate, annotations' `/M`,
+embedded files') is written back as plain text, or removed when it can't be read (PAC failed, then stopped, on one
+stored as UTF-16; veraPDF doesn't check dates). Links whose destination is their own place on their own page (Word
+makes one for each caption it bookmarks) are removed with their structure references, their words kept
+(`app/tagging/self_links.py`, #484, on both routes).
+
 **Language** (`app/pipeline/language.py`, #340): the job's, if given; else the file's own `/Lang` unless the text is
 very clearly another (99 % sure over 1,500 letters or more: a template's "English" over Spanish text); else the
 text's, when the detector (py3langid) is 95 % sure over 300 letters or more; else `DEFAULT_LANGUAGE`. The report says
@@ -172,7 +168,20 @@ from the tag manager (`edit_job.py`) rebuilds it to follow edited headings. They
 structure destinations veraPDF finds the same with and without them. The Adobe route adds them to the improved
 copy only.
 
+**Tags at the right level** (`app/tagging/structure_rules.py`, #437, #438). Over the finished tree, ours or the
+document's own, and again after the tag manager's edits: a Document inside the tree becomes a Part; a P holding Ps
+becomes a Div (or the inner one a Span when the outer has text of its own); inline tags standing directly in a
+grouping tag are put in a P, a run of them together; a Figure, Formula or Form standing as a block gets
+`/Placement /Block`; and a Figure or Formula on one page gets its `/BBox` in the page's user space, from the region
+the tagger made it from or its content's box. Only roles, nesting and attributes change, so the parent tree stays
+as it is. PAC checks these and veraPDF's PDF/UA-1 profile doesn't: before them, a 332-page document veraPDF passed
+had 278 PAC errors and 845 warnings. A Part anywhere but straight in the Document (a deck's Parts inside a longer
+document's Part) becomes a Sect (#526).
+
 ## Existing tags
+
+> **Changed 22 October 2026:** five repairs found with PAC: sections inside headings, Word's pictures, Link tags
+> given their words, blank runs, and stray spaces in text boxes (#486, #489, #490, #526).
 
 When the input already has a structure tree, each element is audited:
 
@@ -221,6 +230,17 @@ Producers' tags often need more than repairs, especially slides:
   (`app/tagging/empty_spans.py`); the page is untouched and the report says how many. A Span is left alone when it
   has tags or an annotation inside, an ID, an Alt, ActualText or expansion that says something (a line break or a
   space doesn't), or content that's a picture, a drawing, or any visible character.
+- **Sections inside headings, and Word's pictures** (#486): a section a producer anchors in a heading or paragraph
+  (InDesign's numbered box in a form's heading) is dissolved into it, so the heading reads "4." then its words.
+  Word maps its pictures to `Sect`, holding their content directly: those become Figures, keeping their description
+  or getting one like any figure, and a described picture drawn only in lines isn't taken for decoration.
+- **Links given their words** (`app/tagging/link_words.py`, #489): a kept Link tag holding only its annotation (the
+  producer left the words in the paragraph) takes the paragraph's runs of text that lie inside the link's box, in
+  order; in a table, the cell holding them. A run only partly inside stays where it is.
+- **Blank runs** (#490, #526): runs of only spaces in a tag with nothing else to read (Word's blank lines kept as
+  paragraphs, the space beside a picture alone in its paragraph), and a Span of only spaces standing straight in a
+  grouping tag (a text box's stray space), become artifacts, so readers don't stop on "blank". Spaces between a
+  paragraph's words stay.
 - **Leftovers:** content the old tags left out is tagged from the layout; a decorative picture or a drawing with no
   text (a tab shape, a border) becomes an artifact, never an empty paragraph.
 
@@ -409,6 +429,8 @@ sentences around them). `app/pipeline/music.py` handles it before the AI step:
 
 ## Fonts, and the two-file case
 
+> **Changed 22 October 2026:** WinAnsi and MacRoman fonts without a Unicode map get one from their encoding (#528).
+
 **Least destructive first.** Glyphs whose declared width disagrees with the embedded font program (PDF/UA 7.21.5) are
 corrected, with the spacing compensated in the content stream so the page stays pixel-identical; this happens in the
 visually exact output. Unembedded Times, Times New Roman, Arial, Helvetica and Courier fonts get embedded Liberation
@@ -423,6 +445,12 @@ the figure's alt text carries what it means, decoration isn't read, and the page
 in a paragraph is left alone, so text nobody can read still shows up as a failure and goes to the flattening route
 below. A drawing font's characters are placed as drawings are: in the figure they lie in, or as decoration. More of
 TeX's named symbols (`circlecopyrt`, `mapsto`, `planckover2pi1`, ...) get their real Unicode values.
+
+**WinAnsi and MacRoman fonts without a map** (#528). A simple font with one of those encodings can be read through
+the encoding, but not every code: the non-breaking space and the soft hyphen are named only in a footnote of the
+standard's table, and PAC reports them as characters it can't map. Such a font gets a ToUnicode map of every
+printable code, from the encoding itself (cp1252, Mac Roman), in `app/tagging/font_unicode.py`; the page is
+unchanged.
 
 **Dual output.** If the visually exact file still fails, the engine checks whether the remaining failures are ones
 only a visible change can fix: unembedded or Type3 fonts, missing Unicode mappings, or content that can't be tagged in

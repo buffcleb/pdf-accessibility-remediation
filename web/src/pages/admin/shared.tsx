@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ApiError, del, get, patch, post, type Group, type LedgerEntry, type User } from "../../api";
+import { DialogButton } from "../../components/AdminDialog";
 import { LedgerTable } from "../../components/tables";
 import { ErrorNotice, Notice, fmtNum, useLoad } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
@@ -74,8 +75,11 @@ export function ServicePicker({ id, services, value, onChange }: { id: string; s
   );
 }
 
-export function Topup({ base, ledger: ledgerPath, onDone, services, fixedService, title = "Add pages" }: {
+/** Adding pages to a pool. `bare`: inside an admin edit dialog (#511), which gives the heading; `formId` lets the
+ * dialog's "Save your changes?" submit it. */
+export function Topup({ base, ledger: ledgerPath, onDone, services, fixedService, title = "Add pages", bare = false, formId }: {
   base: string; ledger?: string; onDone: () => void; services?: ServiceOpt[]; fixedService?: string; title?: string;
+  bare?: boolean; formId?: string;
 }) {
   const [service, setService] = useState(fixedService ?? "standard");
   const u = base.replace(/[^a-z0-9]/gi, "-");
@@ -111,10 +115,8 @@ export function Topup({ base, ledger: ledgerPath, onDone, services, fixedService
   }
 
   const valid = Number(pages) > 0 && (override ? comment.trim().length > 0 : ticket.trim().length > 0);
-  return (
-    <section className="panel" aria-labelledby={`topup-h-${base}`}>
-      <h3 id={`topup-h-${base}`}>{title}</h3>
-      <form onSubmit={submit} className="panel" style={{ border: 0, padding: 0 }}>
+  const body = <>
+      <form id={formId} onSubmit={submit} className="panel" style={{ border: 0, padding: 0 }}>
         <div className="form-row">
           <ServicePicker id={`t-svc-${base}`} services={services} value={service} onChange={setService} />
           <div className="field">
@@ -157,11 +159,25 @@ export function Topup({ base, ledger: ledgerPath, onDone, services, fixedService
           <LedgerTable entries={ledger.data} />
         </details>
       )}
+  </>;
+  return bare ? body : (
+    <section className="panel" aria-labelledby={`topup-h-${base}`}>
+      <h3 id={`topup-h-${base}`}>{title}</h3>
+      {body}
     </section>
   );
 }
 
-export function Adjust({ base, onDone, services, fixedService }: {
+/** Correcting a pool (mistakes only), in the admin edit dialog (#511). */
+export function Adjust(props: { base: string; onDone: () => void; services?: ServiceOpt[]; fixedService?: string }) {
+  return (
+    <p><DialogButton label="Correct the pool" title="Correct the pool" formId={`adjust-${props.base.replace(/[^a-z0-9]/gi, "-")}`}>
+      {() => <AdjustForm {...props} />}
+    </DialogButton></p>
+  );
+}
+
+function AdjustForm({ base, onDone, services, fixedService }: {
   base: string; onDone: () => void; services?: ServiceOpt[]; fixedService?: string;
 }) {
   const [service, setService] = useState(fixedService ?? "standard");
@@ -185,10 +201,9 @@ export function Adjust({ base, onDone, services, fixedService }: {
     }
   }
   return (
-    <details className="panel">
-      <summary>Correct the pool</summary>
+    <>
       <p className="muted small">For mistakes only. Use a negative number to remove pages. The pool can't go below what's already used.</p>
-      <form onSubmit={submit} className="form-row">
+      <form id={`adjust-${u}`} onSubmit={submit} className="dialog-form">
         <ServicePicker id={`a-svc-${base}`} services={services} value={service} onChange={setService} />
         <div className="field">
           <label htmlFor={`a-pages-${u}`}>Pages (+/-)</label>
@@ -198,11 +213,11 @@ export function Adjust({ base, onDone, services, fixedService }: {
           <label htmlFor={`a-comment-${u}`}>Reason <span className="hint">(required)</span></label>
           <input id={`a-comment-${u}`} type="text" required value={comment} onChange={(e) => setComment(e.target.value)} />
         </div>
-        <button className="btn secondary" type="submit" disabled={!Number(pages) || !comment.trim()}>Apply</button>
+        <div className="actions"><button className="btn" type="submit" disabled={!Number(pages) || !comment.trim()}>Apply</button></div>
       </form>
       <ErrorNotice error={error} />
       {msg && <Notice kind="good">{msg}</Notice>}
-    </details>
+    </>
   );
 }
 

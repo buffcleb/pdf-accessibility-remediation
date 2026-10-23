@@ -4,12 +4,16 @@
 
 ## Groups
 
+> **Changed 22 October 2026:** **Create a group**, and the group's top-ups and pool corrections, open in the admin
+> area's standard dialog.
+
 A **group** is who a service is shared with: a department, organization or team. Everyone belongs to exactly one,
 decided at their first sign-in by their email address.
 
-![Administration, Groups: a search box, a table with Northfield University, its email domain, the services on (Standard, Commercial AI) and its pages left, and Create a group.](../../images/admin-groups.png)
+![Administration, Groups: a search box by name or email domain and a status choice (Active and disabled); 1 group, Northfield University, with its email domain, the services on (Standard, Adobe Autotag, Commercial AI) and pages left; and Create a group](../../images/admin-groups.png)
 
-**Groups** lists them all; **Create group** makes a new one. A group's own tabs are the same as a group admin's (see
+**Groups** lists them all, a page at a time, with a search by name or email domain and a status filter. **Create a
+group** opens a dialog for its name and email domains; **Create group** makes it. A group's own tabs are the same as a group admin's (see
 [the admin area](../group-admins/the-admin-area.md#your-groups-pages)), plus what only super admins can change, on
 **Group settings**:
 
@@ -38,7 +42,7 @@ works like any other group: its own services, page pool, limits and admins.
 Each service has a **pool** per group, and optionally a **global pool** shared by every group (set on the service's
 page). Pages are added with a **top-up**:
 
-1. The group's **Services and pages** tab → **Add pages** on the service's row.
+1. The group's **Services and pages** tab → **Add pages** on the service's row, which opens a dialog.
 2. Enter the number of pages and a **ticket number** (and optionally a link and comment), for your records.
 3. No ticket? Tick **override** and give a comment. Overrides are flagged in the ledger and reports.
 
@@ -51,7 +55,9 @@ or the AI it was charged for turned out not to be needed.
 
 ## People (all groups)
 
-**People (all groups)** lists everyone, with their group and use. Search by email. **Manage** opens a panel to:
+**People (all groups)** lists everyone, with their group and use, a page at a time. Search by email or name, pick a
+group, and under **Filters** a role (super admins, group admins, members) or status (active, disabled, waiting for
+approval, declined, data removed); sort by person, group or last sign-in. **Manage** opens a dialog to:
 
 - **move** them to another group (their past use stays with the old group);
 - **correct their usage:** give pages back or charge more, per service, with a reason. It's recorded in the ledger

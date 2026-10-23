@@ -15,6 +15,9 @@ service's own page.
 
 ## A service's page
 
+> **Changed 22 October 2026:** the table lists Adobe Autotag's **Adobe connection** tab, and **Add an AI level** and
+> **Add a kind of document** open in the admin area's standard dialog.
+
 Tabs:
 
 | Tab | Settings |
@@ -23,6 +26,7 @@ Tabs:
 | **Data and notice** | Whether it sends documents to an **external provider** (blocked for local-only groups); an optional **notice** shown when people pick it, with your text |
 | **Pages and cost guards** | Whether **page limits apply** (otherwise use is only counted); **most pages per document**; **most pages sent per day** (extra documents wait, they don't fail); **most documents at once** (for what can't grow with the rest, such as a local AI's GPUs: extra documents wait their turn); **confirm before sending**; an optional **global pool** shared by all groups |
 | **Model** (AI levels) | The gateway model, the review model, and switches (below) |
+| **Adobe connection** (Adobe Autotag) | A note that the engine connects to Adobe with its own credentials and rate limits; use the daily limit and most pages per document to control Adobe spend |
 | **Kinds of document** (AI levels) | Kinds offered at upload (below) |
 | **Groups** | Which groups use it, who has it there, and their pages |
 
@@ -34,7 +38,7 @@ group's **Services and pages** tab.
 An AI level is a model behind the AI gateway, published under a name people understand ("Local AI",
 "Commercial AI"). People pick a level by name and never see the model.
 
-**Add an AI level** publishes one of the gateway's models (the list comes from the gateway's configuration). New
+**Add an AI level** opens a dialog that publishes one of the gateway's models (the list comes from the gateway's configuration). New
 levels start switched off. On its **Model** tab:
 
 - **Gateway model:** the writer (alt text, tables, reading order, notation, OCR corrections), chosen from the
@@ -67,7 +71,7 @@ off instead. Standard and Adobe Autotag can't be deleted.
 
 ### Kinds of document
 
-On an AI level's **Kinds of document** tab, **add kinds** such as *Math and science* or *Forms*: a name and
+On an AI level's **Kinds of document** tab, **Add a kind of document** adds kinds such as *Math and science* or *Forms*: a name and
 description (shown at upload), with the gateway model and review model that suit that kind. *General* is the
 level's own models. Switch a kind off to stop offering it.
 
@@ -75,7 +79,7 @@ People choose a kind at upload, or a group can set one for everyone. If a kind's
 document is processed, the level's General models are used and the document's page says so.
 
 **Let AI decide** picks the kind for each document from its first pages' text. It's switched on in
-[Settings → Uploads and limits](settings.md#uploads-and-limits).
+[Settings → Uploads and limits](settings.md#uploads-and-limits), on the **AI** sub-tab.
 
 ## External services and local-only groups
 

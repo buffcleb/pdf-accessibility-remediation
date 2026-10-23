@@ -1,0 +1,11 @@
+# Only with FRONTEND=worker and INGRESS_CONTROLLER=traefik: the API origin's allow-list (61-api-origin.yaml names it).
+# Only the proxies in front of it (Cloudflare's ranges, API_ORIGIN_ALLOWED_SOURCES) may reach it: anyone else could
+# name themselves in its header (#336). The client is the connection's own address, as with ingress-nginx's list.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: api-origin-sources
+  namespace: ${NAMESPACE}
+spec:
+  ipAllowList:
+    sourceRange: ${API_ORIGIN_SOURCE_LIST}

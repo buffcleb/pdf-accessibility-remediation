@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
+import { AppError } from "./components/AppError";
 import { App } from "./App";
 import { AuthProvider, type AppConfig } from "./auth";
 import { UnsavedChangesProvider } from "./components/unsaved";
@@ -65,7 +66,8 @@ async function start() {
   }
   document.title = config.appName;
   // A data router, so pages can ask before leaving with unsaved changes; the app's own <Routes> do the routing.
-  const router = createBrowserRouter([{ path: "*", element: <UnsavedChangesProvider><App /></UnsavedChangesProvider> }]);
+  const router = createBrowserRouter([{ path: "*", element: <UnsavedChangesProvider><App /></UnsavedChangesProvider>,
+    errorElement: <AppError /> }]);
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <AuthProvider config={config}>

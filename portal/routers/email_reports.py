@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from portal import email_reports, live_reports, notifications, report_views, settings_store
+from portal import email_reports, live_reports, notifications, report_views, rls, settings_store
 from portal.db import get_db
 from portal.deps import Principal, current_principal
 from portal.errors import not_found
@@ -146,9 +146,10 @@ def _view_of(db: Session, kind: str) -> SavedReport | None:
 
 
 @router.get("/email-reports/unsubscribe", response_model=UnsubscribeOut)
-def unsubscribe_info(t: str, db: Session = Depends(get_db)):
+def unsubscribe_info(t: str, request: Request, db: Session = Depends(get_db)):
     """What a link would turn off; changes nothing (mail scanners follow links)."""
     user, kind = email_reports.read_token(db, t)
+    rls.as_person(db, user, request)
     if kind.startswith("view:"):
         view = _view_of(db, kind)
         getting = view is not None and str(user.id) in view.recipients
@@ -161,6 +162,7 @@ def unsubscribe_info(t: str, db: Session = Depends(get_db)):
 @router.post("/email-reports/unsubscribe", response_model=UnsubscribeOut)
 def unsubscribe(body: UnsubscribeIn, request: Request, db: Session = Depends(get_db)):
     user, kind = email_reports.read_token(db, body.token)
+    rls.as_person(db, user, request)
     if kind.startswith("view:"):
         view = _view_of(db, kind)
         if view is not None:

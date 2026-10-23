@@ -30,9 +30,12 @@ const PERSON_STATUS: Record<HelpStatus, string> = {
 const PILL: Record<HelpStatus, string> = { open: "info", in_progress: "warn", waiting: "note", resolved: "good", closed: "muted" };
 
 /** A request's status, in the words of whoever's looking: the person, or the people helping them. */
-export function HelpStatusPill({ status, forPerson = false, replied = false }: { status: HelpStatus; forPerson?: boolean; replied?: boolean }) {
-  if (replied && !forPerson) return <span className="pill info">Replied</span>;
-  return <span className={`pill ${PILL[status]}`}>{(forPerson ? PERSON_STATUS : STAFF_STATUS)[status]}</span>;
+export function HelpStatusPill({ status, forPerson = false, replied = false, prefix }: {
+  status: HelpStatus; forPerson?: boolean; replied?: boolean;
+  prefix?: string;  // "Help:" beside a document's name, where "Received" alone reads as the document's status
+}) {
+  const label = replied && !forPerson ? "Replied" : (forPerson ? PERSON_STATUS : STAFF_STATUS)[status];
+  return <span className={`pill ${replied && !forPerson ? "info" : PILL[status]}`}>{prefix ? `${prefix} ${label}` : label}</span>;
 }
 
 const ACCEPT = "application/pdf,image/png,image/jpeg,text/plain,.txt";

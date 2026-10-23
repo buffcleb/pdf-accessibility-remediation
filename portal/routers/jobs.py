@@ -4,19 +4,20 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import Integer, cast, func, or_, select
+from sqlalchemy import Integer, Select, cast, func, or_, select, true
 from sqlalchemy.orm import Session, object_session
 
-from portal import approval, audit, finding_marks, quota, removal, services, settings_store
+from portal import api_tokens, approval, audit, export, finding_marks, malware, quota, removal, services, settings_store
 from portal.db import get_db
-from portal.deps import Principal, current_principal, require_super_admin
+from portal.deps import Principal, current_principal, document_principal, require_super_admin
 from portal.errors import ApiError, not_found
-from portal.models import HelpRequest, Job, JobFile, User
+from portal.export import STAFF_ONLY_FILES
+from portal.models import ACTIVE_JOB_STATUSES, ApiTokenDownload, HelpRequest, Job, JobFile, User
 from portal.pdfcheck import receive_pdf
 from portal.security.ratelimit import per_person
 from portal.storage import get_storage, job_prefix, safe_name
@@ -45,11 +46,6 @@ FILE_LABELS = {
 }
 
 
-# The engine's own reports, for the people who run the service: the JSON report carries the AI's cost in dollars and its
-# tokens (re-billing is by pages, so only super admins see dollars), and neither is a document anyone else needs. The
-# web app shows the Markdown report in the Report tab through /jobs/{id}/report, and the PDF report is the one for
-# people; veraPDF's XML stays readable, since the Accessibility check tab draws it.
-STAFF_ONLY_FILES = {"report_json", "report_md"}
 
 
 class JobFileOut(BaseModel):
@@ -108,6 +104,7 @@ class JobOut(BaseModel):
     # A super admin's re-run (#323): the document it re-ran, and (on the document's own page) its re-runs
     rerun_of: uuid.UUID | None = None
     reruns: list[uuid.UUID] = []
+    sent_by_script: str | None = None  # the API token's name, when a script sent it (#518)
 
 
 def _file_label(job: Job, kind: str) -> str:
@@ -153,7 +150,7 @@ def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool =
         cost=job.cost if show_cost else None,
         staff={"engine_job_id": job.engine_job_id, "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None}
         if show_cost else None,
-        rerun_of=job.rerun_of,
+        rerun_of=job.rerun_of, sent_by_script=job.api_token.name if job.api_token_id and job.api_token else None,
         status=job.status, progress=job.progress,
         result=finding_marks.summary_with_keys(job.result_summary, "review", "findings"), error_code=job.error_code,
         error_message=job.error_message, created_at=job.created_at, finished_at=job.finished_at,
@@ -253,16 +250,19 @@ class UploadOptions(BaseModel):
     ai_level: str | None      # fixed: the level
     ai_kind: str | None       # fixed: the kind (None: General)
     show_external: bool       # mark the options that send documents to an outside provider
+    malware_scan: bool = False  # uploads are scanned for malware before they're accepted (#455), so say so (#560)
 
 
 @router.get("/upload-options", response_model=UploadOptions)
 def upload_options(p: Principal = Depends(current_principal)):
     g = p.user.group
     if g is None:
-        return UploadOptions(ai_mode="choose", ai_level=None, ai_kind=None, show_external=False)
+        return UploadOptions(ai_mode="choose", ai_level=None, ai_kind=None, show_external=False,
+                             malware_scan=malware.enabled())
     fixed = g.ai_mode == "fixed" and bool(g.ai_level)
     return UploadOptions(ai_mode="fixed" if fixed else "choose", ai_level=g.ai_level if fixed else None,
-                         ai_kind=g.ai_kind if fixed else None, show_external=g.show_external)
+                         ai_kind=g.ai_kind if fixed else None, show_external=g.show_external,
+                         malware_scan=malware.enabled())
 
 
 def _pick_tier(db: Session, user, requested: str | None) -> str | None:
@@ -355,14 +355,37 @@ def _plan(db: Session, user, chosen, processing: str, report_only: bool, ai_alt_
     return _Plan(tier, None if auto else kind, full_review, keys, charge_keys, hold, external, no_ai, auto)
 
 
-@router.post("/jobs", response_model=list[UploadResult], dependencies=[Depends(per_person("upload"))])
+_WAITING_WORDS = {"held": "waiting for you to confirm it", "queued": "waiting its turn",
+                  "submitted": "processing", "processing": "processing"}
+
+
+def _refuse_a_second_copy(db: Session, user_id: uuid.UUID, sha256: str, processing: str, pl: _Plan,
+                          report_only: bool, name: str) -> None:
+    """The same file, with the same choices, already waiting or in progress for this person: refuse the copy, as a
+    second one would only use the pages again (#560: an upload that took a while, the page refreshed, the file sent
+    again). The same file with other choices goes ahead: comparing AI levels is a real use."""
+    same = db.scalar(select(Job).where(
+        Job.user_id == user_id, Job.sha256 == sha256, Job.status.in_(ACTIVE_JOB_STATUSES), Job.deleted_at.is_(None),
+        Job.processing == processing, Job.report_only == report_only,
+        Job.ai_tier.is_(None) if pl.tier is None else Job.ai_tier == pl.tier,
+        Job.ai_kind_auto == pl.auto,
+        # "Let AI decide" fills in the kind later, so only a kind chosen at upload is compared
+        true() if pl.auto else (Job.ai_kind.is_(None) if pl.kind is None else Job.ai_kind == pl.kind),
+    ).order_by(Job.created_at.desc()).limit(1))
+    if same is not None:
+        raise ApiError(409, "already_in_progress",
+                       f"{name} is already in Your documents with the same choices, {_WAITING_WORDS[same.status]}, "
+                       "so it wasn't sent again.")
+
+
+@router.post("/jobs", response_model=list[UploadResult], dependencies=[Depends(per_person("upload", "submit"))])
 def upload(request: Request, files: list[UploadFile] = File(...), report_only: bool = Form(False),
            processing: str = Form(services.STANDARD, max_length=64), ai_tier: str | None = Form(None, max_length=64),
            ai_kind: str | None = Form(None, max_length=40),
            confirm: bool = Form(False), full_review: bool = Form(False), ai_alt_text: bool = Form(True),
            ignore_existing: bool = Form(False),
            per_file: str | None = Form(None, max_length=20_000),
-           p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+           p: Principal = Depends(document_principal("submit")), db: Session = Depends(get_db)):
     """Submit one or more PDFs. Each file is accepted or refused on its own.
 
     processing picks the service. ai_alt_text: for a service whose AI only writes alt text (Adobe),
@@ -371,8 +394,14 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
     is already true.
 
     per_file: JSON {"<index of the file>": {"ai_tier": ..., "ai_kind": ...}} to give some files their own AI level
-    and kind. When the group sets one AI level for everything, what's asked for is ignored."""
+    and kind. When the group sets one AI level for everything, what's asked for is ignored.
+
+    With a script's API token (#518), the token's processing service, AI level and kind are used, whatever is sent,
+    and documents are confirmed only if the token says so."""
     runtime = settings_store.load(db)
+    if p.token is not None:
+        processing, ai_tier, ai_kind, per_file, confirm = (p.token.processing, p.token.ai_tier, p.token.ai_kind, None,
+                                                           p.token.auto_confirm)
     if p.user.group_id is None:
         raise ApiError(422, "no_group", "Your account isn't in a group, so it has no pages to use.")
     approval.require_approved(p.user)
@@ -410,15 +439,22 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
             results.append(UploadResult(filename=name, accepted=False, error=e.detail))
             continue
         try:
+            malware.check(db, request, p.user, checked.file, name, "document")  # with MALWARE_SCAN=clamav (#455)
+        except ApiError as e:
+            checked.file.close()
+            results.append(UploadResult(filename=name, accepted=False, error=e.detail))
+            continue
+        try:
             job_id = uuid.uuid4()
             # Lock the user row so the waiting-documents limit holds under parallel uploads.
             # (How many run at once is the worker's job: see max_concurrent_jobs_per_user.)
             db.scalar(select(User).where(User.id == p.user.id).with_for_update())
+            pl = plan_for(index)
+            _refuse_a_second_copy(db, p.user.id, checked.sha256, processing, pl, report_only, name)
             if quota.active_jobs(db, p.user.id) >= runtime.max_queued_jobs_per_user:
                 raise ApiError(429, "too_many_jobs",
                                f"You already have {runtime.max_queued_jobs_per_user} documents waiting or in progress. "
                                "Submit more when some have finished.")
-            pl = plan_for(index)
             # Held for the person's confirmation: a service that asks for it, or a signed PDF whose signature the
             # remediated copy won't keep (#339; a check only changes nothing, so it isn't held)
             held = [r for r, on in (("service", pl.hold), ("signed", checked.signed and not report_only)) if on]
@@ -434,7 +470,8 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                       charged_services=pl.charge_keys if charged else [], external_services=pl.external,
                       status="held" if held else "queued", full_review=pl.full_review, no_ai=pl.no_ai,
                       ignore_existing=ignore_existing and not report_only,  # a check only changes no tags
-                      ai_kind_auto=pl.auto, progress={"held": held} if held else None)
+                      ai_kind_auto=pl.auto, progress={"held": held} if held else None,
+                      api_token_id=p.token.id if p.token else None)
             db.add(job)
             db.flush()
             key = job_prefix(job.group_id, job.user_id, job.id) + "input/" + safe_name(name)
@@ -448,7 +485,8 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                                                          "ai_kind": services.AUTO if pl.auto else pl.kind,
                                                          "no_ai": pl.no_ai,
                                                          "external": pl.external, "held": bool(held),
-                                                         **({"signed": True} if checked.signed else {})})
+                                                         **({"signed": True} if checked.signed else {}),
+                                                         **({"api_token": p.token.name} if p.token else {})})
             db.commit()
             db.refresh(job)
             results.append(UploadResult(filename=name, accepted=True, job=job_out(job, runtime)))
@@ -462,7 +500,7 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
 
 @router.get("/jobs", response_model=list[JobOut])
 def my_jobs(limit: int = Query(50, ge=1, le=500), before: datetime | None = None,
-            p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+            p: Principal = Depends(document_principal("status")), db: Session = Depends(get_db)):
     stmt = select(Job).where(Job.user_id == p.user.id, Job.deleted_at.is_(None))
     if before:
         stmt = stmt.where(Job.created_at < before)
@@ -492,20 +530,28 @@ def my_documents(q: str = Query("", max_length=200), status: str | None = Query(
                  result: str | None = Query(None, max_length=20), service: str | None = Query(None, max_length=64),
                  audit: bool | None = None, since: datetime | None = None, until: datetime | None = None,
                  sort: str = Query("-created_at", max_length=20), page: int = Query(1, ge=1, le=100_000),
-                 page_size: int = Query(25, ge=1, le=200),
-                 p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+                 page_size: int = Query(25, ge=1, le=200), not_downloaded: bool = False,
+                 via: str | None = Query(None, pattern="^(script|web)$"),
+                 p: Principal = Depends(document_principal("status")), db: Session = Depends(get_db)):
     """The signed-in person's documents, a page at a time: search by file name, filter by status, result,
-    processing service or AI level, audit only and date; sort by date, name, pages or result."""
-    return documents_page(db, [Job.user_id == p.user.id], q=q, status=status, result=result, service=service,
-                          audit=audit, since=since, until=until, sort=sort, page=page, page_size=page_size)
+    processing service or AI level, audit only and date; sort by date, name, pages or result.
+
+    not_downloaded (a script's API token, #518): only the documents this token hasn't downloaded yet, so a polling
+    job asks for status=done&not_downloaded=true and gets just the new ones."""
+    scope = [Job.user_id == p.user.id]
+    if not_downloaded and p.token is not None:
+        scope.append(Job.id.not_in(select(ApiTokenDownload.job_id).where(ApiTokenDownload.token_id == p.token.id)))
+    return documents_page(db, scope, q=q, status=status, result=result, service=service,
+                          audit=audit, since=since, until=until, sort=sort, page=page, page_size=page_size, via=via)
 
 
-def documents_page(db: Session, scope: list, *, q: str, status: str | None, result: str | None, service: str | None,
-                   audit: bool | None, since: datetime | None, until: datetime | None, sort: str, page: int,
-                   page_size: int, people: bool = False, show_cost: bool = False) -> DocumentsPage:
-    """One page of the documents in `scope` (a person's, a group's), searched, filtered and sorted the same way
-    wherever they are listed. With `people`, the list is an admin's view of other people's documents: each says
-    whose it is, the search also matches the person's email, and the list can be sorted by person."""
+def documents_query(scope: list, *, q: str, status: str | None, result: str | None, service: str | None,
+                    audit: bool | None, since: datetime | None, until: datetime | None, sort: str,
+                    people: bool = False, via: str | None = None) -> tuple[list, list]:
+    """The conditions and the order of the documents in `scope` (a person's, a group's), searched, filtered and sorted
+    the same way wherever they are listed, and wherever a document's Previous and Next follow the list. With `people`,
+    the list is an admin's view of other people's documents: the search also matches the person's email, and the list
+    can be sorted by person."""
     where = [*scope, Job.deleted_at.is_(None)]
     if q.strip():
         like = "%" + q.strip().lower().replace("%", r"\%").replace("_", r"\_") + "%"
@@ -536,20 +582,79 @@ def documents_page(db: Session, scope: list, *, q: str, status: str | None, resu
         where.append(Job.created_at >= since)
     if until:
         where.append(Job.created_at < until)
+    if via == "script":  # sent with an API token (#518)
+        where.append(Job.api_token_id.is_not(None))
+    elif via == "web":
+        where.append(Job.api_token_id.is_(None))
+    elif via:
+        raise ApiError(422, "bad_filter", "Unknown way of sending.")
     key, desc = sort.lstrip("-"), sort.startswith("-")
     sorts = {**SORTS, "user": select(func.lower(User.email)).where(User.id == Job.user_id).scalar_subquery()} if people \
         else SORTS
     if key not in sorts:
         raise ApiError(422, "bad_sort", "Unknown sort.")
-    order = sorts[key].desc().nulls_last() if desc else sorts[key].asc().nulls_last()
+    # The id last: documents sent together share a time, and the order has to be the same on every page
+    order = [sorts[key].desc().nulls_last() if desc else sorts[key].asc().nulls_last(), Job.created_at.desc(), Job.id]
+    return where, order
+
+
+def documents_page(db: Session, scope: list, *, q: str, status: str | None, result: str | None, service: str | None,
+                   audit: bool | None, since: datetime | None, until: datetime | None, sort: str, page: int,
+                   page_size: int, people: bool = False, show_cost: bool = False, via: str | None = None) -> DocumentsPage:
+    """One page of the documents in `scope` (see documents_query). With `people`, each says whose it is."""
+    where, order = documents_query(scope, q=q, status=status, result=result, service=service, audit=audit, since=since,
+                                   until=until, sort=sort, people=people, via=via)
     total = db.scalar(select(func.count()).select_from(Job).where(*where)) or 0
     size = min(page_size, max(PAGE_SIZES))
-    jobs = db.scalars(select(Job).where(*where).order_by(order, Job.created_at.desc())
-                      .limit(size).offset((page - 1) * size)).all()
+    jobs = db.scalars(select(Job).where(*where).order_by(*order).limit(size).offset((page - 1) * size)).all()
     active = db.scalar(select(func.count()).select_from(Job).where(
         *scope, Job.status.in_(("queued", "submitted", "processing")))) or 0
     return DocumentsPage(items=_with_help(db, jobs, settings_store.load(db), with_user=people, show_cost=show_cost),
                          total=total, page=page, page_size=size, active=active)
+
+
+class Neighbour(BaseModel):
+    id: uuid.UUID
+    filename: str
+
+
+class Neighbours(BaseModel):
+    """A document's place in a list, for its page's Previous and Next. position: 1-based, None when the document
+    isn't in the list (it no longer matches its filters); previous and next: None at the ends."""
+    position: int | None
+    total: int
+    previous: Neighbour | None
+    next: Neighbour | None
+
+
+def neighbours(db: Session, job_id: uuid.UUID, stmt: Select, order: list, id_col=Job.id,
+               name_col=Job.filename) -> Neighbours:
+    """The documents either side of `job_id` in the list `stmt` (its conditions and joins; its columns are replaced)
+    sorted by `order`: the list's own query, so the order can't differ from what it showed, and across its pages (the
+    web app has only one page of it)."""
+    numbered = stmt.with_only_columns(id_col.label("id"), name_col.label("filename"),
+                                      func.row_number().over(order_by=order).label("n")).subquery()
+    total = db.scalar(select(func.count()).select_from(numbered)) or 0
+    at = db.scalar(select(numbered.c.n).where(numbered.c.id == job_id))
+    if at is None:
+        return Neighbours(position=None, total=total, previous=None, next=None)
+    either = {n: Neighbour(id=i, filename=f) for i, f, n in db.execute(
+        select(numbered.c.id, numbered.c.filename, numbered.c.n).where(numbered.c.n.in_((at - 1, at + 1))))}
+    return Neighbours(position=at, total=total, previous=either.get(at - 1), next=either.get(at + 1))
+
+
+@router.get("/documents/neighbours/{job_id}", response_model=Neighbours)
+def my_document_neighbours(job_id: uuid.UUID, q: str = Query("", max_length=200),
+                           status: str | None = Query(None, max_length=20), result: str | None = Query(None, max_length=20),
+                           service: str | None = Query(None, max_length=64), audit: bool | None = None,
+                           since: datetime | None = None, until: datetime | None = None,
+                           sort: str = Query("-created_at", max_length=20),
+                           via: str | None = Query(None, pattern="^(script|web)$"),
+                           p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Previous and Next on a document's page, opened from My documents: the same filters and sort as the list."""
+    where, order = documents_query([Job.user_id == p.user.id], q=q, status=status, result=result, service=service,
+                                   audit=audit, since=since, until=until, sort=sort, via=via)
+    return neighbours(db, job_id, select(Job).where(*where), order)
 
 
 def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSettings, with_user: bool = False,
@@ -570,7 +675,7 @@ def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSett
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)
-def job_detail(job_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+def job_detail(job_id: uuid.UUID, p: Principal = Depends(document_principal("status")), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
     # Cost is for super admins only: what groups are charged isn't the per-page cost
     out = job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id, show_cost=p.is_super_admin)
@@ -579,8 +684,19 @@ def job_detail(job_id: uuid.UUID, p: Principal = Depends(current_principal), db:
     return out
 
 
+def _send_held(db: Session, request: Request, user: User, job: Job) -> None:
+    """A held document's pages reserved and it queued, or OverQuota (nothing changed). The caller commits."""
+    keys = [job.processing] + ([job.ai_tier] if job.ai_tier else [])
+    quota.reserve(db, user, job.pages, job.id, keys)
+    job.pages_charged = job.pages
+    job.charged_services = keys
+    job.status, job.progress = "queued", None
+    audit.record(db, request, "job.confirmed", actor=user, target_type="job", target_id=job.id,
+                 group_id=job.group_id, details={"pages": job.pages, "services": keys})
+
+
 @router.post("/jobs/{job_id}/confirm", response_model=JobOut)
-def confirm_job(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_principal),
+def confirm_job(job_id: uuid.UUID, request: Request, p: Principal = Depends(document_principal("submit")),
                 db: Session = Depends(get_db)):
     """Send a held document: its pages are reserved now and it joins the queue."""
     approval.require_approved(p.user)
@@ -589,15 +705,64 @@ def confirm_job(job_id: uuid.UUID, request: Request, p: Principal = Depends(curr
         raise not_found("Job")
     if job.status != "held":
         raise ApiError(409, "not_held", "This document isn't waiting for confirmation.")
-    keys = [job.processing] + ([job.ai_tier] if job.ai_tier else [])
-    quota.reserve(db, p.user, job.pages, job.id, keys)
-    job.pages_charged = job.pages
-    job.charged_services = keys
-    job.status, job.progress = "queued", None
-    audit.record(db, request, "job.confirmed", actor=p.user, target_type="job", target_id=job.id,
-                 group_id=job.group_id, details={"pages": job.pages, "services": keys})
+    _send_held(db, request, p.user, job)
     db.commit()
     return job_out(job, settings_store.load(db))
+
+
+class ConfirmMany(BaseModel):
+    job_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=500)
+    mode: str = Field("all", pattern="^(all|fit)$")  # all or none, or the first ones that fit, in upload order
+    dry_run: bool = False  # what would happen, nothing reserved: for the upload form's figures
+
+
+class ConfirmManyOut(BaseModel):
+    sent: list[uuid.UUID]          # sent (or, in a dry run, that would be)
+    held: list[uuid.UUID]          # still waiting
+    needed_pages: int              # all of them
+    sent_pages: int
+    remaining_pages: int | None    # pages left on the tightest of their services before sending (None: unlimited)
+    message: str | None = None     # why the rest didn't fit
+
+
+@router.post("/jobs/confirm", response_model=ConfirmManyOut)
+def confirm_many(body: ConfirmMany, request: Request, p: Principal = Depends(document_principal("submit")),
+                 db: Session = Depends(get_db)):
+    """Send several held documents at once (#494), in one transaction, so the batch is judged against the pages
+    left as a whole and two tabs can't spend the same pages: `all` sends every one or none (403 over_quota, with
+    the pages needed and left), `fit` sends them in upload order until one doesn't fit and leaves the rest held.
+    With dry_run nothing is reserved: the answer is what would happen, from the same checks."""
+    approval.require_approved(p.user)
+    jobs = db.scalars(select(Job).where(Job.id.in_(body.job_ids), Job.user_id == p.user.id, Job.status == "held")
+                      .order_by(Job.created_at, Job.id).with_for_update()).all()
+    if not jobs:
+        raise ApiError(409, "not_held", "None of these documents is waiting for confirmation.")
+    keys = sorted({k for j in jobs for k in [j.processing] + ([j.ai_tier] if j.ai_tier else [])})
+    lefts = [services.remaining(p.user, k, s) for k in keys if (s := services.get_service(db, k)) is not None]
+    left = min((x for x in lefts if x is not None), default=None)
+    needed = sum(j.pages for j in jobs)
+    sent, message = [], None
+    for job in jobs:
+        try:
+            with db.begin_nested():  # one savepoint per document: a refusal undoes only its own reservation
+                _send_held(db, request, p.user, job)
+        except quota.OverQuota as e:
+            message = e.detail.get("message")
+            break
+        sent.append(job)
+    # The answer is made before any rollback: rolled back, the rows can't be read again as this person
+    out = ConfirmManyOut(sent=[j.id for j in sent], held=[j.id for j in jobs if j not in sent], needed_pages=needed,
+                         sent_pages=sum(j.pages for j in sent), remaining_pages=left, message=message)
+    if body.dry_run or (body.mode == "all" and len(sent) < len(jobs)):
+        db.rollback()
+        if not body.dry_run:
+            raise quota.OverQuota(
+                f"These {len(jobs)} documents need {needed:,} pages and there are {left or 0:,} left: none was "
+                "sent. Send the ones that fit, or fewer at a time.", "batch", left or 0, needed, None,
+                keys[0] if keys else services.STANDARD)
+    else:
+        db.commit()
+    return out
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=JobOut)
@@ -762,6 +927,13 @@ def _file(db: Session, job: Job, file_id: uuid.UUID) -> JobFile:
     return f
 
 
+def _mark_downloaded(db: Session, p: Principal, job: Job) -> None:
+    """A script's API token downloaded this document (#518): it's left out of that token's not_downloaded list."""
+    if p.token is not None and db.get(ApiTokenDownload, (p.token.id, job.id)) is None:
+        db.add(ApiTokenDownload(token_id=p.token.id, job_id=job.id))
+        db.commit()
+
+
 def _record_access(db: Session, request: Request, p: Principal, job: Job, f: JobFile, reason: str | None) -> None:
     """Downloads by anyone but the owner are recorded."""
     if job.user_id != p.user.id:
@@ -771,13 +943,16 @@ def _record_access(db: Session, request: Request, p: Principal, job: Job, f: Job
         db.commit()
 
 
-@router.get("/jobs/{job_id}/files/{file_id}", dependencies=[Depends(per_person("download"))])
+@router.get("/jobs/{job_id}/files/{file_id}", dependencies=[Depends(per_person("download", "download"))])
 def download(job_id: uuid.UUID, file_id: uuid.UUID, request: Request, reason: str | None = Query(None, max_length=500),
-             p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+             p: Principal = Depends(document_principal("download")), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
     f = _file(db, job, file_id)
     if f.kind in STAFF_ONLY_FILES and not p.is_super_admin:
         raise not_found("File")
+    if p.token is not None and not api_tokens.may_download(p.token, f.kind):
+        raise ApiError(403, "token_scope", "This API token can't download this file. Make one that can in Settings.")
+    _mark_downloaded(db, p, job)
     _record_access(db, request, p, job, f, reason)
     disposition = f"attachment; filename=\"{safe_name(f.name)}\""
     return StreamingResponse(get_storage().get_stream(f.s3_key), media_type=f.content_type,
@@ -797,3 +972,138 @@ def report_markdown(job_id: uuid.UUID, request: Request, p: Principal = Depends(
     _record_access(db, request, p, job, f, None)
     text = b"".join(get_storage().get_stream(f.s3_key)).decode("utf-8", "replace")
     return {"markdown": text}
+
+
+# --- exporting many documents' files as one zip (#481) ---------------------------------------------
+
+class ExportFilters(BaseModel):
+    """The list's search, filters and sort, as /documents takes them: everything it shows, every page."""
+    q: str = Field("", max_length=200)
+    status: str | None = Field(None, max_length=20)
+    result: str | None = Field(None, max_length=20)
+    service: str | None = Field(None, max_length=64)
+    audit: bool | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+    sort: str = Field("-created_at", max_length=20)
+
+
+class ExportRequest(BaseModel):
+    """The documents chosen (ids), or everything the list shows with its filters."""
+    ids: list[uuid.UUID] | None = Field(None, max_length=1000)
+    filters: ExportFilters | None = None
+
+
+class LeftOut(BaseModel):
+    filename: str
+    reason: str
+
+
+class ExportPlanOut(BaseModel):
+    """What the zip will hold, shown before downloading. matched: the documents asked for; past `limit` (the
+    max_export_documents setting) the export is refused."""
+    matched: int
+    limit: int
+    documents: int
+    files: int
+    size_bytes: int
+    left_out: list[LeftOut]
+
+
+def _export_jobs(db: Session, scope: list, body: ExportRequest, *, people: bool, limit: int) -> tuple[list[Job], int]:
+    """The documents asked for, in scope and not deleted (at most limit + 1, to know the export is too big), and
+    how many were asked for."""
+    if body.ids is not None:
+        ids = list(dict.fromkeys(body.ids))
+        jobs = db.scalars(select(Job).where(*scope, Job.deleted_at.is_(None), Job.id.in_(ids))
+                          .order_by(Job.created_at.desc(), Job.id).limit(limit + 1)).all()
+        return list(jobs), len(jobs) if len(ids) <= limit else len(ids)
+    if body.filters is None:
+        raise ApiError(422, "bad_export", "Choose documents, or export everything the list shows.")
+    f = body.filters
+    where, order = documents_query(scope, q=f.q, status=f.status, result=f.result, service=f.service, audit=f.audit,
+                                   since=f.since, until=f.until, sort=f.sort, people=people)
+    matched = db.scalar(select(func.count()).select_from(Job).where(*where)) or 0
+    return list(db.scalars(select(Job).where(*where).order_by(*order).limit(limit + 1))), matched
+
+
+def export_plan(db: Session, p: Principal, scope: list, body: ExportRequest, *, people: bool = False
+                ) -> tuple[export.Plan, int, int]:
+    runtime = settings_store.load(db)
+    limit = runtime.max_export_documents
+    jobs, matched = _export_jobs(db, scope, body, people=people, limit=limit)
+    plan = export.plan(db, jobs[:limit], is_super_admin=p.is_super_admin, time_zone=runtime.report_time_zone,
+                       retention_days=runtime.file_retention_days)
+    return plan, matched, limit
+
+
+def export_plan_out(plan: export.Plan, matched: int, limit: int) -> ExportPlanOut:
+    return ExportPlanOut(matched=matched, limit=limit, documents=len(plan.documents), files=plan.files,
+                         size_bytes=plan.size, left_out=[LeftOut(filename=j.filename, reason=why) for j, why in plan.left_out])
+
+
+def export_zip(db: Session, request: Request, p: Principal, scope: list, body: ExportRequest, *, people: bool = False,
+               group_id: uuid.UUID | None = None, where: str | None = None, reason: str | None = None,
+               name: str | None = None) -> StreamingResponse:
+    """The zip, streamed. Audited before the first byte goes: the export (documents.exported), and each file from
+    someone else's document as a download is (file.accessed, with its owner), so the bulk-download alert counts
+    the files in an export."""
+    plan, matched, limit = export_plan(db, p, scope, body, people=people)
+    if matched > limit:
+        raise ApiError(422, "too_many_documents", f"An export holds at most {limit} documents, and this would be "
+                                                  f"{matched}. Choose fewer, or narrow the list.")
+    if not plan.documents:
+        raise ApiError(422, "nothing_to_export", "None of these documents has files to download.")
+    others = 0
+    for doc in plan.documents:
+        if doc.job.user_id == p.user.id:
+            continue
+        for e in doc.entries:
+            others += 1
+            audit.record(db, request, "file.accessed", actor=p.user, target_type="job", target_id=doc.job.id,
+                         group_id=doc.job.group_id, details={"file": e.file.name, "kind": e.file.kind,
+                                                             "owner": doc.job.user.email, "reason": reason, "via": "export"})
+    audit.record(db, request, "documents.exported", actor=p.user, target_type="group" if group_id else None,
+                 target_id=group_id, group_id=group_id or p.user.group_id,
+                 details={"documents": len(plan.documents), "files": plan.files, "size_bytes": plan.size,
+                          "left_out": len(plan.left_out), "others_files": others,
+                          "list": where or ("group documents" if group_id else "my documents"),
+                          "how": "chosen" if body.ids is not None else "everything shown"})
+    db.commit()
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    filename = name or f"documents-{stamp}.zip"
+    return StreamingResponse(export.stream(plan, get_storage(), by=p.user.email), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                                      "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@router.post("/documents/export/plan", response_model=ExportPlanOut)
+def my_export_plan(body: ExportRequest, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """What exporting these of the person's documents would hold: shown before downloading."""
+    return export_plan_out(*export_plan(db, p, [Job.user_id == p.user.id], body))
+
+
+@router.post("/documents/export", dependencies=[Depends(per_person("document_export"))])
+def my_export(body: ExportRequest, request: Request, p: Principal = Depends(current_principal),
+              db: Session = Depends(get_db)):
+    """The person's chosen documents (or everything their list shows), every file they may download, as one zip
+    made on the fly. One request against its own hourly limit, however many files."""
+    return export_zip(db, request, p, [Job.user_id == p.user.id], body)
+
+
+@router.get("/jobs/{job_id}/files.zip", dependencies=[Depends(per_person("document_export", "download"))])
+def document_zip(job_id: uuid.UUID, request: Request, reason: str | None = Query(None, max_length=500),
+                 p: Principal = Depends(document_principal("download")), db: Session = Depends(get_db)):
+    """Every file the document's page offers this person, as one zip (#507), as the list's zip export makes it: named
+    from its date and file name with underscores ("2026-10-21_syllabus.zip"). Someone else's files are recorded as
+    downloads are, with the reason given."""
+    job = _visible_job(db, job_id, p)
+    if job.files_deleted_at is not None:
+        raise ApiError(410, "files_deleted", "This document's files have been removed.")
+    if p.token is not None and p.token.download != "all":
+        raise ApiError(403, "token_scope", "This API token downloads chosen files, not the zip. Make one that can in Settings.")
+    _mark_downloaded(db, p, job)
+    plan, _, _ = export_plan(db, p, [Job.id == job.id], ExportRequest(ids=[job.id]))
+    name = safe_name(plan.documents[0].folder.replace(" ", "_") + ".zip", "document.zip") if plan.documents else None
+    return export_zip(db, request, p, [Job.id == job.id], ExportRequest(ids=[job.id]), where="document page",
+                      reason=reason, name=name)

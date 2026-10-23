@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { CHAR_W, endName } from "./chartText";
 import { fmtNum } from "./ui";
 
 /* Charts for the live reports. One measure at a time (never two scales on one chart); the report table below
@@ -21,6 +22,7 @@ export type ChartData = {
 const MAX_SERIES = 8;
 const H = 240;
 const M = { top: 14, bottom: 30, left: 52 };
+
 
 function fmtValue(v: number | null | undefined, unit: string) {
   if (v === null || v === undefined || Number.isNaN(v)) return "–";
@@ -162,7 +164,12 @@ function Plot({ chart, measure, period }: { chart: ChartData; measure: ChartData
   }, [chart, measure]);
 
   const isLine = chart.kind === "line";
-  const labelRoom = isLine && series.length > 1 && series.length <= 4 ? 120 : 16;
+  // Room at the right for each line's name (12px text, about 6.6px a character), up to 30% of the chart: a longer
+  // name is shortened, as the legend above names every line in full (#545)
+  const endNames = isLine && series.length > 1 && series.length <= 4;
+  const labelRoom = endNames
+    ? Math.min(Math.round(width * 0.3), 20 + Math.ceil(Math.max(...series.map((s) => s.length)) * CHAR_W)) : 16;
+  const fits = Math.max(4, Math.floor((labelRoom - 12) / CHAR_W));
   const innerW = Math.max(120, width - M.left - labelRoom);
   const innerH = H - M.top - M.bottom;
   const all = series.flatMap((s) => xs.map((x) => values.get(s)?.get(x) ?? null)).filter((v): v is number => v !== null);
@@ -221,8 +228,9 @@ function Plot({ chart, measure, period }: { chart: ChartData; measure: ChartData
         {xs.map((x, i) => i % labelEvery === 0 && (
           <text key={x} x={xCenter(i)} y={H - 10} className="tick" textAnchor="middle">{fmtX(x, period)}</text>
         ))}
-        {isLine && series.length > 1 && series.length <= 4 && endLabels().map(({ s, at }) => (
-          <text key={s} x={M.left + innerW + 8} y={at} className="end-label" dominantBaseline="middle">{s}</text>
+        {endNames && endLabels().map(({ s, at }) => (
+          <text key={s} x={M.left + innerW + 8} y={at} className="end-label" dominantBaseline="middle">
+            {endName(s, fits)}{endName(s, fits) !== s && <title>{s}</title>}</text>
         ))}
         {refValue !== null && (
           <g>

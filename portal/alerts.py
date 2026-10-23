@@ -12,6 +12,8 @@
   there.
 - monitoring_down: only where the deployment has Prometheus (PORTAL_PROMETHEUS_URL, #397): it hasn't answered for
   `alert_engine_minutes`.
+- siem_behind: only with the audit log sent to a SIEM (PORTAL_SIEM_MODE, #456): an event has waited more than an
+  hour to be sent (the collector away, or refusing it).
 - prom:<name>: an alert Prometheus's rules raised (deploy/k8s/monitoring/rules.yml): a pod crashing or restarting,
   a volume filling, memory near a pod's limit, the engine's queue full for long. They wait their rule's `for:`
   before firing, so they're told at once. One row per rule however many pods it fires for.
@@ -38,16 +40,26 @@ log = logging.getLogger(__name__)
 
 WORKER = "portal-worker"
 BACKUP = "backup"  # the last nightly backup that finished, or when backups were first expected
-ASKED_BY_WORKER = {"no_engine_workers"}  # found only by the worker's own check; the rest anyone can work out
+ASKED_BY_WORKER = {"no_engine_workers", "scanner_down", "scanner_signatures_old"}  # found only by the worker's own
+# checks; the rest anyone can work out
 PROM = "prom:"
 TITLES = {
+    "scanner_down": "The malware scanner isn't answering: uploads are refused",
+    "scanner_signatures_old": "The malware scanner's signatures are out of date",
     "queue_stuck": "The document queue isn't moving",
     "worker_stopped": "The portal's background worker has stopped working",
     "no_engine_workers": "The engine has no workers",
     "backup_stale": "The nightly backup hasn't finished",
     "monitoring_down": "Monitoring (Prometheus) isn't answering",
+    "siem_behind": "The audit log isn't reaching the SIEM",
 }
 FIXES = {
+    "scanner_down": "Every upload is refused while it's down (#455). Look at the clamav pod: kubectl -n NS get pods -l "
+                    "app=clamav, and its log (kubectl -n NS logs deploy/clamav -c clamd). It needs about 2 GB of memory "
+                    "and a minute to load its signatures after a restart.",
+    "scanner_signatures_old": "freshclam, beside clamd in the clamav pod, isn't getting updates: kubectl -n NS logs "
+                              "deploy/clamav -c freshclam. With EGRESS_PROXY=enforce, database.clamav.net must be "
+                              "reachable through the proxy; ClamAV's mirror also refuses a client that asks too often.",
     "queue_stuck": "Look at Administration > Queues: a document in progress may be stuck (Restart it), or the engine's "
                    "workers may be down (kubectl -n NS get pods; logs of deploy/engine-worker).",
     "worker_stopped": "Look at the portal worker's log (kubectl -n NS logs deploy/portal-worker): it says why its passes "
@@ -60,6 +72,9 @@ FIXES = {
                        "be full (PROMETHEUS_SIZE, PROMETHEUS_RETENTION in deploy.env). Until it's back, the alerts "
                        "below from Prometheus and the System page's charts aren't available; the portal's own alerts "
                        "still are.",
+    "siem_behind": "Administration > System shows the last error. Check the collector is up and its address, port, "
+                   "certificate and token (PORTAL_SIEM_* in portal.env; docs/operations/siem.md). Nothing is lost: the "
+                   "export carries on from where it stopped.",
 }
 # Prometheus's rules (deploy/k8s/monitoring/rules.yml; a test keeps the two in step). A rule not named here still
 # alerts, with its own summary and description.
@@ -151,10 +166,11 @@ def _waiting(db: Session) -> int:
 
 def conditions(db: Session, engine_asked: bool = False, engine_workers: int | None = None,
                now: datetime | None = None, prom_asked: bool = False,
-               prom_firing: list[dict] | None = None) -> dict[str, str]:
+               prom_firing: list[dict] | None = None, scanner: dict | None = None) -> dict[str, str]:
     """What's wrong right now, by key, with a sentence on each. With `engine_asked`, `engine_workers` is how many
     documents the engine can take at once (None: it couldn't be reached). With `prom_asked`, `prom_firing` is what
-    Prometheus has firing (None: it couldn't be reached)."""
+    Prometheus has firing (None: it couldn't be reached). `scanner`: the malware scanner as the worker found it, when
+    scanning is on (#455): {"error": ...} when it didn't answer, else {"version": ..., "signatures": datetime}."""
     rs = settings_store.load(db)
     now = now or _now()
     out: dict[str, str] = {}
@@ -176,6 +192,20 @@ def conditions(db: Session, engine_asked: bool = False, engine_workers: int | No
         if last is not None and last.at < now - timedelta(hours=rs.alert_backup_hours):
             out["backup_stale"] = (f"No nightly backup has finished since {last.at:%Y-%m-%d %H:%M} UTC (more than "
                                    f"{rs.alert_backup_hours} hours).")
+    from portal import siem  # the audit log to the campus SIEM (#456)
+    late = siem.behind(db, now)
+    if late is not None and late > siem.BEHIND:
+        err = siem.state(db).get("last_error")
+        out["siem_behind"] = (f"Audit events have waited {int(late.total_seconds() // 60)} minutes to be sent "
+                              f"({siem.mode()})" + (f": {err}" if err else "") + ".")
+    if scanner is not None:
+        if scanner.get("error"):
+            out["scanner_down"] = f"clamd didn't answer: {scanner['error']}."
+        elif scanner.get("signatures") is not None:
+            days = get_portal_settings().malware_signatures_days
+            if scanner["signatures"] < now - timedelta(days=days):
+                out["scanner_signatures_old"] = (f"Its signatures were published {scanner['signatures']:%Y-%m-%d %H:%M} "
+                                                 f"UTC, more than {days} days ago ({scanner.get('version')}).")
     if engine_asked and not engine_workers:
         out["no_engine_workers"] = ("The engine couldn't be reached." if engine_workers is None
                                     else "The engine reports no workers to process documents.")
@@ -188,8 +218,12 @@ def conditions(db: Session, engine_asked: bool = False, engine_workers: int | No
 
 
 def _grace(key: str, rs) -> timedelta:
-    """How long a problem must last before anyone is told: the queue's and the worker's tests already wait."""
-    waits = ("no_engine_workers", "monitoring_down")
+    """How long a problem must last before anyone is told: the queue's and the worker's tests already wait. Old
+    malware signatures wait an hour: a scanner just started has the ones its image was built with, usually days old,
+    until freshclam's first update a minute or so later."""
+    if key == "scanner_signatures_old":
+        return timedelta(hours=1)
+    waits = ("no_engine_workers", "monitoring_down", "scanner_down")
     return timedelta(minutes=rs.alert_engine_minutes) if key in waits else timedelta(0)
 
 
@@ -206,7 +240,7 @@ def _super_admins(db: Session) -> list[str]:
     return sorted({r.user.email for r in rows if r.user.status == "active"})
 
 
-def _mail(db: Session, key: str, subject: str, text: str) -> None:
+def mail_super_admins(db: Session, key: str, subject: str, text: str) -> None:
     rs = settings_store.load(db)
     footer = f"\n\n{rs.service_name}" + (f", {rs.organization_name}" if rs.organization_name else "") + "\n"
     outbox.queue(db, [Mail(to=to, subject=subject, text=text + footer) for to in _super_admins(db)],
@@ -215,17 +249,20 @@ def _mail(db: Session, key: str, subject: str, text: str) -> None:
 
 def evaluate(db: Session, engine_asked: bool = False, engine_workers: int | None = None,
              now: datetime | None = None, prom_asked: bool = False,
-             prom_firing: list[dict] | None = None) -> list[str]:
+             prom_firing: list[dict] | None = None, scanner: dict | None = None) -> list[str]:
     """Bring the alert rows up to date and queue their emails. Returns the keys emailed about this time."""
     rs = settings_store.load(db)
     now = now or _now()
     if get_portal_settings().backup_expected and db.get(WorkerBeat, BACKUP) is None:
         beat(db, BACKUP, now)  # expected from now: no backup within the time is then alerted like a stale one
-    found = conditions(db, engine_asked, engine_workers, now, prom_asked, prom_firing)
+    found = conditions(db, engine_asked, engine_workers, now, prom_asked, prom_firing, scanner)
     rows = {r.key: r for r in db.scalars(select(AlertState)) if ours(r.key)}  # not the pools' (pool_alerts)
     sent: list[str] = []
     if not engine_asked:  # not asked this time: keep what was known
         found.update({k: rows[k].detail for k in ("no_engine_workers",) if k in rows})
+    from portal import malware
+    if scanner is None and malware.enabled():  # scanning on, but not asked this time
+        found.update({k: rows[k].detail for k in ("scanner_down", "scanner_signatures_old") if k in rows})
     if prom_asked and prom_firing is None:  # Prometheus away: what it last said still stands, until it's back
         found.update({k: r.detail for k, r in rows.items() if k.startswith(PROM)})
     for key, detail in found.items():
@@ -239,7 +276,7 @@ def evaluate(db: Session, engine_asked: bool = False, engine_workers: int | None
         due = row.notified_at is None or now - row.notified_at >= timedelta(hours=rs.alert_repeat_hours)
         if due:
             again = row.notified_at is not None
-            _mail(db, key, f"{'Still: ' if again else 'Alert: '}{title(key)}",
+            mail_super_admins(db, key, f"{'Still: ' if again else 'Alert: '}{title(key)}",
                   f"{detail}\n\nWhat to do: {fix(key)}\n\nStarted {row.started_at:%Y-%m-%d %H:%M} UTC. You'll be "
                   f"reminded every {rs.alert_repeat_hours} hour(s) while it lasts, and told when it clears. It's also on "
                   "Administration > Attention.")
@@ -248,7 +285,7 @@ def evaluate(db: Session, engine_asked: bool = False, engine_workers: int | None
     for key, row in rows.items():
         if key not in found:
             if row.notified_at is not None:
-                _mail(db, key, f"Cleared: {title(key)}",
+                mail_super_admins(db, key, f"Cleared: {title(key)}",
                       f"This has cleared: {row.detail}\n\nIt started {row.started_at:%Y-%m-%d %H:%M} UTC.")
             db.delete(row)
     return sent

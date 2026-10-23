@@ -11,6 +11,11 @@ Every output is checked after remediation, and after every edit, in three layers
 | 2. Semantics | pdfplumber (independent of PyMuPDF) | Headings that look like body text, figures over nothing, file-name alt text, hidden text, table text, list numbering, link text, reading order against an independent ordering, language | Review list |
 | 3. AI review | Rendered images + a review model from a different family | Alt text accurate, partly wrong or wrong (with a suggested rewrite); checklists for charts, formulas, handwriting, sheet music | Review list |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/verification-layers-dark.svg">
+  <img src="../images/diagrams/verification-layers.svg" alt="Every output is checked in three layers: integrity, which fails the job or save on any error; semantics and an AI review by a model of another family, which add to the review list; and the review list goes to a person, who fixes what matters in the tag manager.">
+</picture>
+
 ## Layer 1: integrity
 
 `app/verification/integrity.py` reads the finished PDF back with its own tree walk and content-stream scan, sharing no
@@ -39,6 +44,10 @@ each tag with what it covers:
 - single-item lists and non-sequential numbering;
 - generic link text;
 - form fields whose tooltip is missing or only an internal name ("Text1"), #341;
+- tags at the wrong level, as PAC checks them and veraPDF's PDF/UA-1 profile doesn't (#437, #438): a figure or
+  formula on one page without its bounding box (high), a figure standing as a block without `/Placement /Block`,
+  inline tags (Span, Link, Note…) straight in a grouping tag, a P in a P, a Document inside the tree. One finding
+  per kind, with how many and on which pages;
 - tag order that disagrees with an independent layout ordering;
 - passages in another language than their tag;
 - pages mostly in a right-to-left script (Arabic, Hebrew), whose columns were read from the right: one finding naming

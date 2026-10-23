@@ -19,7 +19,7 @@
 | | Help requests | The group's requests and how long they took |
 | | Audit log | Every change to pages, limits, access and services in your group, including changes a super admin made there |
 
-![The Quality report: 100% pass PDF/UA-1, 4 remediated documents, 3 with review findings; a pass-rate chart by day; and a table by period and service with documents, passes, pass rate and review findings, with Columns, Export CSV and Email this view.](../../images/reports-quality.png)
+![The Quality report for Northfield University: a search box, Last 30 days by Day and Filters; 100% pass PDF/UA, 3 remediated documents and 3 with review findings; a pass-rate chart by day for Adobe Autotag + Commercial AI and Standard + Commercial AI; and a table of each day's documents, passes and pass rate, with Columns, Export CSV and Email this view](../../images/reports-quality.png)
 
 Cost figures (what the AI cost) are for super admins only.
 

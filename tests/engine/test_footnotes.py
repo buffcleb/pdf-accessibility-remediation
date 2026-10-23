@@ -121,8 +121,9 @@ def test_a_paragraph_changed_to_a_note_in_the_tag_viewer_is_given_an_id(tmp_path
     with pikepdf.open(dst) as pdf:
         findings, index = check_integrity(pdf)
         assert [f for f in findings if f.severity == "error"] == []
-        note = index.elements[p["i"]].obj
-        assert note.S == Name.Note and "/ID" in note
+        # The note stands in a paragraph of its own now (#438), so it's found by its role, not its old number
+        (note,) = [e.obj for e in index.elements if e.obj.get("/S") == Name.Note]
+        assert "/ID" in note
         assert bytes(note.ID) in {bytes(k) for k in list(pdf.Root.StructTreeRoot.IDTree.Names)[::2]}
 
 
@@ -210,6 +211,11 @@ def test_text_can_be_pointed_at_a_note_by_hand_and_unpointed(tmp_path):
     foot = next(e for e in tm["elements"] if e["role"] == "P" and (e.get("text") or "").startswith("1 "))
     as_note = tmp_path / "note.pdf"
     apply_edits(out, as_note, [{"op": "set_role", "element": foot["i"], "expect_role": "P", "role": "Note"}])
+    # As the tag manager does after a save, the numbers are read again: the note now stands in a paragraph (#438)
+    first = (body, foot)
+    tm = build_tagmap(as_note)
+    body = next(e for e in tm["elements"] if e["role"] == "P" and (e.get("text") or "").startswith("The survey"))
+    foot = next(e for e in tm["elements"] if e["role"] == "Note")
     linked = tmp_path / "linked.pdf"
     log = apply_edits(as_note, linked, [{"op": "link_note", "element": body["i"], "expect_role": "P", "note": foot["i"]}])
     assert "points at note" in log[0]
@@ -223,7 +229,8 @@ def test_text_can_be_pointed_at_a_note_by_hand_and_unpointed(tmp_path):
     assert "refs" not in build_tagmap(unlinked)["elements"][body["i"]]
     # Only a note can be pointed at, and a note doesn't point at one
     with pytest.raises(EditError, match="isn't a note"):
-        apply_edits(out, tmp_path / "x.pdf", [{"op": "link_note", "element": body["i"], "expect_role": "P", "note": foot["i"]}])
+        apply_edits(out, tmp_path / "x.pdf", [{"op": "link_note", "element": first[0]["i"], "expect_role": "P",
+                                                "note": first[1]["i"]}])
     with pytest.raises(EditError, match="can't point at a note"):
         apply_edits(as_note, tmp_path / "x.pdf", [{"op": "link_note", "element": foot["i"], "expect_role": "Note", "note": foot["i"] - 1}])
     for bad in ({"op": "link_note", "element": 3, "note": 3}, {"op": "link_note", "element": 3, "note": "4"}):
@@ -298,6 +305,12 @@ def _as_a_producer_tags_it(tagged, dst):
                         inner = k.K
                         out += list(inner) if isinstance(inner, pikepdf.Array) else [inner]
                         continue
+                    wrapped = (isinstance(k, pikepdf.Dictionary) and k.get("/S") == Name.P
+                               and isinstance(k.get("/K"), pikepdf.Array) and len(k.K) == 1)
+                    if wrapped and isinstance(k.K[0], pikepdf.Dictionary) and k.K[0].get("/S") == Name.Note:
+                        # Our Note stands in a P (#438); a producer's note is the paragraph itself
+                        k.K[0].P = e
+                        k = k.K[0]
                     if isinstance(k, pikepdf.Dictionary) and "/S" in k:
                         walk(k)
                     out.append(k)

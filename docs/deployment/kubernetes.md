@@ -12,6 +12,9 @@ cluster, with every step filled in.
 
 ## What it creates
 
+> **Changed 22 October 2026:** the portal's own Redis and the optional egress proxy added; ingress is denied by
+> default.
+
 One namespace (`pdf-remediation` by default):
 
 | Workload | Kind | Storage |
@@ -22,17 +25,21 @@ One namespace (`pdf-remediation` by default):
 | `litellm` (the AI gateway; its admin UI isn't exposed) | Deployment | – |
 | `verapdf` (PDF/UA checks, kept running), `verapdf-restart` (hourly) | Deployment, CronJob | – |
 | `postgres` (portal and gateway databases) | StatefulSet | Block (ReadWriteOnce) |
-| `redis` (engine queue on db 0, portal on db 1) | StatefulSet | Block |
+| `redis` (the engine's queue) | StatefulSet | Block |
+| `redis-portal` (the portal's rate limits) | StatefulSet | – |
 | `seaweedfs` (S3 for stored files) | StatefulSet | Block |
 | `cloudflared` (optional, with a tunnel token) | Deployment, 2 replicas | – |
 | `music-reader`, `formula-reader` (optional: `MUSIC_READER=on`, `FORMULA_READER=on`) | Deployments | – |
+| `egress-proxy` (optional: `EGRESS_PROXY=log` or `enforce`) | Deployment | – |
+| `clamav` (optional: `MALWARE_SCAN=clamav`, [malware scanning](../operations/malware-scanning.md)) | Deployment | `clamav-db` |
 | `prometheus`, `grafana` and three exporters (`MONITORING=on`, the default) | Deployments | Block |
 | `backup` (optional: `BACKUPS=cronjob`) | CronJob | An NFS share |
 | `portal-migrate-<time>` | Job, per deploy | – |
 
 Every pod runs without added privileges and drops all capabilities; most run as non-root on a read-only root
-filesystem. Network policies close each service to pods that have no business with it, and the pods that open
-uploaded PDFs reach nothing outside the cluster but through the AI gateway
+filesystem. Ingress is denied by default and network policies let each service in only from the pods that use it; the pods
+that open uploaded PDFs reach nothing outside the cluster but through the AI gateway, and with `EGRESS_PROXY` the
+others reach only the hosts the deployment uses
 ([details](../../deploy/k8s/README.md#network-policies-and-the-redis-password)).
 
 ## What the cluster needs
@@ -44,10 +51,16 @@ uploaded PDFs reach nothing outside the cluster but through the AI gateway
     nfs-subdir-external-provisioner or csi-driver-nfs), CephFS, Longhorn RWX, EFS, Azure Files. The engine runs as
     UID 10001, so the share must let it write; an init container checks and says so if it can't.
 - **An image registry** the cluster can pull from (`scripts/build.sh` pushes to GHCR by default; any registry works).
-- **A way in:** an ingress controller (the manifests use `ingressClassName: nginx`), or the bundled Cloudflare Tunnel.
+- **A way in:** an ingress controller, or the bundled Cloudflare Tunnel. `INGRESS_CONTROLLER` in `deploy.env` is
+  `traefik` (RKE2's default from v1.36) or `nginx` (ingress-nginx, retired upstream in March 2026); each Ingress gets
+  that controller's own settings. Traefik needs two settings of its own for the cluster (a longer time to upload, and
+  HTTP on to HTTPS): [Traefik's settings](first-cluster/middleware.md#traefiks-settings-for-the-cluster).
 - **amd64 nodes** (the images are built for linux/amd64), with about 6–8 GB of memory free in total for a small
   deployment.
-- **A network plugin that enforces `NetworkPolicy`** (RKE2's Canal does, as do Calico and Cilium).
+- **A network plugin that enforces `NetworkPolicy`** (RKE2's Canal does, as do Calico and Cilium), ideally with
+  **encryption between nodes** turned on: WireGuard in Canal, Calico or Cilium. The services inside the cluster talk
+  over plain connections, so this is what encrypts them. `scripts/check_cluster_encryption.sh` checks it (read-only),
+  and `deploy.sh` shows the result before deploying; `NODE_ENCRYPTION=require` in `deploy.env` makes it a condition.
 - **Optional: [KEDA](https://keda.sh) and metrics-server**, for scaling with the queue. Without them the sizes stay
   fixed.
 
@@ -78,8 +91,9 @@ uploaded PDFs reach nothing outside the cluster but through the AI gateway
    rolls out the gateway, veraPDF, engine, portal, web app and the optional pieces that are on; and checks each one
    answers.
 
-5. **A way in:** point your ingress controller's DNS at the hostname in `deploy.env` (`APP_HOST`), with TLS from your
-   ingress setup (for example cert-manager), or use the [Cloudflare Tunnel](cloudflare.md#a-tunnel-in-front-tested).
+5. **A way in:** point your ingress controller's DNS at the hostname in `deploy.env` (`APP_HOST`), with TLS set in
+   `deploy.env` (`CERT_ISSUER` for cert-manager, or `INGRESS_TLS_SECRET` for a certificate you supply), or use the
+   [Cloudflare Tunnel](cloudflare.md#a-tunnel-in-front-tested).
 
 `deploy/k8s/README.md` has the full reference: every setting, the optional pieces and day-to-day commands.
 

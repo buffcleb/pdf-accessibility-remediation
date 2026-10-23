@@ -28,6 +28,8 @@ spec:
         prometheus.io/port: "8000"
         prometheus.io/path: /api/v1/metrics
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+${ENGINE_PLACEMENT}
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:
@@ -90,6 +92,8 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9464"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+${ENGINE_PLACEMENT}
       # A worker told to stop (scaling down, a new release) finishes the document it's on first
       terminationGracePeriodSeconds: ${WORKER_GRACE_SECONDS}
       imagePullSecrets: [{ name: pdfrem-ghcr }]
@@ -165,6 +169,8 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9464"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+${ENGINE_PLACEMENT}
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:
@@ -190,6 +196,7 @@ spec:
             failureThreshold: 3
           envFrom: [{ secretRef: { name: pdfrem-engine-env } }, { secretRef: { name: pdfrem-adobe-env } }]
           env:
+${EGRESS_PROXY_ENV}
             - name: REDIS_PASSWORD
               valueFrom: { secretKeyRef: { name: pdfrem-engine-env, key: REDIS_PASSWORD } }
             - { name: REDIS_URL, value: "redis://:$(REDIS_PASSWORD)@redis:6379/0" }
@@ -235,6 +242,8 @@ spec:
       annotations:
         checksum/settings: "${ENGINE_ENV_SHA}"
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
+${ENGINE_PLACEMENT}
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       initContainers:

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import type { DocVersion, Finding, TagEdit } from "../api";
 import { checkLink } from "../checks";
@@ -6,11 +6,15 @@ import { errorMessage, fmtNum } from "../components/ui";
 import { absorbedBy, deletedTags, overrides, pageOrder, type Area } from "./draft";
 import { chooseAt, tagsAt, type LastHit } from "./hit";
 import { holes, subtree } from "./isolate";
-import { builtPreview } from "./outline";
+import { builtPreview, type Box } from "./outline";
 import { tablePreview, tableReplaced } from "./tablegrid";
 import { splitPreview } from "./figure";
-import { loadVersion, type PaneData } from "./pdf";
+import { contentMoves, newTags, splitKeeps } from "./areaPreview";
+import { loadVersion, watchVersion, type LoadState, type PaneData } from "./pdf";
+import { LoadProgress } from "../components/LoadProgress";
+import { LARGE_NOTE, READING_TAGS, downloading, drawingPage, fraction, isLarge } from "../components/loadWords";
 import { PageView, type OverlayItem } from "./PageView";
+import type { Spot } from "./spot";
 
 export type OverlayMode = "flagged" | "all" | "order" | "off";
 // only: in one-page view, the page shown (1-based); it sits at the top of the pane, whatever its offset says
@@ -49,6 +53,11 @@ type Props = {
   onMenu?: (i: number, x: number, y: number, at: { page: number; x: number; y: number } | null) => void;
   onPageMenu?: (page: number, x: number, y: number) => void;
   isolated?: number | null; // a tag isolated: the pages are veiled except for it and what's inside it
+  spot?: Spot | null; // a review item's area, highlighted on its page (#426)
+  onSpot?: (f: Finding) => void;
+  onSpotClose?: () => void;
+  pendingSel?: number | null; // a tag pending edits make, chosen (#427): the place of the edit making it
+  onPendingSelect?: (op: number) => void;
 };
 
 export const TREE = "tree";
@@ -76,26 +85,49 @@ export function VersionPicker({ side, versions, value, onNumber, onTree, treeDis
   );
 }
 
+/** A version's loading in words, and how far its downloads have got (null once they're done, or not yet known). */
+// pdfSize: the file's size as the version records it, for when the download doesn't say
+export function loadingWords(load: LoadState | null,
+  pdfSize?: number | null): { lines: string[]; fraction: number | null } {
+  if (load?.reading) return { lines: [READING_TAGS], fraction: null };
+  const none = { received: 0, total: null };
+  const pdf = load?.pdf ?? none;
+  const doc = { ...pdf, total: pdf.total ?? (pdfSize || null) };
+  return {
+    lines: [downloading("the document", doc), downloading("the tags", load?.tags ?? none)],
+    fraction: load ? fraction([doc, load.tags]) : null,
+  };
+}
+
 export function versionStatus(v: DocVersion): string {
   if (v.status === "failed") return "failed";
   if (v.status !== "ready") return "saving…";
   if (!v.has_tagmap) return "not in the tag manager";
+  if (v.checking) return "checking…";
+  if (v.summary?.checks_unfinished) return "checks didn't finish";
   const s = v.summary;
   if (!s || s.compliant === null) return "";
   return s.compliant ? "passes" : `${fmtNum(s.failed_checks)} failed checks`;
 }
 
 export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, selected, onSelect, onPage, ops, scrollRef, onScroll, onLayout, onData, highlight = null, onTree, treeDisabled,
-  areaMode = false, area = null, onArea, onlyPage = null, tools, picked, onPick, onMenu, onPageMenu, isolated = null }: Props) {
+  areaMode = false, area = null, onArea, onlyPage = null, tools, picked, onPick, onMenu, onPageMenu, isolated = null,
+  spot = null, onSpot, onSpotClose, pendingSel = null, onPendingSelect }: Props) {
   const version = versions.find((v) => v.number === number);
   const [data, setData] = useState<PaneData | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [width, setWidth] = useState(600);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  // While it loads: how far the downloads have got, then whether a page has been drawn yet (#424)
+  const [load, setLoad] = useState<LoadState | null>(null);
+  const [drawn, setDrawn] = useState(false);
+  const markDrawn = useCallback(() => setDrawn(true), []);
 
   useEffect(() => {
     setData(null);
     setError(null);
+    setLoad(null);
+    setDrawn(false);
     onData?.(null);
     if (!version || version.status !== "ready" || !version.has_tagmap) return;
     let live = true;
@@ -103,7 +135,8 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
       (d) => { if (live) { setData(d); onData?.(d); } },
       (e) => { if (live) setError(e); },
     );
-    return () => { live = false; };
+    const unwatch = watchVersion(jobId, number, setLoad);
+    return () => { live = false; unwatch(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, number, version?.status]);
 
@@ -198,15 +231,37 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
         }
       }
     }
+    // Tags pending edits make (an area of untagged content, a split) and content they move between tags (#427):
+    // drawn at once, whatever is being shown, as they will be once saved
+    const moves = side === "right" ? contentMoves(data.tagmap, ops) : null;
+    const keeps = side === "right" ? splitKeeps(data.tagmap, ops) : new Map<number, Box[]>();
+    if (side === "right") {
+      for (const t of newTags(data.tagmap, ops)) {
+        const el = data.tagmap.elements[t.anchor];
+        if (!el) continue;
+        for (const b of t.boxes) {
+          out[b.page - 1]?.items.push({ el, bbox: b.bbox, role: t.role, findings: [], text: t.alt || t.text,
+            pending: true, made: t.op, madeSelected: t.op === pendingSel });
+        }
+      }
+      for (const [i, boxes] of moves!.added) {
+        const el = data.tagmap.elements[i];
+        if (!el) continue;
+        const role = over.get(i)?.role ?? el.role;
+        for (const b of boxes) {
+          out[b.page - 1]?.items.push({ el, bbox: b.bbox, role, findings: [], text: el.text, pending: true });
+        }
+      }
+    }
     for (const raw of data.tagmap.elements) {
-      if (deleted.has(raw.i) || builtFrom.has(raw.i)) continue;
+      if (deleted.has(raw.i) || builtFrom.has(raw.i) || moves?.emptied.has(raw.i)) continue;
       // A tag merged into another by a pending edit is drawn as part of the tag that absorbs it
       const el = merged.has(raw.i) ? data.tagmap.elements[merged.get(raw.i)!] : raw;
       const fs = byEl.get(el.i) ?? [];
       const show = el.i === selected || !!picked?.includes(el.i) || el.i === highlight || (mode === "flagged" && fs.length > 0) || ((mode === "all" || mode === "order") && raw.own);
       if (!show) continue;
       const o = over.get(el.i) ?? {};
-      for (const b of raw.boxes) {
+      for (const b of moves?.boxes.get(raw.i) ?? keeps.get(raw.i) ?? raw.boxes) {
         out[b.page - 1]?.items.push({
           el, bbox: b.bbox, role: o.role ?? el.role, findings: fs, decorative: o.decorative, alt: o.alt, lang: o.lang,
           orderNo: mode === "order" && raw === el ? orderNo.get(el.i) : undefined, highlighted: el.i === highlight,
@@ -214,7 +269,7 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
       }
     }
     return out;
-  }, [data, pages, findings, mode, selected, picked, highlight, over, merged, ops, side]);
+  }, [data, pages, findings, mode, selected, picked, highlight, over, merged, ops, side, pendingSel]);
 
   const picker = (
     <div className="pv-head">
@@ -232,6 +287,16 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
     </div>
   );
 
+  // The wait, in words (#424): the two downloads, then reading them, then drawing the first page in view. The pages
+  // say they are busy until then; the progress sits outside them, as a busy region's announcements may be held back
+  const drawing = !!data && !drawn && pages.length > 0;
+  const progress = data && !drawing ? null : (
+    <LoadProgress className={data ? "pv-loading pv-loading-over" : "pv-loading"}
+      {...(data ? { lines: [drawingPage(shownPage ?? 1)], fraction: null } : loadingWords(load, version?.pdf_size))}
+      note={isLarge({ pages: data?.tagmap.pages.length ?? load?.pages, bytes: version?.pdf_size ?? load?.pdf.total })
+        ? LARGE_NOTE : null} />
+  );
+
   return (
     <section className="pv-pane" aria-label={`${side === "left" ? "Left" : "Right"}: ${version?.label ?? ""}`}>
       {picker}
@@ -245,18 +310,22 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
         ) : error ? (
           <p className="pv-msg" role="alert">{errorMessage(error)}</p>
         ) : !data ? (
-          <p className="muted pv-msg" role="status">Loading pages…</p>
+          <>{progress}<div className="pv-pages" aria-busy="true" /></>
         ) : (
-          <div className={`pv-pages${zoom > 1 ? " zoomed" : ""}`}>
+          <>{progress}
+          <div className={`pv-pages${zoom > 1 ? " zoomed" : ""}`} aria-busy={drawing || undefined}>
             {pages.map((p, i) => shownPage !== null && i !== shownPage - 1 ? null : (
               <PageView key={i} pdf={data.pdf} index={i} size={p} scale={scale} items={perPage[i]?.items ?? []}
                 pageFindings={perPage[i]?.notes ?? []} showLabels={mode === "all"} selected={selected}
                 onSelect={(el) => onSelect(el === selected ? null : el)} onPage={onPage} hitAt={hitAt}
                 areaMode={areaMode} area={area?.page === i + 1 ? area.bbox : null} onArea={onArea}
                 picked={picked} onPick={onPick} onMenu={onMenu} onPageMenu={onPageMenu}
-                veil={inside && data ? holes(data.tagmap, inside, i + 1) : null} />
+                veil={inside && data ? holes(data.tagmap, inside, i + 1) : null} onDrawn={markDrawn}
+                spot={spot?.page === i + 1 ? spot : null} onSpot={onSpot} onSpotClose={onSpotClose}
+                onPendingSelect={onPendingSelect} />
             ))}
           </div>
+          </>
         )}
       </div>
     </section>

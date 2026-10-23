@@ -3,13 +3,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mainContainer, podCommands } from "../src/pages/admin/podCommands";
-import type { About, Pod, Workload } from "../src/pages/admin/podRows";
+import type { About, Container, Pod, Workload } from "../src/pages/admin/podRows";
+
+/** Only the name matters to the commands. */
+const c = (name: string, image: string): Container => ({
+  name, image, product: "", release: null, source: null, digest: null, pinned: null, matches: null,
+});
 
 const pod = (more: Partial<Pod> = {}): Pod => ({
   name: "engine-worker-7f-x2", state: "working", ready: true, phase: "Running", node: "n1", age_s: 60, restarts: 0,
   waiting_reason: null, last_restart_reason: null, liveness_failures_1h: 0, readiness_failures_1h: 0,
   cpu_cores: null, cpu_limit: null, memory_bytes: null, memory_limit: null, busy: null, places: null,
-  namespace: "pdf-remediation", containers: [{ name: "engine-worker", image: "x/engine:1" }], ...more,
+  namespace: "pdf-remediation", containers: [c("engine-worker", "x/engine:1")], ...more,
 });
 const about = (more: Partial<About> = {}): About => ({ description: "d.", sources: [], port: null, shell: true,
   ...more });
@@ -33,7 +38,7 @@ test("commands use the pod's name and namespace, and a KEDA-scaled one gets its 
 test("a fixed-size stateful set with a port: scale, port-forward, and --previous after a restart", () => {
   const w = workload({ name: "postgres", kind: "statefulset", scaler: null, autoscaled: false, desired: 1,
     about: about({ port: 5432 }) });
-  const p = pod({ name: "postgres-0", restarts: 2, containers: [{ name: "postgres", image: "postgres:16" }] });
+  const p = pod({ name: "postgres-0", restarts: 2, containers: [c("postgres", "postgres:16")] });
   const cmds = all(w, p);
   assert.ok(cmds.includes("kubectl -n pdf-remediation scale statefulset/postgres --replicas=1"));
   assert.ok(cmds.includes("kubectl -n pdf-remediation port-forward pod/postgres-0 5432:5432"));
@@ -42,7 +47,7 @@ test("a fixed-size stateful set with a port: scale, port-forward, and --previous
 });
 
 test("several containers: every one's log, and -c picks the one the workload is named after", () => {
-  const p = pod({ containers: [{ name: "a-sidecar", image: "s" }, { name: "engine-worker", image: "e" }] });
+  const p = pod({ containers: [c("a-sidecar", "s"), c("engine-worker", "e")] });
   assert.equal(mainContainer(workload(), p), "engine-worker");
   const cmds = all(workload(), p);
   assert.ok(cmds.includes("kubectl -n pdf-remediation logs engine-worker-7f-x2 --all-containers"));

@@ -2,6 +2,10 @@
 
 [Architecture](README.md) › Source map
 
+> **Changed 22 October 2026:** the files added since 19 October: API tokens, malware scanning, row-level security,
+> security alerts and the SIEM export, paged lists and zips in the portal; the link and structure repairs in the
+> engine; the newer manifests and scripts.
+
 ```
 app/                         the remediation engine
   main.py, config.py         the FastAPI app; every setting (environment variables)
@@ -35,6 +39,8 @@ app/                         the remediation engine
   tagging/      content_marker.py marked-content rewriter (text-run splitting, clips)
                 tagger.py, struct_tree.py, targets.py   the structure tree, and what each piece of content belongs to
                 existing_tags.py  auditing, repairing and rebuilding existing tags
+                link_words.py, self_links.py   kept Links given their words; links that point to themselves removed
+                structure_rules.py   tags at the right level, and figures' placement and boxes, as PAC checks
                 mathml_tags.py, mathml_embed.py   a document's own MathML kept; MathML put on Formula tags (PDF 2.0)
                 table_headers.py, bookmarks.py   cells linked to their headers; bookmarks from the headings
                 editor.py, role_rules.py   tag edits, and which role changes are valid
@@ -60,7 +66,12 @@ portal/                      the portal API and worker
   helpdesk.py                help requests: access, attachments, status, reminders
   live_reports.py, report_views.py   the live reports; scheduled report views
   email_reports.py, notifications.py, mail.py   scheduled summaries; notification preferences; mail providers
-  attention.py, audit.py     what needs admins' attention; the audit log
+  attention.py, audit.py     what needs admins' attention (and what was acknowledged); the audit log
+  security_alerts.py, siem.py   security alerts from the audit log; the audit log sent to a SIEM
+  rls.py                     row-level security: whose request each transaction is
+  api_tokens.py              personal API tokens for scripts
+  malware.py                 uploads streamed to ClamAV before they're stored
+  export.py, paging.py       zips of many documents, made as they're sent; one page of a list
   alerts.py, pool_alerts.py  the service's alerts to super admins; a group's pool running low
   metrics.py, prometheus.py, workloads.py   the portal's Prometheus metrics; reading Prometheus; the System page's pods
   workload_catalog.py        what each workload is and where it comes from (the pods' details)
@@ -70,14 +81,16 @@ portal/                      the portal API and worker
   worker.py, engine.py       job, version and review processing; the engine client
   settings_store.py          runtime settings (changed in the app)
   cli.py, backup_tools.py    operator commands; file export and import for backups
-  routers/      auth, me, branding, jobs, versions, help, groups, admin, reports, queues, email_reports, monitoring
+  routers/      auth, me, branding, jobs, versions, help, groups, admin, reports, queues, email_reports, monitoring,
+                api_tokens, audit_export (the SIEM's pull API)
   security/     tokens.py (JWT, codes), ratelimit.py, botcheck.py (Cloudflare Turnstile)
 
 web/src/                     the React app
   pages/        Home (My documents), JobDetail (the document page), Login, MySettings, Unsubscribe
   pages/admin/  index (menu, Attention), Groups, People, Services, Setup (guided set-up), Help, Queues,
                 QueuesLive, Settings, System and Pods (monitoring), shared
-  components/   UploadForm, DocumentsList, Allowances, LiveReport, ReportChart, help, …
+  components/   UploadForm, DocumentsList, Allowances, LiveReport, ReportChart, ApiTokens, AdminDialog (the
+                standard edit dialog), lists (the shared pager and search bar), RunDetails, help, …
   viewer/       TagViewer, Pane, PageView, TreePane, EditPanel, Reader (read aloud), draft.ts, roles.ts,
                 speech.ts (what read aloud says), pdf.ts, DocumentPanel (title and language), TableDialog and
                 tablegrid.ts (the table editor), history.ts (undo and redo), ReadingPicker (a formula's readings),
@@ -87,13 +100,19 @@ web/tests/                   unit tests of the viewer's logic (npm test: tsc, th
 config/litellm.yaml          the AI gateway's models
 docker/                      the music reader (audiveris), the formula reader (formula), mathcat-cli (mathcat),
                              the web image's nginx (web)
-deploy/k8s/                  Kubernetes manifests and settings templates (35-verapdf: the veraPDF service and its
-                             hourly restart; 45-autoscale: scaling with the queue; 37-formula: the formula reader;
-                             90-backup: the nightly backup; 95-monitoring and monitoring/: Prometheus and Grafana)
+deploy/k8s/                  Kubernetes manifests and settings templates (23-redis-portal: the portal's own Redis;
+                             26-egress-proxy and 82-egress-enforce: outbound traffic; 27-clamav: malware scanning;
+                             35-verapdf: the veraPDF service and its hourly restart; 37-formula: the formula reader;
+                             45-autoscale: scaling with the queue; 62-traefik-api-origin: the API origin on Traefik;
+                             80-network-policies; 90-backup: the nightly backup; 95-monitoring and monitoring/:
+                             Prometheus and Grafana), egress_hosts.py (the proxy's allow-list), gateway_key.py (the
+                             engine's own gateway key)
+deploy/node/                 rke2-drain: drain a node before it shuts down
 deploy/verapdf/              settings of the veraPDF service (how many failed checks it reports, with messages)
 deploy/cloudflare-worker/    the optional Cloudflare Worker front end
 scripts/                     build.sh (and its Trivy scan), deploy.sh, deploy-worker.sh, backup.sh, restore.sh,
-                             sign-in-code.sh, audit-deps.sh (pip-audit and npm audit, for CI and the weekly audit),
+                             rotate-secret.sh, check_cluster_encryption.sh (read-only), sign-in-code.sh,
+                             audit-deps.sh (pip-audit and npm audit, for CI and the weekly audit),
                              regression.sh (the regression documents), a11y.sh (axe over the web app), publish.sh
 harness/                     make_samples.py (synthetic PDFs), run_harness.py (batch tester), run_folder.py, ocr_eval.py
 tests/                       engine/ and portal/ test suites; a11y/ (the web app's accessibility checks)

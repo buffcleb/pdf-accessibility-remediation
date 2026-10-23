@@ -9,21 +9,10 @@ on), each with its own models; kinds don't change what's charged.
 
 ## Who can use a service, and where pages come from
 
-```mermaid
-flowchart TD
-  subgraph Optin ["Who can use a service"]
-    G1["Super admin:<br/>switched on globally"] --> G2["Group admin:<br/>enabled for the group<br/>(blocked if the group is local-only<br/>and the service is external)"]
-    G2 --> G3["Given to everyone in the group,<br/>or person by person"]
-    G3 --> G4["Person picks it at upload<br/>(group's preselected option by default,<br/>or the group's fixed AI level)"]
-  end
-  subgraph Pages ["Where the pages come from (per service)"]
-    P1["Global pool<br/>(optional)"] --- P2["Group pool<br/>(ticketed top-ups)"] --- P3["Person's limit<br/>(own or group default)"]
-  end
-  G4 --> R{"Reserve pages on every<br/>service the document uses,<br/>at all three levels at once"}
-  P1 & P2 & P3 -.-> R
-  R -- "any level short" --> X["Refused, naming the service<br/>and the level that ran out"]
-  R -- ok --> Q["Queued"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/service-access-dark.svg">
+  <img src="../images/diagrams/service-access.svg" alt="A service is used only after a super admin switches it on, a group admin enables it for the group (never an external one for a local-only group), it is given to everyone or person by person, and the person picks it; then pages are reserved on every service the document uses, from the global pool, the group pool and the person's limit at once; if any is short the upload is refused, naming it, otherwise it is queued.">
+</picture>
 
 Each service also has optional **cost guards**: most pages per document, most pages sent per day (extra documents
 wait in the queue rather than fail), and confirm-before-send. It can show a **notice** at upload, for example where
@@ -38,31 +27,10 @@ remediating breaks the signature (#339). A dynamic XFA form is refused: it has n
 
 ## One document's path
 
-```mermaid
-sequenceDiagram
-  actor U as Person
-  participant P as Portal API
-  participant W as Portal worker
-  participant E as Engine
-  participant G as AI gateway
-  U->>P: upload (processing service, AI level, kind)
-  P->>P: access checks, page counts (in a child process<br/>with memory, CPU and time limits), per-document limit
-  alt service asks for confirmation, or the PDF is signed
-    P-->>U: held, nothing reserved
-    U->>P: confirm
-  end
-  P->>P: reserve pages (ledger: reserve)
-  W->>W: queue order: per-person concurrency,<br/>large documents, daily caps, paused queues
-  opt "Let AI decide"
-    W->>E: classify (first pages' text)
-  end
-  W->>E: submit (the level's or kind's gateway models)
-  E->>G: AI calls tagged job + level
-  G-->>E: answers + cost per call
-  W->>E: poll, then fetch files
-  W->>P: store versions and AI cost, ledger: commit (or release on failure)
-  W-->>U: email (as it happens, or in a daily summary)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/document-path-dark.svg">
+  <img src="../images/diagrams/document-path.svg" alt="A person uploads with a processing service, AI level and kind; the portal checks access and counts pages in a limited child process, holds the document if the service asks for confirmation or the PDF is signed, then reserves pages; the worker orders the queue, optionally has the engine classify the document, and submits it; the engine's AI calls go through the gateway, which returns answers and costs; the worker polls, fetches the files, stores the versions, commits or releases the pages, and emails the person.">
+</picture>
 
 Every ledger entry records the service, the scope (global or group), the person, the job, any ticket, override or
 reason, and the balances after it. Super admins can also **correct** a person's usage. Every change to pools,

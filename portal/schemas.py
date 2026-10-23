@@ -73,6 +73,7 @@ class GroupOut(BaseModel):
     ai_kind: str | None  # fixed: its kind of document (None: General)
     show_external: bool  # show people which options send documents to an external provider
     ai_describe: bool | None = None  # "Describe with AI" for its people; None follows the service default
+    api_tokens_enabled: bool = False  # its people may make API tokens for scripts (#518)
     pending_members: int  # people waiting for approval
     help_active: int  # help requests from the group still being worked on
     # The standard service's terms (kept for screens that show one pool)
@@ -183,6 +184,7 @@ def group_out(g: Group, services: list[Service] | None = None) -> GroupOut:
                     emails=_emails_of(g),
                     local_only=g.local_only, require_approval=g.require_approval, ai_mode=g.ai_mode, ai_level=g.ai_level,
                     ai_kind=g.ai_kind, show_external=g.show_external, ai_describe=g.ai_describe,
+                    api_tokens_enabled=g.api_tokens_enabled,
                     pending_members=_pending_in(g), help_active=_help_active_in(g), default_user_cap=std.default_user_cap if std else None,
                     over_quota_message=g.over_quota_message, balance=balance_of(std),
                     services=group_services_out(g, services), created_at=g.created_at)

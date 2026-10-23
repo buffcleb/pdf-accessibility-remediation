@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { del, get, patch, post, type Group, type Service } from "../../api";
 import { ErrorNotice, Loading, fmtNum, useLoad, useTitle } from "../../components/ui";
+import { DialogButton } from "../../components/AdminDialog";
 import { useUnsavedChanges } from "../../components/unsaved";
 import { modelChoices } from "./models";
 import { Adjust, GatewayLink, Topup } from "./shared";
@@ -75,7 +76,9 @@ export function ServicesList() {
             </tbody>
           </table>
         </div>
-        <NewAITier onCreated={services.reload} />
+        <p><DialogButton label="Add an AI level" title="Add an AI level" formId="new-tier">
+          {(close) => <NewAITier onCreated={() => { void services.reload(); close(); }} />}
+        </DialogButton></p>
       </section>
     </>
   );
@@ -286,10 +289,6 @@ export function ServiceDetail() {
  * upload by its name and description; they never see the models. General is the level's own models. */
 function KindsPanel({ service, onChange }: { service: Service; onChange: (s: Service) => void }) {
   const models = useAIModels();
-  const [label, setLabel] = useState("");
-  const [description, setDescription] = useState("");
-  const [model, setModel] = useState("");
-  const [judge, setJudge] = useState("");
   const [error, setError] = useState<unknown>(null);
   const base = `/admin/services/${encodeURIComponent(service.key)}/kinds`;
 
@@ -301,13 +300,6 @@ function KindsPanel({ service, onChange }: { service: Service; onChange: (s: Ser
     } catch (e) {
       setError(e);
       return false;
-    }
-  }
-  async function add(e: FormEvent) {
-    e.preventDefault();
-    if (await act(() => post<Service>(base, { label, description: description || null, gateway_model: model,
-      gateway_judge_model: judge || null }))) {
-      setLabel(""); setDescription(""); setModel(""); setJudge("");
     }
   }
   const options = models.data?.models ?? [];
@@ -356,9 +348,40 @@ function KindsPanel({ service, onChange }: { service: Service; onChange: (s: Ser
           </tbody>
         </table>
       </div>
-      <h3>Add a kind of document</h3>
-      {models.error ? <ErrorNotice error={models.error} /> : null}
-      <form className="form-row" onSubmit={add}>
+      <p><DialogButton label="Add a kind of document" title={`Add a kind of document to ${service.label}`} formId="new-kind" wide>
+        {(close) => <NewKind base={base} options={options} modelsError={models.error}
+          onAdded={(x) => { onChange(x); close(); }} />}
+      </DialogButton></p>
+      <ErrorNotice error={error} />
+    </div>
+  );
+}
+
+/** A new kind of document for an AI level, in the admin edit dialog (#511). */
+function NewKind({ base, options, modelsError, onAdded }: {
+  base: string; options: string[]; modelsError: unknown; onAdded: (s: Service) => void;
+}) {
+  const [label, setLabel] = useState("");
+  const [description, setDescription] = useState("");
+  const [model, setModel] = useState("");
+  const [judge, setJudge] = useState("");
+  const [error, setError] = useState<unknown>(null);
+  useUnsavedChanges(!!(label.trim() || description.trim() || model || judge));
+
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try {
+      onAdded(await post<Service>(base, { label, description: description || null, gateway_model: model,
+        gateway_judge_model: judge || null }));
+    } catch (err) {
+      setError(err);
+    }
+  }
+  return (
+    <>
+      {modelsError ? <ErrorNotice error={modelsError} /> : null}
+      <form id="new-kind" className="dialog-form" onSubmit={add}>
         <div className="field"><label htmlFor="k-label">Name shown to people</label>
           <input id="k-label" type="text" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. Math and science" /></div>
         <div className="field" style={{ flex: "2 1 260px" }}><label htmlFor="k-desc">Description <span className="hint">(shown at upload)</span></label>
@@ -374,10 +397,10 @@ function KindsPanel({ service, onChange }: { service: Service; onChange: (s: Ser
             <option value="">The level's</option>
             {options.filter((m) => m !== model).map((m) => <option key={m} value={m}>{m}</option>)}
           </select></div>
-        <button className="btn" type="submit" disabled={!label.trim() || !model}>Add kind</button>
+        <div className="actions"><button className="btn" type="submit" disabled={!label.trim() || !model}>Add kind</button></div>
       </form>
       <ErrorNotice error={error} />
-    </div>
+    </>
   );
 }
 
@@ -429,13 +452,12 @@ function NewAITier({ onCreated }: { onCreated: () => void }) {
     }
   }
   return (
-    <details className="panel">
-      <summary>Add an AI level</summary>
+    <>
       <p className="muted small">
         An AI level offers one of the AI gateway's models (set up in config/litellm.yaml). New ones start switched off.
       </p>
       {models.error ? <ErrorNotice error={models.error} /> : null}
-      <form className="form-row" onSubmit={create}>
+      <form id="new-tier" className="dialog-form" onSubmit={create}>
         <div className="field">
           <label htmlFor="tier-label">Name shown to people</label>
           <input id="tier-label" type="text" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. Commercial AI" />
@@ -456,9 +478,9 @@ function NewAITier({ onCreated }: { onCreated: () => void }) {
         </div>
         <label className="check"><input type="checkbox" checked={external} onChange={(e) => setExternal(e.target.checked)} /><span>External provider</span></label>
         <label className="check"><input type="checkbox" checked={metered} onChange={(e) => setMetered(e.target.checked)} /><span>Page limits apply</span></label>
-        <button className="btn" type="submit" disabled={!label.trim() || !model}>Add AI level</button>
+        <div className="actions"><button className="btn" type="submit" disabled={!label.trim() || !model}>Add AI level</button></div>
       </form>
       <ErrorNotice error={error} />
-    </details>
+    </>
   );
 }

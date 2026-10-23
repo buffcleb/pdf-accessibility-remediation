@@ -22,6 +22,7 @@ spec:
     metadata:
       labels: { app: web }
     spec:
+      automountServiceAccountToken: false  # no Kubernetes API access (#470)
       imagePullSecrets: [{ name: pdfrem-ghcr }]
       securityContext: { runAsUser: 101, runAsGroup: 101, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
@@ -66,13 +67,14 @@ kind: Ingress
 metadata:
   name: web
   namespace: ${NAMESPACE}
+  # The controller's own settings (INGRESS_CONTROLLER; scripts/deploy.sh), and cert-manager's issuer
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "${MAX_UPLOAD_SIZE}"
-    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    pdfrem/ingress-controller: "${INGRESS_CONTROLLER}"
+${INGRESS_ANNOTATIONS}
+${INGRESS_ISSUER}
 spec:
-  ingressClassName: nginx
+  ingressClassName: ${INGRESS_CLASS}
+${INGRESS_TLS}
   rules:
     - host: ${APP_HOST}
       http:

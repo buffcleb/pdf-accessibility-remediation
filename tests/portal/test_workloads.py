@@ -40,7 +40,7 @@ def _cluster():
         "kube_pod_container_status_last_terminated_reason == 1": [_v(1, pod="engine-worker-c", reason="OOMKilled")],
         'sum by (pod, probe_type) (increase(prober_probe_total{result="failed"}[1h]))': [
             _v(2, pod="engine-worker-c", probe_type="Liveness")],
-        "sum by (pod) (rate(container_cpu_usage_seconds_total[5m]))": [_v(1.5, pod="engine-worker-a")],
+        workloads.Q["cpu"]: [_v(1.5, pod="engine-worker-a")],
         'sum by (pod) (kube_pod_container_resource_limits{resource="memory"})': [_v(6e9, pod="engine-worker-a")],
         workloads.Q["busy"]: [_v(2, pod="engine-worker-a"), _v(0, pod="engine-worker-b"), _v(0, pod="engine-worker-c")],
         "max by (pod) (engine_worker_places)": [_v(2, pod="engine-worker-a"), _v(2, pod="engine-worker-b")],
@@ -123,11 +123,58 @@ def test_a_pod_says_its_namespace_and_containers_and_a_workload_what_it_is():
     by = {w.name: w for w in workloads.collect(_Prom(c), now=NOW)}
     a = next(p for p in by["engine-worker"].pods if p.name == "engine-worker-a")
     assert a.namespace == "pdf-remediation"
-    assert a.containers == [{"name": "engine-worker", "image": "ghcr.io/x/pdfrem-engine:abc"},
-                            {"name": "sidecar", "image": "busybox:1"}]
+    assert [(x["name"], x["image"]) for x in a.containers] == [
+        ("engine-worker", "ghcr.io/x/pdfrem-engine:abc"), ("sidecar", "busybox:1")]
     assert by["engine-worker"].scaler == "keda" and by["engine-api"].scaler is None
     assert "Remediates documents" in by["engine-worker"].about["description"]
     assert by["postgres"].about["sources"][0]["url"] == "https://github.com/postgres/postgres"
+
+
+PG = "sha256:" + "a" * 64
+REDIS = "sha256:" + "b" * 64
+
+
+def test_an_image_says_its_release_digest_and_whether_it_is_the_pinned_one():
+    """#541: from the tag, as the manifests pin it, and the image as running."""
+    r = workloads.image_release
+    assert r(f"ghcr.io/berriai/litellm:v1.105.0@{PG}", f"ghcr.io/berriai/litellm@{PG}") == {
+        "product": "LiteLLM", "release": "1.105.0", "source": "tag", "digest": PG, "pinned": PG, "matches": True}
+    assert r(f"clamav/clamav:1.5.4@{PG}", f"docker.io/clamav/clamav@{REDIS}")["matches"] is False
+    own = r("ghcr.io/buffcleb/pdfrem-engine:6b57d727b0", f"ghcr.io/buffcleb/pdfrem-engine@{PG}")
+    assert (own["product"], own["release"], own["source"], own["pinned"], own["matches"]) == (
+        "pdfrem-engine", "6b57d727b0", "build", None, None)  # tagged by commit; nothing pinned
+    assert r(f"registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0@{PG}", None)["product"] == \
+        "kube-state-metrics"
+    assert r("localhost:5000/tool:2.1", None)["product"] == "tool"
+    assert r("redis:7-alpine", None)["release"] == "7-alpine"
+    assert r("redis:7-alpine", None, "7.4.11")["source"] == "reported"
+    assert (r("busybox", None)["release"], r("busybox:latest", None)["release"]) == (None, None)
+
+
+def test_postgres_and_redis_say_their_release_through_their_exporters():
+    """Their tags name only the major release; the same Redis image in redis-portal gets what redis says."""
+    c = _cluster()
+    c["kube_deployment_spec_replicas"].append(_v(1, deployment="redis-portal"))
+    c["kube_statefulset_replicas"].append(_v(1, statefulset="redis"))
+    c["kube_pod_labels"] += [_v(1, pod="redis-0", label_app="redis"),
+                             _v(1, pod="redis-portal-a", label_app="redis-portal")]
+    c["kube_pod_container_info"] = [
+        _v(1, pod="postgres-0", container="postgres", image_spec=f"postgres:16-alpine@{PG}",
+           image_id=f"docker.io/library/postgres@{PG}"),
+        _v(1, pod="redis-0", container="redis", image_spec=f"redis:7-alpine@{REDIS}",
+           image_id=f"docker.io/library/redis@{REDIS}"),
+        _v(1, pod="redis-portal-a", container="redis", image_spec=f"redis:7-alpine@{REDIS}",
+           image_id=f"docker.io/library/redis@{REDIS}")]
+    c["pg_static"] = [_v(1, short_version="16.15.0", version="PostgreSQL 16.15 on x86_64-pc-linux-musl, 64-bit")]
+    c["redis_instance_info"] = [_v(1, redis_version="7.4.11")]
+    by = {w.name: w for w in workloads.collect(_Prom(c), now=NOW)}
+    release = {n: (by[n].pods[0].containers[0]["release"], by[n].pods[0].containers[0]["source"])
+               for n in ("postgres", "redis", "redis-portal")}
+    assert release == {"postgres": ("16.15", "reported"), "redis": ("7.4.11", "reported"),
+                       "redis-portal": ("7.4.11", "reported")}
+    c["redis_instance_info"] = []  # its exporter isn't answering: the tag's word
+    by = {w.name: w for w in workloads.collect(_Prom(c), now=NOW)}
+    assert by["redis-portal"].pods[0].containers[0]["release"] == "7-alpine"
 
 
 def test_every_workload_in_the_manifests_is_described():

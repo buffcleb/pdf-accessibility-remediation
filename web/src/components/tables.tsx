@@ -31,7 +31,7 @@ export function LedgerTable({ entries, emails }: { entries: LedgerEntry[]; email
         <tbody>
           {entries.map((e) => (
             <tr key={e.id}>
-              <td>{fmtDate(e.created_at)}</td>
+              <td className="when">{fmtDate(e.created_at)}</td>
               <td>
                 {KIND[e.kind]}
                 {e.service_key && e.service_key !== "standard" && <> <span className="pill info">{e.service_key}</span></>}

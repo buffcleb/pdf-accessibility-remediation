@@ -53,20 +53,10 @@ the answers to the earlier open questions are in section 13.
 
 As built (the original design had presigned downloads and an engine webhook; see "Changes needed in the engine"):
 
-```mermaid
-flowchart LR
-  B[Browser<br/>React SPA] -- HTTPS --> WEB[nginx<br/>app + /api proxy]
-  WEB --> P[Portal API<br/>FastAPI]
-  P --> DB[(PostgreSQL)]
-  P --> R[(Redis<br/>rate limits)]
-  P --> S[(Object store<br/>S3 / SeaweedFS)]
-  P -- "SMTP or a mail API" --> M[Mail]
-  P -. "SAML (on hold)" .-> IdP[Identity provider]
-  PW[Portal worker] --> DB
-  PW --> S
-  PW -- "internal HTTP: submit, poll,<br/>fetch files (API key)" --> E[Remediation engine<br/>API + workers]
-  E -- "all AI calls" --> GW[AI gateway<br/>LiteLLM]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/portal-architecture-dark.svg">
+  <img src="../images/diagrams/portal-architecture.svg" alt="The browser's React app reaches nginx, which serves the app and passes /api to the portal API; the API uses PostgreSQL, a Redis for rate limits, an S3 object store and mail, with SAML sign-in designed but on hold; the portal worker shares the database and store and submits documents to the engine over internal HTTP with an API key; the engine makes all AI calls through the AI gateway.">
+</picture>
 
 Downloads stream through the portal API after a permission check, so files never need public URLs.
 
@@ -125,8 +115,8 @@ never exposed to the internet.
 - Super admins start from a bootstrap list (`PORTAL_BOOTSTRAP_SUPER_ADMINS`, a list of email addresses).
   After that they're managed in the UI. The last super admin can't be removed.
 - **Authorization is enforced in the API on every request.** The group is always taken from the
-  stored resource, never from client input. *Not built yet:* Postgres row-level security as a second line of
-  defence (#350). On the cluster the portal connects as a database account that owns no table (#337).
+  stored resource, never from client input. Postgres row-level security is a second line of defence (#350). On
+  the cluster the portal connects as a database account that owns no table (#337), and the policies bind it.
 
 ## 4. Sign-in and account provisioning
 
@@ -300,6 +290,9 @@ As built, the app has two areas: **My documents** for everyone and **Administrat
   - tabs for Needs review, the report (also as an accessible PDF), the accessibility check and versions
   - downloads, and a help request with support
   - when the files will be removed
+  - Previous and Next, in the order and with the filters of the list it was opened from (kept in its address as
+    `?from=`); the API gives the neighbours from the list's own query (`/documents/neighbours/{id}`,
+    `/groups/{id}/documents/neighbours/{id}`, `/reports/documents/neighbours/{id}`)
 - **Tag manager:** the tags beside the page, with editing that saves a new reviewed version.
 - **Settings:** email notifications, email reports, scheduled report views (admins) and sign out of all devices.
 
@@ -371,7 +364,8 @@ Security is the top priority, so these are requirements rather than suggestions.
 - **Authorization:**
   - A deny-by-default dependency on every route, scoped to the role and the group.
   - Group checks come from the database record.
-  - Postgres row-level security as a second line of defence (not built yet, #350).
+  - Postgres row-level security as a second line of defence (#350; see
+    [security and privacy](../architecture/security-and-privacy.md#database)).
   - Automated tests for every role × endpoint pair.
 - **Input:**
   - PDF upload checks as in section 6.
@@ -459,7 +453,7 @@ These weren't in the brief; each is small. All four were built.
    - the three front-end targets
    - a demo Compose file with SeaweedFS and Mailpit
 
-Phases 1–4 and 6 are done, except row-level security. Much more was built after them (services, AI levels, help
+Phases 1–4 and 6 are done. Much more was built after them (services, AI levels, help
 requests, live reports, queues, the tag manager); the [build log](build-log.md) records it in order.
 
 ## 13. Decisions on the earlier open questions

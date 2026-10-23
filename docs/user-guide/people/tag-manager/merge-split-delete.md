@@ -12,9 +12,15 @@ merged tag keeps the type of the first one; change it afterwards if needed.
 
 ## Splitting
 
+> **Changed 22 October 2026:** the new tag a split makes is chosen at once, so its type can be changed before you save.
+
 **Split…** cuts a tag in two, at one of its pieces, or anywhere in its text: click where the new tag should start,
 then **Split at the cursor**. On the page, right-clicking over a later part of a tag that has several parts offers
 **Split here**.
+
+The new tag (the second part) is chosen as soon as it's made: pick its type in the **New tag (not saved)** bar above
+the pages, for example to make the second half a heading. See [The new tag, before you
+save](areas.md#the-new-tag-before-you-save).
 
 ![The Split this paragraph window: the paragraph's text in a box, "Click where the new tag should start", a note that
 the text is shown in the order it's drawn and that read-aloud text is removed from both parts, and the buttons Split

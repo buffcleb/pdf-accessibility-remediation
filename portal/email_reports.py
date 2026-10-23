@@ -113,6 +113,9 @@ def read_token(db: Session, token: str) -> tuple[User, str]:
         # A built-in report, or "view:<id>" for a scheduled report view
         ok = constant_time_equal(sig, keyed_hash(payload, "unsubscribe")[:32]) and (
             kind in KINDS or (kind.startswith("view:") and bool(uuid.UUID(kind[5:]))))
+        if ok:
+            from portal import rls
+            rls.identify(db, user_id=uuid.UUID(user_id))  # row-level security (#350): the signature says whose it is
         user = db.get(User, uuid.UUID(user_id)) if ok else None
     except (ValueError, UnicodeDecodeError):
         user = None

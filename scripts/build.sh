@@ -16,7 +16,9 @@
 # Each pushed image is scanned with Trivy (#362): HIGH and CRITICAL vulnerabilities that have a fix are listed. An
 # image with a CRITICAL one is pushed but held: its tag isn't written to .last-build, so deploy.sh keeps deploying
 # what it deployed before, until the image is rebuilt (usually a base image or package update) or accepted with
-# --accept-findings. Findings looked at and judged harmless go in .trivyignore, with the reason.
+# --accept-findings. Findings looked at and judged harmless go in .trivyignore, with the reason and, when they wait for
+# a fix to be two weeks old, an end date (exp:). Each build ends by listing them: how long each has left, DUE when its
+# wait is nearly over (bump the package then), EXPIRED once it is (scripts/trivyignore_status.py).
 #
 # Options:
 #   --tag TAG            image tag (default: the short commit, with -dirty if there are uncommitted changes)
@@ -138,6 +140,9 @@ if [ "$PUSH" = 1 ] && [ "$SCAN" = 1 ]; then
   done
 fi
 
+# What .trivyignore hides, and when each ignore ends (a fix's two-week wait): printed last, whatever happened above
+ignored() { python3 scripts/trivyignore_status.py .trivyignore 2>/dev/null | while IFS= read -r line; do log "$line"; done; }
+
 if [ "$PUSH" = 1 ]; then
   touch deploy/k8s/.last-build
   for n in ${RECORD[@]+"${RECORD[@]}"}; do
@@ -150,8 +155,10 @@ if [ "$PUSH" = 1 ]; then
   if [ ${#HELD[@]} -gt 0 ]; then
     log "held: ${HELD[*]} (pushed as $TAG, not recorded for deploy.sh): CRITICAL vulnerabilities with a fix (above)"
     log "rebuild after updating the base image or package, or record it with --accept-findings"
+    ignored
     exit 3
   fi
 else
   log "built ${ONLY[*]} as $TAG (not pushed)"
 fi
+ignored

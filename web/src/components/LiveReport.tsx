@@ -6,6 +6,8 @@ import { useFullWidth } from "./fullwidth";
 import { ReportChart, type ChartData } from "./ReportChart";
 import { ScheduleView } from "./ScheduleView";
 import { ErrorNotice, Loading, fmtNum, useLoad } from "./ui";
+import { ListBar, ListPager } from "./lists";
+import { apiQuery } from "./listQuery";
 
 /* Live reports: the report, period, filters, search, sort, page and columns all live in the URL, so a view can
  * be bookmarked or sent to another admin (who sees it within their own rights). */
@@ -43,47 +45,6 @@ const RANGES: [string, string][] = [
   ["30d", "Last 30 days"], ["7d", "Last 7 days"], ["month", "This month"], ["last_month", "Last month"],
   ["year", "This year"], ["all", "All time"], ["custom", "Choose dates"],
 ];
-const RESERVED = new Set(["report", "range", "since", "until", "q", "sort", "page", "page_size", "cols", "group_id"]);
-
-/** The period as since/until (ISO), from a preset or custom dates (until is exclusive: the day after). */
-function period(params: URLSearchParams): { since?: string; until?: string } {
-  const range = params.get("range") ?? "30d";
-  const now = new Date();
-  const day = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  switch (range) {
-    case "7d": return { since: new Date(day(now).getTime() - 6 * 86400000).toISOString() };
-    case "30d": return { since: new Date(day(now).getTime() - 29 * 86400000).toISOString() };
-    case "month": return { since: new Date(now.getFullYear(), now.getMonth(), 1).toISOString() };
-    case "last_month": return { since: new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString(),
-      until: new Date(now.getFullYear(), now.getMonth(), 1).toISOString() };
-    case "year": return { since: new Date(now.getFullYear(), 0, 1).toISOString() };
-    case "custom": {
-      const s = params.get("since"), u = params.get("until");
-      return { since: s ? new Date(`${s}T00:00:00`).toISOString() : undefined,
-        until: u ? new Date(new Date(`${u}T00:00:00`).getTime() + 86400000).toISOString() : undefined };
-    }
-    default: return {};
-  }
-}
-
-function apiQuery(params: URLSearchParams, name: string, groupId?: string, forExport = false): string {
-  const out = new URLSearchParams();
-  const { since, until } = period(params);
-  if (since) out.set("since", since);
-  if (until) out.set("until", until);
-  for (const [k, v] of params) {
-    if (!RESERVED.has(k) && v) out.set(k, v);
-  }
-  for (const k of ["q", "sort", "cols"]) if (params.get(k) !== null) out.set(k, params.get(k)!);
-  if (!forExport) {
-    out.set("page", params.get("page") ?? "1");
-    out.set("page_size", params.get("page_size") ?? "25");
-  }
-  const group = groupId ?? params.get("group_id");
-  if (group) out.set("group_id", group);
-  return `/reports/${name}${forExport ? ".csv" : ""}?${out.toString()}`;
-}
-
 /** Audit details as "key: value · key: old → new" rather than raw JSON. */
 function describeDetails(raw: string): string {
   let d: Record<string, unknown>;
@@ -128,7 +89,8 @@ function cell(col: Column, row: Record<string, unknown>, labels: Record<string, 
     case "bool": text = v ? "Yes" : "No"; break;
     default: text = labels[col.key]?.[String(v)] ?? String(v);
   }
-  const to = col.link === "job" && row._job_id ? `/jobs/${row._job_id}`
+  // A document's page keeps this view of the report in its address, for Back and for Previous and Next (#482)
+  const to = col.link === "job" && row._job_id ? `/jobs/${row._job_id}?from=${encodeURIComponent(back)}`
     : col.link === "help" && row._help_id ? `/admin/help/${row._help_id}`
       : col.link === "group" && row._group_id ? `/admin/groups/${row._group_id}`
         : col.link === "person" && row._group_id ? `/admin/groups/${row._group_id}/people`
@@ -151,18 +113,8 @@ export function LiveReports({ groupId }: { groupId?: string }) {
   const query = apiQuery(params, name, groupId);
   const report = useLoad(() => get<ReportData>(query), [query]);
   const groups = useLoad(() => (isSuper && !groupId ? get<Group[]>("/admin/groups") : Promise.resolve([] as Group[])), [isSuper, groupId]);
-  const [search, setSearch] = useState(params.get("q") ?? "");
   const [exportError, setExportError] = useState<unknown>(null);
   const [exporting, setExporting] = useState(false);
-
-  // Search as you type, a moment after typing stops
-  useEffect(() => {
-    if ((params.get("q") ?? "") === search) return;
-    const t = window.setTimeout(() => update({ q: search || null, page: null }), 400);
-    return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
-  useEffect(() => { setSearch(params.get("q") ?? ""); }, [name]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function update(changes: Record<string, string | null>) {
     const next = new URLSearchParams(params);
@@ -176,20 +128,22 @@ export function LiveReports({ groupId }: { groupId?: string }) {
   const data = report.data;
   const labels = useMemo(() => Object.fromEntries((data?.filters ?? []).map((f) => [f.key, Object.fromEntries(f.options.map((o) => [o.value, o.label]))])), [data]);
   const shown = (data?.columns ?? []).filter((c) => c.shown);
-  const pages = data ? Math.max(1, Math.ceil(data.total_rows / data.page_size)) : 1;
   const range = params.get("range") ?? "30d";
   const periodKind = data?.chart?.x === "day" ? "day" : data?.period ?? "day";
   const sortKey = (data?.sort ?? "").replace(/^-/, "");
   const sortDesc = (data?.sort ?? "").startsWith("-");
-  // The Filters panel and the schedule form belong to the report they were opened on: choosing another report
-  // closes them (each report has its own filters and schedule)
-  const [moreOpenFor, setMoreOpenFor] = useState<string | null>(null);
+  // The schedule form belongs to the report it was opened on: choosing another report closes it (each report has its
+  // own schedule; the search and filters bar starts afresh for each report too)
   const [schedulingFor, setSchedulingFor] = useState<string | null>(null);
-  const moreOpen = moreOpenFor === name;
   const scheduling = schedulingFor === name;
-  const setMoreOpen = (open: boolean) => setMoreOpenFor(open ? name : null);
   const setScheduling = (open: boolean) => setSchedulingFor(open ? name : null);
-  useEffect(() => { setMoreOpenFor(null); setSchedulingFor(null); setExportError(null); }, [name]);
+  useEffect(() => { setSchedulingFor(null); setExportError(null); }, [name]);
+  // Pages of rows, above and below the table (#514)
+  const pager = (where: "top" | "bottom") => data && (
+    <ListPager page={data.page} pageSize={data.page_size} total={data.total_rows} noun={["row", "rows"]} where={where}
+      topId="rp-top" onPage={(p) => update({ page: p > 1 ? String(p) : null })}
+      onSize={(n) => update({ page_size: n === 25 ? null : String(n), page: null })} />
+  );
   // Offer more room when the table is wider than its space
   const { full, setFull } = useFullWidth();
   const tableRef = useRef<HTMLDivElement>(null);
@@ -259,14 +213,21 @@ export function LiveReports({ groupId }: { groupId?: string }) {
         );
       })()}
       {data && <p className="muted small">{data.description}</p>}
-      <form className="report-bar" role="search" aria-label={`Search and filter ${data?.label ?? "the report"}`}
-        onSubmit={(e) => e.preventDefault()}>
-        <div className="report-search-box">
-          <label htmlFor="rp-q" className="visually-hidden">Search</label>
-          <span className="search-icon" aria-hidden="true">⌕</span>
-          <input id="rp-q" type="search" value={search} placeholder={data?.search_hint ? `Search ${data.search_hint}` : "Search"}
-            onChange={(e) => setSearch(e.target.value)} />
-        </div>
+      <ListBar key={name} label={`Search and filter ${data?.label ?? "the report"}`} searchId="rp-q" query={params.get("q") ?? ""}
+        placeholder={data?.search_hint ? `Search ${data.search_hint}` : "Search"} onQuery={(q) => update({ q: q || null, page: null })}
+        chips={chips} onRemove={(key) => update({ [key]: null, page: null })}
+        onClear={() => {
+          const keep = new URLSearchParams();
+          for (const k of ["report", "range", "since", "until", "group_id", "cols", "page_size", "by", "sort"]) if (params.get(k)) keep.set(k, params.get(k)!);
+          setParams(keep, { replace: true });
+        }}
+        more={data && otherFilters.length > 0 ? otherFilters.map((f) => (
+          <div className="field" key={f.key}><label htmlFor={`rp-${f.key}`}>{f.label}</label>
+            <select id={`rp-${f.key}`} value={params.get(f.key) ?? ""} onChange={(e) => update({ [f.key]: e.target.value, page: null })}>
+              <option value="">Any</option>
+              {f.options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select></div>
+        )) : undefined}>
         <label htmlFor="rp-range" className="visually-hidden">Period</label>
         <select id="rp-range" className="report-select" value={range}
           onChange={(e) => update({ range: e.target.value === "30d" ? null : e.target.value, page: null })}>
@@ -291,13 +252,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
             </select>
           </>
         )}
-        {otherFilters.length > 0 && (
-          <button type="button" className={`btn small ${chips.length ? "" : "secondary"}`} aria-expanded={moreOpen}
-            aria-controls="rp-more" onClick={() => setMoreOpen(!moreOpen)}>
-            Filters{chips.length ? ` (${chips.length})` : ""}
-          </button>
-        )}
-      </form>
+      </ListBar>
       {range === "custom" && (
         <div className="report-dates">
           <div className="field"><label htmlFor="rp-since">From</label>
@@ -305,32 +260,6 @@ export function LiveReports({ groupId }: { groupId?: string }) {
           <div className="field"><label htmlFor="rp-until">To</label>
             <input id="rp-until" type="date" value={params.get("until") ?? ""} onChange={(e) => update({ until: e.target.value, page: null })} /></div>
         </div>
-      )}
-      {moreOpen && data && (
-        <div id="rp-more" className="report-more">
-          {otherFilters.map((f) => (
-            <div className="field" key={f.key}><label htmlFor={`rp-${f.key}`}>{f.label}</label>
-              <select id={`rp-${f.key}`} value={params.get(f.key) ?? ""} onChange={(e) => update({ [f.key]: e.target.value, page: null })}>
-                <option value="">Any</option>
-                {f.options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select></div>
-          ))}
-          <button type="button" className="linkbtn small report-more-done" onClick={() => setMoreOpen(false)}>Done</button>
-        </div>
-      )}
-      {chips.length > 0 && (
-        <ul className="report-chips" aria-label="Filters in use">
-          {chips.map((c) => (
-            <li key={c.key} className="chip">{c.text}
-              <button type="button" aria-label={`Remove the ${c.label} filter`} onClick={() => update({ [c.key]: null, page: null })}>×</button>
-            </li>
-          ))}
-          <li><button type="button" className="linkbtn small" onClick={() => {
-            const keep = new URLSearchParams();
-            for (const k of ["report", "range", "since", "until", "group_id", "q", "cols", "page_size", "by"]) if (params.get(k)) keep.set(k, params.get(k)!);
-            setParams(keep, { replace: true });
-          }}>Clear filters</button></li>
-        </ul>
       )}
 
       {report.error ? <ErrorNotice error={report.error} /> : null}
@@ -347,8 +276,9 @@ export function LiveReports({ groupId }: { groupId?: string }) {
             </section>
           )}
           {data.chart && <ReportChart chart={data.chart} period={periodKind} title={data.label} busy={report.loading} />}
-          <div className="report-toolbar">
-            <span role="status" aria-live="polite">{fmtNum(data.total_rows)} {data.total_rows === 1 ? "row" : "rows"}{report.loading ? " (updating…)" : ""}</span>
+          <div className="report-toolbar" id="rp-top">
+            {/* The count is the pager's, below (#545): here only that it's updating */}
+            <span role="status" aria-live="polite" className="small muted">{report.loading ? "Updating…" : ""}</span>
             <details className="report-columns" key={name}>{/* a new chooser, closed, for each report */}
               <summary>Columns</summary>
               <fieldset className="choices">
@@ -373,13 +303,14 @@ export function LiveReports({ groupId }: { groupId?: string }) {
               Email this view
             </button>
           </div>
+          {pager("top")}
           {scheduling && <ScheduleView report={name} label={data.label} params={params}
             groupId={groupId ?? params.get("group_id")} onClose={() => setScheduling(false)} />}
           <ErrorNotice error={exportError} />
           {data.rows.length === 0 ? <p className="empty">Nothing matches.</p> : (
             <div className="table-wrap" ref={tableRef}>
               <table>
-                <caption className="visually-hidden">{data.label}, page {data.page} of {pages}</caption>
+                <caption className="visually-hidden">{data.label}, page {data.page} of {Math.max(1, Math.ceil(data.total_rows / data.page_size))}</caption>
                 <thead>
                   <tr>
                     {shown.map((c) => {
@@ -422,17 +353,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
               </table>
             </div>
           )}
-          {data.total_rows > 0 && (
-            <nav className="pager" aria-label="Pages">
-              <button className="btn secondary small" disabled={data.page <= 1} onClick={() => update({ page: String(data.page - 1) })}>Previous</button>
-              <span>Page {data.page} of {pages}</span>
-              <button className="btn secondary small" disabled={data.page >= pages} onClick={() => update({ page: String(data.page + 1) })}>Next</button>
-              <label htmlFor="rp-size" className="small">Rows per page</label>
-              <select id="rp-size" value={String(data.page_size)} onChange={(e) => update({ page_size: e.target.value === "25" ? null : e.target.value, page: null })}>
-                {[25, 50, 100, 200].map((n) => <option key={n} value={n}>{n}</option>)}
-              </select>
-            </nav>
-          )}
+          {pager("bottom")}
         </>
       )}
     </div>

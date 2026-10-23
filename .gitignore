@@ -27,6 +27,7 @@ deploy/k8s/portal.env
 deploy/k8s/.last-build
 deploy/k8s/.last-build.new
 deploy/k8s/.rendered/
+deploy/k8s/deploy-history
 deploy/k8s/worker.env
 deploy/cloudflare-worker/wrangler.toml
 deploy/cloudflare-worker/.wrangler/

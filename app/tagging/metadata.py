@@ -2,6 +2,7 @@
 names of embedded files."""
 from __future__ import annotations
 
+import datetime as dt
 import re
 
 import pikepdf
@@ -42,6 +43,9 @@ def apply_document_metadata(pdf: pikepdf.Pdf, *, title: str, language: str, pdfu
         changes.append("DisplayDocTitle enabled")
 
     pdf.docinfo[Name.Title] = String(title)
+    fixed = fix_dates(pdf)
+    if fixed:
+        changes.append(f"{fixed} date(s) that weren't valid PDF dates rewritten or removed")
     rewritten = _drop_old_style_metadata(pdf)
     with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
         if rewritten:
@@ -51,6 +55,8 @@ def apply_document_metadata(pdf: pikepdf.Pdf, *, title: str, language: str, pdfu
             except Exception:  # noqa: BLE001 - an odd date or encoding there mustn't cost the title and identifier
                 pass
         meta["dc:title"] = title
+        if meta.get("xmp:ModifyDate"):  # in step with the document information's, which fix_dates just set
+            meta["xmp:ModifyDate"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         meta["pdfuaid:part"] = str(pdfua_part)
         if pdfua_part == 2:
             meta["pdfuaid:rev"] = "2024"  # PDF/UA-2's revision (ISO 14289-2:2024)
@@ -102,6 +108,74 @@ def name_embedded_files(pdf: pikepdf.Pdf) -> int:
         done += 1
     return done
 
+
+
+# A PDF date (ISO 32000-2 7.9.4): D:YYYY, then optionally MM DD HH mm SS each in turn, then Z or +/-HH'mm
+_DATE = re.compile(r"D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?(?:[Zz]|[+-]\d{2}(?:'?\d{2}'?)?)?")
+
+
+def _date_text(value) -> str | None:
+    """A date string's text, read the way producers get it wrong: UTF-16 with or without its byte-order mark (seen
+    as every other byte zero), padding, a missing "D:". None when it isn't a date at all."""
+    try:
+        raw = bytes(value)
+    except Exception:  # noqa: BLE001
+        return None
+    if raw[:2] in (b"\xfe\xff", b"\xff\xfe"):
+        text = raw[2:].decode("utf-16-be" if raw[:1] == b"\xfe" else "utf-16-le", errors="ignore")
+    else:
+        text = raw.replace(b"\x00", b"").decode("latin-1")
+    text = text.strip().replace(" ", "")
+    if text[:1].isdigit():
+        text = "D:" + text
+    m = _DATE.fullmatch(text)
+    if not m:
+        return None
+    month, day, hour, minute, second = (int(g) if g else None for g in m.groups()[1:])
+    ok = (month is None or 1 <= month <= 12) and (day is None or 1 <= day <= 31) and (hour is None or hour <= 23) \
+        and (minute is None or minute <= 59) and (second is None or second <= 59)
+    return text if ok else None
+
+
+def _fix_date(holder: Dictionary, key: str) -> int:
+    """One date entry as plain text, or removed when it can't be read. 1 when it changed."""
+    value = holder.get(key)
+    if not isinstance(value, String):
+        return 0
+    text = _date_text(value)
+    if text is None:
+        del holder[key]
+        return 1
+    if bytes(value) != text.encode("ascii"):
+        holder[key] = String(text)
+        return 1
+    return 0
+
+
+def fix_dates(pdf: pikepdf.Pdf, now: dt.datetime | None = None) -> int:
+    """Dates a checker can read (#483). PAC fails a date stored as UTF-16 (one producer wrote the document's
+    modification date that way, cut short), and stopped altogether on it; veraPDF doesn't check dates. The document
+    information's ModDate becomes now (the file is being changed); every other date (its CreationDate, an
+    annotation's /M, an embedded file's dates) is written back as plain text when it can be read, and removed when it
+    can't (none of them is required). Returns how many were changed or removed, not counting the new ModDate unless
+    the old one wasn't a plain, valid date."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    changed = 0
+    info = pdf.trailer.get("/Info")
+    if isinstance(info, Dictionary):
+        if "/ModDate" in info:  # counted when it wasn't a plain, valid date
+            text = _date_text(info.ModDate)
+            changed += text is None or bytes(info.ModDate) != text.encode("ascii")
+        info.ModDate = String(now.strftime("D:%Y%m%d%H%M%SZ"))
+        changed += _fix_date(info, "/CreationDate")
+    for obj in pdf.objects:
+        if isinstance(obj, pikepdf.Stream):  # an embedded file: its dates are in /Params
+            params = obj.get("/Params")
+            if isinstance(params, Dictionary):
+                changed += _fix_date(params, "/CreationDate") + _fix_date(params, "/ModDate")
+        elif isinstance(obj, Dictionary) and (obj.get("/Type") == Name.Annot or ("/Subtype" in obj and "/Rect" in obj)):
+            changed += _fix_date(obj, "/M") + _fix_date(obj, "/CreationDate")
+    return changed
 
 
 _OLD_ABOUT = re.compile(rb"<rdf:Description[^>]*\sabout\s*=")

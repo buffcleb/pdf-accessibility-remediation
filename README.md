@@ -8,7 +8,7 @@ look, and shows people exactly what still needs a human eye.**
 [![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Target: PDF/UA-1](https://img.shields.io/badge/target-PDF%2FUA--1-2E7D32.svg)](https://www.iso.org/standard/64599.html)
 
-![My documents: pages left for each service, the Submit PDFs box with the AI level, and a list of five documents with their status and result](docs/images/my-documents.png)
+![My documents: pages left for each service, the Submit PDFs box with the processing option and AI level, and Your documents with a search box, a status choice and Filters, above five documents with their status and result](docs/images/my-documents.png)
 
 A self-hosted service with a web portal. People upload PDFs; the engine adds the structure assistive technology needs
 (headings, lists, tables, figures with alt text, reading order, language detected from the text), checks the result
@@ -19,6 +19,8 @@ runs local or cloud models, and everything it writes is checked or flagged for r
 > **Status:** a proof of concept, in use on a test deployment. See [known limitations](docs/evaluation/README.md#known-limitations).
 
 ## Highlights
+
+> **Changed 22 October 2026:** the portal's security alerts, SIEM export and API tokens for scripts are named.
 
 - **Never changes how a document looks.** Tags are added around the existing drawing operators, and every job proves
   the pages render byte-for-byte the same. When a document can't pass without a visible change (usually fonts), you get
@@ -41,11 +43,12 @@ runs local or cloud models, and everything it writes is checked or flagged for r
   never send anything outside.
 - **A complete portal:** emailed-code sign-in, groups and approval, page quotas per service with a ledger, a
   side-by-side **tag manager and editor** with versions, help requests, live reports with charts, scheduled email
-  summaries, queues, and an audit log. It aims at WCAG 2.2 AA itself.
+  summaries, queues, an audit log (with security alerts, and an export to a SIEM), and personal API tokens for
+  scripts. It aims at WCAG 2.2 AA itself.
 - **Optional Adobe route:** send documents to Adobe PDF Services instead, and get Adobe's file checked the same way,
   plus a copy with AI alt text.
 
-![A document's page: Passes PDF/UA-1 with failed checks 111 to 0, the Fixed, To review and Still failing tiles, the Needs review list, and the downloads](docs/images/document-page.png)
+![A document's page: Back and Previous at the top, Passes PDF/UA-1 with failed checks 120 to 0, the Fixed, To review and Still failing tiles, the Needs review list, and the Downloads card with Download everything (zip)](docs/images/document-page.png)
 
 ![The tag manager: the original and the remediated document side by side, the remediated one with its tags outlined and labeled on the page, and the editing panel for the selected heading](docs/images/tag-manager/overview.png)
 
@@ -53,17 +56,10 @@ More in the [tag manager guide](docs/user-guide/people/tag-manager/README.md).
 
 ## How it works
 
-```mermaid
-flowchart LR
-  B[Browser] --> W["Portal<br/>web app, API, worker"]
-  W -- "submit, poll, fetch" --> E["Engine<br/>API + workers"]
-  E --> V["veraPDF ·<br/>Tesseract"]
-  E -- "AI calls" --> G["AI gateway<br/>LiteLLM"]
-  G --> L["Local models"]
-  G -.-> C["Cloud models<br/>(opt-in)"]
-  E -.-> A["Adobe PDF Services<br/>(opt-in)"]
-  W --- D[("PostgreSQL · Redis ·<br/>S3 storage")]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/diagrams/how-it-works-dark.svg">
+  <img src="docs/images/diagrams/how-it-works.svg" alt="People use the portal in a browser; the portal keeps records and files and sends documents to the engine, which checks them with veraPDF and Tesseract and makes its AI calls through the AI gateway to local models, or to cloud models and Adobe PDF Services when those are turned on.">
+</picture>
 
 One document through the engine: **validate** the original → **analyze** the layout (text, scripts and fractions,
 headings, lists, tables, images, columns; OCR for scans) → **AI** for alt text, tables, reading order and notation →
@@ -91,13 +87,16 @@ Open http://localhost:8088 and sign in; the code arrives in Mailpit at http://lo
 
 ## Documentation
 
+> **Changed 22 October 2026:** Operations now includes the runbooks, the SIEM export and malware scanning; the API
+> reference covers the portal's API for scripts.
+
 | | |
 |---|---|
 | **[User guide](docs/user-guide/README.md)** | For [people submitting documents](docs/user-guide/people/README.md), [group admins](docs/user-guide/group-admins/README.md) and [super admins](docs/user-guide/super-admins/README.md) |
 | **[Deployment](docs/deployment/README.md)** | Local, server, Kubernetes, the reference RKE2 deployment, Cloudflare, AWS |
-| **[Operations](docs/operations/README.md)** | Configuration, AI models, email, Adobe, backups, monitoring |
+| **[Operations](docs/operations/README.md)** | Configuration, AI models, email, Adobe, backups, monitoring, limits, runbooks (incidents, secrets, rolling back), the SIEM export, malware scanning |
 | **[Architecture](docs/architecture/README.md)** | The parts, the pipeline, verification, security and design decisions |
-| **[API reference](docs/api/README.md)** | The engine's API, for integrations |
+| **[API reference](docs/api/README.md)** | The engine's API, for integrations; the portal's API for scripts with a personal token |
 | **[Evaluation](docs/evaluation/README.md)** | Test method, results, cost model, test reports |
 | **[Design notes](docs/design/README.md)** | The original portal specification and the build log |
 
@@ -130,6 +129,8 @@ main, each job only when files it tests have changed. Batch testing against fold
 
 ## License
 
+> **Changed 22 October 2026:** the optional ClamAV and Squid are named.
+
 [GNU Affero General Public License v3.0](LICENSE). If you run a modified version as a network service, you must offer
 its source to the people using it.
 
@@ -137,4 +138,6 @@ It builds on, among others, PyMuPDF (AGPL-3.0), veraPDF (GPL-3.0+ or MPL-2.0), T
 (MPL-2.0), pdfplumber (MIT), WeasyPrint (BSD), LiteLLM (MIT) and pdf.js (Apache-2.0).
 The optional music reading service is [Audiveris](https://github.com/Audiveris/audiveris) (AGPL-3.0), run as a
 separate program. Formulas are read by rule with [MathCAT](https://github.com/daisy/MathCAT) (MIT), and the optional
-formula reader is RapidLaTeXOCR (Apache-2.0) with pix2tex's model (MIT).
+formula reader is RapidLaTeXOCR (Apache-2.0) with pix2tex's model (MIT). The optional malware scanner is
+[ClamAV](https://www.clamav.net/) (GPL-2.0) and the optional egress proxy [Squid](https://www.squid-cache.org/)
+(GPL-2.0), each run from its own image.

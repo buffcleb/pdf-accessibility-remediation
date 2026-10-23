@@ -106,6 +106,7 @@ spec:
         metadata:
           labels: { app: backup }
         spec:
+          automountServiceAccountToken: false  # no Kubernetes API access (#470)
           restartPolicy: Never
           imagePullSecrets: [{ name: pdfrem-ghcr }]
           securityContext: { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }

@@ -1,2 +1,24 @@
 # Vulnerabilities scripts/build.sh's Trivy scan should not report (#362): one ID per line, each with the reason it
 # doesn't apply here and the date it was looked at. Revisit when a fix version exists.
+
+# 2026-10-21, the formula reading image (docker/formula) only: the fixes (certifi 2026.10.19, released 2026-10-20;
+# pillow 13.0.0, 2026-10-16) are newer than its rule that every pinned release is at least two weeks old. Bump both
+# in docker/formula/requirements.txt once they are (#504); these lines stop applying on 2026-11-03 either way.
+# certifi: the service makes no HTTPS calls while running (its model is fetched at build and checked by SHA-256), so
+# the compromised CA certificates it bundles have nothing to trust.
+GHSA-6q48-6c7w-9gw2 exp:2026-11-03
+# pillow: it decodes only PNG crops the engine renders from the PDF and sends over the internal Redis queue, never a
+# person's own image file, so the JPEG, TIFF, GIF and PDF-writing flaws can't be reached; the rest need a crafted PNG.
+CVE-2026-112403 exp:2026-11-03
+CVE-2026-112397 exp:2026-11-03
+CVE-2026-112400 exp:2026-11-03
+CVE-2026-112404 exp:2026-11-03
+CVE-2026-112895 exp:2026-11-03
+CVE-2026-112896 exp:2026-11-03
+CVE-2026-112897 exp:2026-11-03
+# 2026-10-22, the same image: two CRITICAL pillow findings published 2026-10-19, fixed in the same pillow 13.0.0. The
+# service hands the model only PNG bytes from the queue (docker/formula/serve.py checks the signature), opens no file
+# by name, and writes no images. CVE-2026-112393 is in saving compressed TIFF; CVE-2026-112900 needs EPS input and
+# Ghostscript, which the image doesn't have (python:3.12-slim with libgl1 and libglib2.0 only).
+CVE-2026-112393 exp:2026-11-03
+CVE-2026-112900 exp:2026-11-03

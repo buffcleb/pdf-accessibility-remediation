@@ -17,6 +17,7 @@ from typing import Iterator
 import pikepdf
 from pikepdf import Array, Dictionary, Name
 
+from app.pipeline.models import bbox_area, bbox_intersection
 from app.tagging.content_marker import mcid_of
 from app.tagging.mathml_tags import in_mathml
 
@@ -44,6 +45,12 @@ CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 OFFICE_AUTO_ALT = re.compile(r"\s*(Description automatically generated(?: with (?:very high|high|medium|low) confidence)?"
                              r"|AI-generated content may be incorrect)\.?\s*", re.I)
 _ROW_GROUP_KIDS = {"TR"}
+# Elements that hold text and inline elements only, and the groupings that don't belong inside them (#486)
+_TEXT_BLOCKS = {"P", "H", "H1", "H2", "H3", "H4", "H5", "H6"}
+_GROUPINGS = {"Sect", "Div", "Art", "Part", "NonStruct"}
+# Tags inside a line of text: a space they hold may be the one between two words (#490)
+_INLINE_ROLES = {"Span", "Quote", "Note", "Reference", "BibEntry", "Code", "Link", "Annot", "Ruby", "Warichu", "Lbl",
+                 "Em", "Strong", "Sub"}
 MAX_SPAN = 100  # a RowSpan or ColSpan past this is a producer's error: no real table is that wide
 # How far a stream's marked-content ids may run past the number of its sequences before the numbering is judged
 # unusable (an id of a billion would size the ParentTree array by it): this many ids per sequence, plus this slack
@@ -139,6 +146,11 @@ class ExistingTree:
         self.outlines_released = 0  # undescribed Figures that were only the outline of some text
         self.double_claims = 0  # content the file's own tags claimed more than once (one claim kept)
         self.double_claim_pages: list[int] = []
+        # The tables found on each page from its ruling lines (page index -> TableRegions), set by the tagger: where
+        # a kept table's merged cells are when the file didn't say (#557)
+        self.page_tables: dict[int, list] = {}
+        self._describe = None
+        self._info: dict[ObjGen, ElemInfo] = {}
 
     # ------------------------------------------------------------------ inspect
     def inspect(self) -> ExistingTagReport:
@@ -249,6 +261,7 @@ class ExistingTree:
             gone = {id(m) for m in refs}
             self._remove_refs(e, refs)
             e.mcrefs = [m for m in e.mcrefs if id(m) not in gone]
+            # An emptied cell stays for now: its table goes whole in _cascade_empty if no cell holds anything
             if not e.mcrefs and not e.objrefs and not e.children and e.role not in ("TD", "TH", "Document"):
                 self._mark(e, "removed", "its content already belongs to another tag")
             else:
@@ -310,7 +323,11 @@ class ExistingTree:
         text for figures missing it (from the AI pass over the same region). `describe(elem_info) ->
         (page, bbox, list label) | None` places elements on the page, for joining lists split by a note.
         Returns the set of MCIDs per stream still referenced by the retained tree."""
+        self._describe = describe
+        self._info = {e.obj.objgen: e for e in self.elements if e.obj.is_indirect}
         self._decide_tables()
+        self._figures_from_shapes()
+        self._lift_out_of_text_blocks()
         self._fix_headings()
         for e in self.elements:
             if e.decision in ("replaced", "removed"):
@@ -469,18 +486,49 @@ class ExistingTree:
         return n
 
     def _cascade_empty(self) -> None:
-        """A container whose only children were removed is itself empty: remove it too."""
+        """A container whose only children were removed is itself empty: remove it too. Empty cells stay, they keep
+        a table's grid, but a table with nothing in any cell goes whole (#556: the second copy of a table the file
+        tagged twice, left with no content once its claims went to the first)."""
         changed = True
         while changed:
             changed = False
+            dropped = {d.obj.objgen for d in self.elements
+                       if d.obj.is_indirect and d.decision in ("replaced", "removed", "artifacted")}
             for e in self.elements:
-                if e.decision in ("replaced", "removed", "artifacted") or e.mcrefs or e.objrefs or not e.children:
+                if e.decision in ("replaced", "removed", "artifacted"):
+                    continue
+                if e.role == "Table" and not self._has_content(e, dropped):
+                    for d in self._descendants(e):
+                        if d.decision not in ("replaced", "removed", "artifacted"):
+                            self._mark(d, "removed", "a table with nothing in any of its cells")
+                    changed = True
+                    continue
+                if e.mcrefs or e.objrefs or not e.children:
                     continue
                 if e.role in ("TD", "TH", "Document"):
                     continue
                 if all(c.decision in ("replaced", "removed", "artifacted") for c in e.children):
                     self._mark(e, "removed", "empty after its empty children were removed")
                     changed = True
+
+    def _has_content(self, e: ElemInfo, dropped: set[ObjGen]) -> bool:
+        """Whether anything under e (itself included) that is still kept (not in `dropped`) holds content or an
+        annotation. Read from the tree as it now stands, so tags a repair moved in or made (a TBody, a Link) count."""
+        seen: set[ObjGen] = set()
+
+        def holds(obj) -> bool:
+            if obj.is_indirect:
+                if obj.objgen in dropped or obj.objgen in seen:
+                    return False
+                seen.add(obj.objgen)
+            for kid in self._iter_k(obj.get("/K")):
+                if _is_struct_elem(kid):
+                    if holds(kid):
+                        return True
+                elif not isinstance(kid, Dictionary) or "/MCID" in kid or "/Obj" in kid:
+                    return True
+            return False
+        return holds(e.obj)
 
     def _new_elem(self, role: str, parent) -> pikepdf.Object:
         d = Dictionary(Type=Name.StructElem, S=Name("/" + role), P=parent, K=Array())
@@ -765,7 +813,8 @@ class ExistingTree:
 
     def _pad_table_rows(self, e: ElemInfo) -> None:
         """PDF/UA 7.2-42/43: every row must span the same number of columns (counting row and
-        column spans). Short rows get empty TD cells at the end."""
+        column spans). Short rows are placed against the table drawn on the page when there is one (#557: merged
+        cells the file wrote no spans for); otherwise they get empty TD cells at the end."""
         def span(cell, key):
             for a in self._iter_k(cell.get("/A")):
                 if isinstance(a, Dictionary) and key in a:
@@ -788,6 +837,8 @@ class ExistingTree:
             rows += [r for r in groups if resolve_role(str(r.S)[1:], self.role_map) == "TR"]
         if not rows:
             return
+        if self._place_by_drawn_table(e, rows, span):
+            return
         carry: dict[int, int] = {}  # row index -> columns occupied by row spans from above
         widths = []
         for i, row in enumerate(rows):
@@ -805,6 +856,108 @@ class ExistingTree:
                 padded += target - w
         if padded:
             self._mark(e, "repaired", f"{padded} empty cell(s) added so every row spans {target} columns")
+
+    def _place_by_drawn_table(self, e: ElemInfo, rows: list, span) -> bool:
+        """Short rows of a kept table with no spans, placed by the table drawn on the page (#557). Word and Acrobat
+        write a cell merged down a column (a drug class over three drugs) as one TD in its first row and nothing in
+        the rows below; padding those rows at the end moves every cell after the gap one column to the left. Here
+        each tagged cell takes the column of the drawn cell it sits in, and each gap is closed by the cell the
+        drawing merges over it: the cell to its left (ColSpan) or the one above (RowSpan). A gap no merged cell
+        covers gets an empty TD in its place. Returns False, changing nothing, when the drawing doesn't settle every
+        cell: the table is then padded at the end as before."""
+        cells = [[c for c in self._iter_k(r.get("/K")) if _is_struct_elem(c)] for r in rows]
+        widths = [len(rc) for rc in cells]
+        if self._describe is None or len(set(widths)) == 1 or not all(widths):
+            return False
+        if any(span(c, k) != 1 for rc in cells for c in rc for k in ("/RowSpan", "/ColSpan")):
+            return False
+        target = max(widths)
+        where = self._describe(e)
+        if where is None:
+            return False
+        pi, box, _ = where
+        drawn = max((t for t in self.page_tables.get(pi, []) if t.n_cols == target),
+                    key=lambda t: bbox_intersection(box, t.bbox), default=None)
+        if drawn is None or bbox_intersection(box, drawn.bbox) < 0.5 * max(bbox_area(box), 1e-6):
+            return False
+
+        def drawn_at(x: float, y: float):
+            return next((d for d in drawn.cells if d.bbox is not None
+                         and d.bbox[0] <= x <= d.bbox[2] and d.bbox[1] <= y <= d.bbox[3]), None)
+
+        def centre(c):
+            info = self._info.get(c.objgen) if c.is_indirect else None
+            at = self._describe(info) if info is not None else None
+            if at is None or at[0] != pi:
+                return None
+            b = at[1]
+            return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+
+        # Each row's cells in their drawn columns, and the height the row sits at
+        placed = []
+        for rc in cells:
+            spots = [centre(c) for c in rc]
+            if any(s is None for s in spots):
+                return False
+            ds = [drawn_at(*s) for s in spots]
+            if any(d is None for d in ds):
+                return False
+            cols = [d.col for d in ds]
+            if cols != sorted(set(cols)):
+                return False
+            placed.append(({col: (c, d) for col, c, d in zip(cols, rc, ds)}, sum(s[1] for s in spots) / len(spots)))
+
+        new_k, row_span, col_span, added = [], {}, {}, 0
+        above: dict[int, tuple] = {}  # column -> (cell, drawn cell) holding it in the row before
+        for (by_col, y), row in zip(placed, rows):
+            out, here = [], {}
+            for col in range(target):
+                if col in by_col:
+                    c, d = by_col[col]
+                    out.append(c)
+                    here[col] = (c, d)
+                    continue
+                cover = next((d for d in drawn.cells if d.bbox is not None and d.col <= col < d.col + d.col_span
+                              and d.bbox[1] <= y <= d.bbox[3]), None)
+                left, up = here.get(col - 1), above.get(col)
+                if cover is not None and left is not None and left[1] is cover:
+                    col_span[left[0].objgen] = col_span.get(left[0].objgen, 1) + 1
+                    here[col] = left
+                elif cover is not None and up is not None and up[1] is cover and col_span.get(up[0].objgen, 1) == 1:
+                    row_span[up[0].objgen] = row_span.get(up[0].objgen, 1) + 1
+                    here[col] = up
+                else:
+                    blank = self._new_elem("TD", row)
+                    out.append(blank)
+                    here[col] = (blank, None)
+                    added += 1
+            new_k.append(out)
+            above = here
+        for row, out in zip(rows, new_k):
+            row.K = Array(out)
+        merged = 0
+        for key, spans in (("/RowSpan", row_span), ("/ColSpan", col_span)):
+            for og, n in spans.items():
+                self._set_table_attr(self.pdf.get_object(og), key, n)
+                merged += 1
+        self._mark(e, "repaired", f"{merged} merged cell(s) given their span and {added} empty cell(s) put in place, "
+                   "from the table drawn on the page")
+        return True
+
+    def _set_table_attr(self, cell, key: str, value) -> None:
+        attrs = cell.get("/A")
+        for a in self._iter_k(attrs):
+            if isinstance(a, Dictionary) and a.get("/O") == Name.Table:
+                a[key] = value
+                return
+        new_attr = Dictionary(O=Name.Table)
+        new_attr[key] = value
+        if attrs is None:
+            cell.A = new_attr
+        elif isinstance(attrs, Array):
+            attrs.append(new_attr)
+        else:
+            cell.A = Array([attrs, new_attr])
 
     def _decide_tables(self) -> None:
         for e in self.elements:
@@ -826,6 +979,82 @@ class ExistingTree:
                 for d in self._descendants(e):
                     d.decision = "replaced"
                 self._mark(e, "replaced", "malformed table: " + "; ".join(sorted(set(problems))[:3]))
+
+    def _figures_from_shapes(self) -> None:
+        """Word maps its pictures (InlineShape, Chart and the like) to Sect in the RoleMap. One that holds its content
+        directly, with no tags inside, and has an Alt entry (Word writes one for a picture, empty when nobody
+        described it) or ActualText is a picture: it becomes a Figure, keeping its description, and one without gets
+        a description as any figure does (#486). As a Sect PAC warned of a possibly inappropriate Sect and of content
+        in an inadmissible place, and dissolving it into its paragraph would leave a reader nothing for it."""
+        for e in self.elements:
+            if e.decision in ("replaced", "removed", "artifacted") or e.role not in _GROUPINGS:
+                continue
+            if not e.mcrefs or e.children or not ("/Alt" in e.obj or str(e.obj.get("/ActualText") or "").strip()):
+                continue
+            was = e.raw_role
+            e.obj.S = Name.Figure
+            e.raw_role = e.role = "Figure"
+            self._mark(e, "repaired", f"/{was} (a picture mapped to /Sect): now a Figure")
+
+    def _lift_out_of_text_blocks(self) -> None:
+        """A grouping inside a paragraph or heading (#486): InDesign puts an anchored object, such as a form's
+        numbered box, into its heading as a Story (mapped to Sect) holding a heading of its own with the number. PAC
+        warns of a possibly inappropriate Sect, and a reader meets a heading inside a heading. The grouping is
+        dissolved into the paragraph or heading where it stood, and so is any paragraph or heading inside it: their
+        words become part of it ("4." then the heading's words). Inline elements stay as they are."""
+        gone = ("replaced", "removed", "artifacted")
+        for e in self.elements:  # document order: an outer block first
+            if e.decision in gone or e.role not in _TEXT_BLOCKS:
+                continue
+            if not any(c.role in _GROUPINGS and c.decision not in gone for c in e.children):
+                continue
+            items, kids, dissolved = self._dissolve_into(e, e, top=True)
+            if not dissolved:
+                continue
+            e.obj.K = Array(items)
+            e.children = kids
+            self._mark(e, "repaired", f"{dissolved} section(s) or block(s) inside this /{e.role} made part of it")
+
+    def _dissolve_into(self, src: ElemInfo, into: ElemInfo, top: bool = False) -> tuple[list, list, int]:
+        """src's content as items of into's /K: groupings and text blocks (below the top) dissolved into them,
+        everything else kept. Marked content keeps its page: an MCID of another page becomes an MCR with /Pg."""
+        items, kids, dissolved = [], [], 0
+        by_obj = {id(c.obj): c for c in src.children}
+        for item in self._iter_k(src.obj.get("/K")):
+            if _is_struct_elem(item):
+                child = by_obj.get(id(item)) or self._info_of(item)
+                dissolve = child is not None and child.decision not in ("replaced", "removed", "artifacted") and (
+                    child.role in _GROUPINGS if top else child.role in _GROUPINGS | _TEXT_BLOCKS)
+                if dissolve:
+                    more, more_kids, n = self._dissolve_into(child, into)
+                    items += more
+                    kids += more_kids
+                    dissolved += n + 1
+                    into.mcrefs += child.mcrefs
+                    into.objrefs += child.objrefs
+                    child.mcrefs, child.objrefs, child.children = [], [], []
+                    self._mark(child, "removed", f"inside a /{into.role}: its content became part of it")
+                    continue
+                if child is not None:
+                    item.P = into.obj
+                    child.parent = into.obj
+                    kids.append(child)
+                items.append(item)
+            elif not isinstance(item, Dictionary) and src is not into and src.page != into.page \
+                    and src.page is not None:
+                try:
+                    mcid = int(item)
+                except (TypeError, ValueError):
+                    items.append(item)
+                    continue
+                items.append(Dictionary(Type=Name.MCR, Pg=self.pdf.get_object(src.page), MCID=mcid))
+            elif isinstance(item, Dictionary) and src is not into and "/Pg" not in item and src.page is not None \
+                    and src.page != into.page and item.get("/Type") in (Name.MCR, Name.OBJR):
+                item.Pg = self.pdf.get_object(src.page)
+                items.append(item)
+            else:
+                items.append(item)
+        return items, kids, dissolved
 
     def _fix_headings(self) -> None:
         prev = 0
@@ -961,7 +1190,55 @@ class ExistingTree:
         return [e for e in self.elements if e.decision not in ("replaced", "removed", "artifacted") and e.mcrefs]
 
     def artifact_mcids(self) -> set[tuple[ObjGen, int]]:
-        return {(m.owner, m.mcid) for e in self.elements if e.decision == "artifacted" for m in e.mcrefs if m.valid}
+        return {(m.owner, m.mcid) for e in self.elements if e.decision == "artifacted" for m in e.mcrefs
+                if m.valid} | getattr(self, "blank_artifacts", set())
+
+    def hide_blank(self, blank: set[tuple]) -> int:
+        """Runs of text that are only spaces (`blank`: (stream objgen, mcid)), in a tag with no visible text of its own
+        (#490): Word's blank lines, kept as paragraphs holding a space, and the space beside a picture alone in its
+        paragraph. PAC notes each as tagged text of only whitespace, and a reader stops on each to hear "blank". The
+        runs leave the tag and become artifacts; a tag left with nothing is removed as empty tags are (a table cell
+        stays). A tag with visible text keeps its spaces: they keep its words apart; so do inline tags (a Span holding
+        the space between two styled words is folded into its paragraph by empty_spans instead), except a Span
+        standing straight in a grouping tag: there are no words beside it to keep apart, and folded in, its space
+        would be content in the grouping tag, which PAC flags as in a possibly inadmissible location (#526: a text
+        box's stray space). Returns how many runs."""
+        done = getattr(self, "blank_artifacts", set())
+        for e in self.elements:
+            if e.decision in ("replaced", "removed", "artifacted") or in_mathml(e.obj):
+                continue
+            if e.role in _INLINE_ROLES and not (e.role == "Span" and self._in_grouping(e)):
+                continue
+            valid = [m for m in e.mcrefs if m.valid]
+            if not valid or any((m.owner, m.mcid) not in blank for m in valid):
+                continue
+            gone = {(m.owner, m.mcid) for m in valid}
+
+            def is_blank(item) -> bool:
+                if isinstance(item, Dictionary):
+                    if "/MCID" not in item or _is_struct_elem(item):
+                        return False
+                    stm, kpg = item.get("/Stm"), item.get("/Pg")
+                    owner = stm.objgen if stm is not None else (kpg.objgen if kpg is not None else e.page)
+                    return (owner, mcid_of(item)) in gone
+                try:
+                    return (e.page, int(item)) in gone
+                except (TypeError, ValueError):
+                    return False
+
+            e.obj.K = Array([it for it in self._iter_k(e.obj.get("/K")) if not is_blank(it)])
+            e.mcrefs = [m for m in e.mcrefs if (m.owner, m.mcid) not in gone]
+            done |= gone
+            self._mark(e, "repaired", f"{len(gone)} run(s) of only spaces made artifacts")
+        self.blank_artifacts = done
+        return len(done)
+
+    def _in_grouping(self, e: ElemInfo) -> bool:
+        """Whether e stands straight in a grouping tag (Document, Part, Art, Sect, Div), which holds no content."""
+        p = e.parent
+        if not (isinstance(p, Dictionary) and _is_struct_elem(p)):
+            return False
+        return resolve_role(str(p.get("/S", ""))[1:], self.role_map) in _GROUPINGS | {"Document"}
 
     def strip(self) -> None:
         """Discard the whole tree (rebuild mode)."""

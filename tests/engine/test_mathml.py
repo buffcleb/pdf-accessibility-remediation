@@ -130,6 +130,7 @@ def test_a_run_with_formulas_reports_them_and_offers_the_files(samples, tmp_path
     flagged = [f for f in reports["tag_verification"]["primary"]["findings"]
                if f["issue"] == "two readings of a formula disagree"]
     assert len(flagged) == 1 and [r["source"] for r in flagged[0]["extra"]["readings"]] == ["ai", "rule"]
+    assert len(flagged[0]["boxes"]) == 1  # the formula's block, for Show (#426)
     summary = reports["remediation_summary"]
     assert "Formulas: 1 saved as MathML" in summary and "1 disagree" in summary
 

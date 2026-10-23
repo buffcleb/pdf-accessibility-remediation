@@ -28,7 +28,7 @@ first sign-in.
    each person's queue, large documents, and whether to offer **Let AI decide**.
 7. **Set retention.** **Settings → Sign-in and data:** how long files and records are kept, sign-in timeouts, and
    whether new groups approve members first.
-8. **Create a group.** **Groups → Create group:** its name and email domains, so people on those domains join it.
+8. **Create a group.** **Groups → Create a group:** its name and email domains, so people on those domains join it.
    For individual people (a gmail.com address, a guest), add their addresses under **People allowed by address**
    on the group's settings instead of a domain.
    Make someone its group admin. ([Groups and people](groups-and-people.md))

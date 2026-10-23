@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { get } from "../../api";
 import { LiveRegion, Notice, fmtNum, useLoad } from "../../components/ui";
-import { POD_STATES, age, cores, memory, podSummary, rowNote, slots, use, type Pod, type PodState, type Workload,
-  type Workloads } from "./podRows";
+import { POD_STATES, age, cores, memory, pin, podSummary, release, rowNote, shortDigest, slots, use, versionRows,
+  type Pod, type PodState, type Workload, type Workloads } from "./podRows";
 import { podCommands } from "./podCommands";
+import { copyText } from "../../components/copy";
 
 const always = () => true;
 
@@ -53,7 +54,42 @@ export function PodView() {
           </div>
         ))}
       </div>
+      <Versions workloads={d.workloads} />
     </section>
+  );
+}
+
+/** Every workload's release in one table, for checking against an advisory (#541). */
+function Versions({ workloads }: { workloads: Workload[] }) {
+  const rows = versionRows(workloads);
+  if (rows.length === 0) return null;
+  return (
+    <>
+      <h3 id="versions-heading">Versions</h3>
+      <p className="muted small">The release each workload runs, from its image's tag (this service's own images:
+        the commit they were built from), or as PostgreSQL and Redis report it. The full digest is in each pod's
+        <strong> About</strong>.</p>
+      <div className="table-wrap">
+        <table aria-labelledby="versions-heading">
+          <thead><tr>
+            <th scope="col">Workload</th><th scope="col">Release</th><th scope="col">Digest</th>
+            <th scope="col">Pinned</th>
+          </tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={`${r.workload}/${r.container.name}/${r.container.digest}/${r.container.image}`}>
+                <td>{r.workload}{r.container.name !== r.workload && <span className="muted"> ({r.container.name})</span>}
+                  {rows.filter((x) => x.workload === r.workload && x.container.name === r.container.name).length > 1
+                    && <span className="muted small"> {r.pods} pod{r.pods === 1 ? "" : "s"}</span>}</td>
+                <td>{release(r.container)}</td>
+                <td><code>{shortDigest(r.container.digest)}</code></td>
+                <td>{r.container.matches === false ? <strong>{pin(r.container)}</strong> : pin(r.container)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 
@@ -102,38 +138,20 @@ function About({ w, p }: { w: Workload; p: Pod }) {
           <h4>{p.containers.length === 1 ? "Image" : "Images"}</h4>
           <ul>
             {p.containers.map((c) => (
-              <li key={c.name}>{p.containers.length > 1 && <>{c.name}: </>}<code>{c.image || "–"}</code></li>
+              <li key={c.name}>
+                {p.containers.length > 1 && <>{c.name}: </>}<code>{c.image || "–"}</code>
+                <dl className="pod-facts">
+                  <dt>Version</dt><dd>{release(c)}</dd>
+                  <dt>Digest</dt><dd>{c.digest ? <code className="pod-digest">{c.digest}</code> : "Not known yet"}</dd>
+                  <dt>Pinned</dt><dd>{pin(c)}</dd>
+                </dl>
+              </li>
             ))}
           </ul>
         </>
       )}
     </details>
   );
-}
-
-/** Text onto the clipboard: the Clipboard API, or where a browser refuses it, a hidden text area's copy. */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    const back = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const area = document.createElement("textarea");
-    area.value = text;
-    area.setAttribute("readonly", "");
-    area.style.position = "fixed";
-    area.style.opacity = "0";
-    document.body.appendChild(area);
-    area.select();
-    try {
-      return document.execCommand("copy");
-    } catch {
-      return false;
-    } finally {
-      area.remove();
-      back?.focus();  // the button pressed keeps the keyboard's place
-    }
-  }
 }
 
 /** The kubectl commands that apply to this pod, each with a copy button (#419). */

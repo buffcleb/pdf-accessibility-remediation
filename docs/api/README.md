@@ -1,11 +1,15 @@
-# API reference (the engine)
+# API reference
+
+> **Changed 22 October 2026:** the engine's API key is required (#457), `GET /api/v1/capacity` counts a stopping
+> worker's document (#531), and the portal's API for scripts has [a section of its own](#the-portals-api-for-scripts).
 
 The portal is the normal way in. The engine's API is **internal**, for the portal, integrations and testing; never
 expose it to the internet. Interactive documentation is served at `/docs` on the engine (for example
 `http://localhost:8000/docs`).
 
-If `SERVICE_API_KEY` is set, every call except `/health`, `/live` and `/metrics` needs an `X-API-Key` header
-(`401` without it).
+Every call except `/health`, `/live` and `/metrics` needs an `X-API-Key` header with `SERVICE_API_KEY` (`401`
+without it). The API won't start without that setting, unless `ALLOW_NO_API_KEY=true` (local development only: the
+API then takes calls without a key).
 
 ## Contents
 
@@ -16,6 +20,7 @@ If `SERVICE_API_KEY` is set, every call except `/health`, `/live` and `/metrics`
 - [Classify a document](#classify-a-document)
 - [Other endpoints](#other-endpoints)
 - [Many documents: the harness](#many-documents-the-harness)
+- [The portal's API for scripts](#the-portals-api-for-scripts)
 
 ## Remediate a document
 
@@ -61,7 +66,9 @@ curl -F "file=@report.pdf" -F "ai_provider=gateway" -F "ai_model=local-vision" h
 
 `GET /api/v1/jobs/{job_id}`
 
-While the job runs, `status` is `processing`, with a `progress` stage. A job whose worker was killed before it could
+While the job runs, `status` is `processing`, with a `progress` stage. An edit job whose file and tag map are
+already final, and only its checks are left, also gives `partial`: `{"files": {"remediated_primary": url},
+"tag_map": url}`, so the version can be opened before it's checked. A job whose worker was killed before it could
 record a failure (the hard time limit, out of memory) is reported as `failed` with error `time_limit_exceeded` or
 `worker_lost`, not left as `processing`. When it finishes:
 
@@ -138,6 +145,7 @@ A failed job has `status: failed` with an `error` code and message, for example 
 | `judge_model` | Optional review model |
 | `reference` | Optional: the version a corrected file replaces; the visual comparison is made against it |
 | `validator`, `verapdf_ua2` | Optional: how veraPDF runs, as in the remediation flags |
+| `ai_read` | Optional JSON list: the AI's readings flagged on the version this one is based on, each `{"ai_read": [page, bbox, kind, spoken], "element": n, "readings": {...}}` as that version's findings carry them in `extra`. They're flagged again on the result, except where these edits give the element new text |
 
 Returns a job id, polled like a remediation.
 
@@ -168,9 +176,12 @@ Returns `{kind, confidence, probabilities, backend, model, notation, hints, page
   when one is configured), the AI providers and Adobe's status.
 - `POST /api/v1/jobs/{job_id}/stop`: stops a job that's waiting or in progress. It reports as failed with error
   `stopped`, and the worker process running it is ended. A finished job is left as it is (`"stopped": false`).
-- `GET /api/v1/capacity`: `{"workers": 2, "documents_at_once": 4}`, the workers answering now and how many
-  documents they process at once between them (`null` when none answer). The portal uses it to decide how many
-  documents to hand over when workers are scaled with the queue.
+- `GET /api/v1/capacity`: `{"workers": 2, "documents_at_once": 4, "documents_on_stopping_workers": 0}`, the
+  workers answering now and how many documents they process at once between them (`null` when none answer). The
+  portal uses it to decide how many documents to hand over when workers are scaled with the queue. A worker told to
+  stop (a new release, scaling down) finishes its document but no longer answers; that document still counts in
+  `documents_at_once` while its heartbeat is fresh, and `documents_on_stopping_workers` says how many there are
+  (#531), so new documents go to the new worker meanwhile.
 - `GET /api/v1/metrics`: for Prometheus (#397), in its text format, without the API key: what's waiting in Redis
   (`engine_queue_length` by queue: `engine`, `adobe`, `music`) and `engine_redis_up`. Each worker serves its own on
   port 9464 (`WORKER_METRICS_PORT`; `WORKER_METRICS=off` turns it off): `engine_worker_busy` and
@@ -187,3 +198,35 @@ python harness/run_harness.py path/to/folder --provider gateway --model local-vi
 ```
 
 See [harness/README.md](../../harness/README.md).
+
+## The portal's API for scripts
+
+> **New 22 October 2026:** personal API tokens (#518).
+
+People can send their own documents from a script with a **personal API token**, made in the portal's Settings
+once super admins and their group's admins have switched tokens on. This is the portal's API, at the service's
+public address, not the engine's. The guide for people writing the scripts, with `curl` examples, is
+[Scripting](../user-guide/people/scripting.md); what super admins set is in
+[Settings](../user-guide/super-admins/settings.md).
+
+- **Sign-in:** `Authorization: Bearer pdfr_…`. The token is shown once; only a keyed hash of it is kept (under
+  `PORTAL_SECRET_KEY`, so a new one of those stops every token).
+- **What a token may call:** only its owner's own documents, on the document routes:
+
+  | Call | Needs |
+  |---|---|
+  | `POST /api/v1/jobs` (multipart, one or more `files`) | Always allowed. Each document uses the token's processing service, AI level and kind, whatever the request says |
+  | `GET /api/v1/jobs/{id}`, `GET /api/v1/documents` (`page`, `page_size` up to 200, the list's filters) | **Check their status** |
+  | `GET /api/v1/documents?not_downloaded=true` | Download: the finished documents this token hasn't downloaded yet |
+  | `GET /api/v1/jobs/{id}/files.zip`, `GET /api/v1/jobs/{id}/files/{file}` | Download: **Everything**, or **Chosen files** one at a time |
+
+  Anything else, Administration and Settings included, is refused with `403 token_not_allowed`, whoever owns the
+  token; a call the token wasn't given is `403 token_scope`.
+- **Limits:** five tokens a person, 90 days by default and 365 at most, stopped after 90 days unused (Settings ›
+  API tokens for scripts); the same per-person hourly limits as the web app (`429` past one). Switching tokens off,
+  for the service or a group, stops every one at once. ([Limits](../operations/limits.md#reports-files-and-sign-in))
+- **Records:** documents sent this way are marked **sent by script** with the token's name; making and revoking a
+  token is in the audit log (`api_token.created`, `api_token.revoked`). Owners are emailed before a token expires.
+
+The rest of the portal's API is for its own web app and may change between releases. With `PORTAL_ENABLE_DOCS=true`
+its interactive documentation is at `/api/v1/docs`; leave it off in production.

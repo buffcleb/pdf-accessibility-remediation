@@ -27,43 +27,24 @@ Adobe's file as it is, checked by the engine. It's off until a super admin switc
 
 ## System context
 
-```mermaid
-flowchart LR
-  B["Browser<br/>React app"] -- "HTTPS<br/>access token + refresh cookie" --> WEB["Web<br/>nginx: app + /api proxy"]
-  WEB --> API["Portal API<br/>FastAPI"]
-  subgraph Portal ["Portal"]
-    API --> DB[("PostgreSQL<br/>users, groups, services,<br/>quotas, ledger, jobs,<br/>versions, audit")]
-    API --> RP[("Redis<br/>rate limits")]
-    API --> S3[("Object store<br/>S3 API<br/>encrypted at rest")]
-    PW["Portal worker"] --> DB
-    PW --> S3
-    API -- "sign-in codes" --> MAIL["Mail<br/>SMTP / SES / API"]
-    PW -- "notifications,<br/>reports" --> MAIL
-  end
-  PW -- "internal HTTP + API key:<br/>submit, poll, fetch files" --> EAPI
-  subgraph Engine ["Engine"]
-    EAPI["Engine API<br/>FastAPI"] --> ER[("Redis<br/>queue")]
-    ER --> EW["Workers<br/>Celery"]
-    ER -- "queue: adobe" --> AW["Adobe worker"]
-    EW --> VP["veraPDF service<br/>(kept running; command line<br/>in the worker as a fallback)"]
-    EW --> TS["Tesseract OCR"]
-    EAPI --- JS[("Shared job<br/>folder")]
-    EW --- JS
-    AW --- JS
-    EW -- "all AI calls,<br/>tagged job + level" --> GW["AI gateway<br/>LiteLLM"]
-    GW --- GDB[("LiteLLM DB<br/>spend, keys")]
-  end
-  GW --> LOC["Local models<br/>LocalAI / vLLM / Ollama"]
-  GW -.-> CLOUD["Cloud and commercial<br/>models (opt-in levels)"]
-  AW -. "opt-in service,<br/>rate limited" .-> ADOBE["Adobe PDF Services<br/>Autotag"]
-```
+> **Changed 22 October 2026:** the optional malware scanner (ClamAV) and egress proxy are drawn and listed, the
+> portal's Redis is its own, and scripts can call the portal with a personal API token.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/system-context-dark.svg">
+  <img src="../images/diagrams/system-context.svg" alt="The portal (web, portal-api, portal-worker, optional ClamAV, with PostgreSQL, its own Redis and an encrypted object store) sends documents to the engine (engine API, workers, Adobe worker, veraPDF and Tesseract, with a Redis queue and a shared job folder); every AI call goes through the AI gateway to local models, or cloud models when turned on; the Adobe worker reaches Adobe PDF Services when turned on; browsers and scripts with a personal API token reach the portal over HTTPS.">
+</picture>
+
+With `EGRESS_PROXY` on, the portal, the gateway, the Adobe worker and ClamAV reach the internet only through an egress
+proxy in the cluster, which can let through only the hosts the deployment uses; the engine's own pods never reach it.
 
 | Component | Technology | Role |
 |---|---|---|
 | Web app | React + Vite, served by nginx | All screens, including the tag manager and editor (pdf.js). nginx also proxies `/api` to the portal API |
-| Portal API | FastAPI, SQLAlchemy 2, Alembic | Accounts, groups, services, quotas, uploads, versions, help requests, reports, audit |
+| Portal API | FastAPI, SQLAlchemy 2, Alembic | Accounts, groups, services, quotas, uploads, versions, help requests, reports, audit; personal API tokens for scripts |
 | Portal worker | Python loop | Sends queued jobs, edits and reviews to the engine, polls them, copies results into storage, settles quotas, sends email, applies retention, raises alerts to super admins |
-| Database | PostgreSQL 16 | Everything the portal knows. The quota ledger is append-only (a trigger refuses updates) |
+| Database | PostgreSQL 16 | Everything the portal knows. The quota ledger is append-only (a trigger refuses updates); row-level security checks group boundaries a second time |
+| Rate limits | Redis, the portal's own (`redis-portal` on Kubernetes) | Sign-in and per-person limits, apart from the engine's queue (on Kubernetes, with its own password and nothing kept on disk) |
 | Object store | S3 API (SeaweedFS locally; AWS S3, Cloudflare R2 and so on elsewhere) | Input and output files under `groups/{group}/users/{user}/jobs/{job}/…`, encrypted at rest |
 | Engine API and workers | FastAPI, Celery, Redis | The remediation pipeline, tag edits, re-reviews and the kind-of-document classifier. Never exposed to the internet |
 | AI gateway | LiteLLM + its own PostgreSQL | Routes each call to the model behind an AI level; reports cost per call; budget backstop; admin UI |
@@ -75,6 +56,8 @@ flowchart LR
 | Math | latex2mathml, MathCAT (`mathcat-cli` in the engine image) | Each formula as MathML; speech and Nemeth and UEB braille read by rule, to check the AI's reading |
 | Music and formula readers (optional) | Audiveris; RapidLaTeXOCR | Services asked over Redis lists: MusicXML for music examples, a second reading of each formula from its picture |
 | Monitoring (optional) | Prometheus, Grafana, kube-state-metrics, Redis and Postgres exporters | Metrics of every part; alerts reach super admins through the portal; Administration › System shows figures and every workload's pods; Grafana for super admins at `/grafana` |
+| Malware scanning (optional) | ClamAV (clamd and freshclam) | Every upload and help-desk attachment scanned before it's stored ([details](../operations/malware-scanning.md)) |
+| Egress proxy (optional, Kubernetes) | Squid | Outbound traffic from the portal, gateway, Adobe worker and ClamAV, recorded or limited to an allow-list ([details](../../deploy/k8s/README.md#outbound-traffic-the-egress-proxy)) |
 | Backups (optional) | A nightly Kubernetes job onto an NFS share | Both databases and the stored files, in the folders `scripts/restore.sh` reads |
 
 ## Where to go next

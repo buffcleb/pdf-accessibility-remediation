@@ -3,8 +3,11 @@ import { useLocation, useSearchParams } from "react-router-dom";
 import { get, type Job } from "../api";
 import { useAuth } from "../auth";
 import { JobsTable, type Selection } from "./JobsTable";
-import { MarkDoneBar, canMarkDone } from "./removal";
-import { ErrorNotice, Loading, Notice, fmtNum, useLoad } from "./ui";
+import { documentsApiQuery } from "./listQuery";
+import { ExportZip } from "./exportZip";
+import { MarkDoneBar, SelectedBar, canMarkDone } from "./removal";
+import { ErrorNotice, Loading, Notice, useLoad } from "./ui";
+import { ListBar, ListPager, type Chip } from "./lists";
 
 export type DocumentsPage = { items: Job[]; total: number; page: number; page_size: number; active: number };
 
@@ -13,7 +16,7 @@ const STATUSES: [string, string][] = [["", "All statuses"], ["held", "Waiting fo
 const RESULTS: [string, string][] = [["", "Any result"], ["passes", "Passes PDF/UA"], ["needs_work", "Needs work"],
   ["review", "Has items to review"], ["help", "Open help request"]];
 const AUDIT: [string, string][] = [["", "Both"], ["false", "Remediated"], ["true", "Audit only"]];
-const SIZES = [25, 50, 100, 200];
+const VIA: [string, string][] = [["", "Either"], ["script", "By a script (API token)"], ["web", "In the web app"]];
 
 /** Another list of documents than the signed-in person's own: a group's, for its admins. */
 export type DocumentsScope = {
@@ -23,9 +26,10 @@ export type DocumentsScope = {
   services: { key: string; label: string }[];
   /** What a document's page calls the way back to this list */
   backLabel: string;
-  /** Which rows can be selected, and the bar that acts on the selection; without them rows have no checkboxes */
+  /** Which rows can be selected beyond those with files to download, and the bar that acts on the selection (given
+   * the zip download to show in it) */
   can?: Selection["can"];
-  bar?: (selected: Set<string>, onDone: (message: string) => void) => ReactNode;
+  bar?: (selected: Set<string>, onDone: (message: string) => void, extra: ReactNode) => ReactNode;
 };
 
 /** Documents, a page at a time, with search, filters and sorting: the person's own, or with `scope` a group's for
@@ -36,19 +40,13 @@ export function DocumentsList({ onStatusChange, scope }: { onStatusChange?: (key
   const { me } = useAuth();
   const [params, setParams] = useSearchParams();
   const location = useLocation();
-  const [search, setSearch] = useState(params.get("q") ?? "");
-  const [moreOpen, setMoreOpen] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [doneMsg, setDoneMsg] = useState("");
   const size = Number(params.get("size")) || 25;
   const page = Number(params.get("page")) || 1;
   const sort = params.get("sort") ?? "-created_at";
 
-  const api = new URLSearchParams();
-  for (const k of ["q", "status", "result", "service", "audit"]) if (params.get(k)) api.set(k, params.get(k)!);
-  if (params.get("from")) api.set("since", new Date(`${params.get("from")}T00:00:00`).toISOString());
-  if (params.get("to")) api.set("until", new Date(new Date(`${params.get("to")}T00:00:00`).getTime() + 86400000).toISOString());
-  api.set("sort", sort);
+  const api = documentsApiQuery(params);
   api.set("page", String(page));
   api.set("page_size", String(size));
   const query = api.toString();
@@ -69,13 +67,6 @@ export function DocumentsList({ onStatusChange, scope }: { onStatusChange?: (key
     setParams(next, { replace: true });
   }
 
-  // Search as you type, a moment after typing stops
-  useEffect(() => {
-    if ((params.get("q") ?? "") === search) return;
-    const t = window.setTimeout(() => update({ q: search || null }), 350);
-    return () => window.clearTimeout(t);
-  }, [search]); // eslint-disable-line react-hooks/exhaustive-deps
-
   const services = scope?.services ?? (me?.services ?? []).filter((s) => s.available || s.used_pages > 0);
   const what = scope ? "the group's documents" : "your documents";
   const searchLabel = scope ? "Search by file name or person" : "Search by file name";
@@ -84,9 +75,10 @@ export function DocumentsList({ onStatusChange, scope }: { onStatusChange?: (key
     params.get("result") && { key: "result", text: label(RESULTS, params.get("result")) },
     params.get("service") && { key: "service", text: services.find((s) => s.key === params.get("service"))?.label ?? params.get("service") },
     params.get("audit") && { key: "audit", text: label(AUDIT, params.get("audit")) },
+    params.get("via") && { key: "via", text: label(VIA, params.get("via")) },
     params.get("from") && { key: "from", text: `From ${params.get("from")}` },
     params.get("to") && { key: "to", text: `To ${params.get("to")}` },
-  ].filter(Boolean) as { key: string; text: string }[];
+  ].filter(Boolean) as Chip[];
   const filtering = !!(params.get("q") || params.get("status") || chips.length);
   const data = docs.data;
   const done = (message: string) => {
@@ -94,27 +86,25 @@ export function DocumentsList({ onStatusChange, scope }: { onStatusChange?: (key
     setDoneMsg(message);
     if (message) void docs.reload();
   };
-  const pages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
-  const first = data && data.total ? (page - 1) * data.page_size + 1 : 0;
-  const last = data ? Math.min(data.total, page * data.page_size) : 0;
+  // The chosen documents' files as one zip (#481); never everything by default (#501)
+  const exportSelected = <ExportZip endpoint={endpoint} request={{ ids: [...selected] }} label="Download as a zip" />;
+  const pager = (where: "top" | "bottom") => data && (
+    <ListPager page={page} pageSize={data.page_size} total={data.total} noun={["document", "documents"]} where={where}
+      topId="dl-top" onPage={(p) => update({ page: p > 1 ? String(p) : null }, true)}
+      onSize={(n) => update({ size: n === 25 ? null : String(n) })} />
+  );
 
   return (
     <div className="documents-list">
-      <form className="report-bar" role="search" aria-label={`Search and filter ${what}`} onSubmit={(e) => e.preventDefault()}>
-        <div className="report-search-box">
-          <label htmlFor="dl-q" className="visually-hidden">{searchLabel}</label>
-          <span className="search-icon" aria-hidden="true">⌕</span>
-          <input id="dl-q" type="search" value={search} placeholder={searchLabel} onChange={(e) => setSearch(e.target.value)} />
-        </div>
-        <label htmlFor="dl-status" className="visually-hidden">Status</label>
-        <select id="dl-status" className="report-select" value={params.get("status") ?? ""} onChange={(e) => update({ status: e.target.value })}>
-          {STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-        </select>
-        <button type="button" className={`btn small ${chips.length ? "" : "secondary"}`} aria-expanded={moreOpen}
-          aria-controls="dl-more" onClick={() => setMoreOpen(!moreOpen)}>Filters{chips.length ? ` (${chips.length})` : ""}</button>
-      </form>
-      {moreOpen && (
-        <div id="dl-more" className="report-more">
+      <ListBar label={`Search and filter ${what}`} searchId="dl-q" query={params.get("q") ?? ""} placeholder={searchLabel}
+        onQuery={(q) => update({ q: q || null })} chips={chips} active={!!params.get("status")}
+        onRemove={(key) => update({ [key]: null })}
+        onClear={() => {
+          const keep = new URLSearchParams();
+          for (const k of ["size", "sort"]) if (params.get(k)) keep.set(k, params.get(k)!);
+          setParams(keep, { replace: true });
+        }}
+        more={<>
           <div className="field"><label htmlFor="dl-result">Result</label>
             <select id="dl-result" value={params.get("result") ?? ""} onChange={(e) => update({ result: e.target.value })}>
               {RESULTS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
@@ -128,57 +118,38 @@ export function DocumentsList({ onStatusChange, scope }: { onStatusChange?: (key
             <select id="dl-audit" value={params.get("audit") ?? ""} onChange={(e) => update({ audit: e.target.value })}>
               {AUDIT.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
             </select></div>
+          <div className="field"><label htmlFor="dl-via">Sent</label>
+            <select id="dl-via" value={params.get("via") ?? ""} onChange={(e) => update({ via: e.target.value })}>
+              {VIA.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+            </select></div>
           <div className="field"><label htmlFor="dl-from">Submitted from</label>
             <input id="dl-from" type="date" value={params.get("from") ?? ""} onChange={(e) => update({ from: e.target.value })} /></div>
           <div className="field"><label htmlFor="dl-to">To</label>
             <input id="dl-to" type="date" value={params.get("to") ?? ""} onChange={(e) => update({ to: e.target.value })} /></div>
-          <button type="button" className="linkbtn small report-more-done" onClick={() => setMoreOpen(false)}>Done</button>
-        </div>
-      )}
-      {chips.length > 0 && (
-        <ul className="report-chips" aria-label="Filters in use">
-          {chips.map((c) => (
-            <li key={c.key} className="chip">{c.text}
-              <button type="button" aria-label={`Remove the filter ${c.text}`} onClick={() => update({ [c.key]: null })}>×</button>
-            </li>
-          ))}
-        </ul>
-      )}
+        </>}>
+        <label htmlFor="dl-status" className="visually-hidden">Status</label>
+        <select id="dl-status" className="report-select" value={params.get("status") ?? ""} onChange={(e) => update({ status: e.target.value })}>
+          {STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+      </ListBar>
 
       {docs.error ? <ErrorNotice error={docs.error} /> : null}
       {!data ? <Loading /> : (
         <>
-          <p className="small muted documents-count" role="status" aria-live="polite">
-            {data.total === 0 ? (filtering ? "Nothing matches." : "") : `${fmtNum(first)}–${fmtNum(last)} of ${fmtNum(data.total)} documents`}
-            {filtering && <> · <button type="button" className="linkbtn small" onClick={() => {
-              setSearch("");
-              const keep = new URLSearchParams();
-              if (params.get("size")) keep.set("size", params.get("size")!);
-              setParams(keep, { replace: true });
-            }}>Clear search and filters</button></>}
-          </p>
+          {/* With more than one page, the pager above the list says where you are */}
+          <div id="dl-top">{data.total === 0
+            ? <p className="small muted list-count" role="status">{filtering ? "Nothing matches." : ""}</p> : pager("top")}</div>
           {doneMsg && <Notice>{doneMsg}</Notice>}
-          {scope ? scope.bar?.(selected, done)
-            : <MarkDoneBar selected={selected} holdHours={data.items[0]?.removal_hold_hours ?? 24} onDone={done} />}
+          {scope ? (scope.bar ? scope.bar(selected, done, exportSelected)
+            : <SelectedBar selected={selected} onDone={done}>{exportSelected}</SelectedBar>)
+            : <MarkDoneBar selected={selected} holdHours={data.items[0]?.removal_hold_hours ?? 24} onDone={done} extra={exportSelected} />}
           {(data.total > 0 || !filtering) && (
             <JobsTable jobs={data.items} sort={sort} showUser={!!scope} showService={!!scope}
-              selection={scope && !scope.can ? undefined : { can: scope?.can ?? canMarkDone, selected, onChange: setSelected }} onSort={(key) => update({ sort: sort === key ? `-${key}` : sort === `-${key}` ? key
+              selection={{ can: (j) => !j.files_deleted || (scope?.can ?? canMarkDone)(j), selected, onChange: setSelected }} onSort={(key) => update({ sort: sort === key ? `-${key}` : sort === `-${key}` ? key
               : key === "created_at" ? "-created_at" : key }, true)}
               back={{ back: location.pathname + location.search, backLabel: scope?.backLabel ?? "My documents" }} />
           )}
-          {data.total > Math.min(...SIZES) && (
-            <nav className="pager" aria-label="Pages of documents">
-              <button type="button" className="btn secondary small" disabled={page <= 1} onClick={() => update({ page: String(page - 1) }, true)}>
-                ← Previous</button>
-              <span className="small">Page {fmtNum(page)} of {fmtNum(pages)}</span>
-              <button type="button" className="btn secondary small" disabled={page >= pages} onClick={() => update({ page: String(page + 1) }, true)}>
-                Next →</button>
-              <label className="small pager-size">Show
-                <select value={size} onChange={(e) => update({ size: e.target.value === "25" ? null : e.target.value })}>
-                  {SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
-                </select> per page</label>
-            </nav>
-          )}
+          {pager("bottom")}
         </>
       )}
     </div>

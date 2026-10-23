@@ -197,3 +197,95 @@ def test_adobe_improved_copy_is_named_by_what_was_done(setup):
     assert improved_label(resp(glyph_lists=["Arial: incomplete CIDSet removed"])) == "Adobe + fixes"
     assert improved_label(resp(alt_text=1, glyph_widths=4)) == "Adobe + AI alt text and fixes"
     assert improved_label(resp(bookmarks=12)) == "Adobe + fixes"   # bookmarks from the headings, nothing else
+    assert improved_label(resp(pdfua_identifier=True, header_scope=4)) == "Adobe + fixes"  # what PDF/UA asks of it
+
+
+def _improved_with_findings(eng, jid):
+    """Adobe's file fails and has its own review item; the improved copy passes with the AI's alt text to check."""
+    _complete_with_alt_text(eng, jid)
+    rep = eng.jobs[jid]["reports"]
+    rep["comparison"]["before"] = {"compliant": False, "failed_checks": 120}
+    rep["comparison"]["after_enhanced"] = {"compliant": True, "failed_checks": 0, "figures_missing_alt": 0,
+                                           "verapdf": {"ua1": {"failures": []}}}
+    rep["comparison"]["after"] = {"compliant": False, "failed_checks": 4, "figures_missing_alt": 3,
+                                  "verapdf": {"ua1": {"failures": [{"clause": "7.3", "description": "no alt",
+                                                                    "failed_checks": 3, "pages": [1]}]}}}
+    rep["tag_verification"]["primary"]["findings"] = [{"severity": "high", "page": 1, "issue": "Figure without alt"}]
+    rep["tag_verification"]["enhanced"]["findings"] = [{"severity": "review", "page": 1, "element": 4,
+                                                        "issue": "Check the AI's alt text"}]
+
+
+def test_the_improved_copy_is_the_document_people_get(setup):
+    """#499: with Adobe's file improved (AI alt text and fixes), the verdict, tiles and Needs review are about the improved
+    copy, its review items open it in the tag manager, and Adobe's file as it came back stays a choice."""
+    s = setup
+    _adobe(s)
+    _tier(s, "Cloud AI", "cloud-vision", metered=False, default=True, judge="cloud-judge")
+    user = s["c"]["user"]
+    job = _send(user, ("doc.pdf", pdf_bytes(2))).json()[0]["job"]
+    run_worker(s["db"])
+    _improved_with_findings(s["engine"], next(iter(s["engine"].jobs)))
+    run_worker(s["db"])
+    r = user.get(f"{API}/jobs/{job['id']}").json()["result"]
+    assert r["verdict_of"] == "enhanced" and r["compliant_after"] is True and r["failed_checks_after"] == 0
+    assert r["adobe_file_compliant"] is False and r["remaining_failures"] == []
+    assert r["before_after"]["figures_missing_alt"][1] == 0
+    assert [f["issue"] for f in r["review"]["findings"]] == ["Check the AI's alt text"]
+    # Adobe's file is still a download and a version of its own, with its own verdict
+    body = user.get(f"{API}/jobs/{job['id']}").json()
+    assert {"primary", "enhanced"} <= {f["kind"] for f in body["files"]}
+    versions = user.get(f"{API}/jobs/{job['id']}/versions").json()["versions"]
+    by_kind = {v["kind"]: v for v in versions}
+    assert by_kind["primary"]["summary"]["compliant"] is False and by_kind["enhanced"]["summary"]["compliant"] is True
+    # The lists and reports count it as passing, as its page says
+    assert user.get(f"{API}/documents", params={"result": "passes"}).json()["total"] == 1
+
+
+def test_adobe_without_an_improved_copy_is_about_adobes_file(setup):
+    s = setup
+    _adobe(s)
+    user = s["c"]["user"]
+    job = _send(user, ("doc.pdf", pdf_bytes(2))).json()[0]["job"]
+    run_worker(s["db"])
+    _complete_adobe(s["engine"], next(iter(s["engine"].jobs)))
+    run_worker(s["db"])
+    r = user.get(f"{API}/jobs/{job['id']}").json()["result"]
+    assert r["verdict_of"] == "primary" and r["compliant_after"] is False and r["adobe_file_compliant"] is None
+
+
+def test_documents_finished_before_are_brought_up_to_date_once(setup):
+    """resummarize-improved: an Adobe document finished before #499 had Adobe's file's verdict; it's recomputed from
+    the engine's JSON report, the rest of its summary kept. Others are left alone."""
+    import json
+    import uuid
+
+    from portal import worker
+    from portal.storage import get_storage
+    s = setup
+    _adobe(s)
+    _tier(s, "Cloud AI", "cloud-vision", metered=False, default=True, judge="cloud-judge")
+    user = s["c"]["user"]
+    job_id = _send(user, ("doc.pdf", pdf_bytes(2))).json()[0]["job"]["id"]
+    run_worker(s["db"])
+    jid = next(iter(s["engine"].jobs))
+    _improved_with_findings(s["engine"], jid)
+    run_worker(s["db"])
+    db = s["db"]
+    job = db.get(Job, uuid.UUID(job_id))
+    # As it was stored before: Adobe's file's verdict, no verdict_of; the JSON report is the engine's response
+    report = next(f for f in job.files if f.kind == "report_json")
+    get_storage().put_bytes(report.s3_key, json.dumps(s["engine"].jobs[jid]).encode(), "application/json")
+    old = {**job.result_summary, "compliant_after": False, "failed_checks_after": 4, "summary": "kept as it was"}
+    for k in ("verdict_of", "adobe_file_compliant"):
+        old.pop(k)
+    job.result_summary = old
+    db.commit()
+    assert worker.resummarize_improved(db, dry_run=True) == (1, 0)
+    db.refresh(job)
+    assert job.result_summary["compliant_after"] is False  # a dry run changes nothing
+    assert worker.resummarize_improved(db) == (1, 0)
+    db.refresh(job)
+    r = job.result_summary
+    assert r["verdict_of"] == "enhanced" and r["compliant_after"] is True and r["failed_checks_after"] == 0
+    assert r["summary"] == "kept as it was"
+    assert worker.resummarize_improved(db) == (0, 0)  # once

@@ -1,8 +1,9 @@
 # Who may talk to what, inside the cluster. Without these, every pod in every namespace could reach the queues, the
 # database, the file store, the validator, the AI gateway and the engine's API (none of which asks who is calling,
 # apart from Postgres and the gateway). Each policy below selects one service and lists the pods allowed in; a pod
-# selected by a policy with no matching rule is closed to everything else. Pods not named here (the web pod,
-# cloudflared) keep the cluster's default: open.
+# selected by a policy with no matching rule is closed to everything else. Everything else is closed by
+# default-deny-ingress (#453): the web pod is let in from anywhere on its port (the way in), and cloudflared and the
+# jobs take no connections.
 #
 # Probes from the kubelet and traffic between the pods named here are the only flows these services need. The
 # ingress controller reaches only the web pod (60-web.yaml), or the portal API in the Worker front end
@@ -11,12 +12,36 @@
 # Egress: the pods that open uploaded PDFs (the engine's API, workers and scheduler, and the music reader) reach only
 # the cluster services they use and DNS, so an engine taken over by a crafted PDF can't send anything out (#361).
 # Their AI calls go through the gateway (AI_GATEWAY_ONLY in 40-engine.yaml). The gateway, the Adobe worker (Adobe's
-# API) and the portal keep their internet access. The job folder is an NFS mount made by the node, not the pod, so
-# it isn't affected.
+# API) and the portal reach the internet directly, or only through the egress proxy and its list of hosts with
+# EGRESS_PROXY=enforce (26-egress-proxy.yaml, 82-egress-enforce.yaml, #453). The job folder is an NFS mount made by
+# the node, not the pod, so it isn't affected.
 #
 # Monitoring (#397, 95-monitoring.yaml): Prometheus reads the metrics of the portal, the engine and the workers on
 # their own ports, and its exporters reach Postgres and Redis. The rules for it are here whether or not it's
 # deployed; with no Prometheus pod they let nothing in.
+# Nothing in unless a policy below lets it in (#453): a pod added without one is closed, not open
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# The web pod is the way in: from the ingress controller (on the nodes' own network with RKE2) or cloudflared, so
+# from anywhere, on its port only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: web } }
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ port: 8080 }]
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -53,13 +78,26 @@ spec:
         - podSelector: { matchLabels: { app: engine-worker } }
         - podSelector: { matchLabels: { app: engine-adobe-worker } }
         - podSelector: { matchLabels: { app: engine-beat } }
-        - podSelector: { matchLabels: { app: portal-api } }
-        - podSelector: { matchLabels: { app: portal-worker } }
         - podSelector: { matchLabels: { app: music-reader } }
         - podSelector: { matchLabels: { app: formula-reader } }  # the formula reading service (37-formula.yaml)
         # KEDA reads the music and formula queues' lengths (46-music-autoscale.yaml, 47-formula-autoscale.yaml)
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: keda } }
         - podSelector: { matchLabels: { app: redis-exporter } }
+      ports: [{ port: 6379 }]
+---
+# The portal's own Redis (23-redis-portal.yaml, #472): the portal's API and worker only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-portal
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: { matchLabels: { app: redis-portal } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: portal-api } }
+        - podSelector: { matchLabels: { app: portal-worker } }
       ports: [{ port: 6379 }]
 ---
 apiVersion: networking.k8s.io/v1

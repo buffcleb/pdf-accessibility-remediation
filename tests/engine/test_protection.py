@@ -7,6 +7,7 @@ import uuid
 import pikepdf
 
 from app.pipeline import protection
+from tests.engine.pdfs import remediate
 
 
 def _restricted(src, dst, **refused):
@@ -120,12 +121,5 @@ def test_xfa_forms_are_told_apart_and_a_static_ones_xfa_is_removed(samples, tmp_
 
 
 def _run(tmp_path, src):
-    from app.pipeline.orchestrator import JobOptions, run_remediation
-    from app.storage import JobStore
-
-    jid = str(uuid.uuid4())
-    store = JobStore(jid, root=tmp_path / "jobs")
-    store.create()
-    shutil.copyfile(src, store.input_pdf)
-    result = asyncio.run(run_remediation(store, JobOptions(stem="x", job_id=jid, provider="mock")))
+    result, store = remediate(tmp_path, src, stem="x")
     return result, store.output_dir / result["files"]["remediated_primary"]

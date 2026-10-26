@@ -221,7 +221,8 @@ function AdjustForm({ base, onDone, services, fixedService }: {
   );
 }
 
-export function GroupSettings({ group, onSaved }: { group: Group; onSaved: (g: Group) => void }) {
+/** The group's name, default limit and out-of-pages message; with `canDisable` (super admins), disabling it too. */
+export function GroupSettings({ group, onSaved, canDisable = true }: { group: Group; onSaved: (g: Group) => void; canDisable?: boolean }) {
   const [name, setName] = useState(group.name);
   const [cap, setCap] = useState(group.default_user_cap === null ? "" : String(group.default_user_cap));
   const [message, setMessage] = useState(group.over_quota_message ?? "");
@@ -277,9 +278,11 @@ export function GroupSettings({ group, onSaved }: { group: Group; onSaved: (g: G
         </div>
         <div className="actions">
           <button className="btn" type="submit" disabled={!dirty}>Save</button>
-          <button className={`btn ${group.status === "active" ? "danger" : "secondary"}`} type="button" onClick={() => void toggle()}>
-            {group.status === "active" ? "Disable group" : "Enable group"}
-          </button>
+          {canDisable && (
+            <button className={`btn ${group.status === "active" ? "danger" : "secondary"}`} type="button" onClick={() => void toggle()}>
+              {group.status === "active" ? "Disable group" : "Enable group"}
+            </button>
+          )}
           {dirty && <span className="small unsaved-note">Unsaved changes</span>}
           {saved && !dirty && <span role="status" className="muted">Saved.</span>}
         </div>

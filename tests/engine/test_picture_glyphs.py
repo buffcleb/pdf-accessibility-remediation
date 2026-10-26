@@ -2,7 +2,6 @@
 fonts have no Unicode value to find. Inside a figure or decoration they get private-use values, so every font is
 fully mapped (PDF/UA 7.21.7) without flattening the page. Found on a mathematics-of-music textbook."""
 import pikepdf
-import pymupdf as fitz
 from pikepdf import Array, Dictionary, Name
 
 from app.pipeline import music
@@ -10,6 +9,7 @@ from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.font_unicode import glyph_to_unicode, map_picture_glyphs, parse_tounicode
 from app.tagging.tagger import tag_document
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import one_page, same_render
 
 
 def _type3(pdf, names):
@@ -22,16 +22,7 @@ def _type3(pdf, names):
 
 
 def _doc(path, body: bytes, fonts):
-    pdf = pikepdf.new()
-    helv = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica,
-                                        Encoding=Name.WinAnsiEncoding))
-    made = {name: make(pdf) for name, make in fonts.items()}
-    page = pdf.make_indirect(Dictionary(
-        Type=Name.Page, MediaBox=Array([0, 0, 612, 792]),
-        Resources=Dictionary(Font=Dictionary(F1=helv, **made)), Contents=pdf.make_stream(body)))
-    pdf.Root.Pages = pdf.make_indirect(Dictionary(Type=Name.Pages, Kids=Array([page]), Count=1))
-    page.Parent = pdf.Root.Pages
-    pdf.save(path)
+    one_page(path, body, fonts)
     return path
 
 
@@ -66,8 +57,7 @@ def test_note_heads_in_a_music_figure_get_private_use_values(tmp_path):
     (figure,) = [e for e in tm["elements"] if e["role"] == "Figure"]
     assert [p for p in tm["pieces"] if p["el"] == figure["i"] and p["kind"] == "text"]  # the notes are in the figure
     assert len([e for e in tm["elements"] if e["role"] == "P"]) == 2                    # and only the two sentences are paragraphs
-    with fitz.open(src) as a, fitz.open(dst) as b:
-        assert a[0].get_pixmap(dpi=72).samples == b[0].get_pixmap(dpi=72).samples
+    assert same_render(src, dst)
 
 
 def test_the_same_characters_in_a_paragraph_are_left_for_a_person(tmp_path):

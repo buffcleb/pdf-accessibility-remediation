@@ -10,8 +10,8 @@ from app.storage import JobStore
 def _run(samples, tmp_path, monkeypatch, widths_fixed: int) -> int:
     """How many times the comparison ran for one job, with the width fixer made to report `widths_fixed`."""
     calls = []
-    original = orchestrator._visual_fidelity
-    monkeypatch.setattr(orchestrator, "_visual_fidelity", lambda a, b, dpi=50: calls.append(1) or original(a, b, dpi))
+    original = orchestrator.visual_fidelity
+    monkeypatch.setattr(orchestrator, "visual_fidelity", lambda a, b, dpi=50: calls.append(1) or original(a, b, dpi))
     monkeypatch.setattr(orchestrator, "_fix_widths", lambda pdf, vera, work, label, stem: (vera, widths_fixed))
     store = JobStore("00000000-0000-4000-8000-000000000001", root=tmp_path)
     store.create()

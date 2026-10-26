@@ -207,7 +207,7 @@ def test_the_profiles_are_checked_side_by_side_through_the_service(monkeypatch, 
     import threading
     import time
 
-    from app.pipeline import orchestrator
+    from app.pipeline import outputs
 
     monkeypatch.setattr(get_settings(), "verapdf_flavours", "ua1,ua2")
     seen = []
@@ -216,16 +216,16 @@ def test_the_profiles_are_checked_side_by_side_through_the_service(monkeypatch, 
         seen.append((fl, threading.get_ident(), verapdf._options.get().service))
         time.sleep(0.4)
         return verapdf.VeraResult(flavour=fl, available=True, compliant=True)
-    monkeypatch.setattr(orchestrator, "run_verapdf", check)
+    monkeypatch.setattr(outputs, "run_verapdf", check)
     monkeypatch.setattr(verapdf, "uses_service", lambda: True)
     started = time.monotonic()
     with verapdf.job_validator({"validator": "service"}):
-        results = orchestrator._validate(tmp_path / "a.pdf", tmp_path, "after", "a")
+        results = outputs.validate(tmp_path / "a.pdf", tmp_path, "after", "a")
     assert time.monotonic() - started < 0.7                         # side by side, not 0.8 s one after the other
     assert list(results) == ["ua1", "ua2"] and {s[2] for s in seen} == {True}
     assert len({s[1] for s in seen}) == 2
 
     seen.clear()
     monkeypatch.setattr(verapdf, "uses_service", lambda: False)    # the command line: one after the other
-    orchestrator._validate(tmp_path / "a.pdf", tmp_path, "after", "a")
+    outputs.validate(tmp_path / "a.pdf", tmp_path, "after", "a")
     assert len({s[1] for s in seen}) == 1

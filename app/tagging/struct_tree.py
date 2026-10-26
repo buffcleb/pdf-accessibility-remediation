@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -10,13 +9,14 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, String
 
 from app.pipeline.language import passage_language
-from app.pipeline.lists import fix_row_order, label_order, nest
+from app.pipeline.lists import LabelKey, _core, fix_row_order, label_kind, label_order, nest
 from app.pipeline.models import DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, TextBlock, bbox_intersection
 from app.pipeline.structure import caption_pairs, footnote_words, row_top
 from app.tagging.content_marker import StreamMarks, apply, mcid_of
 from app.tagging.existing_tags import _is_struct_elem, _role_map, resolve_role
 from app.tagging.table_headers import header_links, id_of, is_complex, write_id_tree
 from app.tagging.targets import MARK_ROLES, mark_key
+from app.tagging.tree import new_elem, new_mcr
 
 ObjGen = tuple[int, int]
 log = logging.getLogger(__name__)
@@ -62,21 +62,22 @@ def _iter_elems(node, seen: set | None = None):
             yield from _iter_elems(it, seen)
 
 
+# ListNumbering for each kind of list label (lists.LabelKey.kind); a bullet is a Disc, a dash or asterisk None
+_NUMBERING = {"decimal": "Decimal", "lower": "LowerAlpha", "upper": "UpperAlpha", "lroman": "LowerRoman",
+              "uroman": "UpperRoman"}
+
+
+def _numbering(key: LabelKey) -> str:
+    """A list level's ListNumbering from the kind of its labels, as lists.label_kind found it nesting the list: by
+    the labels around it, "(i)" after "(h)" is a letter, and a list starting at "(c)" is lettered (#619)."""
+    if key.kind in _NUMBERING:
+        return _NUMBERING[key.kind]
+    return "None" if key.style in ("-", "–", "*") else "Disc"
+
+
 def _list_numbering(label: str | None) -> str:
-    if not label:
-        return "Disc"
-    core = label.strip("().")
-    if core.isdigit():
-        return "Decimal"
-    if re.fullmatch(r"[ivxlc]+", core):
-        return "LowerRoman"
-    if re.fullmatch(r"[IVXLC]+", core):
-        return "UpperRoman"
-    if re.fullmatch(r"[a-z]", core):
-        return "LowerAlpha"
-    if re.fullmatch(r"[A-Z]", core):
-        return "UpperAlpha"
-    return "Disc" if core in ("•", "●", "·", "•") else "None" if core in ("-", "–", "*") else "Disc"
+    """ListNumbering from a list's first label alone (a kept list's, in the PDF/UA-2 step), by the same rule."""
+    return _numbering(label_kind(label)[0])
 
 
 class StructTreeBuilder:
@@ -89,6 +90,9 @@ class StructTreeBuilder:
         self.stats = BuildStats()
         self.page_objs = [p.obj for p in pdf.pages]
         self.page_index = {p.objgen: i for i, p in enumerate(self.page_objs)}
+        # The last list built: its kind of label and its last label, for the next one's first label to be read in
+        # (a list split in two by a figure: "(v)" after "(iv)" is roman, "(c)" after "(b)" a letter, #619)
+        self._last_list: tuple[LabelKey, str] | None = None
         self.refs: dict[str, list[Ref]] = defaultdict(list)
         self.key_elems: dict[str, pikepdf.Object] = {}  # leaf key -> element (for annotation placement)
         self.key_page: dict[str, int] = {}
@@ -96,6 +100,10 @@ class StructTreeBuilder:
         # Figures and formulas made here, by element: (page, box in visual space), for their bounding box (#437)
         self.boxes: dict[tuple, tuple[int, tuple]] = {}
         self.ids: set[bytes] | None = None  # element IDs in the tree, gathered when the first is made
+        # How each mark's note is said ("endnote 1"), by the mark's key, where it isn't a footnote
+        kinds = {b.id: b.note_kind for p in analysis.pages for b in p.blocks if b.role == "Note"}
+        self.note_kinds = {mark_key(b.id, i): kinds[n] for p in analysis.pages for b in p.blocks
+                           for i, n in enumerate(b.mark_notes) if n in kinds and kinds[n] != "footnote"}
 
     # ------------------------------------------------------------------ entry
     def build(self, marks: dict[int, list[StreamMarks]], retain_root: bool) -> pikepdf.Object:
@@ -110,7 +118,7 @@ class StructTreeBuilder:
             self._insert_for_page(doc, page.number, new)
         self._attach_leftovers(doc)
         self._annotations(doc)
-        self._normalize_headings(doc)
+        self.normalize_headings(doc)
         if not retain_root:
             self._sectionize(doc)
         self._link_notes()
@@ -236,7 +244,7 @@ class StructTreeBuilder:
                 self.stats.leftover_content += 1
                 log.warning("content for %s had no element; tagged as %s", key, str(new[0].S)[1:])
 
-    def _normalize_headings(self, doc) -> None:
+    def normalize_headings(self, doc) -> None:
         """PDF/UA 7.4.2: in final (reading) order the first heading is H1 and levels never skip."""
         prev = 0
         for e in _iter_elems(doc):
@@ -270,13 +278,11 @@ class StructTreeBuilder:
         return root, doc
 
     def _elem(self, role: str, parent: pikepdf.Object, page_index: int | None, **extra) -> pikepdf.Object:
-        d = Dictionary(Type=Name.StructElem, S=Name("/" + role), P=parent, K=Array())
-        if page_index is not None:
-            d.Pg = self.page_objs[page_index]
+        d = new_elem(self.pdf, role, parent, self.page_objs[page_index] if page_index is not None else None)
         for k, v in extra.items():
             d[Name("/" + k)] = v
         self.stats.elements[role] += 1
-        return self.pdf.make_indirect(d)
+        return d
 
     def _attach_text(self, elem: pikepdf.Object, block: TextBlock, page_index: int) -> bool:
         """A text block's content, with each footnote mark marked apart (targets.mark_key) as a Reference inside it,
@@ -299,7 +305,7 @@ class StructTreeBuilder:
             if ref is None:
                 ref = made[km[0]] = self._elem("Reference", elem, page_index)
                 if all_said:
-                    ref.ActualText = String(footnote_words(km[1]))
+                    ref.ActualText = String(footnote_words(km[1], self.note_kinds.get(km[0], "footnote")))
                 elem.K.append(ref)
                 self.key_elems[km[0]] = ref
                 self.stats.footnote_references += 1
@@ -311,11 +317,32 @@ class StructTreeBuilder:
         self.key_page[block.id] = page_index
         return True
 
+    def _continue_note(self, block: TextBlock, page_index: int) -> bool:
+        """A note's text carried onto the next page is part of the note's own tag: its content is added to it (marked
+        content references name their page), and its read-aloud text to the note's."""
+        note = self.key_elems.get(block.continues)
+        refs = self.refs.get(block.id)
+        if note is None or not refs:
+            return False
+        if "/ActualText" in note:
+            note.ActualText = String(f"{note.ActualText} {block.actual_text or block.text}")
+            for r in sorted(refs, key=lambda r: (r.page_index, r.is_form, r.mcid)):
+                note.K.append(self._mcr(r))
+        else:
+            target = note
+            if block.actual_text:
+                target = self._elem("Span", note, page_index, ActualText=String(block.actual_text))
+                note.K.append(target)
+            for r in sorted(refs, key=lambda r: (r.page_index, r.is_form, r.mcid)):
+                target.K.append(r.mcid if target is not note and not r.is_form and r.page_index == page_index
+                                else self._mcr(r))
+            if target is not note:
+                target.Pg = self.page_objs[page_index]
+        self.key_elems[block.id] = note
+        return True
+
     def _mcr(self, r: Ref) -> Dictionary:
-        mcr = Dictionary(Type=Name.MCR, Pg=self.page_objs[r.page_index], MCID=r.mcid)
-        if r.is_form:
-            mcr.Stm = r.owner
-        return mcr
+        return new_mcr(self.page_objs[r.page_index], r.mcid, r.owner if r.is_form else None)
 
     def _attach_refs(self, elem: pikepdf.Object, key: str, page_index: int) -> bool:
         refs = self.refs.get(key)
@@ -327,10 +354,7 @@ class StructTreeBuilder:
             if not r.is_form and r.page_index == page_index:
                 k.append(r.mcid)
             else:
-                mcr = Dictionary(Type=Name.MCR, Pg=self.page_objs[r.page_index], MCID=r.mcid)
-                if r.is_form:
-                    mcr.Stm = r.owner
-                k.append(mcr)
+                k.append(self._mcr(r))
         elem.Pg = page_obj
         self.key_elems[key] = elem
         self.key_page[key] = page_index
@@ -345,7 +369,8 @@ class StructTreeBuilder:
             if not run:
                 return
             items = fix_row_order(run, lambda b: b.list_label, row_top, lambda b: b.font_size)
-            levels = nest(items, lambda b: b.list_label, lambda b: b.bbox[0], lambda b: b.font_size)
+            before = {self._last_list[0]: self._last_list[1]} if self._last_list else None
+            levels = nest(items, lambda b: b.list_label, lambda b: b.bbox[0], lambda b: b.font_size, before)
             label_order(levels, lambda b: b.list_label)
             for level in levels:
                 lst = self._list(level, doc, page.number)
@@ -366,6 +391,8 @@ class StructTreeBuilder:
 
             if isinstance(el, TextBlock):
                 if el.role == "Artifact" or el.id in pairs:
+                    continue
+                if el.continues and self._continue_note(el, page.number):
                     continue
                 role = "P" if el.role == "Caption" else el.role
                 e = self._elem(role, doc, page.number)
@@ -442,11 +469,13 @@ class StructTreeBuilder:
         group.K = Array([cap, main] if first else [main, cap])
         return [group]
 
-    def _list(self, level, parent, page_no: int) -> pikepdf.Object | None:
-        """One list level: L > LI > LBody, with each item's nested lists inside its LBody after its text."""
-        first = level.items[0][0].list_label if level.items else None
+    def _list(self, level, parent, page_no: int, top: bool = True) -> pikepdf.Object | None:
+        """One list level: L > LI > LBody, with each item's nested lists inside its LBody after its text. top: a list
+        of its own, not one nested in an item (whose labels were read with its parent's when nesting)."""
+        if top and level.items:
+            self._last_list = (level.key, _core(level.items[-1][0].list_label or ""))
         lst = self._elem("L", parent, page_no,
-                         A=Dictionary(O=Name.List, ListNumbering=Name("/" + _list_numbering(first))))
+                         A=Dictionary(O=Name.List, ListNumbering=Name("/" + _numbering(level.key))))
         for el, children in level.items:
             li = self._elem("LI", lst, page_no)
             body = self._elem("LBody", li, page_no)
@@ -462,7 +491,7 @@ class StructTreeBuilder:
                     body.ActualText = String(el.actual_text)
                 has_text = self._attach_text(body, el, page_no)  # its footnote marks become References
             for child in children:
-                sub = self._list(child, body, page_no)
+                sub = self._list(child, body, page_no, top=False)
                 if sub is not None:
                     body.K.append(sub)
             if has_text or len(body.K):

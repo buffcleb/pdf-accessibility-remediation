@@ -11,6 +11,7 @@ import { MySettings } from "./pages/MySettings";
 import { Unsubscribe } from "./pages/Unsubscribe";
 import { lazy, Suspense } from "react";
 import { loadOrReload } from "./staleBuild";
+import { isAdmin } from "./permissions";
 
 // The viewer bundles pdf.js, so it loads only when opened.
 // After a deploy, a page loaded before it reloads once to fetch the new build's file (staleBuild.ts).
@@ -27,7 +28,7 @@ function RequireAuth({ children }: { children: ReactElement }) {
 function RequireAdmin({ children, superOnly = false }: { children: ReactElement; superOnly?: boolean }) {
   const { me } = useAuth();
   if (!me) return null;
-  const ok = superOnly ? me.is_super_admin : me.is_super_admin || me.admin_of.length > 0;
+  const ok = superOnly ? me.is_super_admin : isAdmin(me);
   return ok ? children : <p>You don't have access to this page.</p>;
 }
 

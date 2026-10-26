@@ -75,10 +75,16 @@ def _now() -> datetime:
 
 # --- access ----------------------------------------------------------------------------------------
 
+# Support's roles in a request: they see every request and its internal notes, and answer for the service (#564)
+STAFF = ("super_admin", "service_admin")
+
+
 def role_of(user: User, req: HelpRequest) -> str | None:
     """How this user takes part in the request, or None if they can't see it."""
     if user.is_super_admin:
         return "super_admin"
+    if user.is_service_admin:
+        return "service_admin"
     if req.user_id == user.id:
         return "person"
     if req.group_id is not None and req.group_id in user.admin_group_ids():
@@ -87,7 +93,7 @@ def role_of(user: User, req: HelpRequest) -> str | None:
 
 
 def visible_messages(req: HelpRequest, role: str) -> list[HelpMessage]:
-    return [m for m in req.messages if m.kind != "note" or role == "super_admin"]
+    return [m for m in req.messages if m.kind != "note" or role in STAFF]
 
 
 # --- attachments -----------------------------------------------------------------------------------
@@ -173,7 +179,7 @@ def add_message(db: Session, req: HelpRequest, author: User, role: str, kind: st
     now = _now()
     req.updated_at = now
     if kind == "message":
-        if role == "super_admin":
+        if role in STAFF:
             req.staff_wrote_at = now
         else:
             req.person_wrote_at = now
@@ -226,18 +232,19 @@ def event_text(m: HelpMessage, for_person: bool) -> str | None:
 
 # --- emails ----------------------------------------------------------------------------------------
 
-def _super_admins(db: Session) -> list[str]:
-    rows = db.scalars(select(RoleAssignment).where(RoleAssignment.role == "super_admin"))
+def _staff(db: Session) -> list[str]:
+    """Support: every active super admin and service admin. Each gets these emails as their Help requests choice says."""
+    rows = db.scalars(select(RoleAssignment).where(RoleAssignment.role.in_(STAFF)))
     return sorted({r.user.email for r in rows if r.user.status == "active"})
 
 
 def _staff_recipients(db: Session, req: HelpRequest) -> list[str]:
-    """The super admin handling it, or every super admin while nobody has taken it."""
+    """The super admin or service admin handling it, or all of them while nobody has taken it."""
     if req.assignee_id:
         u = db.get(User, req.assignee_id)
         if u is not None and u.status == "active":
             return [u.email]
-    return _super_admins(db)
+    return _staff(db)
 
 
 def _footer(db: Session) -> str:
@@ -293,13 +300,13 @@ def new_request_mails(db: Session, req: HelpRequest, first: HelpMessage, detail:
         text = (f"{req.filename}, submitted by {who} ({group}), couldn't be processed. A help request was opened for "
                 f"it.\n\n{first.body}\n" + (f"Recorded with the failure: {detail.strip()[:1500]}\n" if detail else "")
                 + f"\nOpen the request:\n{_url(f'/admin/help/{req.id}')}\n" + _footer(db))
-        return [Mail(to=to, subject=f"Failed document: {req.filename}", text=text) for to in _super_admins(db)]
+        return [Mail(to=to, subject=f"Failed document: {req.filename}", text=text) for to in _staff(db)]
     text = (f"{who} ({group}) asked for help with {req.filename}.\n\n"
             f"Kind of problem: {KIND_LABELS[req.kind]}\n"
             + (f"Version: {req.version_label}\n" if req.version_label else "")
             + (f"Page: {req.page}\n" if req.page else "")
             + f"\n{first.body}\n\nOpen the request:\n{_url(f'/admin/help/{req.id}')}\n" + _footer(db))
-    return [Mail(to=to, subject=f"Help request: {req.filename}", text=text) for to in _super_admins(db)]
+    return [Mail(to=to, subject=f"Help request: {req.filename}", text=text) for to in _staff(db)]
 
 
 def _digest(db: Session, req: HelpRequest, side: str, since: datetime | None) -> list[Mail]:
@@ -312,7 +319,7 @@ def _digest(db: Session, req: HelpRequest, side: str, since: datetime | None) ->
         subject = f"Update on your help request: {req.filename}"
         intro = f"There's an update on your help request about {req.filename}. It's now: {PERSON_STATUS[req.status]}."
     else:
-        items = [m for m in req.messages if m.kind == "message" and m.author_role != "super_admin"
+        items = [m for m in req.messages if m.kind == "message" and m.author_role not in STAFF
                  and (since is None or m.created_at > since)]
         recipients = _staff_recipients(db, req)
         link = _url(f"/admin/help/{req.id}")
@@ -402,7 +409,7 @@ def remind_and_close(db: Session) -> dict:
             counts["closed"] += 1
         elif req.reminders_sent < len(REMIND_AFTER) and age >= REMIND_AFTER[req.reminders_sent]:
             req.reminders_sent += 1
-            last = next((m for m in reversed(req.messages) if m.kind == "message" and m.author_role == "super_admin"), None)
+            last = next((m for m in reversed(req.messages) if m.kind == "message" and m.author_role in STAFF), None)
             text = (f"We're waiting for your reply about {req.filename}."
                     + (f"\n\nOur last message:\n{last.body}" if last else "")
                     + f"\n\nReply here:\n{link}\n\nIf we don't hear back within {CLOSE_AFTER.days} days of our message, "

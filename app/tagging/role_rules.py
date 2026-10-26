@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from app.verification.integrity import ALLOWED_KIDS
 
 HEADINGS = {"H", "H1", "H2", "H3", "H4", "H5", "H6"}
-TEXT = HEADINGS | {"P", "Caption", "BlockQuote", "Note", "Code", "Quote", "Span", "Reference", "BibEntry",
+TEXT = HEADINGS | {"P", "Caption", "BlockQuote", "Note", "FENote", "Code", "Quote", "Span", "Reference", "BibEntry",
                    "Figure", "Formula"}
 GROUPING = {"Document", "Part", "Art", "Sect", "Div", "NonStruct", "Private", "Form", "Index"}
 # Tags that are blocks of their own: a text tag can't hold them

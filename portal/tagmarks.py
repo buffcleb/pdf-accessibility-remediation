@@ -6,10 +6,16 @@ tags already held: the same marked piece of the page (same number, same place, s
 or link. A group counts as original when anything in it does. Tags the service repaired (a role mapped, alt text
 added) are still the original's.
 
-Worked out when a tag map is read, from the original version's tag map, so it holds for every version (including
-ones people have edited) without changing any file.
+Worked out from the original version's tag map, so it holds for every version (including ones people have edited).
+The marks are written into a version's tag map when it is stored (#580), and the stored file is served as it is;
+tag maps stored before that are marked when read.
 """
 from __future__ import annotations
+
+import json
+
+# A tag map stored with its marks starts with this (dump_marked), so the viewer's request can tell without reading it
+MARKED = b'{"orig_marked":true,'
 
 
 def _same_place(a: list, b: list, tol: float = 2.0) -> bool:
@@ -52,3 +58,14 @@ def mark_all(tagmap: dict) -> dict:
     for e in tagmap.get("elements") or []:
         e["orig"] = True
     return tagmap
+
+
+def dump_marked(tagmap: dict) -> bytes:
+    """A marked tag map as stored: MARKED first, then the map."""
+    rest = {k: v for k, v in tagmap.items() if k != "orig_marked"}
+    return json.dumps({"orig_marked": True, **rest}, separators=(",", ":")).encode()
+
+
+def is_marked(head: bytes) -> bool:
+    """Whether a stored tag map, from its first bytes, already has its marks."""
+    return head.startswith(MARKED)

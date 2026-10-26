@@ -58,3 +58,15 @@ text.](../../../images/tag-manager/toc.png)
 - Set the levels first: once it's a table of contents, indenting no longer applies.
 - If the contents page was read as paragraphs, build it into a list first (above), save, then convert it.
 - Until you save, the tree shows the new types, and choosing **Keep it a list** undoes it.
+
+## Where each entry goes
+
+**New 25 October 2026** (#631). PDF/UA-2 asks each table of contents entry to name the heading it goes to. In a file
+delivered as PDF/UA-2 (or one that came as PDF 2.0), the tool names it from the entry's own link. An entry with no
+link is pointed at the one heading with the same words ("2.1 Getting started ..... 14" goes to "2.1 Getting started"),
+and flagged **contents entry pointed at a heading by its text** for you to check. An entry no heading matches, or that
+two headings match, is flagged **contents entry goes nowhere**.
+
+To set or change where an entry goes, right-click it and choose **Goes to → "…"**. The headings with most words in
+common with the entry come first. **Goes to no heading** takes the target away. Once you've chosen, the flag on that
+entry goes.

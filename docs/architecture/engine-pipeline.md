@@ -34,7 +34,9 @@ What happens to one document inside the engine, step by step, and the rules each
 2. **Fix font Unicode maps.** Fonts whose glyphs have no Unicode value (common in LaTeX output) get their map
    completed from glyph names. Rendering is unchanged.
 3. **Analyze layout** (PyMuPDF), in visual page space, character by character:
-   - **text:** superscripts and subscripts attach to their line. Stacked fractions are found from their drawn bars,
+   - **text:** superscripts and subscripts attach to their line, including ones set at the line's own size and
+     moved up or down by a text rise, when they touch its characters (**changed 24 October 2026**, #596; labels
+     above or below a diagram's arrow stay apart). Stacked fractions are found from their drawn bars,
      and math gets read-aloud text ("10 to the power of 4", "fraction, …, over …, end fraction").
      A rule isn't a fraction bar when it's part of a box or a grid (a table cell's border), when it's the underline
      of the text over it (a link that wraps onto a second line), or when it has words over or under it and nothing
@@ -58,7 +60,9 @@ What happens to one document inside the engine, step by step, and the rules each
      heading or a caption beside a scheme stays text, and structures inside a table are left to the table. The AI
      is told the picture is a structure or a scheme, and the labels go with it.
    - **headings:** leveled by style, consistently. The same style gets the same level, section numbers set depth,
-     and no level is skipped.
+     and no level is skipped. A line led by a list's label isn't a heading however large its print: "(a)", "b)" or
+     "iv.", or a number before more than 12 words, a question or a lead-in ending in ":" (**changed 24 October
+     2026**, #596: a worksheet's numbered questions, larger than its body text, had become headings).
    - **running headers and footers,** including "Page N of M" lines, become artifacts.
    - **list items:** several items on one line are split into separate items.
    - **columns and reading order:** top to bottom in bands, columns left to right inside a band. Columns can sit
@@ -129,9 +133,8 @@ It produces:
   (`*`, `†`, `‡`, `§`, `¶`) the table's cells carry, whatever its size (on a 332-page guideline fewer than half were
   smaller). It becomes a `Note`; each cell with the symbol says it ("500 (footnote asterisk)") and names the note in
   `/Ref`. Letters (a, b) aren't taken. On a document whose own tags are kept, the notes and cells are its tags, and
-  only the ones the engine adds are changed. PDF/UA-2 has no `Note` (it would be `FENote`); the engine declares
-  part 1 for PDF 1.x files (a PDF 2.0 file is declared part 2, #409, and its notes haven't been checked against
-  PDF/UA-2 yet);
+  only the ones the engine adds are changed. PDF/UA-2 has no `Note`: a file made PDF/UA-2 (below) has `FENote`s
+  instead, in the PDF 2.0 namespace, each naming in `/Ref` the tags that cite it;
 - captions ("Figure 1: …", "Table 2 …") tagged with what they describe, when they sit right next to it and are read
   next to it: a table's `Caption` is its first or last child; a figure and its `Caption` are grouped in a `Sect`.
   The caption stays outside the `Figure`, because screen readers read a figure's alt text in place of everything
@@ -143,7 +146,19 @@ It produces:
 The ParentTree is always regenerated. The document also gets `MarkInfo`, `Lang`, a title with `DisplayDocTitle`, the
 XMP `pdfuaid:part` and `/Tabs /S`. The part is 1 for a PDF 1.x file (`PDFUA_PART`, which refuses anything else),
 and 2 for a PDF 2.0 file, with `pdfuaid:rev` 2024 (#409): PDF/UA-1 requires PDF 1.x, so a PDF 2.0 file is
-labelled and judged by PDF/UA-2, with PDF/UA-1 still run for the font repairs.
+labelled and judged by PDF/UA-2, with PDF/UA-1 still run for the font repairs. Which part applies is decided in
+one place, `app/tagging/conformance.py` (#445).
+
+**PDF/UA-2 for a PDF 1.x document** (#445, `flags.pdfua` `"2"` or `"both"`, `app/tagging/pdfua2.py`). The finished
+PDF/UA-1 file is made PDF/UA-2 rather than tagged again, so the AI and tagging work is done once: saved as PDF 2.0,
+labelled part 2 rev 2024, its Document in the PDF 2.0 namespace; notes as `FENote` naming what cites them; a
+structure destination (`/SD`) on every link, bookmark and opening action inside the document (the heading on the
+target page, else its first tag); `ListNumbering` on labelled lists (a kept list's `None` too); form fields given
+`Contents` and embedded files a `Desc`; private use characters taken out of read-aloud and alt text, and read-aloud
+text given to tags whose text has them. With `"2"` the delivered files are converted in place before verification,
+tag maps and the report; with `"both"` the main file's copy is added and checked on its own. On the regression set
+delivered this way, 31 of 32 pass PDF/UA-2; the one left has TeX line-drawing glyphs veraPDF counts as private use
+content (8.4.3).
 
 A title that's only an application and file name ("Microsoft Word - syllabus.docx"), a bare file name or a
 placeholder counts as no title: the first H1 is used instead (#446, on both routes). The document's dates are made readable (`fix_dates` in `app/tagging/metadata.py`, #483, on
@@ -430,12 +445,16 @@ sentences around them). `app/pipeline/music.py` handles it before the AI step:
 ## Fonts, and the two-file case
 
 > **Changed 22 October 2026:** WinAnsi and MacRoman fonts without a Unicode map get one from their encoding (#528).
+>
+> **Changed 23 October 2026:** each substitute font file is embedded once and shared (#577).
 
 **Least destructive first.** Glyphs whose declared width disagrees with the embedded font program (PDF/UA 7.21.5) are
 corrected, with the spacing compensated in the content stream so the page stays pixel-identical; this happens in the
 visually exact output. Unembedded Times, Times New Roman, Arial, Helvetica and Courier fonts get embedded Liberation
 substitutes with identical metrics, so text and tags are unchanged and only glyph shapes may differ from what a given
-viewer substituted; this goes into the **modified** output.
+viewer substituted; this goes into the **modified** output. Each substitute file is embedded once and shared by
+every font that uses it: a document with its own font dictionaries on every page would otherwise carry the same file
+hundreds of times (a 332-page guideline: 74.6 MB, 13.8 MB with one copy of each).
 
 **Characters that are pictures.** Some fonts draw things that aren't text: a music font's note heads and clefs,
 the slanted line and arc pieces of LaTeX's picture fonts (`LINE10`, `LCIRCLE10`). They have no Unicode value to

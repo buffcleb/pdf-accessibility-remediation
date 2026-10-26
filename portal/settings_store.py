@@ -110,6 +110,10 @@ class RuntimeSettings(BaseModel):
     api_token_days: int = Field(90, ge=1, le=3650)
     api_token_max_days: int = Field(365, ge=1, le=3650)
     api_tokens_per_person: int = Field(5, ge=1, le=100)
+
+    # PDF/UA-2 for PDF 1.x documents (#445): switched on here first; then each group's admins let its people choose
+    # PDF/UA-2 or Both (a PDF/UA-2 copy besides the PDF/UA-1 file) and set the group's default
+    pdfua2_enabled: bool = False
     api_token_idle_days: int = Field(90, ge=0, le=3650)
     # Large documents: more pages than this (0 = off) are mixed in after every `large_doc_every` smaller ones, and
     # only `large_doc_at_once` run at a time; with nothing smaller waiting they go one after another
@@ -236,6 +240,7 @@ class RuntimeSettingsUpdate(BaseModel):
     max_queued_jobs_per_user: int | None = Field(None, ge=1, le=100000)
     max_export_documents: int | None = Field(None, ge=1, le=1000)
     api_tokens_enabled: bool | None = None
+    pdfua2_enabled: bool | None = None
     api_token_days: int | None = Field(None, ge=1, le=3650)
     api_token_max_days: int | None = Field(None, ge=1, le=3650)
     api_tokens_per_person: int | None = Field(None, ge=1, le=100)

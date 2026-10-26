@@ -20,6 +20,8 @@ from pathlib import Path
 import pikepdf
 from pikepdf import Array, Dictionary, Name
 
+from app.tagging.tree import items as _items
+
 _PG, _OBJ = "/AdobeMergePage", "/AdobeMergeAnnot"  # temporary markers while a part's tree is copied
 
 
@@ -134,12 +136,6 @@ def _number_tree(node, out: dict[int, object]) -> None:
             out[int(nums[i])] = nums[i + 1]
     for kid in node.get("/Kids", Array()):
         _number_tree(kid, out)
-
-
-def _items(k) -> list:
-    if k is None:
-        return []
-    return list(k) if isinstance(k, Array) else [k]
 
 
 def _shift_struct_parents(part: pikepdf.Pdf, offset: int) -> None:

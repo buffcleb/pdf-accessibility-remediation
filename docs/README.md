@@ -3,6 +3,10 @@
 > **Reviewed 22 October 2026.** [What changed](changes-2026-10-22.md): every substantive change by reader, with links.
 > In the pages, each changed section starts with **Changed 22 October 2026**, **New 22 October 2026** or (in the
 > evaluation documents) **Updated 22 October 2026**.
+>
+> **Changed 23 October 2026:** the service admin role (#564). [What changed](changes-2026-10-23.md).
+>
+> **Changed 26 October 2026:** subgroups (#431). [What changed](changes-2026-10-26.md).
 
 ## Using the service
 
@@ -10,6 +14,8 @@
   - [People submitting documents](user-guide/people/README.md): signing in, uploading, results, the tag manager,
     getting help, email
   - [Group admins](user-guide/group-admins/README.md): approval, pages and limits, group settings, reports
+  - [Service admins](user-guide/service-admins/README.md): what's theirs across every group, and what stays with
+    super admins
   - [Super admins](user-guide/super-admins/README.md): first-time setup, services and AI levels, settings, help
     requests, queues, reports and audit
   - [Glossary](user-guide/glossary.md)
@@ -25,8 +31,8 @@
   [the reference RKE2 deployment](deployment/reference-rke2.md),
   [Cloudflare](deployment/cloudflare.md) and [AWS](deployment/aws.md)
 - **[Operations](operations/README.md):** [configuration](operations/configuration.md),
-  [AI models](operations/ai-models.md), [email and branding](operations/email-and-branding.md),
-  [Adobe Autotag](operations/adobe-autotag.md), [backups and migrations](operations/backups-and-migrations.md),
+  [every setting](operations/settings-reference.md), [AI models](operations/ai-models.md),
+  [email and branding](operations/email-and-branding.md), [Adobe Autotag](operations/adobe-autotag.md), [backups and migrations](operations/backups-and-migrations.md),
   [monitoring and troubleshooting](operations/monitoring.md), [limits](operations/limits.md),
   [CI on your own runners](operations/ci-runners.md), [incident response](operations/incident-response.md),
   [rotating secrets](operations/secret-rotation.md), [rolling back](operations/rollback.md),

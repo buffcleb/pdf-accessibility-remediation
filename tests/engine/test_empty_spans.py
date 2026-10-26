@@ -6,8 +6,8 @@ from pikepdf import Array, Dictionary, Name, String
 
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
-from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import integrity_errors
 
 
 def _labels(path):
@@ -76,9 +76,7 @@ def test_spans_around_nothing_visible_are_folded_into_their_tag(tmp_path):
     dst = tmp_path / "out.pdf"
     res = tag_document(src, dst, prepare_analysis(src), title="Labels", language="en-US")
     assert res.empty_spans_removed == 2
-    with pikepdf.open(dst) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(dst) == []
     first, second, third = _paragraphs(dst)
     # The space is still tagged, as part of the label it follows
     assert first == ("P", [], [0, 1]) and second == ("P", [], [2, 3])

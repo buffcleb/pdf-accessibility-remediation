@@ -310,6 +310,7 @@ async def get_job(job_id: str, format: str = Query("json", pattern="^(json|markd
             remediated_primary=ref(files.get("remediated_primary")),
             remediated_visual_fallback=ref(files.get("remediated_visual_fallback")),
             enhanced=ref(files.get("enhanced")),
+            remediated_pdfua2=ref(files.get("remediated_pdfua2")),
         ),
         metrics=Metrics.model_validate(result.get("metrics", {})),
         reports=Reports(

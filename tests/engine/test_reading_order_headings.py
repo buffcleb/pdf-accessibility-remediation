@@ -1,12 +1,10 @@
 """#297: the AI's reading order can't read a heading after the text drawn under it in its column."""
 from app.pipeline.enrichment import headings_first
-from app.pipeline.models import PageAnalysis, TextBlock
+from tests.engine.layout import block, page
 
 
 def _page(*blocks):
-    return PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792),
-                        blocks=[TextBlock(id=i, page=0, bbox=bbox, text=i, font_size=11, role=role)
-                                for i, role, bbox in blocks])
+    return page(*(block(i, bbox, i, role) for i, role, bbox in blocks))
 
 
 GUIDE = _page(("org", "P", (72, 67, 179, 84)), ("title", "H1", (72, 86, 401, 117)),

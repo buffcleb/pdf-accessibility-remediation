@@ -19,6 +19,7 @@ const TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 const PERSON = "jordan.lee@northfield.example";
 const GROUP_ADMIN = "priya.shah@northfield.example";
 const SUPER_ADMIN = "alex.morgan@northfield.example";
+const SERVICE_ADMIN = "sam.rivera@northfield.example";
 const PAGES = [
   { name: "sign in", as: null, path: "/login" },
   { name: "my documents", as: PERSON, path: "/" },
@@ -59,6 +60,26 @@ const PAGES = [
       await page.getByRole("button", { name: /^Manage jordan/ }).click();
       await page.locator("dialog.admin-dialog[open] .access-check, dialog.admin-dialog[open] .person-section").first().waitFor();
     } },
+  // Subgroups (#431): the list as a tree, Add a subgroup, a subgroup's pages (its limit) and settings (follows the
+  // parent, or its own), and moving someone between the group and its subgroup
+  { name: "admin: groups with a subgroup", as: SUPER_ADMIN, path: "/admin/groups" },
+  { name: "group: add a subgroup dialog", as: GROUP_ADMIN, path: `/admin/groups/${SEED.group}`,
+    act: async (page) => {
+      await page.getByRole("button", { name: "Add a subgroup" }).click();
+      await page.locator("dialog.admin-dialog[open]").waitFor();
+    } },
+  { name: "subgroup: services and pages", as: GROUP_ADMIN, path: `/admin/groups/${SEED.subgroup}/services` },
+  { name: "subgroup: limit dialog", as: GROUP_ADMIN, path: `/admin/groups/${SEED.subgroup}/services`,
+    act: async (page) => {
+      await page.getByRole("button", { name: /^Set limit for Standard/ }).click();
+      await page.locator("dialog.admin-dialog[open] #cap-pages").waitFor();
+    } },
+  { name: "subgroup: settings", as: GROUP_ADMIN, path: `/admin/groups/${SEED.subgroup}/settings` },
+  { name: "group: people, move to a subgroup", as: GROUP_ADMIN, path: `/admin/groups/${SEED.group}/people`,
+    act: async (page) => {
+      await page.getByRole("button", { name: /^Manage casey/ }).click();
+      await page.locator("dialog.admin-dialog[open] select[id^=mv-]").waitFor();
+    } },
   { name: "admin: groups, create dialog", as: SUPER_ADMIN, path: "/admin/groups",
     act: async (page) => {
       await page.getByRole("button", { name: "Create a group" }).click();
@@ -93,7 +114,7 @@ const PAGES = [
   { name: "admin: help", as: SUPER_ADMIN, path: "/admin/help" },
   { name: "admin: queues", as: SUPER_ADMIN, path: "/admin/queues" },
   { name: "admin: system", as: SUPER_ADMIN, path: "/admin/system" },
-  // A pod's details with About open: its images' versions and digests (#541); the Versions table is on both
+  // A pod's details with About open: its images' versions and digests (#541)
   { name: "admin: system, a pod's about", as: SUPER_ADMIN, path: "/admin/system", wait: ".pod-rows",
     act: async (page) => {
       await page.getByRole("button", { name: /^postgres-0:/ }).click();
@@ -102,15 +123,36 @@ const PAGES = [
     } },
   { name: "document: in progress, run details", as: SUPER_ADMIN, path: `/jobs/${SEED.processing}`, wait: ".run-so-far" },
   { name: "admin: system, over time", as: SUPER_ADMIN, path: "/admin/system/over-time" },
+  // Every workload's release (#570), the database's not the pinned digest
+  { name: "admin: system, versions", as: SUPER_ADMIN, path: "/admin/system/versions", wait: "#versions-heading" },
   { name: "admin: system, audit export", as: SUPER_ADMIN, path: "/admin/system/audit-export" },
   // Two pages of rows: the pagers above and below the list (#514)
   { name: "admin: reports, audit over two pages", as: SUPER_ADMIN, path: "/admin/reports?report=audit&range=all",
     wait: ".list-pager-top" },
   { name: "admin: reports", as: SUPER_ADMIN, path: "/admin/reports" },
+  // The Columns dropdown open over the table (#569)
+  { name: "admin: reports, columns open", as: SUPER_ADMIN, path: "/admin/reports", wait: ".report-columns",
+    act: async (page) => {
+      await page.locator(".report-columns > summary").click();
+      await page.locator(".report-columns .choices").waitFor();
+    } },
   { name: "admin: settings", as: SUPER_ADMIN, path: "/admin/settings" },
   // Uploads and limits, one sub-tab per topic (#521)
   ...["uploads", "downloads", "ai", "checks", "help", "alerts"].map((t) => (
     { name: `admin: settings, limits: ${t}`, as: SUPER_ADMIN, path: `/admin/settings/limits/${t}` })),
+  // A service admin (#564): every group, help, queues, System and reports, without the service's own settings
+  { name: "service admin: attention", as: SERVICE_ADMIN, path: "/admin" },
+  { name: "service admin: people, manage dialog", as: SERVICE_ADMIN, path: "/admin/people",
+    act: async (page) => {
+      await page.getByRole("button", { name: /^Manage jordan/ }).click();
+      await page.locator("dialog.admin-dialog[open] .person-section").first().waitFor();
+    } },
+  { name: "service admin: group settings", as: SERVICE_ADMIN, path: `/admin/groups/${SEED.group}/settings` },
+  { name: "service admin: help", as: SERVICE_ADMIN, path: "/admin/help" },
+  { name: "service admin: queues", as: SERVICE_ADMIN, path: "/admin/queues" },
+  { name: "service admin: system", as: SERVICE_ADMIN, path: "/admin/system" },
+  { name: "service admin: system, versions", as: SERVICE_ADMIN, path: "/admin/system/versions", wait: "#versions-heading" },
+  { name: "service admin: document, run details", as: SERVICE_ADMIN, path: `/jobs/${SEED.done}?tab=staff` },
 ].filter((p) => !process.env.A11Y_ONLY || p.name.includes(process.env.A11Y_ONLY));
 
 async function signIn(context, email) {

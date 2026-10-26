@@ -207,7 +207,7 @@ def test_the_zip_is_streamed_a_chunk_at_a_time(setup):
     ids = [_done(s, "user", f"d{i}.pdf") for i in range(3)]
     db = s["db"]
     jobs = [db.get(Job, uuid.UUID(i)) for i in ids]
-    plan = export.plan(db, jobs, is_super_admin=False, time_zone="UTC", retention_days=30)
+    plan = export.plan(db, jobs, staff=False, time_zone="UTC", retention_days=30)
     big = 5 * 1024 * 1024
     chunk = 64 * 1024
 

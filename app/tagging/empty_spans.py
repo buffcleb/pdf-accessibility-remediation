@@ -15,16 +15,11 @@ from pathlib import Path
 
 import pikepdf
 import pymupdf as fitz
-from pikepdf import Array, Dictionary, Name
+from pikepdf import Array, Dictionary
 
 from app.tagging.content_marker import mcid_of
 from app.tagging.existing_tags import _is_struct_elem, resolve_role
-
-
-def _items(k) -> list:
-    if k is None:
-        return []
-    return list(k) if isinstance(k, Array) else [k]
+from app.tagging.tree import items as _items, new_mcr
 
 
 def _visible(text: str) -> bool:
@@ -108,7 +103,7 @@ def remove_empty_spans(pdf: pikepdf.Pdf, src: Path, existing_bbox: dict, existin
                             it.Pg = pg
                         out.append(it)
                     else:
-                        out.append(Dictionary(Type=Name.MCR, Pg=pg, MCID=int(it)))
+                        out.append(new_mcr(pg, int(it)))
                 removed += 1
                 changed = True
                 continue

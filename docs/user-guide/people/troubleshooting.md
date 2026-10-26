@@ -58,10 +58,13 @@
 ## After the service is updated
 
 > **New 22 October 2026:** what happens to a page you opened before an update.
+>
+> **Changed 23 October 2026:** the next click brings the new version (#575).
 
-A page you opened before the service was updated reloads itself once, to fetch the new version, the first time it
-needs part of the app it hasn't loaded yet (opening the tag manager, say). If that doesn't help, it says **The service
-was updated**, with **Reload**. Nothing you saved is lost; unsaved changes in the tag manager are kept for you
+A page you opened before the service was updated gets the new version the next time you move to another page or tab:
+that page loads in full instead of appearing straight away. If you have unsaved changes it waits until they're saved
+or discarded, and moves as usual meanwhile. Opening part of the app the page hasn't loaded yet (the tag manager, say)
+reloads it too. If that doesn't help, it says **The service was updated**, with **Reload**. Nothing you saved is lost; unsaved changes in the tag manager are kept for you
 ([Saving](tag-manager/saving.md#unsaved-changes-are-kept-for-you)).
 
 Still stuck? [Ask for help](getting-help.md) on the document's page.

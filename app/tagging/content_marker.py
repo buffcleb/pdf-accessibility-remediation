@@ -666,6 +666,15 @@ class ContentMarker:
             self.result.streams.append(marks)
 
 
+def write_ops(pdf: pikepdf.Pdf, owner: pikepdf.Object, ops: list) -> None:
+    """Content-stream instructions written back to their owner: a form XObject's stream, or a page's /Contents."""
+    data = pikepdf.unparse_content_stream(ops)
+    if isinstance(owner, pikepdf.Stream):
+        owner.write(data)
+    else:
+        owner.Contents = pdf.make_stream(data)
+
+
 def inherited_resources(page: pikepdf.Object) -> pikepdf.Object:
     """A page's /Resources, or the nearest ancestor's. A /Parent chain is the file's to write: one that loops (a
     page naming itself, two nodes naming each other) would be walked for ever, so each node is visited once."""

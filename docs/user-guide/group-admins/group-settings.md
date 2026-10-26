@@ -59,7 +59,20 @@ it expires and was last used (never the token itself). **Revoke** stops one at o
 log. Documents sent by a script are marked **sent by script** on their page, and the group's **Documents** can be
 filtered to them.
 
-## Managed by super admins
+## PDF/UA-2
 
-The group's name, email domains, group admins and corrections to its pool are edited by super admins (on the same
-tab, for them).
+**New 24 October 2026** (#445). Once super admins offer PDF/UA-2 for the service, **Let people choose PDF/UA-2**
+puts an **Accessibility standard** choice on your people's upload form: PDF/UA-1, PDF/UA-2 (the file delivered as
+PDF 2.0) or Both (a PDF/UA-1 file and a PDF/UA-2 copy, from one run, for the same pages). **Preselected standard**
+is what the form starts with, and what a script's documents get when it doesn't say. Off, or while the service
+doesn't offer it, everyone gets PDF/UA-1.
+
+PDF/UA-1 is still what most policies and checkers mean. PDF/UA-2 is newer and needs PDF 2.0, which current Adobe
+Acrobat and PAC 2024 read but some older readers and checkers don't yet: Both is the safe choice while you find out.
+
+## Managed by super admins and service admins
+
+> **Changed 23 October 2026:** service admins too (#564).
+
+The group's name, email domains, group admins and corrections to its pool are edited by super admins and service
+admins (on the same tab, for them).

@@ -1,4 +1,7 @@
-"""Super-admin routes: groups, domains, group admins, users across groups, settings, audit log."""
+"""Administration across groups: groups, domains, group admins, people, roles, pages, settings, audit log.
+
+Super admins may use all of it. Service admins (#564) may use the routes that ask for one of their permissions
+(portal/permissions.py); the rest stay with super admins."""
 from __future__ import annotations
 
 import uuid
@@ -10,14 +13,16 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from portal import approval, audit, paging, quota, services, settings_store
+from portal import approval, audit, inherit, paging, quota, services, settings_store
 from portal.db import get_db
-from portal.deps import Principal, require_super_admin
+from portal.deps import Principal, require, require_super_admin
 from portal.errors import ApiError, conflict, not_found
 from portal.identity import Eligibility, domain_of, lookup_email, normalize_domain, normalize_email, provision
 from portal.models import AuditEvent, AuthSession, Group, GroupDomain, GroupEmail, RoleAssignment, Service, User
 from portal.paging import Page
-from portal.routers.common import AuditOut, LedgerOut, audit_query
+from portal.permissions import (ALL_GROUPS, ATTENTION, DISABLE_GROUPS, GROUP_ADMINS, MANAGE_GROUPS, PAGES, PEOPLE,
+                                PERSON_DATA, REPORTS, ROLES)
+from portal.routers.common import AuditOut, LedgerOut, audit_query, by_whom
 from portal.schemas import GroupOut, UserOut, group_out, user_out
 from portal.security.ratelimit import per_person
 
@@ -42,6 +47,7 @@ class GroupCreate(BaseModel):
     over_quota_message: str | None = Field(None, max_length=2000)
     local_only: bool = False
     require_approval: bool | None = None  # None: the default for new groups (a setting)
+    parent_id: uuid.UUID | None = None  # a subgroup of this group (#431); one level only
 
 
 class GroupUpdate(BaseModel):
@@ -83,36 +89,69 @@ def _claim_domain(db: Session, group: Group, raw: str, public_ok: bool = False) 
 
 
 @router.get("/groups", response_model=list[GroupOut])
-def list_groups(_: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+def list_groups(_: Principal = Depends(require(ALL_GROUPS)), db: Session = Depends(get_db)):
     return [group_out(g) for g in db.scalars(select(Group).order_by(Group.name))]
 
 
 @router.post("/groups", response_model=GroupOut, status_code=201)
-def create_group(body: GroupCreate, request: Request, p: Principal = Depends(require_super_admin),
+def create_group(body: GroupCreate, request: Request, p: Principal = Depends(require(MANAGE_GROUPS)),
                  db: Session = Depends(get_db)):
-    name = body.name.strip()
-    if db.scalar(select(Group).where(func.lower(Group.name) == name.lower())):
-        raise conflict("group_exists", f"A group named \"{name}\" already exists.")
-    require = (body.require_approval if body.require_approval is not None
-               else settings_store.load(db).new_groups_require_approval)
-    group = Group(name=name, over_quota_message=body.over_quota_message, local_only=body.local_only,
-                  require_approval=require)
-    db.add(group)
-    db.flush()
-    services.setup_new_group(db, group)
+    parent = subgroup_parent(db, body.parent_id) if body.parent_id else None
+    group = new_group(db, body.name, parent=parent, local_only=body.local_only, require_approval=body.require_approval,
+                      over_quota_message=body.over_quota_message)
     group.service(services.STANDARD).default_user_cap = body.default_user_cap
     domains = [_claim_domain(db, group, d) for d in body.domains]
     audit.record(db, request, "group.created", actor=p.user, target_type="group", target_id=group.id,
-                 group_id=group.id, details={"name": name, "domains": domains,
+                 group_id=group.id, details={"name": group.name, "domains": domains,
                                              "default_user_cap": body.default_user_cap,
-                                             "local_only": body.local_only, "require_approval": require})
+                                             "local_only": group.local_only, "require_approval": group.require_approval,
+                                             "parent": str(parent.id) if parent else None})
     db.commit()
     db.refresh(group)
     return group_out(group)
 
 
+def subgroup_parent(db: Session, parent_id: uuid.UUID) -> Group:
+    """The group a new subgroup goes under (#431): one that isn't a subgroup itself."""
+    parent = db.get(Group, parent_id)
+    if parent is None:
+        raise not_found("Group")
+    if parent.parent_id is not None:
+        raise ApiError(422, "subgroup_depth", "A subgroup can't have subgroups of its own: subgroups are one level deep.")
+    return parent
+
+
+def new_group(db: Session, name: str, *, parent: Group | None = None, local_only: bool = False,
+              require_approval: bool | None = None, over_quota_message: str | None = None) -> Group:
+    """A new group, with the standard service. A subgroup (#431) takes its settings from its parent (those given here
+    it overrides, local-only only to turn it on) and starts with its parent's services switched on as the parent
+    has them."""
+    name = name.strip()
+    if db.scalar(select(Group).where(func.lower(Group.name) == name.lower())):
+        raise conflict("group_exists", f"A group named \"{name}\" already exists.")
+    group = Group(name=name, parent_id=parent.id if parent else None)
+    if parent is not None:
+        inherit.start(group, parent)
+    else:
+        group.require_approval = settings_store.load(db).new_groups_require_approval
+    given = {"local_only": local_only or None, "require_approval": require_approval,
+             "over_quota_message": over_quota_message}
+    given = {k: v for k, v in given.items() if v is not None}
+    for k, v in given.items():
+        setattr(group, k, v)
+    inherit.overridden(group, set(given))
+    db.add(group)
+    db.flush()
+    services.setup_new_group(db, group)
+    for pgs in parent.services if parent is not None else []:
+        gs = services.group_service(db, group, pgs.service_key, create=True)
+        gs.enabled, gs.all_users, gs.is_default, gs.default_user_cap = (pgs.enabled, pgs.all_users, pgs.is_default,
+                                                                        pgs.default_user_cap)
+    return group
+
+
 @router.get("/groups/{group_id}", response_model=GroupOut)
-def get_group(group_id: uuid.UUID, _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+def get_group(group_id: uuid.UUID, _: Principal = Depends(require(ALL_GROUPS)), db: Session = Depends(get_db)):
     group = db.get(Group, group_id)
     if group is None:
         raise not_found("Group")
@@ -121,12 +160,15 @@ def get_group(group_id: uuid.UUID, _: Principal = Depends(require_super_admin), 
 
 @router.patch("/groups/{group_id}", response_model=GroupOut)
 def update_group(group_id: uuid.UUID, body: GroupUpdate, request: Request,
-                 p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                 p: Principal = Depends(require(MANAGE_GROUPS)), db: Session = Depends(get_db)):
     group = db.get(Group, group_id)
     if group is None:
         raise not_found("Group")
+    sent = body.model_dump(exclude_unset=True)
+    if "status" in sent and sent["status"] != group.status and not p.can(DISABLE_GROUPS):
+        raise ApiError(403, "forbidden", "Only a super admin can disable a group or enable it again.")
     changes = {}
-    for key, value in body.model_dump(exclude_unset=True).items():
+    for key, value in sent.items():
         if key in ("name", "status", "local_only") and value is None:
             raise ApiError(422, "invalid", f"{key} cannot be empty.")
         if key == "default_user_cap":
@@ -140,10 +182,15 @@ def update_group(group_id: uuid.UUID, body: GroupUpdate, request: Request,
             clash = db.scalar(select(Group).where(func.lower(Group.name) == value.lower(), Group.id != group.id))
             if clash:
                 raise conflict("group_exists", f"A group named \"{value}\" already exists.")
+        if key == "local_only":
+            inherit.check_local_only(db, group, value)
         old = getattr(group, key)
         if old != value:
             setattr(group, key, value)
             changes[key] = [old, value]
+    inherit.overridden(group, set(sent))  # a subgroup's own from now on (#431)
+    if subs := inherit.pass_down(db, group, set(changes)):
+        changes["subgroups_following"] = subs
     if changes.get("status", [None, None])[1] == "disabled":
         member_ids = select(User.id).where(User.group_id == group.id)
         changes["sessions_revoked"] = revoke_sessions(db, member_ids, "group_disabled")
@@ -156,7 +203,7 @@ def update_group(group_id: uuid.UUID, body: GroupUpdate, request: Request,
 
 @router.post("/groups/{group_id}/domains", response_model=GroupOut, status_code=201)
 def add_domain(group_id: uuid.UUID, body: DomainIn, request: Request,
-               p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+               p: Principal = Depends(require(MANAGE_GROUPS)), db: Session = Depends(get_db)):
     group = db.get(Group, group_id)
     if group is None:
         raise not_found("Group")
@@ -174,7 +221,7 @@ def add_domain(group_id: uuid.UUID, body: DomainIn, request: Request,
 
 @router.delete("/groups/{group_id}/domains/{domain}", response_model=GroupOut)
 def remove_domain(group_id: uuid.UUID, domain: str, request: Request,
-                  p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                  p: Principal = Depends(require(MANAGE_GROUPS)), db: Session = Depends(get_db)):
     """New accounts can no longer be created for this domain. Existing accounts keep working."""
     group = db.get(Group, group_id)
     row = db.get(GroupDomain, normalize_domain(domain))
@@ -198,7 +245,7 @@ class GroupEmailIn(BaseModel):
 
 @router.post("/groups/{group_id}/emails", response_model=GroupOut, status_code=201)
 def add_group_email(group_id: uuid.UUID, body: GroupEmailIn, request: Request,
-                    p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                    p: Principal = Depends(require(MANAGE_GROUPS)), db: Session = Depends(get_db)):
     """Let one person into the group by their address, without their domain. It takes precedence over a domain
     match. Someone who already has an account keeps theirs (and its group): move them in People instead."""
     group = db.get(Group, group_id)
@@ -237,7 +284,7 @@ def add_group_email(group_id: uuid.UUID, body: GroupEmailIn, request: Request,
 
 @router.delete("/groups/{group_id}/emails/{email}", response_model=GroupOut)
 def remove_group_email(group_id: uuid.UUID, email: str, request: Request,
-                       p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                       p: Principal = Depends(require(MANAGE_GROUPS)), db: Session = Depends(get_db)):
     """They can no longer sign up by this address. An account they already have keeps working: disable it in
     People to stop that."""
     group = db.get(Group, group_id)
@@ -259,7 +306,7 @@ class AdminIn(BaseModel):
 
 
 @router.get("/groups/{group_id}/admins", response_model=list[UserOut])
-def list_group_admins(group_id: uuid.UUID, _: Principal = Depends(require_super_admin),
+def list_group_admins(group_id: uuid.UUID, _: Principal = Depends(require(GROUP_ADMINS)),
                       db: Session = Depends(get_db)):
     if db.get(Group, group_id) is None:
         raise not_found("Group")
@@ -270,7 +317,7 @@ def list_group_admins(group_id: uuid.UUID, _: Principal = Depends(require_super_
 
 @router.post("/groups/{group_id}/admins", response_model=UserOut, status_code=201)
 def add_group_admin(group_id: uuid.UUID, body: AdminIn, request: Request,
-                    p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                    p: Principal = Depends(require(GROUP_ADMINS)), db: Session = Depends(get_db)):
     """Make a member of the group its admin. If they haven't signed in yet, their account is created
     now, provided their email domain belongs to this group or the group lists their address."""
     group = db.get(Group, group_id)
@@ -290,7 +337,7 @@ def add_group_admin(group_id: uuid.UUID, body: AdminIn, request: Request,
     elif user.group_id != group.id:
         raise conflict("other_group", f"{email} belongs to another group. Move the user first.")
     approval.mark_approved_as_admin(user, p.user.email)
-    if group.id not in user.admin_group_ids():
+    if group.id not in user.direct_admin_group_ids():
         db.add(RoleAssignment(user_id=user.id, role="group_admin", group_id=group.id))
         audit.record(db, request, "role.granted", actor=p.user, target_type="user", target_id=user.id,
                      group_id=group.id, details={"role": "group_admin", "email": email})
@@ -301,7 +348,7 @@ def add_group_admin(group_id: uuid.UUID, body: AdminIn, request: Request,
 
 @router.delete("/groups/{group_id}/admins/{user_id}", status_code=204)
 def remove_group_admin(group_id: uuid.UUID, user_id: uuid.UUID, request: Request,
-                       p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                       p: Principal = Depends(require(GROUP_ADMINS)), db: Session = Depends(get_db)):
     role = db.scalar(select(RoleAssignment).where(RoleAssignment.user_id == user_id,
                                                   RoleAssignment.role == "group_admin",
                                                   RoleAssignment.group_id == group_id))
@@ -326,7 +373,7 @@ class UserAdminUpdate(BaseModel):
 def search_users(q: str | None = Query(None, max_length=200), group_id: uuid.UUID | None = None,
                  status: str | None = Query(None, pattern="^(active|disabled)$"),
                  limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
-                 _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                 _: Principal = Depends(require(PEOPLE)), db: Session = Depends(get_db)):
     stmt = select(User)
     if q:
         like = f"%{q.lower().replace('%', r'\%').replace('_', r'\_')}%"
@@ -344,10 +391,10 @@ PEOPLE_SORTS = {"email": User.email, "group": select(Group.name).where(Group.id 
 
 @router.get("/people", response_model=Page[UserOut])
 def people(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None,
-           role: str | None = Query(None, pattern="^(super_admin|group_admin|member)$"),
+           role: str | None = Query(None, pattern="^(super_admin|service_admin|group_admin|member)$"),
            status: str | None = Query(None, pattern="^(active|disabled|pending|declined|removed)$"),
            sort: str = Query("email", max_length=20), page: int = Query(1, ge=1, le=100_000),
-           page_size: int = Query(25, ge=1, le=200), _: Principal = Depends(require_super_admin),
+           page_size: int = Query(25, ge=1, le=200), _: Principal = Depends(require(PEOPLE)),
            db: Session = Depends(get_db)):
     """Everyone, a page at a time (#514): search by email or name; filter by group, role and status (active, disabled,
     waiting for approval, declined, data removed); sort by email, group, last sign-in or when they joined."""
@@ -358,10 +405,8 @@ def people(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None
     if group_id:
         stmt = stmt.where(User.group_id == group_id)
     roles = select(RoleAssignment.user_id)
-    if role == "super_admin":
-        stmt = stmt.where(User.id.in_(roles.where(RoleAssignment.role == "super_admin")))
-    elif role == "group_admin":
-        stmt = stmt.where(User.id.in_(roles.where(RoleAssignment.role == "group_admin")))
+    if role in ("super_admin", "service_admin", "group_admin"):
+        stmt = stmt.where(User.id.in_(roles.where(RoleAssignment.role == role)))
     elif role == "member":
         stmt = stmt.where(User.id.not_in(roles))
     if status in ("active", "disabled"):
@@ -375,10 +420,11 @@ def people(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None
 
 @router.patch("/users/{user_id}", response_model=UserOut)
 def update_user(user_id: uuid.UUID, body: UserAdminUpdate, request: Request,
-                p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                p: Principal = Depends(require(PEOPLE)), db: Session = Depends(get_db)):
     user = db.get(User, user_id)
     if user is None:
         raise not_found("User")
+    _not_across_groups(p, user)
     sent = body.model_dump(exclude_unset=True)
     changes = {}
     if "status" in sent and sent["status"] is None:
@@ -389,8 +435,8 @@ def update_user(user_id: uuid.UUID, body: UserAdminUpdate, request: Request,
         new_group = db.get(Group, sent["group_id"]) if sent["group_id"] else None
         if sent["group_id"] and new_group is None:
             raise not_found("Group")
-        if new_group is None and not user.is_super_admin:
-            raise ApiError(422, "group_required", "Only super admins can be without a group.")
+        if new_group is None and not user.across_groups:
+            raise ApiError(422, "group_required", "Only super admins and service admins can be without a group.")
         # Admin rights don't follow the user to a new group. Past usage stays with the old group.
         for role in [r for r in user.roles if r.role == "group_admin"]:
             db.delete(role)
@@ -411,14 +457,22 @@ def update_user(user_id: uuid.UUID, body: UserAdminUpdate, request: Request,
     return user_out(user)
 
 
+def _not_across_groups(p: Principal, user: User) -> None:
+    """Super admins' and service admins' accounts are changed by super admins only."""
+    if user.across_groups and not p.is_super_admin:
+        raise ApiError(403, "forbidden", "Only a super admin can change a super admin's or a service admin's account.")
+
+
 @router.post("/users/{user_id}/super-admin", response_model=UserOut)
-def grant_super_admin(user_id: uuid.UUID, request: Request, p: Principal = Depends(require_super_admin),
+def grant_super_admin(user_id: uuid.UUID, request: Request, p: Principal = Depends(require(ROLES)),
                       db: Session = Depends(get_db)):
     user = db.get(User, user_id)
     if user is None:
         raise not_found("User")
     if not user.is_super_admin:
         approval.mark_approved_as_admin(user, p.user.email)
+        # A super admin may do everything a service admin may: the lesser role goes
+        _drop_role(db, request, p, user, "service_admin")
         db.add(RoleAssignment(user_id=user.id, role="super_admin"))
         audit.record(db, request, "role.granted", actor=p.user, target_type="user", target_id=user.id,
                      group_id=user.group_id, details={"role": "super_admin", "email": user.email})
@@ -427,13 +481,55 @@ def grant_super_admin(user_id: uuid.UUID, request: Request, p: Principal = Depen
     return user_out(user)
 
 
+@router.post("/users/{user_id}/service-admin", response_model=UserOut)
+def grant_service_admin(user_id: uuid.UUID, request: Request, p: Principal = Depends(require(ROLES)),
+                        db: Session = Depends(get_db)):
+    """Make someone a service admin (#564): they help run every group, without the service's own settings."""
+    user = db.get(User, user_id)
+    if user is None or user.removed_at is not None:
+        raise not_found("User")
+    if user.is_super_admin:
+        raise conflict("is_super_admin", f"{user.email} is a super admin, who may already do everything a service "
+                                         "admin may. Remove super admin rights first.")
+    if not user.is_service_admin:
+        approval.mark_approved_as_admin(user, p.user.email)
+        db.add(RoleAssignment(user_id=user.id, role="service_admin"))
+        audit.record(db, request, "role.granted", actor=p.user, target_type="user", target_id=user.id,
+                     group_id=user.group_id, details={"role": "service_admin", "email": user.email})
+        db.commit()
+        db.refresh(user)
+    return user_out(user)
+
+
+@router.delete("/users/{user_id}/service-admin", response_model=UserOut)
+def revoke_service_admin(user_id: uuid.UUID, request: Request, p: Principal = Depends(require(ROLES)),
+                         db: Session = Depends(get_db)):
+    user = db.get(User, user_id)
+    if user is None or not user.is_service_admin:
+        raise not_found("Service admin")
+    if user.group_id is None:
+        raise ApiError(422, "group_required", "Assign this user to a group before removing service admin rights.")
+    _drop_role(db, request, p, user, "service_admin")
+    db.commit()
+    db.refresh(user)
+    return user_out(user)
+
+
+def _drop_role(db: Session, request: Request, p: Principal, user: User, role: str) -> None:
+    for r in [r for r in user.roles if r.role == role]:
+        user.roles.remove(r)
+        audit.record(db, request, "role.revoked", actor=p.user, target_type="user", target_id=user.id,
+                     group_id=user.group_id, details={"role": role, "email": user.email})
+
+
 @router.post("/users/{user_id}/sessions/end", status_code=204)
-def end_sessions(user_id: uuid.UUID, request: Request, p: Principal = Depends(require_super_admin),
+def end_sessions(user_id: uuid.UUID, request: Request, p: Principal = Depends(require(PEOPLE)),
                  db: Session = Depends(get_db)):
     """Sign a person out everywhere (#354): a lost device, or an account someone else may be using."""
     user = db.get(User, user_id)
     if user is None:
         raise not_found("User")
+    _not_across_groups(p, user)
     count = revoke_sessions(db, [user.id], "ended_by_admin")
     audit.record(db, request, "sessions.ended", actor=p.user, target_type="user", target_id=user.id,
                  group_id=user.group_id, details={"sessions": count})
@@ -448,7 +544,7 @@ class RemovePerson(BaseModel):
 
 
 @router.post("/users/{user_id}/remove", response_model=UserOut)
-def remove_person(user_id: uuid.UUID, body: RemovePerson, request: Request, p: Principal = Depends(require_super_admin),
+def remove_person(user_id: uuid.UUID, body: RemovePerson, request: Request, p: Principal = Depends(require(PERSON_DATA)),
                   db: Session = Depends(get_db)):
     """Remove a person's data on their request: their files deleted, their name and email gone from every record,
     the records themselves kept. Final."""
@@ -469,7 +565,7 @@ def remove_person(user_id: uuid.UUID, body: RemovePerson, request: Request, p: P
 
 @router.get("/users/{user_id}/export", dependencies=[Depends(per_person("export"))])
 def export_person(user_id: uuid.UUID, request: Request, files: bool = False,
-                  p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                  p: Principal = Depends(require(PERSON_DATA)), db: Session = Depends(get_db)):
     """Everything held about a person, for a records request: JSON, or with files=true a zip that also has their
     documents' files that still exist. Audited."""
     from fastapi.responses import Response
@@ -488,7 +584,7 @@ def export_person(user_id: uuid.UUID, request: Request, files: bool = False,
 
 
 @router.delete("/users/{user_id}/super-admin", response_model=UserOut)
-def revoke_super_admin(user_id: uuid.UUID, request: Request, p: Principal = Depends(require_super_admin),
+def revoke_super_admin(user_id: uuid.UUID, request: Request, p: Principal = Depends(require(ROLES)),
                        db: Session = Depends(get_db)):
     user = db.get(User, user_id)
     if user is None or not user.is_super_admin:
@@ -533,7 +629,7 @@ def patch_settings(body: settings_store.RuntimeSettingsUpdate, request: Request,
 def all_audit(action: str | None = Query(None, max_length=64), group_id: uuid.UUID | None = None,
               actor_id: uuid.UUID | None = None, since: datetime | None = None, until: datetime | None = None,
               before_id: int | None = None, limit: int = Query(100, ge=1, le=1000),
-              _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+              _: Principal = Depends(require(REPORTS)), db: Session = Depends(get_db)):
     stmt = audit_query(action=action, actor_id=actor_id, since=since, until=until, before_id=before_id)
     if group_id:
         stmt = stmt.where(AuditEvent.group_id == group_id)
@@ -578,7 +674,7 @@ def _record_adjust(db, request, p, entry, body, group_id) -> None:
 
 
 @router.post("/groups/{group_id}/topups", response_model=LedgerOut, status_code=201)
-def add_topup(group_id: uuid.UUID, body: TopupIn, request: Request, p: Principal = Depends(require_super_admin),
+def add_topup(group_id: uuid.UUID, body: TopupIn, request: Request, p: Principal = Depends(require(PAGES)),
               db: Session = Depends(get_db)):
     entry = quota.topup(db, group_id, body.pages, _actor(p, request), ticket_ref=body.ticket_ref,
                         ticket_url=body.ticket_url, override=body.override, comment=body.comment, service=body.service)
@@ -589,7 +685,7 @@ def add_topup(group_id: uuid.UUID, body: TopupIn, request: Request, p: Principal
 
 @router.post("/groups/{group_id}/adjustments", response_model=LedgerOut, status_code=201)
 def add_adjustment(group_id: uuid.UUID, body: AdjustIn, request: Request,
-                   p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                   p: Principal = Depends(require(PAGES)), db: Session = Depends(get_db)):
     entry = quota.adjust(db, group_id, body.pages, _actor(p, request), comment=body.comment,
                          ticket_ref=body.ticket_ref, service=body.service)
     _record_adjust(db, request, p, entry, body, group_id)
@@ -606,9 +702,9 @@ class UsageCorrectionIn(BaseModel):
 
 @router.post("/users/{user_id}/usage-corrections", response_model=UserOut, status_code=201)
 def correct_user_usage(user_id: uuid.UUID, body: UsageCorrectionIn, request: Request,
-                       p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
-    """Correct one person's usage of a service. Recorded in the ledger and in both the super admin's and
-    the group's audit log."""
+                       p: Principal = Depends(require(PAGES)), db: Session = Depends(get_db)):
+    """Correct one person's usage of a service. Recorded in the ledger and in both the service-wide and the group's
+    audit log."""
     user = db.get(User, user_id)
     if user is None:
         raise not_found("User")
@@ -617,7 +713,7 @@ def correct_user_usage(user_id: uuid.UUID, body: UsageCorrectionIn, request: Req
     audit.record(db, request, "quota.usage_corrected", actor=p.user, target_type="user", target_id=user.id,
                  group_id=user.group_id, details={"email": user.email, "service": body.service, "pages": body.pages,
                                                   "used_pages": [before, after], "comment": entry.comment,
-                                                  "ticket_ref": entry.ticket_ref, "by_super_admin": True})
+                                                  "ticket_ref": entry.ticket_ref, **by_whom(p)})
     db.commit()
     db.refresh(user)
     return user_out(user)
@@ -677,7 +773,8 @@ class ServiceOut(BaseModel):
     allow_notation: bool
     allow_ocr_ai: bool
     engine_route: str
-    audit_ai: str  # AI levels: audits "free" (use AI, no pages), "charge" (this level's pages) or "off" (no AI)
+    audit_ai: str  # AI levels: audits "free" (use AI, no pages), "charge" (this level's pages), "off" (no AI)
+    #                or "disabled" (Check only not offered with this level, #586)
     sort: int
     groups_enabled: int
     kinds: list[KindOut] = []  # AI levels: kinds of document beyond General, with their models (super admins only)
@@ -690,7 +787,7 @@ class ServiceUpdate(BaseModel):
     allow_full_review: bool | None = None  # AI tiers: people may ask for every figure to be reviewed
     allow_notation: bool | None = None  # AI tiers: the AI reads specialist notation the layout rules can't
     allow_ocr_ai: bool | None = None  # AI tiers: the AI corrects OCR words Tesseract was unsure of
-    audit_ai: str | None = Field(None, pattern="^(free|charge|off)$")  # AI levels: AI in audits
+    audit_ai: str | None = Field(None, pattern="^(free|charge|off|disabled)$")  # AI levels: AI in audits
     description: str | None = Field(None, max_length=2000)
     enabled: bool | None = None
     external: bool | None = None
@@ -853,7 +950,8 @@ def create_ai_tier(body: AITierCreate, request: Request, p: Principal = Depends(
 
 
 @router.get("/services", response_model=list[ServiceOut])
-def list_services(_: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+def list_services(_: Principal = Depends(require(ALL_GROUPS)), db: Session = Depends(get_db)):
+    # Read only for service admins (#564): they offer the services that are on to groups, and check people's access
     return [service_out(db, s) for s in services.all_services(db)]
 
 
@@ -958,8 +1056,9 @@ def add_service_adjustment(key: str, body: AdjustIn, request: Request, p: Princi
 # --- attention and access checks ----------------------------------------------------------------------
 
 @router.get("/attention")
-def admin_attention(_: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
-    """What needs a super admin's attention, across every group and service, most serious first."""
+def admin_attention(_: Principal = Depends(require(ATTENTION)), db: Session = Depends(get_db)):
+    """What needs support's attention (super admins and service admins), across every group and service, most serious
+    first."""
     from portal.attention import attention
     return [i.to_dict() for i in attention(db)]
 
@@ -969,23 +1068,23 @@ class AckIn(BaseModel):
 
 
 @router.get("/attention/acknowledged")
-def admin_acknowledged(_: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
-    """The items super admins have acknowledged (#538): what each said, who and when."""
+def admin_acknowledged(_: Principal = Depends(require(ATTENTION)), db: Session = Depends(get_db)):
+    """The items acknowledged on this list (#538): what each said, who and when."""
     from portal.attention import acknowledged
     return acknowledged(db, None)
 
 
 @router.post("/attention/acknowledge")
-def admin_acknowledge(body: AckIn, request: Request, p: Principal = Depends(require_super_admin),
+def admin_acknowledge(body: AckIn, request: Request, p: Principal = Depends(require(ATTENTION)),
                       db: Session = Depends(get_db)):
-    """Acknowledge an item for every super admin, until something new joins it (#538)."""
+    """Acknowledge an item for everyone who sees this list, until something new joins it (#538)."""
     from portal.attention import acknowledge, acked
     return acked(db, request, p, None, acknowledge(db, None, body.key, p.user.email), body.key)
 
 
 @router.delete("/attention/acknowledge")
 def admin_unacknowledge(request: Request, key: str = Query(min_length=1, max_length=200),
-                        p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                        p: Principal = Depends(require(ATTENTION)), db: Session = Depends(get_db)):
     """Show an acknowledged item again."""
     from portal.attention import unacked, unacknowledge
     return unacked(db, request, p, None, unacknowledge(db, None, key), key)
@@ -995,7 +1094,7 @@ def admin_unacknowledge(request: Request, key: str = Query(min_length=1, max_len
 
 @router.get("/access-check")
 def admin_access_check(email: str = Query(..., max_length=320), service: str = Query(..., max_length=64),
-                       _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                       _: Principal = Depends(require(ATTENTION)), db: Session = Depends(get_db)):
     """Why this person can or can't use this service: every check in order."""
     from portal.attention import explain_access
     user = db.scalar(select(User).where(User.email == lookup_email(email)))

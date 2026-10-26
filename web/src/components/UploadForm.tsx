@@ -1,9 +1,10 @@
 import { useEffect, useId, useRef, useState, type DragEvent } from "react";
 import {
-  get, heldFor, post, uploadFiles, type ConfirmMany, type FileChoice, type Job, type ServiceChoice, type UploadOptions,
-  type UploadResult,
+  get, heldFor, post, uploadFiles, PDFUA_LABELS, type ConfirmMany, type FileChoice, type Job, type PdfUa,
+  type ServiceChoice, type UploadOptions, type UploadResult,
 } from "../api";
 import { ErrorNotice, LiveRegion, Notice, fmtBytes, fmtNum, useLoad } from "./ui";
+import { checkNotOffered, checkNotOfferedLine } from "./checkOffer";
 import { SLOW_UPLOAD_SECONDS, uploadWait } from "./uploadWait";
 
 type Picked = { file: File; choice: FileChoice | null; open: boolean };
@@ -26,6 +27,7 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   const [altText, setAltText] = useState(true);
   const [fullReview, setFullReview] = useState(false);
   const [ignoreTags, setIgnoreTags] = useState(false);  // #396: the documents' own tags are poor
+  const [pdfua, setPdfua] = useState<PdfUa | null>(null);  // #445: null until chosen, then the group's default
   const [held, setHeld] = useState<Job[]>([]);
   // Whether the held documents fit the pages left, as the server judges it (a dry run of sending them, #494)
   const [fit, setFit] = useState<ConfirmMany | null>(null);
@@ -55,6 +57,10 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   // Adobe's AI only writes alt text, and only if asked (on by default).
   const altTextOnly = chosen?.ai_use === "alt_text";
   const usesAi = !altTextOnly || altText;
+  // PDF/UA-2 (#445): offered where the service and group allow it, and made by the engine's own route only
+  const partChoices = opts?.pdfua_choices ?? ["1"];
+  const pdfuaOffered = partChoices.length > 1 && chosen?.engine_route === "standard";
+  const partChosen: PdfUa = pdfua ?? opts?.pdfua_default ?? "1";
   const levels = choices.filter((c) => c.kind === "ai_tier");
   const defaultLevel = levels.find((c) => c.is_default) ?? null;
   const fixedChoice: FileChoice | null = fixed ? { ai_tier: opts!.ai_level, ai_kind: opts!.ai_kind } : null;
@@ -62,6 +68,8 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   const level = levels.find((c) => c.key === base.ai_tier) ?? null;
   const canChange = !fixed && usesAi && (levels.length > 1 || levels.some((l) => l.kinds.length > 1));
   const fullAllowed = !level || level.allow_full_review;
+  // Levels whose checks are turned off (#586): Check only isn't offered while one is chosen, for the batch or a file
+  const noCheck = usesAi ? checkNotOffered(levels, [base.ai_tier, ...(fixed ? [] : files.map((f) => f.choice?.ai_tier))]) : [];
 
   function label(c: FileChoice) {
     const l = levels.find((x) => x.key === c.ai_tier);
@@ -122,7 +130,8 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
       if (!fixed) files.forEach((f, i) => { if (f.choice) perFile[i] = f.choice; });
       const res = await uploadFiles(files.map((f) => f.file), check, chosen?.key ?? "standard", false,
         fixed ? null : base.ai_tier, fullReview && fullAllowed && usesAi && !check,
-        !altTextOnly || altText, base.ai_kind, perFile, ignoreTags && !check);
+        !altTextOnly || altText, base.ai_kind, perFile, ignoreTags && !check,
+        pdfuaOffered && !check ? partChosen : null);
       setResults(res);
       setHeld(res.filter((r) => r.job?.status === "held").map((r) => r.job!));
       const ok = res.filter((r) => r.accepted).length;
@@ -249,10 +258,25 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
       {usesAi && level?.notice && <Notice kind="warn" title={`About ${level.label}`}>{level.notice}</Notice>}
 
       {(() => {
-        const on = (fullReview && usesAi && fullAllowed ? 1 : 0) + (ignoreTags ? 1 : 0);
+        const on = (fullReview && usesAi && fullAllowed ? 1 : 0) + (ignoreTags ? 1 : 0)
+          + (pdfuaOffered && partChosen !== "1" ? 1 : 0);
         return (
           <details className="upload-more">
             <summary>More options{on ? ` (${on} on)` : ""}</summary>
+            {pdfuaOffered && (
+              <fieldset className="choice-set">
+                <legend>Accessibility standard</legend>
+                {partChoices.map((p) => (
+                  <label key={p} className="check">
+                    <input type="radio" name="pdfua" checked={partChosen === p} onChange={() => setPdfua(p)} />
+                    <span>{PDFUA_LABELS[p]}{p === "2" && <span className="muted"> The file is converted to PDF 2.0,
+                      which some older PDF readers don't support yet.</span>}{p === "both" && <span className="muted"> Two
+                      files from one run, each checked for its own standard.</span>}</span>
+                  </label>
+                ))}
+                <p className="muted small">Not used for Check only.</p>
+              </fieldset>
+            )}
             <label className="check">
               <input type="checkbox" checked={ignoreTags} onChange={(e) => setIgnoreTags(e.target.checked)} />
               <span>
@@ -278,7 +302,8 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
         <button className="btn" disabled={!!busy || files.length === 0} onClick={() => void submit(false)}>
           {busy === "remediate" ? "Uploading…" : "Remediate"}
         </button>
-        <button className="btn secondary" disabled={!!busy || files.length === 0} onClick={() => void submit(true)}
+        <button className="btn secondary" disabled={!!busy || files.length === 0 || noCheck.length > 0}
+          onClick={() => void submit(true)}
           aria-describedby={`${ids}-check`}>
           {busy === "check" ? "Uploading…" : "Check only"}
         </button>
@@ -287,8 +312,8 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
         {busy && slow ? uploadWait(files.length, !!opts?.malware_scan) : ""}
       </p>
       <p id={`${ids}-check`} className="muted small upload-hint">
-        Remediate uses one page of your limit for each page. Check only reports problems without changing the
-        files{checkCost(level, chosen)}.
+        Remediate uses one page of your limit for each page. {noCheck.length > 0 ? checkNotOfferedLine(noCheck)
+          : <>Check only reports problems without changing the files{checkCost(level, chosen)}.</>}
       </p>
 
       <ErrorNotice error={error} />

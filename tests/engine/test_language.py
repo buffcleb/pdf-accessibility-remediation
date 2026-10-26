@@ -1,13 +1,10 @@
 """#340: a document's language comes from its text when the PDF gives none (or clearly the wrong one), and a passage
 clearly in another language gets its own on its tag."""
-import asyncio
-import shutil
-import uuid
-
 import pikepdf
 import pymupdf as fitz
 
 from app.pipeline import language
+from tests.engine.pdfs import remediate
 
 SPANISH = ("La biblioteca de la universidad abre todos los días de la semana, desde las ocho de la mañana hasta "
            "las diez de la noche. Los estudiantes pueden reservar salas de estudio en grupo con una semana de "
@@ -64,14 +61,7 @@ def _doc(path, lines, lang=None):
 
 
 def _remediate(tmp_path, src):
-    from app.pipeline.orchestrator import JobOptions, run_remediation
-    from app.storage import JobStore
-
-    jid = str(uuid.uuid4())
-    store = JobStore(jid, root=tmp_path / "jobs")
-    store.create()
-    shutil.copyfile(src, store.input_pdf)
-    res = asyncio.run(run_remediation(store, JobOptions(stem="l", job_id=jid, provider="mock")))
+    res, store = remediate(tmp_path, src, stem="l")
     return res, next(store.dir.rglob("l_remediated.pdf"))
 
 

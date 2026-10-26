@@ -2,7 +2,8 @@
 
 A pool counts as low below `low_pool_percent` of its size or `low_pool_pages` pages, whichever is larger (Settings;
 Attention uses the same). The worker checks about once a minute: when a pool drops below, the group's admins (or the
-super admins, if it has none) get one email; topping it up above re-arms it. An empty pool is low too.
+super admins, if it has none) get one email; topping it up above re-arms it. An empty pool is low too. A subgroup's
+limit on its parent's pool (#431) counts the same way, and its admins and its parent's are told.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from portal import outbox, quota, services, settings_store
+from portal import outbox, services, settings_store
 from portal.approval import _admins_of
 from portal.mail import Mail
 from portal.models import AlertState, Group
@@ -41,11 +42,13 @@ def check(db: Session, now: datetime | None = None) -> list[str]:
     for g in db.scalars(select(Group).where(Group.status == "active")):
         for gs in g.services:
             s = services.get_service(db, gs.service_key)
-            if s is None or not s.enabled or not gs.enabled or not s.metered or gs.pool_pages <= 0:
+            if s is None or not s.enabled or not gs.enabled or not s.metered:
                 continue
-            left = quota.group_remaining(gs)
-            if is_low(left, gs.pool_pages, rs):
-                low[_key(g.id, s.key)] = (g, s, left, gs.pool_pages)
+            if g.parent_id is not None and gs.cap_pages is None:
+                continue  # a subgroup with no limit of its own: its parent's pool is told about
+            size, left = services.pool_left(g, s.key) or (0, 0)
+            if size > 0 and is_low(left, size, rs):
+                low[_key(g.id, s.key)] = (g, s, left, size)
     sent = []
     footer = f"\n{rs.service_name}" + (f", {rs.organization_name}" if rs.organization_name else "") + "\n"
     for key, (g, s, left, pool) in low.items():
@@ -54,7 +57,8 @@ def check(db: Session, now: datetime | None = None) -> list[str]:
         detail = f"{g.name}: {left:,} of {pool:,} {s.label} pages left."
         what = "has run out" if left <= 0 else "is running low"
         outbox.queue(db, [Mail(to=to, subject=f"{g.name}: {s.label} pages {'used up' if left <= 0 else 'running low'}",
-                               text=f"Your group's pool of {s.label} pages {what}: {left:,} of {pool:,} left. People in "
+                               text=f"Your group's {'limit' if g.parent_id else 'pool'} of {s.label} pages {what}: "
+                                    f"{left:,} of {pool:,} left. People in "
                                     f"the group can't send documents with it once it's empty.\n\nTo add pages, ask "
                                     f"your service's administrators (the group's Services and pages page shows how)."
                                     f"\n{footer}") for to in _admins_of(db, g)], rs.mail_from_name, "alert")

@@ -44,6 +44,34 @@ export function drawingPage(page: number): string {
   return `Drawing page ${page}`;
 }
 
+/** A version's loading as the tag manager follows it (viewer/pdf.ts): the PDF's and the tag map's downloads, whether
+ *  pdf.js is opening the PDF, and the page count once the tag map is in (#579: it comes on its own). */
+export type Loading = { pdf: Received; tags: Received; reading: boolean; pages: number | null };
+
+const NONE: Received = { received: 0, total: null };
+
+/** The page view's wait: both downloads, then reading once both are in. pdfSize: the file's size as the version
+ *  records it, for when the download doesn't say. */
+export function pageLoading(load: Loading | null, pdfSize?: number | null): { lines: string[]; fraction: number | null } {
+  const tags = load?.tags ?? NONE;
+  if (load?.reading) {
+    if (load.pages !== null) return { lines: [READING_TAGS], fraction: null };
+    return { lines: [downloading("the tags", tags)], fraction: fraction([tags]) };  // the PDF is in, the tags aren't
+  }
+  const pdf = load?.pdf ?? NONE;
+  const doc = { ...pdf, total: pdf.total ?? (pdfSize || null) };
+  return {
+    lines: [downloading("the document", doc), downloading("the tags", tags)],
+    fraction: load ? fraction([doc, tags]) : null,
+  };
+}
+
+/** The tag tree's wait: the tag map's download alone, as the tree doesn't need the PDF (#579). */
+export function tagsLoading(load: Loading | null): { lines: string[]; fraction: number | null } {
+  const tags = load?.tags ?? NONE;
+  return { lines: [downloading("the tags", tags)], fraction: load ? fraction([tags]) : null };
+}
+
 /** How far the downloads have got together, 0 to 1, or null when a size isn't known (a spinner, not a bar). */
 export function fraction(downloads: Received[]): number | null {
   if (!downloads.length || downloads.some((d) => d.total === null || d.total <= 0)) return null;

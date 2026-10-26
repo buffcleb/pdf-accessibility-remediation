@@ -37,10 +37,6 @@ def _font_dirs() -> list[str]:
     return ([extra] if extra else []) + list(_DIRS)
 
 
-def substitutes_available() -> bool:
-    return _find("LiberationSerif-Regular") is not None
-
-
 def _find(stem: str) -> Path | None:
     for d in _font_dirs():
         p = Path(d) / f"{stem}.ttf"
@@ -100,6 +96,9 @@ def _code_map(font: Dictionary) -> dict[int, str]:
 def embed_standard_fonts(src: Path, dst: Path) -> list[str]:
     """Embed substitutes into src, writing dst. Returns 'Original -> Substitute' descriptions."""
     done: list[str] = []
+    # One program per substitute file, shared by every font that uses it: a document with a font dictionary per page
+    # would otherwise carry the same file hundreds of times (#577)
+    programs: dict[str, tuple[fitz.Font, pikepdf.Object]] = {}
     with pikepdf.open(src) as pdf:
         for obj in pdf.objects:
             if not isinstance(obj, Dictionary) or obj.get("/Type") != Name.Font:
@@ -119,15 +118,17 @@ def embed_standard_fonts(src: Path, dst: Path) -> list[str]:
             path = _find(stem)
             if path is None:
                 continue
-            font = fitz.Font(fontfile=str(path))
+            if stem not in programs:
+                data = path.read_bytes()
+                stream = pdf.make_stream(data)
+                stream.Length1 = len(data)
+                programs[stem] = (fitz.Font(fontfile=str(path)), stream)
+            font, stream = programs[stem]
             codes = _code_map(obj)
             widths = []
             for code in range(256):
                 ch = codes.get(code)
                 widths.append(round(font.glyph_advance(ord(ch)) * 1000) if ch and font.has_glyph(ord(ch)) else 0)
-            data = path.read_bytes()
-            stream = pdf.make_stream(data)
-            stream.Length1 = len(data)
             flags = 32 | (2 if fam == "serif" else 0) | (1 if fam == "mono" else 0) | (64 if italic else 0)
             bbox = font.bbox
             new_desc = Dictionary(
@@ -153,5 +154,5 @@ def embed_standard_fonts(src: Path, dst: Path) -> list[str]:
             done.append(f"{original} -> {stem}")
         if done:
             pdf.save(dst)
-    log.info("embedded %d substitute font(s)", len(done))
+    log.info("embedded %d substitute font(s), %d program(s)", len(done), len(programs))
     return done

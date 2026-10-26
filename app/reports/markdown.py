@@ -134,6 +134,9 @@ def render_job_markdown(job_id: str, meta: dict, status: str, result: dict | Non
         out.append(f"The remediated document **{verdict} PDF/UA-{2 if after.get('pdfua_part') == 2 else 1}**"
                    + (f" ({before.get('failed_checks')} → {after.get('failed_checks')} failed checks)."
                       if isinstance(before.get("failed_checks"), int) and isinstance(after.get("failed_checks"), int) else "."))
+        if comp.get("pdfua2_changes"):
+            from app.reports.pdf import pdf2_note
+            out += ["", pdf2_note(comp)]
         if files.get("remediated_visual_fallback"):
             pages = ", ".join(str(p) for p in comp.get("destructive_pages") or [])
             out.append("")

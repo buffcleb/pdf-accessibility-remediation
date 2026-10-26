@@ -2,7 +2,8 @@
 
 [Guide for group admins](README.md) › The admin area
 
-**Administration** (in the header) is shared by group admins and super admins; each sees what their role allows.
+**Administration** (in the header) is shared by group admins, service admins and super admins; each sees what their
+role allows.
 As a group admin, the menu on the left has:
 
 - **Attention:** what needs action now (below).

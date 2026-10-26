@@ -5,6 +5,7 @@ import {
   download, get, post, postForm, type HelpKind, type HelpMessage, type HelpRequest, type HelpStatus, type Job, type Versions,
 } from "../api";
 import { useAuth } from "../auth";
+import { isStaffRole } from "../permissions";
 import { ErrorNotice, Loading, fmtDate, useLoad } from "./ui";
 import { useUnsavedChanges } from "./unsaved";
 
@@ -74,7 +75,7 @@ function Attachments({ request, message }: { request: string; message: HelpMessa
   );
 }
 
-const ROLE_LABEL = { person: "", group_admin: "group admin", super_admin: "support", system: "" } as const;
+const ROLE_LABEL = { person: "", group_admin: "group admin", service_admin: "support", super_admin: "support", system: "" } as const;
 
 /** The conversation, and a box to add to it. Super admins can also write internal notes. */
 export function HelpThread({ req, onChange, label = "Reply" }: { req: HelpRequest; onChange: (r: HelpRequest) => void; label?: string }) {
@@ -93,7 +94,8 @@ export function HelpThread({ req, onChange, label = "Reply" }: { req: HelpReques
     if (fresh.length) setAnnounce(`New message from ${fresh[fresh.length - 1].author_email}.`);
   }, [req.messages, me?.email]);
   const finished = req.status === "resolved" || req.status === "closed";
-  const canWrite = !finished || req.role === "super_admin";
+  const staff = isStaffRole(req.role);
+  const canWrite = !finished || staff;
 
   async function send(internal: boolean) {
     setBusy(true);
@@ -120,7 +122,7 @@ export function HelpThread({ req, onChange, label = "Reply" }: { req: HelpReques
         {req.messages.map((m) => m.kind === "event" ? (
           <li key={m.id} className="event">{m.body} · {fmtDate(m.created_at)}</li>
         ) : (
-          <li key={m.id} className={`msg${m.kind === "note" ? " note" : m.author_role === "super_admin" ? " staff" : ""}`}>
+          <li key={m.id} className={`msg${m.kind === "note" ? " note" : isStaffRole(m.author_role) ? " staff" : ""}`}>
             <span className="who">
               <strong>{m.kind === "note" ? "Internal note" : m.author_email === me?.email ? "You" : m.author_email}</strong>
               {m.kind === "note" ? ` · ${m.author_email}` : ROLE_LABEL[m.author_role] ? ` (${ROLE_LABEL[m.author_role]})` : ""}
@@ -141,14 +143,14 @@ export function HelpThread({ req, onChange, label = "Reply" }: { req: HelpReques
           <ErrorNotice error={error} />
           <div className="actions">
             <button className="btn" type="submit" disabled={busy || (!body.trim() && files.length === 0)}>
-              {req.role === "super_admin" ? `Send to ${req.user_email}` : "Send"}
+              {staff ? `Send to ${req.user_email}` : "Send"}
             </button>
-            {req.role === "super_admin" && (
+            {staff && (
               <button className="btn secondary" type="button" disabled={busy || !body.trim()} onClick={() => void send(true)}>
                 Add as internal note
               </button>
             )}
-            {req.role === "super_admin" && <span className="muted small">Internal notes are only seen by super admins.</span>}
+            {staff && <span className="muted small">Internal notes are only seen by super admins and service admins.</span>}
           </div>
         </form>
       ) : (
@@ -324,6 +326,7 @@ export function HelpPanel({ job }: { job: Job }) {
           </div>
         </section>
       ))}
+      {!req && !own && <p className="muted small">Nobody has asked for help with this document.</p>}
     </div>
   );
 }

@@ -265,3 +265,24 @@ def test_every_prometheus_rule_has_a_title_and_a_fix():
     assert len(names) == 11
     assert names == set(alerts.PROM_TITLES) == set(alerts.PROM_FIXES)
     assert all(len(alerts.PROM + n) <= 40 for n in names)  # alert_states.key
+
+
+def test_a_full_volumes_advice_names_each_volumes_setting_and_the_runbook():
+    """#592: each claim with a size in deploy.env, by that setting; there's no STORAGE_SIZE."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).parents[2]
+    advice = alerts.fix(alerts.PROM + "VolumeFilling")
+    assert "docs/deployment/first-cluster/storage.md#growing-a-volume" in advice
+    assert (root / "docs/deployment/first-cluster/storage.md").read_text().count("\n## Growing a volume\n") == 1
+    assert "STORAGE_SIZE" not in advice
+    sized = set()
+    for f in (root / "deploy/k8s/manifests").glob("*.yaml"):
+        sized |= set(re.findall(r"storage: \$\{([A-Z_]+_SIZE)\}", f.read_text()))
+    assert sized - {"BACKUP_SIZE"} == {"DB_SIZE", "REDIS_SIZE", "FILES_SIZE", "JOBDATA_SIZE", "PROMETHEUS_SIZE",
+                                       "GRAFANA_SIZE"}
+    for claim, setting in [("data-postgres-0", "DB_SIZE"), ("data-seaweedfs-0", "FILES_SIZE"),
+                           ("data-redis-0", "REDIS_SIZE"), ("jobdata", "JOBDATA_SIZE"),
+                           ("prometheus-data", "PROMETHEUS_SIZE"), ("grafana-data", "GRAFANA_SIZE")]:
+        assert f"{claim} {setting}" in advice or f"{claim} is {setting}" in advice

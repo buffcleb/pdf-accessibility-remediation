@@ -1,5 +1,6 @@
 """Monitoring from the admin area (#397): Administration > System's figures, charts and pods (#398), read from the
-deployment's Prometheus with fixed queries, and signing super admins in to Grafana through the portal.
+deployment's Prometheus with fixed queries, for super admins and service admins (#564); and signing super admins in to
+Grafana through the portal.
 
 Grafana sits behind the web app's nginx at /grafana. Opening it from the admin area gives the browser a short-lived
 cookie, signed by the portal and sent only to /grafana. On every request there, nginx asks /monitoring/grafana-auth
@@ -20,12 +21,13 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from portal import audit, prometheus, rls, workloads
+from portal import audit, permissions, prometheus, rls, workloads
 from portal.config import get_portal_settings
 from portal.db import get_db
-from portal.deps import Principal, require_super_admin
+from portal.deps import Principal, require
 from portal.errors import ApiError
 from portal.models import User
+from portal.permissions import GRAFANA, SYSTEM
 from portal.security.tokens import constant_time_equal, keyed_hash
 
 router = APIRouter(tags=["monitoring"])
@@ -52,7 +54,7 @@ def grafana_user(db: Session, token: str | None, now: float | None = None) -> Us
         user = db.get(User, uuid.UUID(uid))
     except (ValueError, TypeError):
         return None
-    if user is None or user.status != "active" or user.removed_at is not None or not user.is_super_admin:
+    if user is None or user.status != "active" or user.removed_at is not None or not permissions.has(user, GRAFANA):
         return None
     return user
 
@@ -62,7 +64,7 @@ class GrafanaOut(BaseModel):
 
 
 @router.post("/admin/monitoring/grafana", response_model=GrafanaOut)
-def open_grafana(request: Request, response: Response, p: Principal = Depends(require_super_admin),
+def open_grafana(request: Request, response: Response, p: Principal = Depends(require(GRAFANA)),
                  db: Session = Depends(get_db)):
     """Let the caller into Grafana: the cookie that /grafana's requests are checked with, for eight hours."""
     s = get_portal_settings()
@@ -203,7 +205,7 @@ def _chart(prom: prometheus.Prometheus, title: str, unit: str, queries, start: f
 
 @router.get("/admin/monitoring/system", response_model=SystemOut)
 def system(range_: Literal["6h", "24h", "7d"] = Query("6h", alias="range"),
-           p: Principal = Depends(require_super_admin)):
+           p: Principal = Depends(require(SYSTEM))):
     """What the deployment's Prometheus says now, and over the last 6 hours, day or week."""
     s = get_portal_settings()
     prom = prometheus.get_prometheus()
@@ -233,7 +235,7 @@ class WorkloadsOut(BaseModel):
 
 
 @router.get("/admin/monitoring/workloads", response_model=WorkloadsOut)
-def pods(p: Principal = Depends(require_super_admin)):
+def pods(p: Principal = Depends(require(SYSTEM))):
     """Every workload and its pods, as Prometheus last saw them (#398)."""
     prom = prometheus.get_prometheus()
     out = WorkloadsOut(monitoring=prom is not None, reachable=False)

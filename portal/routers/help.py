@@ -1,4 +1,5 @@
-"""Help requests: asking for help with a document, the conversation about it, and the super admins' queue."""
+"""Help requests: asking for help with a document, the conversation about it, and support's queue (super admins and,
+#564, service admins)."""
 from __future__ import annotations
 
 import io
@@ -15,10 +16,13 @@ from sqlalchemy.orm import Session
 
 from portal import approval, audit, helpdesk, malware, paging, settings_store
 from portal.db import get_db
-from portal.deps import Principal, current_principal, group_for_admin, require_super_admin
+from portal.deps import Principal, current_principal, group_for_admin, require
 from portal.errors import ApiError, conflict, not_found, too_many
-from portal.models import HELP_KINDS, HELP_STATUSES, DocumentVersion, Group, HelpAttachment, HelpRequest, Job, User
+from portal.models import (
+    HELP_KINDS, HELP_STATUSES, DocumentVersion, Group, HelpAttachment, HelpRequest, Job, User, group_family,
+)
 from portal.paging import Page
+from portal.permissions import HELP
 from portal.security.ratelimit import RateLimiter, get_rate_limiter
 from portal.storage import get_storage, safe_name
 
@@ -37,7 +41,7 @@ class AttachmentOut(BaseModel):
 
 class MessageOut(BaseModel):
     id: uuid.UUID
-    kind: str  # message | note (super admins only) | event
+    kind: str  # message | note (support only) | event
     author_email: str
     author_role: str
     body: str
@@ -70,7 +74,7 @@ class HelpSummary(BaseModel):
 
 class HelpOut(HelpSummary):
     tag: dict | None
-    role: str  # how the caller takes part: person | group_admin | super_admin
+    role: str  # how the caller takes part: person | group_admin | service_admin | super_admin
     messages: list[MessageOut]
     resolution: str | None  # what was done, as the person was told
     resolved_version_number: int | None
@@ -80,7 +84,7 @@ class HelpOut(HelpSummary):
     finished_at: datetime | None
     reopen_until: datetime | None  # the person can reopen it themselves until then
     can_reopen: bool
-    pages_charged: int | None  # what the document cost, as a hint for refunds (super admins)
+    pages_charged: int | None  # what the document cost, as a hint for refunds (support)
 
 
 def _summary(req: HelpRequest, job: Job | None = None) -> dict:
@@ -110,12 +114,12 @@ def _out(db: Session, req: HelpRequest, role: str) -> HelpOut:
                                                      DocumentVersion.number == req.resolved_version_number))
     until = helpdesk.reopen_until(req, settings_store.load(db).help_reopen_days)
     can_reopen = not req.active and req.job_id is not None and (
-        role == "super_admin" or (role == "person" and until is not None and helpdesk._now() <= until))
+        role in helpdesk.STAFF or (role == "person" and until is not None and helpdesk._now() <= until))
     return HelpOut(**_summary(req, job), tag=req.tag, role=role, messages=msgs, resolution=req.resolution,
                    resolved_version_number=req.resolved_version_number, resolved_version_label=rv.label if rv else None,
                    resolved_version_status=rv.status if rv else None, pages_refunded=req.pages_refunded,
                    finished_at=req.finished_at, reopen_until=until, can_reopen=can_reopen,
-                   pages_charged=job.pages_charged if job and role == "super_admin" else None)
+                   pages_charged=job.pages_charged if job and role in helpdesk.STAFF else None)
 
 
 def _visible(db: Session, request_id: uuid.UUID, p: Principal, lock: bool = False) -> tuple[HelpRequest, str]:
@@ -220,7 +224,7 @@ def help_for_job(job_id: uuid.UUID, p: Principal = Depends(current_principal), d
     req = next((r for r in reqs if r.active), reqs[0] if reqs else None)
     role = helpdesk.role_of(p.user, req) if req else None
     if req is None or role is None:
-        if job.user_id != p.user.id and not p.is_super_admin and not (job.group_id and p.can_admin_group(job.group_id)):
+        if job.user_id != p.user.id and not p.can(HELP) and not (job.group_id and p.can_admin_group(job.group_id)):
             raise not_found("Job")
         return None
     _seen(db, req, p)
@@ -248,12 +252,13 @@ def post_message(request_id: uuid.UUID, request: Request,
                  body: str = Form("", max_length=helpdesk.MAX_BODY), internal: bool = Form(False),
                  files: list[UploadFile] = File(default=[]), p: Principal = Depends(current_principal),
                  db: Session = Depends(get_db), limiter: RateLimiter = Depends(get_rate_limiter)):
-    """Write on a request, with files if needed. Internal notes are for super admins and aren't sent to anyone."""
+    """Write on a request, with files if needed. Internal notes are for super admins and service admins, and aren't
+    sent to anyone."""
     req, role = _visible(db, request_id, p, lock=True)
     body = body.strip()
-    if internal and role != "super_admin":
-        raise ApiError(403, "forbidden", "Only super admins can write internal notes.")
-    if not req.active and role != "super_admin":
+    if internal and role not in helpdesk.STAFF:
+        raise ApiError(403, "forbidden", "Only super admins and service admins can write internal notes.")
+    if not req.active and role not in helpdesk.STAFF:
         raise ApiError(409, "help_finished",
                        "This request is finished. If there's still a problem, ask for help with the document again.")
     if not body and not any(f.filename for f in files):
@@ -266,11 +271,11 @@ def post_message(request_id: uuid.UUID, request: Request,
     msg = helpdesk.add_message(db, req, p.user, role, "note" if internal else "message", body)
     helpdesk.store_attachments(db, req, msg, uploads)
     if not internal:
-        if role != "super_admin" and req.status == "waiting":
+        if role not in helpdesk.STAFF and req.status == "waiting":
             helpdesk.set_status(db, req, "in_progress", None, "system")
         if role == "person":
             req.person_seen_at = helpdesk._now()  # their own reply isn't news to them
-        if role == "super_admin":
+        if role in helpdesk.STAFF:
             helpdesk.notify(db, req, "person")
         else:
             helpdesk.notify(db, req, "staff")
@@ -288,7 +293,7 @@ def download_attachment(request_id: uuid.UUID, attachment_id: uuid.UUID, request
                         p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     req, role = _visible(db, request_id, p)
     att = db.get(HelpAttachment, attachment_id)
-    if att is None or att.request_id != req.id or (att.message.kind == "note" and role != "super_admin"):
+    if att is None or att.request_id != req.id or (att.message.kind == "note" and role not in helpdesk.STAFF):
         raise not_found("Attachment")
     if req.user_id != p.user.id:
         audit.record(db, request, "help.attachment_opened", actor=p.user, target_type="help_request",
@@ -299,7 +304,7 @@ def download_attachment(request_id: uuid.UUID, attachment_id: uuid.UUID, request
                                       "Content-Length": str(att.size_bytes), "X-Content-Type-Options": "nosniff"})
 
 
-# --- super admins ----------------------------------------------------------------------------------
+# --- support: super admins and service admins -----------------------------------------------------
 
 class StatusChange(BaseModel):
     status: str = Field(pattern="^(in_progress|waiting|resolved|closed)$")
@@ -307,7 +312,7 @@ class StatusChange(BaseModel):
 
 @router.post("/help/{request_id}/status", response_model=HelpOut)
 def change_status(request_id: uuid.UUID, body: StatusChange, request: Request,
-                  p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                  p: Principal = Depends(require(HELP)), db: Session = Depends(get_db)):
     req, role = _visible(db, request_id, p, lock=True)
     old = req.status
     if body.status in ("in_progress", "waiting") and not req.active and req.job_id and db.scalar(
@@ -331,7 +336,7 @@ class Assign(BaseModel):
 
 
 @router.post("/help/{request_id}/assign", response_model=HelpOut)
-def assign(request_id: uuid.UUID, body: Assign, request: Request, p: Principal = Depends(require_super_admin),
+def assign(request_id: uuid.UUID, body: Assign, request: Request, p: Principal = Depends(require(HELP)),
            db: Session = Depends(get_db)):
     req, role = _visible(db, request_id, p, lock=True)
     new_id, new_email = (p.user.id, p.user.email) if body.take else (None, None)
@@ -347,7 +352,7 @@ def assign(request_id: uuid.UUID, body: Assign, request: Request, p: Principal =
     return _out(db, req, role)
 
 
-# The list's own view of a request, as SQL (#514): it needs a super admin (HelpRequest.needs_staff), and since when it
+# The list's own view of a request, as SQL (#514): it needs support (HelpRequest.needs_staff), and since when it
 # has waited (_summary): since the person last wrote, or since its status last changed
 _NEEDS_STAFF, _WAITING_SINCE = helpdesk.NEEDS_STAFF, helpdesk.WAITING_SINCE
 HELP_SORTS = {"waiting": _WAITING_SINCE, "updated": HelpRequest.updated_at, "created": HelpRequest.created_at,
@@ -356,7 +361,7 @@ HELP_SHOW = ("needs_us", "active", "all", *HELP_STATUSES)
 
 
 class HelpPage(Page[HelpSummary]):
-    needs_us: int  # active requests needing a super admin, whatever the filters (for the Show list's count)
+    needs_us: int  # active requests needing support, whatever the filters (for the Show list's count)
 
 
 def _help_page(db: Session, scope: list, *, saved: bool | None, show: str, kind: str | None, group_id: uuid.UUID | None,
@@ -397,7 +402,7 @@ def queue_page(saved: bool = False, show: str = Query("needs_us", max_length=16)
                kind: str | None = Query(None, max_length=16), group_id: uuid.UUID | None = None,
                q: str = Query("", max_length=200), sort: str = Query("waiting", max_length=20),
                page: int = Query(1, ge=1, le=100_000), page_size: int = Query(25, ge=1, le=200),
-               _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+               _: Principal = Depends(require(HELP)), db: Session = Depends(get_db)):
     """Every help request (or the saved ones), a page at a time (#514): see _help_page."""
     return _help_page(db, [], saved=saved, show=show, kind=kind, group_id=group_id, q=q, sort=sort, page=page,
                       page_size=page_size)
@@ -410,14 +415,14 @@ def group_page(group_id: uuid.UUID, show: str = Query("all", max_length=16), kin
                p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """A group's help requests for its admins, a page at a time (#514), newest activity first: see _help_page."""
     group: Group = group_for_admin(group_id, p, db)
-    return _help_page(db, [HelpRequest.group_id == group.id], saved=None, show=show, kind=kind, group_id=None, q=q,
+    return _help_page(db, [HelpRequest.group_id.in_(group_family(db, group.id))], saved=None, show=show, kind=kind, group_id=None, q=q,
                       sort=sort, page=page, page_size=page_size)
 
 
 @router.get("/admin/help", response_model=list[HelpSummary])
 def queue(saved: bool = False, status: str | None = Query(None, max_length=16), kind: str | None = Query(None, max_length=16),
           group_id: uuid.UUID | None = None, q: str | None = Query(None, max_length=200),
-          _: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+          _: Principal = Depends(require(HELP)), db: Session = Depends(get_db)):
     """Every request (or the saved ones), newest activity first; the app sorts and filters further."""
     stmt = select(HelpRequest).where(HelpRequest.saved.is_(saved))
     if status in HELP_STATUSES:
@@ -438,7 +443,7 @@ def queue(saved: bool = False, status: str | None = Query(None, max_length=16), 
 @router.get("/groups/{group_id}/help", response_model=list[HelpSummary])
 def group_requests(group_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     group: Group = group_for_admin(group_id, p, db)
-    reqs = db.scalars(select(HelpRequest).where(HelpRequest.group_id == group.id)
+    reqs = db.scalars(select(HelpRequest).where(HelpRequest.group_id.in_(group_family(db, group.id)))
                       .order_by(HelpRequest.updated_at.desc()).limit(500)).all()
     jobs = {j.id: j for j in db.scalars(select(Job).where(Job.id.in_([r.job_id for r in reqs if r.job_id])))}
     return [HelpSummary(**_summary(r, jobs.get(r.job_id))) for r in reqs]
@@ -461,7 +466,7 @@ def _scan(db: Session, request: Request, user, uploads: list[tuple[str, str, byt
 
 @router.post("/help/{request_id}/corrected", response_model=HelpOut, status_code=201)
 def upload_corrected(request_id: uuid.UUID, request: Request, file: UploadFile = File(...),
-                     p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+                     p: Principal = Depends(require(HELP)), db: Session = Depends(get_db)):
     """A corrected PDF made outside the portal becomes a new version of the document, "Corrected by support N".
     It must have the same number of pages; it's checked like any saved version (integrity, veraPDF, and a
     visual comparison with the version it replaces), and failed checks are shown, not blocking."""
@@ -519,7 +524,7 @@ class Resolve(BaseModel):
 
 @router.post("/help/{request_id}/resolve", response_model=HelpOut)
 def resolve(request_id: uuid.UUID, body: Resolve, request: Request,
-            p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+            p: Principal = Depends(require(HELP)), db: Session = Depends(get_db)):
     """Finish a request: resolved (usually with a new version) or closed without changes. The note is posted to
     the person; pages can be given back through the usual audited usage correction."""
     from portal import quota, services
@@ -568,7 +573,7 @@ def resolve(request_id: uuid.UUID, body: Resolve, request: Request,
 @router.post("/help/{request_id}/reopen", response_model=HelpOut)
 def reopen(request_id: uuid.UUID, request: Request,
            p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
-    """The person reopens a finished request within the reopen window (super admins: any time)."""
+    """The person reopens a finished request within the reopen window (support: any time)."""
     req, role = _visible(db, request_id, p, lock=True)
     out = _out(db, req, role)
     if not out.can_reopen:
@@ -590,7 +595,7 @@ class SaveIn(BaseModel):
 
 
 @router.post("/help/{request_id}/save", response_model=HelpOut)
-def save_request(request_id: uuid.UUID, body: SaveIn, request: Request, p: Principal = Depends(require_super_admin),
+def save_request(request_id: uuid.UUID, body: SaveIn, request: Request, p: Principal = Depends(require(HELP)),
                  db: Session = Depends(get_db)):
     """Keep a request past the document's retention (it moves to the Saved view), or let it expire again."""
     req, role = _visible(db, request_id, p, lock=True)

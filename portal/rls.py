@@ -5,8 +5,9 @@ the person's id, their groups (their own and those they administer), the address
 bypass for super admins and cross-group work. They are transaction-local (`set_config(..., true)`), so a pooled
 connection carries nothing over to the next request. A session nobody set up sees no group-scoped rows at all.
 
-Using the bypass is audited (`rls.bypass`): a super admin's once per sign-in session and kind of request (the route,
-never its IDs), and cross-group work outside a request (the worker, the status check, metrics) once per process.
+Using the bypass is audited (`rls.bypass`): a super admin's or a service admin's (#564) once per sign-in session and
+kind of request (the route, never its IDs, and their role), and cross-group work outside a request (the worker, the
+status check, metrics) once per process.
 """
 from __future__ import annotations
 
@@ -52,16 +53,17 @@ def identify(db: Session, *, user_id: uuid.UUID | None = None, email: str | None
 
 
 def as_person(db: Session, user, request: Request | None = None, sign_in_id: uuid.UUID | None = None) -> None:
-    """The signed-in person's rows: their group's, and those of the groups they administer. Super admins work across
-    groups, so they get the bypass."""
-    if user.is_super_admin:
+    """The signed-in person's rows: their group's, and those of the groups they administer. Super admins and service
+    admins work across groups, so they get the bypass."""
+    if user.across_groups:
         _set(db, bypass="on", user=str(user.id))
         name = "other"
         if request is not None:
             # The route's pattern, never the path itself (it carries IDs); a router's routes lack the API's prefix
             route = getattr(request.scope.get("route"), "path", None) or "other"
             name = f"{request.method} {route if route.startswith(API_PREFIX) else API_PREFIX + route}"
-        _audit_once(("super_admin", sign_in_id or user.id, name), request, actor=user, details={"route": name})
+        role = "super_admin" if user.is_super_admin else "service_admin"
+        _audit_once((role, sign_in_id or user.id, name), request, actor=user, details={"route": name, "role": role})
         return
     groups = sorted(str(g) for g in {user.group_id, *user.admin_group_ids()} if g)
     _set(db, user=str(user.id), groups=",".join(groups))

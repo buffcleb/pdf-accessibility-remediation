@@ -129,3 +129,18 @@ def test_a_table_caption_is_the_tables_first_child(tmp_path, verapdf_available):
     assert tables and tables[0][0] == "Caption" and set(tables[0][1:]) == {"TR"}, tables
     if verapdf_available:
         assert res["reports"]["comparison"]["after"]["compliant"] is True
+
+
+def test_a_scheme_graph_or_plate_caption_is_a_caption_and_pairs_with_its_figure():
+    """#620: "Scheme 1", "Graph 2" and "Plate 3" are captions too (they were kept out of a drawing, but stayed
+    paragraphs); a worked example's or an equation's label isn't."""
+    from app.pipeline.markers import CAPTION, DRAWING_CAPTION
+
+    for text in ("Scheme 1. Synthesis of aspirin", "Graph 2: Rate against temperature", "Plate 3 The site"):
+        assert CAPTION.match(text) and DRAWING_CAPTION.match(text)
+        fig, cap = _fig("i1", (50, 100, 290, 250)), _cap("b1", (50, 258, 260, 268), text)
+        assert caption_pairs(_page(fig, cap)) == {"b1": "i1"}
+    for text in ("Example 3. Find the mass", "Equation 4", "Eq. 2"):
+        assert not CAPTION.match(text) and DRAWING_CAPTION.match(text)      # read as text beside a drawing
+    for text in ("Exhibit 1. Costs", "Image 2"):
+        assert DRAWING_CAPTION.match(text)                                   # kept out of a drawing, as captions

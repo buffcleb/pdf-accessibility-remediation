@@ -2,7 +2,7 @@
 // page never sees. A 401 triggers one refresh attempt, then the user is sent to sign in.
 import type { ReadingChoice, Readings } from "./viewer/readings";
 
-export type Role = { role: "super_admin" | "group_admin"; group_id: string | null };
+export type Role = { role: "super_admin" | "service_admin" | "group_admin"; group_id: string | null };
 
 export type User = {
   id: string;
@@ -96,7 +96,7 @@ export type Service = {
   allow_notation: boolean;
   allow_ocr_ai: boolean;
   /** AI levels: an audit (Check only) with this level is free, counts against its pages, or is made without AI. */
-  audit_ai: "free" | "charge" | "off";
+  audit_ai: "free" | "charge" | "off" | "disabled";
   engine_route: "standard" | "adobe";
   sort: number;
   groups_enabled: number;
@@ -127,7 +127,9 @@ export type ServiceChoice = {
   /** AI levels: kinds of document, General first. Never model names. */
   kinds: { key: string; label: string; description: string | null }[];
   /** AI levels: an audit with this level is free, counts against its pages, or is made without AI. */
-  audit_ai: "free" | "charge" | "off" | null;
+  audit_ai: "free" | "charge" | "off" | "disabled" | null;
+  /** Processing services: the engine's own route or Adobe's (PDF/UA-2 is offered with the engine's own only, #445). */
+  engine_route?: "standard" | "adobe" | null;
 };
 
 /** What the upload form offers, as the person's group sets it. */
@@ -140,6 +142,18 @@ export type UploadOptions = {
   show_external: boolean;
   /** Uploads are scanned for malware before they're accepted (#455), so the form can say so while it waits (#560). */
   malware_scan?: boolean;
+  /** The PDF/UA parts people may choose (#445): ["1"], or ["1", "2", "both"] where the service and group allow it. */
+  pdfua_choices?: PdfUa[];
+  /** The one preselected. */
+  pdfua_default?: PdfUa;
+};
+
+/** The PDF/UA part a document is run for (#445): PDF/UA-1, PDF/UA-2 (the file as PDF 2.0), or both (two files). */
+export type PdfUa = "1" | "2" | "both";
+export const PDFUA_LABELS: Record<PdfUa, string> = {
+  "1": "PDF/UA-1",
+  "2": "PDF/UA-2 (as PDF 2.0)",
+  both: "Both: a PDF/UA-1 file and a PDF/UA-2 copy",
 };
 
 /** A file's own AI level and kind, instead of the batch's. */
@@ -147,6 +161,10 @@ export type FileChoice = { ai_tier: string | null; ai_kind: string | null };
 
 export type Me = User & {
   is_super_admin: boolean;
+  /** Helps run every group, without the service's own settings (#564). */
+  is_service_admin?: boolean;
+  /** What their roles let them do: src/permissions.ts. */
+  permissions?: string[];
   admin_of: string[];
   /** Approved, or an admin. */
   can_submit: boolean;
@@ -154,7 +172,7 @@ export type Me = User & {
   pending_approvals: number;
   /** Their own help requests with something new. */
   help_unread: number;
-  /** Super admins: help requests waiting on a super admin. */
+  /** Support (super admins, service admins): help requests waiting on support. */
   help_needs_us: number;
   /** "Describe with AI" in the tag manager, as the service default, the group and the person work out. */
   can_describe?: boolean;
@@ -168,7 +186,7 @@ export type HelpMessage = {
   /** "note": super admins only; "event": a status change or hand-over. */
   kind: "message" | "note" | "event";
   author_email: string;
-  author_role: "person" | "group_admin" | "super_admin" | "system";
+  author_role: "person" | "group_admin" | "service_admin" | "super_admin" | "system";
   body: string;
   created_at: string;
   attachments: HelpAttachment[];
@@ -197,7 +215,7 @@ export type HelpSummary = {
 };
 export type HelpRequest = HelpSummary & {
   tag: { i: number; role: string; text: string } | null;
-  role: "person" | "group_admin" | "super_admin";
+  role: "person" | "group_admin" | "service_admin" | "super_admin";
   messages: HelpMessage[];
   /** What was done, as the person was told. */
   resolution: string | null;
@@ -213,7 +231,16 @@ export type HelpRequest = HelpSummary & {
   pages_charged: number | null;
 };
 
-export type Balance = { pool_pages: number; used_pages: number; reserved_pages: number; remaining_pages: number };
+export type Balance = {
+  pool_pages: number;
+  used_pages: number;
+  reserved_pages: number;
+  remaining_pages: number;
+  /** A subgroup's limit on its parent's pool (#431); null: none. */
+  cap_pages?: number | null;
+  /** A subgroup's: the pool is its parent's, and used/reserved are the subgroup's own. */
+  shared?: boolean;
+};
 
 export type Group = {
   id: string;
@@ -232,8 +259,17 @@ export type Group = {
   show_external: boolean;
   /** Its people may make API tokens for scripts (#518) */
   api_tokens_enabled: boolean;
+  /** Its people may choose PDF/UA-2 or Both (#445), once super admins offer it; and what's preselected. */
+  pdfua_choice?: boolean;
+  pdfua_default?: PdfUa;
   /** "Describe with AI" for the group's people; null follows the service default. */
   ai_describe?: boolean | null;
+  /** A subgroup's parent, and a parent's subgroups (#431): one level deep. */
+  parent?: { id: string; name: string; local_only?: boolean } | null;
+  /** A subgroup's settings taken from its parent (#431): ai, local_only, require_approval, ai_describe, show_external, over_quota_message. */
+  inherits?: string[];
+  subgroups?: { id: string; name: string }[];
+  /** People waiting for approval, and help requests still open, in the group and its subgroups. */
   pending_members: number;
   help_active: number;
   default_user_cap: number | null;
@@ -266,6 +302,9 @@ export const MARK_LABELS: Record<MarkStatus, string> = { checked: "Checked", fix
 
 export type JobResult = {
   pdfua_part?: 1 | 2;  // which PDF/UA the verdicts are by: 2 for a PDF 2.0 document (#409)
+  /** Both (#445): whether the PDF/UA-2 copy passes; and, for PDF/UA-2 or Both, that a file was converted to PDF 2.0. */
+  pdfua2_compliant?: boolean | null;
+  converted_pdf2?: boolean;
   compliant_before: boolean | null;
   compliant_after: boolean | null;
   failed_checks_before: number | null;
@@ -327,6 +366,7 @@ export type Job = {
   needs_confirmation: boolean;
   full_review: boolean;
   ignore_existing: boolean; // its own tags were ignored and it was tagged afresh (#396)
+  pdfua?: PdfUa; // the PDF/UA part it was run for (#445)
   /** Made without AI (an audit, when its AI level is set that way). */
   no_ai: boolean;
   ai_refunded: boolean;
@@ -380,9 +420,10 @@ export type LedgerEntry = {
   id: number;
   created_at: string;
   group_id: string | null;
+  subgroup_id?: string | null;
   service_key: string;
   scope: "global" | "group";
-  kind: "topup" | "adjust" | "reserve" | "commit" | "release" | "correct";
+  kind: "topup" | "adjust" | "reserve" | "commit" | "release" | "correct" | "cap";
   pages: number;
   user_id: string | null;
   job_id: string | null;
@@ -430,6 +471,8 @@ export type RuntimeSettings = {
   max_files_per_upload: number;
   max_export_documents: number;
   api_tokens_enabled: boolean;
+  /** PDF/UA-2 for PDF 1.x documents is offered to groups (#445). */
+  pdfua2_enabled: boolean;
   api_token_days: number;
   api_token_max_days: number;
   api_tokens_per_person: number;
@@ -719,7 +762,8 @@ export async function del<T>(path: string): Promise<T | undefined> {
 
 export async function uploadFiles(files: File[], reportOnly: boolean, processing = "standard",
   confirm = false, aiTier: string | null = null, fullReview = false, aiAltText = true,
-  aiKind: string | null = null, perFile: Record<number, FileChoice> = {}, ignoreExisting = false): Promise<UploadResult[]> {
+  aiKind: string | null = null, perFile: Record<number, FileChoice> = {}, ignoreExisting = false,
+  pdfua: PdfUa | null = null): Promise<UploadResult[]> {
   const form = new FormData();
   files.forEach((f) => form.append("files", f, f.name));
   form.append("report_only", String(reportOnly));
@@ -730,6 +774,7 @@ export async function uploadFiles(files: File[], reportOnly: boolean, processing
   if (aiTier && aiKind && aiKind !== "general") form.append("ai_kind", aiKind);
   if (fullReview) form.append("full_review", "true");
   if (ignoreExisting) form.append("ignore_existing", "true");
+  if (pdfua) form.append("pdfua", pdfua);
   if (Object.keys(perFile).length) form.append("per_file", JSON.stringify(perFile));
   const r = await send("/jobs", { method: "POST", body: form });
   return r.json();
@@ -899,6 +944,8 @@ export type TagEdit =
   | { op: "make_toc"; element: number; expect_role: string }
   | { op: "set_headers"; element: number; expect_role: string; headers: number[] }
   | { op: "link_note"; element: number; expect_role: string; note: number | null }
+  // The heading a table of contents entry goes to (/Ref, #631)
+  | { op: "set_toc_target"; element: number; expect_role: string; target: number | null }
   | { op: "set_field_label"; element: number; expect_role: string; label: string }
   // The whole document's, naming no tag (#363)
   | { op: "set_doc_title"; title: string }

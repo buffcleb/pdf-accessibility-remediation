@@ -89,15 +89,16 @@ class Level:
     parent: list | None = None  # the list of levels this level belongs to
 
 
-def nest(items: list, label_of, x_of, size_of) -> list[Level]:
+def nest(items: list, label_of, x_of, size_of, before: dict[LabelKey, str] | None = None) -> list[Level]:
     """Group a run of list items (in reading order) into top-level lists, each a Level whose items are
-    (item, [nested Levels])."""
+    (item, [nested Levels]). before: the list just before the run, {its kind of label: its last label}: a list split
+    by a paragraph or a figure carries on from it ("(v)" after "(iv)" is roman, "(c)" after "(b)" a letter, #619)."""
     top: list[Level] = []
     stack: list[tuple[Level, list]] = []  # (level, children list of its last item)
     for it in items:
         label = label_of(it)
         x, size = x_of(it), max(size_of(it), 1.0)
-        key, _ = label_kind(label, {lv.key: lv.last_label for lv, _ in stack})
+        key, _ = label_kind(label, {lv.key: lv.last_label for lv, _ in stack} if stack else (before or {}))
         # Levels whose labels sit clearly to the right of this one are finished
         while stack and x < stack[-1][0].x - 0.6 * size:
             stack.pop()

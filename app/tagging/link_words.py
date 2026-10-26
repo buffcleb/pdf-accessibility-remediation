@@ -19,21 +19,12 @@ from __future__ import annotations
 import pikepdf
 from pikepdf import Array, Dictionary, Name
 
-from app.pipeline.models import BBox, bbox_intersection
+from app.pipeline.models import BBox, bbox_area, bbox_intersection
 from app.tagging.content_marker import Matrix, apply, bbox_of_points, mcid_of
 from app.tagging.existing_tags import _is_struct_elem, resolve_role
+from app.tagging.tree import items as _items, new_mcr
 
 INSIDE = 0.6  # this share of a run's box inside the link's box makes it the link's
-
-
-def _items(k) -> list:
-    if k is None:
-        return []
-    return list(k) if isinstance(k, Array) else [k]
-
-
-def _area(b: BBox) -> float:
-    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
 
 
 def link_boxes(annot: Dictionary, m: Matrix) -> list[BBox]:
@@ -84,7 +75,7 @@ def move_link_words(pdf: pikepdf.Pdf, existing_bbox: dict, existing_kinds: dict,
         if existing_kinds.get(owner.objgen, {}).get(mcid, set()) != {"text"}:
             return None
         box = existing_bbox.get(owner.objgen, {}).get(mcid)
-        return ((owner.objgen, mcid), box) if box is not None and _area(box) > 0 else None
+        return ((owner.objgen, mcid), box) if box is not None and bbox_area(box) > 0 else None
 
     def links_of(e) -> list[tuple[Dictionary, list[BBox]]]:
         """The Link tags among e's kids that hold annotations and no words, with the annotations' boxes."""
@@ -120,7 +111,7 @@ def move_link_words(pdf: pikepdf.Pdf, existing_bbox: dict, existing_kinds: dict,
         if pg is not None and "/Pg" not in link:
             link.Pg = pg
         same_page = pg is None or link.Pg.objgen == pg.objgen
-        words = [w if isinstance(w, Dictionary) or same_page else Dictionary(Type=Name.MCR, Pg=pg, MCID=int(w))
+        words = [w if isinstance(w, Dictionary) or same_page else new_mcr(pg, int(w))
                  for w in words]
         link.K = Array(words + _items(link.get("/K")))
         target.K = Array(out)
@@ -140,7 +131,7 @@ def move_link_words(pdf: pikepdf.Pdf, existing_bbox: dict, existing_kinds: dict,
                     continue
                 best, share = None, 0.0
                 for n, (_, boxes) in enumerate(links):
-                    inside = sum(bbox_intersection(rb[1], b) for b in boxes) / _area(rb[1])
+                    inside = sum(bbox_intersection(rb[1], b) for b in boxes) / bbox_area(rb[1])
                     if inside > share:
                         best, share = n, inside
                 if best is not None and share >= INSIDE:
@@ -165,8 +156,7 @@ def move_link_words(pdf: pikepdf.Pdf, existing_bbox: dict, existing_kinds: dict,
                     if pg is not None and "/Pg" not in link:
                         link.Pg = pg
                     same_page = pg is None or link.Pg.objgen == pg.objgen
-                    words = [w if isinstance(w, Dictionary) or same_page else Dictionary(Type=Name.MCR, Pg=pg,
-                                                                                         MCID=int(w))
+                    words = [w if isinstance(w, Dictionary) or same_page else new_mcr(pg, int(w))
                              for w in words]
                     link.K = Array(words + _items(link.get("/K")))
                     done += 1
@@ -207,7 +197,7 @@ def move_link_words(pdf: pikepdf.Pdf, existing_bbox: dict, existing_kinds: dict,
         for parent, link, boxes, page in waiting:
             inside = [(tag, item, key) for tag, item, key, box in runs.get(page, [])
                       if key not in taken
-                      and sum(bbox_intersection(box, b) for b in boxes) / _area(box) >= INSIDE]
+                      and sum(bbox_intersection(box, b) for b in boxes) / bbox_area(box) >= INSIDE]
             tags = {tag.objgen for tag, _, _ in inside}
             if len(tags) != 1:
                 continue  # no words, or words in more than one tag: not certain whose they are

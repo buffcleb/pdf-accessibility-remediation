@@ -8,8 +8,8 @@ import { tablePreview, tableReplaced } from "./tablegrid";
 import { splitPreview, type SplitPart } from "./figure";
 import { contentMoves, newTags, splitKeptText } from "./areaPreview";
 import { centered, keptInView } from "./scroll";
-import { loadVersion, watchVersion, type LoadState } from "./pdf";
-import { loadingWords } from "./Pane";
+import { loadTagmap, watchVersion, type LoadState } from "./pdf";
+import { tagsLoading } from "../components/loadWords";
 import { LoadProgress } from "../components/LoadProgress";
 import { checkElementRole, checkMove } from "./roles";
 import { worstSeverity } from "./PageView";
@@ -69,13 +69,14 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
     setMap(null);
     setError(null);
     setLoad(null);
-    loadVersion(jobId, number).then(
-      (d) => {
+    // The tag map alone: the tree shows while the PDF is still on its way (#579)
+    loadTagmap(jobId, number).then(
+      (tagmap) => {
         if (!live) return;
-        setMap(d.tagmap);
+        setMap(tagmap);
         // Start with the top two levels open
         const start = new Set<number>();
-        for (const e of d.tagmap.elements) if (e.parent === null || d.tagmap.elements[e.parent]?.parent === null) start.add(e.i);
+        for (const e of tagmap.elements) if (e.parent === null || tagmap.elements[e.parent]?.parent === null) start.add(e.i);
         setOpen(start);
       },
       (e) => { if (live) setError(e); },
@@ -372,7 +373,7 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
           <p className="pv-msg" role="alert">{errorMessage(error)}</p>
         ) : !map ? (
           // The same download as the pages beside it, which announce it: shown here, not said twice
-          <LoadProgress className="pv-loading" quiet {...loadingWords(load)} />
+          <LoadProgress className="pv-loading" quiet {...tagsLoading(load)} />
         ) : rows.length === 0 ? (
           <p className="muted pv-msg">{page ? `No tags on page ${page}.` : "This version has no tags."}</p>
         ) : (

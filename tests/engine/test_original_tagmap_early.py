@@ -3,14 +3,14 @@ job waits on the validator and the AI, instead of being built at the end after e
 import asyncio
 import time
 
-from app.pipeline import orchestrator
+from app.pipeline import orchestrator, outputs
 from app.pipeline.orchestrator import JobOptions, run_remediation
 from app.storage import JobStore
 
 
 def test_the_originals_tag_map_is_built_while_the_original_is_validated(samples, tmp_path, monkeypatch):
     moments: dict[str, float] = {}
-    original_validate, original_build = orchestrator._validate, orchestrator.build_tagmap
+    original_validate, original_build = orchestrator.validate, outputs.build_tagmap
 
     def slow_validate(*args, **kwargs):
         # The validator is a subprocess the job waits on; stand in for it with a wait the map can run during
@@ -22,8 +22,8 @@ def test_the_originals_tag_map_is_built_while_the_original_is_validated(samples,
         moments.setdefault("map_started", time.monotonic())
         return original_build(path)
 
-    monkeypatch.setattr(orchestrator, "_validate", slow_validate)
-    monkeypatch.setattr(orchestrator, "build_tagmap", build)
+    monkeypatch.setattr(orchestrator, "validate", slow_validate)
+    monkeypatch.setattr(outputs, "build_tagmap", build)
     store = JobStore("00000000-0000-4000-8000-000000000002", root=tmp_path)
     store.create()
     store.input_pdf.write_bytes((samples / "simple_report.pdf").read_bytes())

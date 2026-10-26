@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TagEdit, TagElement, TagMap } from "../src/api";
-import { menuAndTypes, menuEntries, pageMenu, pick, pointsAt, tagMenu } from "../src/viewer/menu";
+import { goesTo, menuAndTypes, menuEntries, pageMenu, pick, pointsAt, tagMenu, titleWords } from "../src/viewer/menu";
 import { splitPieces } from "../src/viewer/pieces";
 import { describe, editMarks, listPlan, overrides, withoutEdits } from "../src/viewer/draft";
 
@@ -214,6 +214,45 @@ test("a tag can be pointed at a footnote on its page or the next, and unpointed"
   const made: TagEdit[] = [{ op: "set_role", element: 5, expect_role: "P", role: "Note" }];
   assert.ok(item(tagMenu(map, made, [1]), "note:5"));
   assert.equal(tagMenu(map, [], [2]).filter((x) => x.group === "note").length, 0);
+});
+
+test("in a PDF/UA-2 file the notes are FENote, and a mark can point at one (#633)", () => {
+  const map = doc([
+    { i: 0, role: "Document", parent: null },
+    { i: 1, role: "P", parent: 0, own: true, text: "Body text with a mark", page: 1, refs: [2] },
+    { i: 2, role: "FENote", parent: 0, own: true, text: "1 Smith and Jones", page: 1 },
+    { i: 3, role: "FENote", parent: 0, own: true, text: "2 Later note", page: 1 },
+  ]);
+  assert.equal(pointsAt(map, [], 1), 2);
+  const notes = tagMenu(map, [], [1]).filter((x) => x.group === "note");
+  assert.deepEqual(notes.map((x) => x.id), ["note:2", "note:3", "note:none"]);
+  assert.ok(/already points/.test(notes[0].disabled!));
+  assert.equal(tagMenu(map, [], [2]).filter((x) => x.group === "note").length, 0);  // a note points at nothing
+});
+
+test("a contents entry goes to a heading: the one with its words first (#631)", () => {
+  const map = doc([
+    { i: 0, role: "Document", parent: null },
+    { i: 1, role: "TOC", parent: 0 },
+    { i: 2, role: "TOCI", parent: 1, own: true, text: "2.1 Getting started .......... 14" },
+    { i: 3, role: "H1", parent: 0, own: true, text: "Introduction" },
+    { i: 4, role: "H2", parent: 0, own: true, text: "2.1 Getting started", page: 3 },
+    { i: 5, role: "P", parent: 0, own: true, text: "Getting started is easy" },
+  ]);
+  assert.deepEqual(titleWords("2.1 Getting started .......... 14"), ["getting", "started"]);
+  const choices = tagMenu(map, [], [2]).filter((x) => x.group === "toc");
+  assert.deepEqual(choices.map((x) => x.id), ["toc:4", "toc:3"]);          // headings only, the same words first
+  assert.ok(choices[0].label.includes("(page 3)"));
+  assert.equal(tagMenu(map, [], [2]).filter((x) => x.group === "note").length, 0);  // not a footnote's menu
+  const set = choices[0].ops!;
+  assert.deepEqual(set, [{ op: "set_toc_target", element: 2, expect_role: "TOCI", target: 4 }]);
+  assert.equal(goesTo(map, set, 2), 4);
+  assert.ok(/already goes/.test(item(tagMenu(map, set, [2]), "toc:4")!.disabled!));
+  assert.deepEqual(item(tagMenu(map, set, [2]), "toc:none")!.ops,
+    [{ op: "set_toc_target", element: 2, expect_role: "TOCI", target: null }]);
+  assert.ok(/goes to the heading “2.1 Getting/.test(describe(set[0], map)));
+  assert.deepEqual(editMarks(map, set).get(2), ["goes to a heading"]);
+  assert.equal(tagMenu(map, [], [5]).filter((x) => x.group === "toc").length, 0);  // only an entry has a target
 });
 
 test("undoing a tag's changes keeps the rest workable", () => {

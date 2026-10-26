@@ -19,6 +19,9 @@
 #   --provider NAME      AI provider (default mock: no AI calls, no cost)
 #   --model NAME         model, for providers that take one
 #   --every N            how often the full set runs by itself (default 5; 0: never)
+#   --pdfua 1|2|both     the PDF/UA part delivered (default 1; 2: as PDF 2.0, judged by PDF/UA-2)
+#   --jobs N             documents run at once (default 3; 1: one after another). Memory is the limit: Docker
+#                        Desktop's (Settings > Resources) holds them all, and a long document uses several processes
 #   -h, --help
 #
 # Settings (environment):
@@ -26,6 +29,8 @@
 #   REGRESSION_ENV_FILE  an env file with AI keys for real providers (default .env, if there is one)
 #   REGRESSION_SAMPLES   the folder holding quick/ and full/ (default samples/regression here). The set is
 #                        git-ignored, so a worktree has none: point this at the checkout that has it
+#   REGRESSION_KEEP      a folder to keep each document's outputs in (DIR/<document>/), to compare two runs' tags with
+#                        python -m harness.roles_dump tagmaps BEFORE AFTER
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,7 +38,7 @@ cd "$ROOT"
 die() { echo "regression: $*" >&2; exit 1; }
 usage() { sed -n '2,/^set -Eeuo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
-SET="" PROVIDER="mock" MODEL="" EVERY=5
+SET="" PROVIDER="mock" MODEL="" EVERY=5 JOBS=3 PDFUA=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --quick) SET=quick ;;
@@ -41,12 +46,16 @@ while [ $# -gt 0 ]; do
     --provider) PROVIDER="${2:?--provider needs a name}"; shift ;;
     --model) MODEL="${2:?--model needs a name}"; shift ;;
     --every) EVERY="${2:?--every needs a number}"; shift ;;
+    --jobs) JOBS="${2:?--jobs needs a number}"; shift ;;
+    --pdfua) PDFUA="${2:?--pdfua needs 1, 2 or both}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
   shift
 done
 case "$EVERY" in ''|*[!0-9]*) die "--every takes a whole number" ;; esac
+case "$JOBS" in ''|0|*[!0-9]*) die "--jobs takes a whole number from 1" ;; esac
+case "$PDFUA" in 1|2|both) ;; *) die "--pdfua takes 1, 2 or both" ;; esac
 
 DIR="${REGRESSION_SAMPLES:-$ROOT/samples/regression}"
 if [ ! -d "$DIR/quick" ] || [ ! -d "$DIR/full" ]; then
@@ -83,9 +92,15 @@ else
   env_file="${REGRESSION_ENV_FILE:-.env}"
   [ -f "$env_file" ] && args+=(--env-file "$env_file")
 fi
-args+=(--entrypoint python "$IMAGE" harness/run_folder.py "/srv/samples/regression/$SET" --provider "$PROVIDER")
+if [ -n "${REGRESSION_KEEP:-}" ]; then
+  mkdir -p "$REGRESSION_KEEP"
+  args+=(-v "$(cd "$REGRESSION_KEEP" && pwd):/srv/keep")
+fi
+args+=(--entrypoint python "$IMAGE" harness/run_folder.py "/srv/samples/regression/$SET" --provider "$PROVIDER"
+      --jobs "$JOBS" --pdfua "$PDFUA")
+[ -n "${REGRESSION_KEEP:-}" ] && args+=(--keep /srv/keep)
 [ -n "$MODEL" ] && args+=(--model "$MODEL")
 
-echo "regression: the $SET set with $PROVIDER AI$why"
+echo "regression: the $SET set with $PROVIDER AI, $JOBS at a time$why"
 # (two notices PyMuPDF prints on every run are left out; the exit status is the run's)
 docker "${args[@]}" 2>&1 | grep -v "fitz. API is deprecated\|pymupdf_layout"

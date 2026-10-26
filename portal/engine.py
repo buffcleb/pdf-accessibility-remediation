@@ -30,7 +30,8 @@ class AIChoice:
 class Engine(Protocol):
     def submit(self, filename: str, fileobj: BinaryIO, report_only: bool, ai: "AIChoice | None" = None,
                full_review: bool = False, route: str = "standard", branding: dict | None = None,
-               no_ai: bool = False, validator: dict | None = None, ignore_existing: bool = False) -> str: ...
+               no_ai: bool = False, validator: dict | None = None, ignore_existing: bool = False,
+               pdfua: str = "1") -> str: ...
     def submit_edit(self, filename: str, fileobj: BinaryIO, edits: list[dict], review: str = "none",
                     judge: str | None = None, reference: BinaryIO | None = None,
                     validator: dict | None = None, ai_read: list[dict] | None = None) -> str: ...
@@ -55,17 +56,20 @@ class HttpEngine:
 
     def submit(self, filename: str, fileobj: BinaryIO, report_only: bool, ai: "AIChoice | None" = None,
                full_review: bool = False, route: str = "standard", branding: dict | None = None,
-               no_ai: bool = False, validator: dict | None = None, ignore_existing: bool = False) -> str:
+               no_ai: bool = False, validator: dict | None = None, ignore_existing: bool = False,
+               pdfua: str = "1") -> str:
         """ai: the job's AI tier (a gateway model); without one, the configured default provider is used.
         full_review: the AI review checks every figure instead of the flagged ones plus a sample.
         route: the engine route of the job's processing service (standard | adobe).
         branding: for the PDF report (service and organization name, accent color, the AI level by name).
         no_ai: no AI at all, for an audit whose AI level is set to make audits without it.
-        validator: how veraPDF runs ({"validator": "service" | "command_line", "verapdf_ua2": bool})."""
+        validator: how veraPDF runs ({"validator": "service" | "command_line", "verapdf_ua2": bool}).
+        pdfua: the PDF/UA part delivered, "1", "2" or "both" (#445)."""
         provider, model = (("gateway", ai.model) if ai else ("none", None) if no_ai else (self.provider, self.model))
         data = {"ai_provider": provider,
                 "flags": json.dumps({"report_only": report_only, **({"full_review": True} if full_review else {}),
                                      **({"ignore_existing": True} if ignore_existing else {}),
+                                     **({"pdfua": pdfua} if pdfua != "1" else {}),
                                      **({"notation_ai": False} if ai and not ai.notation else {}),
                                      **({"ocr_ai": False} if ai and not ai.ocr else {}),
                                      **({"verify_ai": False, "notation_ai": False, "ocr_ai": False}

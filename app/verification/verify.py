@@ -33,6 +33,9 @@ class VerifyOptions:
     ai_read: list = field(default_factory=list)
     # Verdicts shared between the outputs of one job (pass the same dict for each output)
     review_cache: dict | None = None
+    # Table of contents entries the PDF/UA-2 step pointed at a heading by their text (#631): [(element, heading)],
+    # each flagged for a person to check. A reviewed version gets them again through ai_read ("toc-target")
+    toc_guesses: list = field(default_factory=list)
 
 
 def _overlap(a, b) -> float:
@@ -61,6 +64,11 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
             # the element mostly inside the block, preferring the one covering most of it
             if ov >= 0.5 * area and ov > best_overlap:
                 best, best_overlap = e, ov
+        if kind == "toc-target":
+            entry = _best_toci(index, checker, page, bbox)
+            if entry is not None:
+                out.append(_toc_guess(checker, entry, spoken))
+            continue
         snippet = str(spoken)[:160]
         where = area_boxes([bbox]) if bbox else None  # the block itself, for when no tag holds it
         # What the finding came from, so a reviewed version (an edit job, which has no AI enrichment) can place it
@@ -97,15 +105,67 @@ def _ai_read_findings(index, checker: SemanticChecker, items: list) -> list[Find
     return out
 
 
+def _best_toci(index, checker: SemanticChecker, page: int, bbox):
+    """The table of contents entry on the page that covers most of bbox."""
+    best, best_overlap = None, 0.0
+    for e in index.elements:
+        if e.role != "TOCI" or checker._page_of(e) != page:
+            continue
+        c = checker.subtree(e).bbox
+        ov = _overlap(bbox, c) if c and bbox else 0.0
+        if ov > best_overlap:
+            best, best_overlap = e, ov
+    return best
+
+
+def _toc_guess(checker: SemanticChecker, e, heading: str) -> Finding:
+    """A contents entry the PDF/UA-2 step pointed at the heading of the same words, to check (#631)."""
+    page = checker._page_of(e)
+    bbox = checker.subtree(e).bbox
+    return Finding(
+        layer="semantic", severity="review", issue="contents entry pointed at a heading by its text",
+        page=page + 1 if page is not None else None, role="TOCI", element=e.index,
+        detail=f"this entry has no link to follow, so it was pointed at the heading \u201c{heading}\u201d, which "
+               "has the same words",
+        action="Check it goes to the right heading in the tag manager, and choose another there if not",
+        extra={"ai_read": [page, list(bbox) if bbox else None, "toc-target", heading]},
+        boxes=area_boxes([bbox]) if bbox else None)
+
+
+def _toc_findings(pdf, index, checker: SemanticChecker, guesses: list) -> list[Finding]:
+    """Table of contents entries in a PDF 2.0 file (PDF/UA-2 8.2.5.8): each pointed at a heading by its text, and
+    each that names no target, for a person to choose it (#631)."""
+    out = []
+    for place, heading in guesses:
+        if 0 <= place < len(index.elements) and index.elements[place].role == "TOCI":
+            out.append(_toc_guess(checker, index.elements[place], heading))
+    if str(pdf.pdf_version) < "2.0":
+        return out
+    for e in index.elements:
+        if e.role == "TOCI" and "/Ref" not in e.obj:
+            page = checker._page_of(e)
+            bbox = checker.subtree(e).bbox
+            out.append(Finding(
+                layer="semantic", severity="review", issue="contents entry goes nowhere",
+                page=page + 1 if page is not None else None, role="TOCI", element=e.index,
+                detail="this table of contents entry doesn't say which heading it goes to (PDF/UA-2 8.2.5.8), and "
+                       "no heading has its words",
+                action="Choose the heading it goes to in the tag manager",
+                boxes=area_boxes([bbox]) if bbox else None))
+    return out
+
+
 def carried_ai_read(items: list, ops: list[dict]) -> list:
     """The AI's readings a reviewed version carries over from the version it's based on (the portal sends each
     finding's "ai_read", with "readings" when two readings disagreed, and the "element" it was on): those whose
     element the edits didn't give new text, as VerifyOptions.ai_read takes them. A person who wrote or chose the
     text has checked it."""
     written = {op.get("element") for op in ops if op.get("op") in ("set_alt", "set_actual_text")}
+    targeted = {op.get("element") for op in ops if op.get("op") == "set_toc_target"}
     out = []
     for it in items:
-        if it.get("element") is not None and it["element"] in written:
+        done = targeted if it["ai_read"][2] == "toc-target" else written  # a person chose its target, or its text
+        if it.get("element") is not None and it["element"] in done:
             continue
         page, bbox, kind, spoken = it["ai_read"]
         out.append((page, bbox, kind, spoken) + ((it["readings"],) if it.get("readings") else ()))
@@ -147,6 +207,7 @@ def _structural(path: Path, opts: VerifyOptions) -> tuple[VerificationReport, Re
         report.findings += checker.run()
         report.skipped += checker.skipped
         report.findings += _ai_read_findings(index, checker, opts.ai_read)
+        report.findings += _toc_findings(pdf, index, checker, opts.toc_guesses)
         if settings.verify_contrast:
             report.findings += contrast.check(path, settings.verify_max_pages)
         report.findings += _rtl_findings(path, settings.verify_max_pages)

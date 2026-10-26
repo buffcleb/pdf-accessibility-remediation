@@ -7,7 +7,10 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
-RUN npm run build
+# The build's id (scripts/build.sh passes the image tag): in the bundle and in /build.json, so pages open before a
+# deploy load the new build when the person moves on
+ARG WEB_BUILD_ID=""
+RUN WEB_BUILD_ID="$WEB_BUILD_ID" npm run build
 
 FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:378d0c32f6562f7fd9629170797f57d2b953aa09be983b3daaf4809bb039ca00
 # Packages of the base image with a fixed vulnerability newer than its digest (scripts/build.sh's Trivy scan): libexpat

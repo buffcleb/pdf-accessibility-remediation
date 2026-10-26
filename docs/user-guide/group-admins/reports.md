@@ -21,7 +21,7 @@
 
 ![The Quality report for Northfield University: a search box, Last 30 days by Day and Filters; 100% pass PDF/UA, 3 remediated documents and 3 with review findings; a pass-rate chart by day for Adobe Autotag + Commercial AI and Standard + Commercial AI; and a table of each day's documents, passes and pass rate, with Columns, Export CSV and Email this view](../../images/reports-quality.png)
 
-Cost figures (what the AI cost) are for super admins only.
+Cost figures (what the AI cost) are for super admins and service admins only.
 
 ## Working with a report
 

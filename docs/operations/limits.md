@@ -154,7 +154,7 @@ With `FORMULA_READER=on` on a cluster (#403):
 | Edits in one save or draft | 5,000 | Built in: `MAX_EDITS`, `portal/routers/versions.py` | The save is refused |
 | Saves of one document being checked | 3 | Built in: `MAX_PENDING_PER_JOB`, same file | Wait for one to finish |
 | Undo of a save into a reviewed version | 24 hours | Built in: `UNDO_HOURS`, same file and `portal/worker.py` | The file before is deleted |
-| Text in one alt text or read-aloud text | 4,000 characters | Built in: `MAX_TEXT`, `app/tagging/editor.py` | The edit is refused |
+| Text in one alt text or read-aloud text | 4,000 characters | Built in: `MAX_TEXT`, `app/tagging/editor/_ctx.py` | The edit is refused |
 
 ## Help requests
 

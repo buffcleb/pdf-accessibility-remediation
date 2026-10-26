@@ -3,14 +3,13 @@ Only some ring systems were figures (and only the rings); other molecules were l
 "OAc" was a paragraph of its own. The drawings here are made up."""
 import math
 
-import pikepdf
 import pymupdf as fitz
 
 from app.pipeline import schemes
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
-from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import integrity_errors
 
 BOND = 14.0
 
@@ -120,9 +119,7 @@ def test_a_drawn_scheme_is_tagged_as_one_figure_with_its_labels_inside(tmp_path)
     figure.alt = "A cyclic ketone is reduced with sodium borohydride to the alcohol."
     dst = tmp_path / "out.pdf"
     tag_document(src, dst, analysis, title="Scheme", language="en-US")
-    with pikepdf.open(dst) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(dst) == []
     tm = build_tagmap(dst)
     (tagged,) = [e for e in tm["elements"] if e["role"] == "Figure"]
     inside = [p for p in tm["pieces"] if p["el"] == tagged["i"]]

@@ -70,8 +70,12 @@ portal API on your servers, so the app and its API stay on one origin (the sign-
    `CLOUDFLARE_API_TOKEN`, or `npx wrangler login` once). `--dry-run` checks without publishing. Remove the tunnel's
    public hostname for the app first: the Worker's custom domain takes its place.
 
+> **Changed 23 October 2026:** `/build.json` is kept uncached (#575).
+
 With the Worker there's no web pod, so no Grafana; Prometheus, its alerts and Administration › System are the
-same. The Worker is `deploy/cloudflare-worker/worker.js`; security headers come from `web/public/_headers`. To go
+same. The Worker is `deploy/cloudflare-worker/worker.js`; security headers come from `web/public/_headers`, which
+also keeps `/build.json` (the build's id, which pages open before a deploy compare on the next click, #575) from being
+cached. To go
 back, set `FRONTEND=cluster`, rerun `scripts/deploy.sh`, delete the Worker, and route the hostname through the
 tunnel again.
 

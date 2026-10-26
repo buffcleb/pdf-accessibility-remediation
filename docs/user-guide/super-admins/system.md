@@ -6,7 +6,7 @@
 when the deployment includes monitoring (`MONITORING=on`, the default; see
 [Operations › Monitoring](../../operations/monitoring.md#prometheus-and-grafana)); otherwise the page says so.
 
-It has three tabs: **Now**, **Over time** and **Audit export**. **Open Grafana** is beside them.
+It has four tabs: **Now**, **Over time**, **Versions** and **Audit export**. **Open Grafana** is beside them.
 
 ## Now
 
@@ -67,30 +67,12 @@ and memory against its limits, and the documents it's working on. Two parts open
 
 - **About** the workload: what it does and what stops working without it, where it comes from (its upstream
   project, or the file in this project that builds it), and the image it runs, with its **version**, its
-  **digest** and whether it's the **pinned** one (below).
+  **digest** and whether it's the **pinned** one (see [Versions](#versions)).
 - **kubectl commands** for that pod, with its real name and namespace, each with a **Copy** button: its log (as
   it's written, the last hour, the run before a restart), a look at it (describe, events, CPU and memory, its
   rollout and its autoscaler), and reaching it with `port-forward`. The commands that change something (restart,
   delete the pod, scale, a shell inside it) are listed apart. The portal runs none of them: they're for someone with
   `kubectl` access to the cluster.
-
-#### Versions
-
-> **New 22 October 2026:** each pod's version, digest and pin, and the **Versions** table.
-
-Under the rows, **Versions** lists every workload's release in one table, for checking against a security advisory
-at a glance (an advisory names a release, such as `litellm 1.107.0`, and often the images' digests). Each pod's
-**About** says the same for each of its containers, with the full digest.
-
-| Column | What it says |
-|---|---|
-| Release | The release, from the image's tag: **LiteLLM 1.105.0**, **ClamAV 1.5.4**. This service's own images (engine, portal, web, music and formula readers) say the **commit** they were built from (`scripts/build.sh` tags them with it). PostgreSQL and Redis, whose tags name only the major release (`postgres:16-alpine`), say the release **as they report it** to monitoring: **PostgreSQL 16.15 (as it reports)** |
-| Digest | The image as running, shortened (`sha256:` and 12 characters). The full digest is in the pod's **About** |
-| Pinned | Whether that's the digest the deployment pins (`scripts/deploy.sh` pins every image that isn't this service's own). **Not the pinned digest** is in bold: the pod runs something other than what was deployed |
-
-A workload part-way through a new release has a row for each release while both run, with the number of pods on
-each. Everything here comes from what Kubernetes and the exporters already tell Prometheus: the portal asks no
-program and no registry, so it can't say when a release was published.
 
 ## Over time
 
@@ -108,6 +90,25 @@ service whose memory climbs to its limit is restarted, and shows in Restarts.
 A node near 100% is full: pods scheduled there wait or are moved, and the node's other workloads compete with this
 service's.
 
+## Versions
+
+> **Changed 23 October 2026:** **Versions** is a tab of its own. It was under the pods on **Now** (new 22 October
+> 2026, with each pod's version, digest and pin).
+
+**Versions** lists every workload's release in one table, refreshed every 15 seconds, for checking against a security
+advisory at a glance (an advisory names a release, such as `litellm 1.107.0`, and often the images' digests). Each
+pod's **About**, on **Now**, says the same for each of its containers, with the full digest.
+
+| Column | What it says |
+|---|---|
+| Release | The release, from the image's tag: **LiteLLM 1.105.0**, **ClamAV 1.5.4**. This service's own images (engine, portal, web, music and formula readers) say the **commit** they were built from (`scripts/build.sh` tags them with it). PostgreSQL and Redis, whose tags name only the major release (`postgres:16-alpine`), say the release **as they report it** to monitoring: **PostgreSQL 16.15 (as it reports)** |
+| Digest | The image as running, shortened (`sha256:` and 12 characters). The full digest is in the pod's **About** |
+| Pinned | Whether that's the digest the deployment pins (`scripts/deploy.sh` pins every image that isn't this service's own). **Not the pinned digest** is in bold: the pod runs something other than what was deployed |
+
+A workload part-way through a new release has a row for each release while both run, with the number of pods on
+each. Everything here comes from what Kubernetes and the exporters already tell Prometheus: the portal asks no
+program and no registry, so it can't say when a release was published.
+
 ## Audit export
 
 Where the audit log is sent (a SIEM, by syslog or HTTPS), how far it has got, and its last error if a send failed.
@@ -118,6 +119,7 @@ When the export is off, the tab says so. Setting it up: [Operations › SIEM](..
 **Open Grafana** opens it in a new tab: the same figures and more, in as much detail as you like, with a ready-made
 **PDF Remediation** dashboard. There's no separate Grafana account: choosing Open Grafana signs you in for eight hours,
 and only while you're a super admin (taking the role away, or disabling the account, ends it at the next click).
+Service admins see the rest of System, but not **Open Grafana** (changed 23 October 2026, #564).
 Coming to `/grafana/` without having opened it from here brings you back to this page.
 
 Dashboards you make in Grafana are kept. The **PDF Remediation** dashboard itself comes with the deployment: changes
@@ -137,7 +139,7 @@ with what to do. They are:
 | A service is running fewer pods than it should | For 15 minutes |
 | Prometheus can't read a service's metrics | For 10 minutes |
 | A pod is near its memory limit | Above 90% of it for 15 minutes |
-| A volume is nearly full | Less than 10% left for 30 minutes |
+| A volume is nearly full | Less than 10% left for 30 minutes; the share is `VOLUME_ALERT_FREE_PERCENT` in `deploy.env`. To grow the volume: [growing a volume](../../deployment/first-cluster/storage.md#growing-a-volume) (changed 23 October 2026) |
 | Redis isn't answering / The database isn't answering | For 5 minutes |
 | Documents have waited 30 minutes for an engine worker | Every place has been in use for half an hour |
 | The portal is answering with errors | More than 5% of its answers for 10 minutes |

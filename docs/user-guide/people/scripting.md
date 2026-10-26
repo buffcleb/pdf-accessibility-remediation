@@ -42,6 +42,10 @@ One request can carry several PDFs (up to your service's **most files per upload
 curl -sS -H "Authorization: Bearer $TOKEN" -F "files=@syllabus.pdf" -F "files=@handbook.pdf" "$PORTAL/api/v1/jobs"
 ```
 
+**New 24 October 2026:** add `-F "pdfua=2"` (PDF/UA-2, as PDF 2.0) or `-F "pdfua=both"` where your group offers
+PDF/UA-2; without it, your group's choice is used. Asking for it where it isn't offered is refused with
+`pdfua_not_allowed`. With Both, the PDF/UA-2 copy can be downloaded like the other files.
+
 The answer lists each file:
 - `"accepted": true`, with `job.id` (keep it if a script will check on it); or
 - `"accepted": false`, with `error.message` saying why, for example too many pages or over your pages.

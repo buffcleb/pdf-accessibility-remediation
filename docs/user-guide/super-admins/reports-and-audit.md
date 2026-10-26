@@ -5,7 +5,9 @@
 **Administration → Reports** works as for group admins ([how to use the reports](../group-admins/reports.md)), with
 two differences: you pick **every group or one**, and you get more reports and columns.
 
-## Reports only super admins see
+## Reports only super admins and service admins see
+
+> **Changed 23 October 2026:** service admins see these too, and the audit log (#564).
 
 | Report | What it shows |
 |---|---|

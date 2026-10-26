@@ -55,9 +55,12 @@ On its **Pages and cost guards** tab, **Audits** sets what **Check only** uses w
 
 - **Use AI, free** (the default): the AI writes alt text and reads tables, reading order and notation for the
   report, as in a remediation, and no pages are counted. Nothing limits what checks cost you, so prefer one of the
-  other two for a paid level.
+  others for a paid level.
 - **Use AI and count its pages:** each page counts against this level's pages (not the processing pages).
 - **No AI:** checks are made without AI and use no pages.
+- **Disabled:** Check only isn't offered with this level. The upload form greys it out while the level is chosen,
+  and says why; people choose another level to check, or remediate. Scripts get `check_not_offered`.
+  **New 23 October 2026** (#586).
 
 ### Deleting an AI level
 

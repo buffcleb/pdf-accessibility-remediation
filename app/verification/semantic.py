@@ -911,7 +911,7 @@ class SemanticChecker:
         if not doc_lang:
             return
         for e in els:
-            if e.role not in ("P", "H1", "H2", "H3", "H4", "H5", "H6", "LBody", "TD", "Caption", "Note") \
+            if e.role not in ("P", "H1", "H2", "H3", "H4", "H5", "H6", "LBody", "TD", "Caption", "Note", "FENote") \
                     or e.index not in self.own:
                 continue
             text = self.own[e.index].text

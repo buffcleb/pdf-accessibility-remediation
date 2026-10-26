@@ -95,7 +95,7 @@ makes and keeps the same).
 | `LITELLM_IMAGE`, `VERAPDF_IMAGE`, `CURL_IMAGE`, `CLOUDFLARED_IMAGE` | Outside images, pinned by digest: moving one is a choice. The optional pieces' (`CLAMAV_IMAGE`, `EGRESS_PROXY_IMAGE`, and monitoring's) are pinned in `scripts/deploy.sh` and can be set here too |
 | `GATEWAY_ADMIN_URL`, `GATEWAY_SHARED_LOGIN` | The AI gateway's admin UI ([AI models](../../docs/operations/ai-models.md)) |
 | `GATEWAY_ENGINE_BUDGET` | What the engine's own gateway key may spend, USD per 30 days ([above](#which-pod-sees-which-secret)); empty: no cap of its own |
-| `STORAGE_CLASS`, `SHARED_STORAGE_CLASS`, `DB_SIZE`, `REDIS_SIZE`, `FILES_SIZE`, `JOBDATA_SIZE` | Storage (required) and volume sizes (10, 1, 50 and 50 Gi) |
+| `STORAGE_CLASS`, `SHARED_STORAGE_CLASS`, `DB_SIZE`, `REDIS_SIZE`, `FILES_SIZE`, `JOBDATA_SIZE` | Storage (required) and volume sizes (10, 1, 50 and 50 Gi). A size can go up later and `deploy.sh` grows the volume; never down ([growing a volume](../../docs/deployment/first-cluster/storage.md#growing-a-volume), changed 23 October 2026) |
 | `ENGINE_WORKERS`, `WORKER_CONCURRENCY`, `WORKER_MEMORY_LIMIT`, `ADOBE_WORKERS` | Engine capacity ([sizing](#sizing)); Adobe workers stay at 0 until [Adobe](../../docs/operations/adobe-autotag.md) is set up |
 | `VERAPDF_HEAP`, `VERAPDF_MEMORY_LIMIT`, `VERAPDF_RESTART_SCHEDULE` | The [veraPDF service](../../docs/operations/configuration.md#verapdf-service) |
 | `AUTOSCALE`, `ENGINE_WORKERS_MAX`, `VERAPDF_MAX`, `LITELLM_MAX`, `SCALE_DOWN_SECONDS` | [Scaling with the queue](#scaling-with-the-queue) |
@@ -106,6 +106,7 @@ makes and keeps the same).
 | `CERT_ISSUER`, `INGRESS_TLS_SECRET` | HTTPS at your own ingress controller: a cert-manager ClusterIssuer, or a certificate you supply as a Secret |
 | `NODE_ENCRYPTION` | Whether traffic between the nodes is encrypted, checked before each deploy (`scripts/check_cluster_encryption.sh`): `check` (the default) shows it, `require` stops a deploy without it, `off` doesn't check |
 | `EGRESS_PROXY`, `EGRESS_ALLOW`, `CLUSTER_CIDRS` | Outbound traffic: `off` (the default), `log` or `enforce`; more hosts to allow; the cluster's own ranges, kept out of the proxy's reach ([the egress proxy](#outbound-traffic-the-egress-proxy)) |
+| `EGRESS_DENY`, `NODE_CIDRS`, `KUBE_API_CIDRS`, `KUBE_API_PORT` | Outbound traffic from everything else: `off` (the default) or `on`, each pod reaching only what it uses; the nodes' and the API servers' addresses ([default deny](#outbound-traffic-default-deny), new 24 October 2026) |
 | `BACKUPS`, `BACKUP_*` | [Nightly backups](../../docs/operations/backups-and-migrations.md#nightly-backups-on-the-cluster) |
 | `MONITORING`, `PROMETHEUS_*`, `GRAFANA_SIZE`, `MONITORING_STORAGE_CLASS` | [Prometheus and Grafana](../../docs/operations/monitoring.md#prometheus-and-grafana) |
 | `MALWARE_SCAN`, `CLAMAV_IMAGE`, `CLAMAV_MEMORY_REQUEST`, `CLAMAV_MEMORY_LIMIT` | [Malware scanning](../../docs/operations/malware-scanning.md): `off` (the default) or `clamav` |
@@ -267,7 +268,9 @@ by a crafted PDF can't send anything out (#361). Their AI calls all go through t
 `40-engine.yaml`: a provider named directly, such as the portal's fallback or the default judge, becomes the
 gateway's default or judge model, `GATEWAY_DEFAULT_MODEL` and `GATEWAY_JUDGE_MODEL` in engine.env), and the Jev
 classifier goes through the gateway's `/systemone` route, which adds the OpenRouter key. The gateway, the Adobe
-worker (Adobe's API) and the portal reach the internet directly, unless the egress proxy is on (next).
+worker (Adobe's API) and the portal reach the internet directly, unless the egress proxy is on (next). With
+`EGRESS_DENY=on`, every other pod is closed too, to all but what it uses ([default deny](#outbound-traffic-default-deny),
+new 24 October 2026).
 
 ## Outbound traffic: the egress proxy
 
@@ -337,6 +340,97 @@ recommended.
 **On first applying this:** watch that the readiness probes keep passing (`scripts/deploy.sh status`); the probes
 come from each node, which Canal lets through, but a different network plugin might not, and then every probed pod
 would need a rule for the node network as well.
+
+## Outbound traffic: default deny
+
+> **New 24 October 2026 (#594).**
+
+Without it, a pod that no egress policy names can open a connection to anywhere: SeaweedFS (every stored document,
+and its encryption key), Postgres, both Redis, veraPDF, the web pod, cloudflared, monitoring and the jobs. With
+**`EGRESS_DENY=on`** in `deploy.env`, nothing in the namespace reaches out unless a policy lets it
+(`manifests/83-egress-deny.yaml`): every pod may ask the cluster's DNS, and each workload reaches only what it uses.
+`deploy.sh` applies them with the ingress policies, before any workload starts. The default is `off` (as before).
+
+| Pods | Reach (besides DNS) |
+|---|---|
+| Postgres, both Redis, SeaweedFS, veraPDF | Nothing: they only answer. Replies to a connection they were let in on always get out (Calico, in Canal, tracks connections) |
+| The engine's API, workers and scheduler; the music and formula readers | As before (#361): Redis, and for the engine veraPDF and the AI gateway |
+| Web | The portal API (8080), and Grafana (3000) |
+| cloudflared | Cloudflare's edge outside the cluster on 7844 (TCP and UDP: QUIC or HTTP/2) and 443 (Cloudflare's API), and the service its public hostname points at: the web pod, or the portal API with `FRONTEND=worker` |
+| Prometheus | The pods it reads, on their metrics ports (8000, 8080, 9121, 9187, 9464), each node's kubelet (`NODE_CIDRS`, 10250), the Kubernetes API |
+| kube-state-metrics, the hourly veraPDF restart | The Kubernetes API |
+| The Postgres exporter, the migration job | Postgres |
+| The Redis exporter | The engine's Redis |
+| Grafana | Prometheus |
+| The nightly backup | Postgres and SeaweedFS. The NAS share is mounted by the node, not the pod, so it isn't affected (nor is the job folder) |
+| The egress proxy | As before: anywhere outside the cluster, its own list deciding which hosts (`26-egress-proxy.yaml`) |
+| The portal, the AI gateway, the Adobe worker, ClamAV | As `EGRESS_PROXY` makes them: with `off` and `log` anywhere, as before (`84-egress-direct.yaml`); with `enforce` only through the proxy (`82-egress-enforce.yaml`). `deploy.sh` keeps one or the other in place while the mode changes, so they're never cut off |
+
+**Why those four stay open with `off` and `log`:** with `off` they reach their providers directly, and in `log` the
+proxy is a recorder, not a gate; closing them here would make `EGRESS_DENY` a second, less exact `enforce`. The
+proxy's list of hosts is what limits them, so turning `EGRESS_PROXY=enforce` on is the step that closes them.
+
+**The Kubernetes API.** Pods call the `kubernetes` service's cluster address (`10.43.0.1:443` on RKE2), which the node
+rewrites to one API server's own address and port before Calico checks the policy, so the policy has to name the
+API servers themselves: `KUBE_API_CIDRS` (the nodes, `NODE_CIDRS`, by default: RKE2's servers are nodes) on
+`KUBE_API_PORT` (6443). A Kubernetes policy can't name the API server any other way (Cilium has a `kube-apiserver`
+entity; Calico and the standard policy don't). Charts that can't know the addresses open the API's usual ports to
+any address instead (Bitnami's `kubeAPIServerPorts`, for one); naming them is tighter, and `deploy.sh`
+checks, before it asks to go ahead, that every endpoint of the `kubernetes` service is in `KUBE_API_CIDRS` on
+`KUBE_API_PORT`, and stops if one isn't (a server node added later, say). Set `NODE_CIDRS` to the nodes' addresses
+(`kubectl get nodes -o wide`), one by one or as a range.
+
+**Not affected:** KEDA reads Postgres and Redis from its own namespace, which their ingress policies let in; the
+kubelet's probes (ingress, from the node); `deploy.sh` and `scripts/backup.sh`, which use `kubectl exec`, not the
+pod network; SeaweedFS's own master, filer and volume server talking to each other inside its one pod.
+
+**Rolling it out:**
+
+1. In `deploy.env`: `EGRESS_DENY=on` and `NODE_CIDRS`. Deploy. `deploy.sh` prints "outbound from everything else:
+   only what each pod uses" and the API's addresses; the deploy itself runs the migration job and `deploy.sh`'s
+   own checks under the new policies.
+2. Check that the way out is closed, from a pod that should reach nothing:
+
+   ```bash
+   kubectl -n pdf-remediation exec seaweedfs-0 -- nc -vz -w 5 example.com 443
+   ```
+
+   The name still resolves (DNS is allowed), and the connection times out.
+3. Use the service, and check each of these:
+
+   | Check | What it exercises |
+   |---|---|
+   | Sign in with an emailed code | The portal's mail (unchanged), the web pod and cloudflared to the portal |
+   | Upload a document | The portal to SeaweedFS (and ClamAV, if on) |
+   | A document at Standard, and one at an AI level | The engine, veraPDF, the AI gateway |
+   | One through Adobe, if `ADOBE_WORKERS` is above 0 | The Adobe worker |
+   | The site through the tunnel; `kubectl -n pdf-remediation logs deploy/cloudflared --since=10m` shows registered connections and no errors | cloudflared to Cloudflare's edge and the web pod |
+   | Grafana at `/grafana/`, its dashboards with data | The web pod to Grafana, Grafana to Prometheus |
+   | Administration > System: pods, nodes, versions and volumes | Prometheus to the pods, the kubelets and the API; kube-state-metrics to the API |
+   | Settings > Alerts: nothing new firing (no target down) | Every scrape |
+   | The next hour's `verapdf-restart` job completes (`kubectl -n pdf-remediation get jobs`) | The API, for the restart |
+   | The next nightly backup completes, and its alert stays quiet | The backup to Postgres and SeaweedFS |
+   | The next deploy with a migration | The migration job to Postgres |
+
+**Finding a blocked flow.** A connection a policy refuses is dropped, so it shows as a timeout in whatever made it
+(the pod's log, or the check above that fails), not as a refusal. To tell a policy from something else:
+- try it from the pod: `kubectl -n pdf-remediation exec <pod> -- nc -vz -w 5 <host> <port>` (the images without `nc`
+  have `wget` or `python`);
+- see what the pod's policies allow: `kubectl -n pdf-remediation describe networkpolicy` lists each one's pods and
+  rules;
+- RKE2's Canal keeps no log of dropped flows (Calico's flow logs need its operator and Whisker, which Canal doesn't
+  install); Calico's `Log` action, in a Calico policy placed after these, would write each one to the node's kernel
+  log, but that's untried here.
+
+If it is a policy, back out (next) and add the missing rule to `83-egress-deny.yaml` with a test
+(`tests/engine/test_egress_deny.py` holds each workload's allow-list).
+
+**Backing out:** `EGRESS_DENY=off` and deploy: the policies go first, before anything else is applied. In a hurry,
+without a deploy, the same in one command (the next deploy with `on` puts them back):
+
+```bash
+kubectl -n pdf-remediation delete networkpolicy -l pdfrem/egress-deny
+```
 
 ## What a pod may do and use
 

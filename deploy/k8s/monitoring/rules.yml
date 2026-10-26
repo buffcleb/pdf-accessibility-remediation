@@ -52,7 +52,7 @@ groups:
       - alert: VolumeFilling
         expr: |
           max by (persistentvolumeclaim) (kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes)
-            < 0.1
+            < 0.1  # VOLUME_ALERT_FREE_PERCENT: deploy.sh puts deploy.env's share here (10% by default)
         for: 30m
         annotations:
           description: "The volume {{ $labels.persistentvolumeclaim }} has {{ $value | humanizePercentage }} left."

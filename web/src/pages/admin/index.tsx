@@ -6,6 +6,7 @@ import { AccessCheckForm, AttentionList, serviceOptions } from "../../components
 import { LiveReports } from "../../components/LiveReport";
 import { CsvExports } from "../../components/tables";
 import { ErrorNotice, Loading, useLoad, useTitle } from "../../components/ui";
+import { acrossGroups, can } from "../../permissions";
 import { GroupsList, GroupWorkspace } from "./Groups";
 import { HelpDetail, HelpQueue } from "./Help";
 import { PeopleAll } from "./People";
@@ -16,10 +17,12 @@ import { SystemPage } from "./System";
 import { OfferService } from "./Setup";
 import { GatewayLink } from "./shared";
 
-/** One administration area for super admins and group admins; what each sees follows their role. */
+/** One administration area for super admins, service admins (#564) and group admins; what each sees follows their
+ * role's permissions (src/permissions.ts). */
 export function Admin() {
   const { me } = useAuth();
   const isSuper = !!me?.is_super_admin;
+  const across = acrossGroups(me);
   // The menu can be folded away on any admin page; the choice is remembered on this device
   const [collapsed, setCollapsed] = useState(() => {
     try { return localStorage.getItem("admin-menu") === "collapsed"; } catch { return false; }
@@ -27,7 +30,7 @@ export function Admin() {
   useEffect(() => {
     try { localStorage.setItem("admin-menu", collapsed ? "collapsed" : "open"); } catch { /* not stored: fine */ }
   }, [collapsed]);
-  const waiting = (me?.pending_approvals ?? 0) + (isSuper ? me?.help_needs_us ?? 0 : 0);
+  const waiting = (me?.pending_approvals ?? 0) + (can(me, "help") ? me?.help_needs_us ?? 0 : 0);
   return (
     <div className={`admin-shell${collapsed ? " collapsed" : ""}`}>
       <nav className="admin-side" aria-label="Administration">
@@ -39,20 +42,18 @@ export function Admin() {
         </button>
         <div id="admin-links" className="admin-links" hidden={collapsed}>
           <NavLink to="/admin" end>Attention</NavLink>
-          <NavLink to="/admin/groups">{isSuper ? "Groups" : me && me.admin_of.length === 1 ? "My group" : "My groups"}
+          <NavLink to="/admin/groups">{across ? "Groups" : me && me.admin_of.length === 1 ? "My group" : "My groups"}
             {!!me?.pending_approvals && <> <span className="badge">{me.pending_approvals}<span className="visually-hidden"> waiting for approval</span></span></>}</NavLink>
-          {isSuper && (
-            <>
-              <NavLink to="/admin/help">Help requests
-                {!!me?.help_needs_us && <> <span className="badge">{me.help_needs_us}<span className="visually-hidden"> waiting on us</span></span></>}</NavLink>
-              <NavLink to="/admin/services">Services and AI levels</NavLink>
-              <NavLink to="/admin/people">People (all groups)</NavLink>
-              <NavLink to="/admin/queues">Queues</NavLink>
-              <NavLink to="/admin/system">System</NavLink>
-              <NavLink to="/admin/reports">Reports</NavLink>
-              <NavLink to="/admin/settings">Settings</NavLink>
-            </>
+          {can(me, "help") && (
+            <NavLink to="/admin/help">Help requests
+              {!!me?.help_needs_us && <> <span className="badge">{me.help_needs_us}<span className="visually-hidden"> waiting on us</span></span></>}</NavLink>
           )}
+          {isSuper && <NavLink to="/admin/services">Services and AI levels</NavLink>}
+          {can(me, "people") && <NavLink to="/admin/people">People (all groups)</NavLink>}
+          {can(me, "queues") && <NavLink to="/admin/queues">Queues</NavLink>}
+          {can(me, "system") && <NavLink to="/admin/system">System</NavLink>}
+          {can(me, "reports.all") && <NavLink to="/admin/reports">Reports</NavLink>}
+          {isSuper && <NavLink to="/admin/settings">Settings</NavLink>}
           <hr />
           <NavLink to="/admin/offer">+ Offer a service to a group</NavLink>
           {isSuper && <span className="small"><GatewayLink /></span>}
@@ -65,15 +66,15 @@ export function Admin() {
           <Route path="groups/:groupId/*" element={<GroupWorkspace />} />
           <Route path="offer" element={<OfferService />} />
           <Route path="help/:id" element={<HelpDetail />} />
-          {isSuper && (
+          {can(me, "help") && <Route path="help" element={<HelpQueue />} />}
+          {isSuper && <Route path="services" element={<ServicesList />} />}
+          {isSuper && <Route path="services/:key" element={<ServiceDetail />} />}
+          {can(me, "people") && <Route path="people" element={<PeopleAll />} />}
+          {can(me, "people") && <Route path="users" element={<Navigate to="/admin/people" replace />} />}
+          {can(me, "queues") && <Route path="queues" element={<QueuesPage />} />}
+          {can(me, "system") && <Route path="system/*" element={<SystemPage />} />}
+          {can(me, "reports.all") && (
             <>
-              <Route path="help" element={<HelpQueue />} />
-              <Route path="services" element={<ServicesList />} />
-              <Route path="services/:key" element={<ServiceDetail />} />
-              <Route path="people" element={<PeopleAll />} />
-              <Route path="queues" element={<QueuesPage />} />
-              <Route path="system/*" element={<SystemPage />} />
-              <Route path="users" element={<Navigate to="/admin/people" replace />} />
               <Route path="reports" element={<><h1>Reports</h1><LiveReports />
                 <details className="panel">
                   <summary>Fixed-format CSV exports</summary>
@@ -85,10 +86,10 @@ export function Admin() {
                     { name: "access", label: "sign-in log (all groups)", hint: "Sign-ins, failed attempts and sign-outs." },
                   ]} />
                 </details></>} />
-              <Route path="settings/*" element={<SettingsArea />} />
               <Route path="audit" element={<Navigate to="/admin/reports?report=audit" replace />} />
             </>
           )}
+          {isSuper && <Route path="settings/*" element={<SettingsArea />} />}
           <Route path="*" element={<p>Page not found.</p>} />
         </Routes>
       </div>
@@ -96,14 +97,14 @@ export function Admin() {
   );
 }
 
-/** Attention first. Super admins see everything; group admins see their groups. */
+/** Attention first. Super admins and service admins see everything; group admins see their groups. */
 function AdminHome() {
   useTitle("Administration");
   const { me } = useAuth();
-  const isSuper = !!me?.is_super_admin;
-  const services = useLoad(() => (isSuper ? get<Service[]>("/admin/services") : Promise.resolve([] as Service[])), [isSuper]);
-  const groups = useLoad(() => (isSuper ? Promise.resolve([] as Group[]) : get<Group[]>("/groups")), [isSuper]);
-  if (isSuper) {
+  const all = can(me, "attention");
+  const services = useLoad(() => (all ? get<Service[]>("/admin/services") : Promise.resolve([] as Service[])), [all]);
+  const groups = useLoad(() => (all ? Promise.resolve([] as Group[]) : get<Group[]>("/groups")), [all]);
+  if (all) {
     return (
       <>
         <h1>Needs attention</h1>

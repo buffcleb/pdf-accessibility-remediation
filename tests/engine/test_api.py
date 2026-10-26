@@ -290,3 +290,15 @@ def test_describing_an_area_refuses_bad_requests(client, tmp_path):
             r = client.post("/api/v1/describe", files={"file": ("figure.pdf", f, "application/pdf")},
                             data={"ai_provider": "mock", **data})
         assert r.status_code == code, (data, r.text)
+
+
+def test_pdfua_both_returns_the_pdfua_2_copy(client, samples):
+    """#445: with flags.pdfua "both" the response names the PDF/UA-2 copy, which downloads as PDF 2.0."""
+    with (samples / "table_doc.pdf").open("rb") as fh:
+        r = client.post("/api/v1/remediate", files={"file": ("table doc.pdf", fh, "application/pdf")},
+                        data={"ai_provider": "none", "flags": json.dumps({"pdfua": "both"})})
+    body = client.get(f"/api/v1/jobs/{r.json()['job_id']}").json()
+    assert body["status"] == "completed", body
+    pdf = client.get(body["files"]["remediated_pdfua2"])
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF-2.0")
+    assert "after_pdfua2" in body["reports"]["comparison"]

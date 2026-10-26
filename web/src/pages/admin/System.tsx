@@ -1,8 +1,10 @@
 import { useState, type ReactNode } from "react";
 import { NavLink, Navigate, Route, Routes, useSearchParams } from "react-router-dom";
 import { get, post } from "../../api";
+import { useAuth } from "../../auth";
+import { can } from "../../permissions";
 import { ReportChart, type ChartData } from "../../components/ReportChart";
-import { PodView } from "./Pods";
+import { PodView, VersionsView } from "./Pods";
 import { ErrorNotice, Loading, Notice, errorMessage, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 
 type Figure = { key: string; label: string; value: number | null; unit: string; of?: number | null };
@@ -70,9 +72,11 @@ function SiemPanel() {
   );
 }
 
-/** Super admins (#397): the service's health from its Prometheus, now and over time, and the way into Grafana. */
+/** Super admins and service admins (#397, #564): the service's health from its Prometheus, now and over time; and, for
+ * super admins, the way into Grafana. */
 export function SystemPage() {
   useTitle("System");
+  const { me } = useAuth();
   const [params] = useSearchParams();
   const [range, setRange] = useState<(typeof RANGES)[number][0]>("6h");
   const data = useLoad(() => get<System>(`/admin/monitoring/system?range=${range}`), [range], always, 60000);
@@ -111,9 +115,10 @@ export function SystemPage() {
         <nav className="tabs" aria-label="System sections">
           <NavLink to="/admin/system" end>Now</NavLink>
           <NavLink to="/admin/system/over-time">Over time</NavLink>
+          <NavLink to="/admin/system/versions">Versions</NavLink>
           <NavLink to="/admin/system/audit-export">Audit export</NavLink>
         </nav>
-        {d.monitoring && d.grafana && (
+        {d.monitoring && d.grafana && can(me, "grafana") && (
           <button type="button" className="btn secondary small" onClick={openGrafana} disabled={opening}>
             {opening ? "Opening…" : "Open Grafana"}<span className="visually-hidden"> (opens in a new tab)</span>
           </button>
@@ -158,6 +163,7 @@ export function SystemPage() {
           </div>
           <p className="muted small">Grafana has these and more, in detail; the charts show at most eight series each.</p>
         </Monitored>} />
+        <Route path="versions" element={<Monitored d={d}><VersionsView /></Monitored>} />
         <Route path="audit-export" element={<SiemPanel />} />
         <Route path="*" element={<Navigate to="/admin/system" replace />} />
       </Routes>

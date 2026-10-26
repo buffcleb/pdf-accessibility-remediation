@@ -2,13 +2,12 @@
 a spreadsheet formula, a NUL and an instruction aimed at the AI comes out with that text as text: in the tagged PDF,
 the tag map and the reports, where the PDF report escapes it. The portal's side is in tests/portal/test_hostile_text.py;
 the prompts' side (the text quoted as data, controls stripped) in test_prompt_boundary.py."""
-import asyncio
 import json
-import shutil
-import uuid
 
 import pikepdf
 import pymupdf as fitz
+
+from tests.engine.pdfs import remediate
 
 SQL = "'; DROP TABLE jobs; --"
 HTML = "<script>alert(1)</script><img src=x onerror=alert(2)>"
@@ -35,14 +34,7 @@ def _hostile(path):
 
 
 def _remediate(tmp_path, src):
-    from app.pipeline.orchestrator import JobOptions, run_remediation
-    from app.storage import JobStore
-
-    jid = str(uuid.uuid4())
-    store = JobStore(jid, root=tmp_path / "jobs")
-    store.create()
-    shutil.copyfile(src, store.input_pdf)
-    res = asyncio.run(run_remediation(store, JobOptions(stem="h", job_id=jid, provider="mock")))
+    res, store = remediate(tmp_path, src, stem="h")
     return res, store.dir
 
 

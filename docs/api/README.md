@@ -50,6 +50,7 @@ API then takes calls without a key).
 | `ignore_existing` | `false` | Ignore the document's own tags (poor ones) and tag it afresh from the page |
 | `validator` | the service when configured | How veraPDF runs for this job: `service` (kept running, `VERAPDF_URL`) or `command_line` |
 | `verapdf_ua2` | `true` | Also check PDF/UA-2 (shown for information; the verdict is PDF/UA-1, except for a PDF 2.0 file, judged by PDF/UA-2; each snapshot's `pdfua_part` says which) |
+| `pdfua` | `"1"` | The PDF/UA part delivered (#445): `"1"`, `"2"` (the finished files saved as PDF 2.0 and made PDF/UA-2, then checked by it) or `"both"` (a PDF/UA-2 copy of the main file beside it, `files.remediated_pdfua2`, its verdict in `comparison.after_pdfua2`). A PDF 2.0 document is PDF/UA-2 whatever this says. `comparison.pdfua2_changes` lists what the step changed |
 | `return_base64` | `false` | Return files inline in the JSON instead of as links |
 | `report_branding` | none | For the PDF report: `service_name`, `organization`, `accent_color`, `ai_label` |
 | `debug` | `false` | Keep working files and AI prompt and response logs (the document's text with them, on the job folder until `JOB_TTL_HOURS`) |
@@ -78,7 +79,8 @@ record a failure (the hard time limit, out of memory) is reported as `failed` wi
   "files": {
     "remediated_primary": "/api/v1/jobs/{id}/files/x_remediated.pdf",   // or base64 with return_base64
     "remediated_visual_fallback": null,                                 // set only when there are two files
-    "enhanced": null                       // Adobe route with AI: Adobe's file plus AI alt text
+    "enhanced": null,                      // Adobe route with AI: Adobe's file plus AI alt text
+    "remediated_pdfua2": null              // flags.pdfua "both": the main file as PDF 2.0, PDF/UA-2 (#445)
   },
   "metrics": { "pages_processed": 14, "ai_tokens_used": {"prompt_tokens": 14500, "completion_tokens": 2300},
                "processing_time_seconds": 45.2, "ai_calls": 31, "images_described": 9, "ai_cost_usd": 0.0,
@@ -215,7 +217,7 @@ public address, not the engine's. The guide for people writing the scripts, with
 
   | Call | Needs |
   |---|---|
-  | `POST /api/v1/jobs` (multipart, one or more `files`) | Always allowed. Each document uses the token's processing service, AI level and kind, whatever the request says |
+  | `POST /api/v1/jobs` (multipart, one or more `files`) | Always allowed. Each document uses the token's processing service, AI level and kind, whatever the request says; `pdfua` (`1`, `2`, `both`) where the group offers PDF/UA-2, else the group's choice |
   | `GET /api/v1/jobs/{id}`, `GET /api/v1/documents` (`page`, `page_size` up to 200, the list's filters) | **Check their status** |
   | `GET /api/v1/documents?not_downloaded=true` | Download: the finished documents this token hasn't downloaded yet |
   | `GET /api/v1/jobs/{id}/files.zip`, `GET /api/v1/jobs/{id}/files/{file}` | Download: **Everything**, or **Chosen files** one at a time |

@@ -3,7 +3,7 @@
 import type { TagElement, TagMap } from "../api";
 
 const HEADINGS = ["H", "H1", "H2", "H3", "H4", "H5", "H6"];
-const TEXT = new Set([...HEADINGS, "P", "Caption", "BlockQuote", "Note", "Code", "Quote", "Span", "Reference", "BibEntry", "Figure", "Formula"]);
+const TEXT = new Set([...HEADINGS, "P", "Caption", "BlockQuote", "Note", "FENote", "Code", "Quote", "Span", "Reference", "BibEntry", "Figure", "Formula"]);
 const BLOCKS = new Set([...HEADINGS, "P", "L", "Table", "Sect", "Div", "Art", "Part", "BlockQuote", "TOC", "Index", "Document"]);
 const ALLOWED_KIDS: Record<string, Set<string>> = {
   Table: new Set(["TR", "THead", "TBody", "TFoot", "Caption"]),
@@ -102,7 +102,7 @@ export function checkMove(role: string, oldParent: string | null, newParent: str
 }
 
 // Tags that hold content of their own, so content can be moved into them (the engine's CONTENT_ROLES)
-export const CONTENT_ROLES = new Set([...HEADINGS, "P", "Caption", "BlockQuote", "Note", "Code", "Quote", "Span", "Reference",
+export const CONTENT_ROLES = new Set([...HEADINGS, "P", "Caption", "BlockQuote", "Note", "FENote", "Code", "Quote", "Span", "Reference",
   "BibEntry", "Figure", "Formula", "TD", "TH", "LBody", "Lbl", "Link", "Form", "TOCI"]);
 // Types a new tag made from untagged items can have (the engine's NEW_AREA_ROLES)
 export const NEW_AREA_ROLES = ["P", "H1", "H2", "H3", "H4", "H5", "H6", "Figure", "Formula", "Caption", "Note", "Quote", "BlockQuote", "Code"];

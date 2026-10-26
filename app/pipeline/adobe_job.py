@@ -28,14 +28,14 @@ from app.ai.registry import get_provider
 from app.pipeline import limits, mathml, protection
 from app.pipeline.enrichment import EnrichmentStats
 from app.config import get_settings
-from app.pipeline.orchestrator import (
-    JobOptions, Progress, _ai_read, _bookmarks, _delta, _describe_regions, _math_outputs, _move_xml, _primary,
-    _read_formulas, _snapshot, _tagmap_file, _validate, _verdict_line, _visual_fidelity, _write_json_report,
-    _xml_name,
-)
+from app.pipeline.orchestrator import JobOptions, _ai_read, _describe_regions, _math_outputs, _primary, _read_formulas
+from app.pipeline.outputs import (Progress, add_bookmarks, delta, move_xml, snapshot, tagmap_file, validate, verdict_line,
+                                  visual_fidelity, write_json_report, xml_name)
+from app.pipeline.run_result import RunResult
 from app.storage import JobStore
 from app.validation.audit import audit_pdf
 from app.verification.verify import VerifyOptions, verify_output
+from app.tagging.tree import TEXT_ROLES as _TEXT_ROLES
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
 
     progress("validating_original", 5)
     before_audit = await asyncio.to_thread(audit_pdf, src)
-    before_vera = await asyncio.to_thread(_validate, src, out, "before", stem)
+    before_vera = await asyncio.to_thread(validate, src, out, "before", stem)
     if not _primary(before_vera):
         warnings.append(f"veraPDF unavailable: {next(iter(before_vera.values())).error}")
 
@@ -97,8 +97,8 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
 
     # After ------------------------------------------------------------------------------------
     progress("validating_output", 72)
-    vera_after = await asyncio.to_thread(_validate, primary, work, "after", stem)
-    tag_maps = {"original": await _tagmap_file(out, stem, "original", src)}
+    vera_after = await asyncio.to_thread(validate, primary, work, "after", stem)
+    tag_maps = {"original": await tagmap_file(out, stem, "original", src)}
     verification = None
     primary_map = None
     if s.verify_enabled:
@@ -110,7 +110,7 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
         if not rep.integrity_passed:
             warnings.append(f"Adobe's tags have {len(rep.errors)} structural problem(s); see the tag review. "
                             "The file is kept as Adobe returned it")
-    tag_maps["primary"] = await _tagmap_file(out, stem, "primary", primary, primary_map)
+    tag_maps["primary"] = await tagmap_file(out, stem, "primary", primary, primary_map)
 
     # Improved copy: AI alt text, document fixes and lossless font fixes. Adobe's file stays as it is. ----------------
     enhanced_name = None
@@ -155,9 +155,9 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
     # Adobe doesn't write bookmarks. Its tags' headings are the copy's (alt text and font fixes don't touch them),
     # so Adobe's tag map says where they go
     # (after any veraPDF check of the copy, which doesn't look at the outline)
-    improvements["bookmarks"] = (await _bookmarks(candidate, primary_map))[0]["bookmarks"]
+    improvements["bookmarks"] = (await add_bookmarks(candidate, primary_map))[0]["bookmarks"]
     changed = any(improvements[k] for k in improvements)
-    if changed and not (await asyncio.to_thread(_visual_fidelity, primary, candidate))["identical"]:
+    if changed and not (await asyncio.to_thread(visual_fidelity, primary, candidate))["identical"]:
         warnings.append("the improved copy didn't render identically to Adobe's file, so it was discarded")
         changed = False
     if changed:
@@ -165,7 +165,7 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
         shutil.copyfile(candidate, enhanced)
         enhanced_name = enhanced.name
         progress("validating_improved_copy", 90)
-        vera_enhanced = vera_candidate or await asyncio.to_thread(_validate, enhanced, work, "after_enhanced", stem)
+        vera_enhanced = vera_candidate or await asyncio.to_thread(validate, enhanced, work, "after_enhanced", stem)
         if s.verify_enabled:
             # The AI review checks the AI's alt text; font fixes alone need no AI review.
             rep = await verify_output(enhanced, VerifyOptions(
@@ -174,22 +174,22 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
                 # the AI's readings are listed for a person to check, as on the standard route
                 ai_read=_ai_read(enrichment)))
             verification["enhanced"] = rep.to_dict()
-            tag_maps["enhanced"] = await _tagmap_file(out, stem, "enhanced", enhanced, rep.tagmap)
+            tag_maps["enhanced"] = await tagmap_file(out, stem, "enhanced", enhanced, rep.tagmap)
             if rep.ai.get("error"):
                 warnings.append(f"AI review did not run: {rep.ai['error']}")
         else:
-            tag_maps["enhanced"] = await _tagmap_file(out, stem, "enhanced", enhanced)
+            tag_maps["enhanced"] = await tagmap_file(out, stem, "enhanced", enhanced)
 
-    before_snapshot = _snapshot(before_audit, before_vera)
-    after_snapshot = _snapshot(await asyncio.to_thread(audit_pdf, primary), vera_after)
+    before_snapshot = snapshot(before_audit, before_vera)
+    after_snapshot = snapshot(await asyncio.to_thread(audit_pdf, primary), vera_after)
     comparison = {
         "before": before_snapshot,
         "after": after_snapshot,
-        "delta": _delta(before_snapshot, after_snapshot),
-        "visual_fidelity": await asyncio.to_thread(_visual_fidelity, src, primary),
+        "delta": delta(before_snapshot, after_snapshot),
+        "visual_fidelity": await asyncio.to_thread(visual_fidelity, src, primary),
     }
     if enhanced_name:
-        comparison["after_enhanced"] = _snapshot(await asyncio.to_thread(audit_pdf, out / enhanced_name),
+        comparison["after_enhanced"] = snapshot(await asyncio.to_thread(audit_pdf, out / enhanced_name),
                                                  vera_enhanced)
     pages = sum(p.pages for p in parts)
     adobe = {
@@ -222,14 +222,14 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
     if review_ai.get("ai_tokens_used"):
         metrics["verification_ai_cost_usd"] = round(float(review_ai["ai_tokens_used"].get("cost_usd", 0.0)), 6)
 
-    summary = [_verdict_line("Before", before_snapshot), _verdict_line("After (Adobe)", after_snapshot),
+    summary = [verdict_line("Before", before_snapshot), verdict_line("After (Adobe)", after_snapshot),
                f"Tagged by Adobe PDF Services Autotag: {pages} page(s)"
                + (f" in {len(parts)} parts, merged into one document" if len(parts) > 1 else "") + ".",
                "The file is Adobe's output unchanged. Adobe doesn't write alt text for figures, and its tags "
                "aren't guaranteed to meet PDF/UA."]
     if enhanced_name:
         summary.append(f"Improved copy ({enhanced_name}); Adobe's file is unchanged. {_describe(improvements)} "
-                       + _verdict_line("Improved copy", comparison["after_enhanced"]))
+                       + verdict_line("Improved copy", comparison["after_enhanced"]))
     vf = comparison["visual_fidelity"]
     summary.append(f"Visual fidelity: {vf.get('pages_identical')}/{vf.get('pages_compared')} pages pixel-identical "
                    "to the original.")
@@ -239,14 +239,14 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
         summary.append(f"Formulas: {enrichment.math_formulas} saved as MathML as well, in the math files and the "
                        "formula list.")
     summary += [f"Warning: {w}" for w in warnings]
-    result = {
-        "files": {"remediated_primary": primary_name, "remediated_visual_fallback": None,
+    result = RunResult(
+        files={"remediated_primary": primary_name, "remediated_visual_fallback": None,
                   "enhanced": enhanced_name},
-        "metrics": metrics,
-        "reports": {
-            "verapdf_before": _xml_name(before_vera),
-            "verapdf_after": {"primary": _move_xml(vera_after, out, f"{stem}_verapdf_after"), "visual_fallback": None,
-                              "enhanced": _move_xml(vera_enhanced, out, f"{stem}_verapdf_after_improved")},
+        metrics=metrics,
+        reports={
+            "verapdf_before": xml_name(before_vera),
+            "verapdf_after": {"primary": move_xml(vera_after, out, f"{stem}_verapdf_after"), "visual_fallback": None,
+                              "enhanced": move_xml(vera_enhanced, out, f"{stem}_verapdf_after_improved")},
             "improvements": improvements if enhanced_name else None,
             "comparison": comparison,
             "remediation_summary": "\n".join(summary),
@@ -261,9 +261,9 @@ async def run_adobe(store: JobStore, opts: JobOptions, progress: Progress = lamb
             "math_disagreements": mathml.disagreements(math_formulas) or None,
             **{k: math_files.get(k) for k in ("math_files", "math_list", "math_nemeth", "math_ueb")},
         },
-        "warnings": warnings,
-    }
-    _write_json_report(out, stem, result, store)
+        warnings=warnings,
+    ).to_dict()
+    write_json_report(out, stem, result, store)
     progress("completed", 100)
     return result
 
@@ -280,13 +280,13 @@ def _font_fixes(primary, pdf, work, stem: str, warnings: list[str]) -> dict:
     out["unicode_maps"] = add_missing_tounicode(pdf, tmp)
     if out["unicode_maps"]:
         tmp.replace(pdf)
-    vera = _validate(pdf, work, "after_enhanced", stem)
+    vera = validate(pdf, work, "after_enhanced", stem)
     vera, out["glyph_lists"] = _fix_glyph_lists(pdf, vera, work, "after_enhanced", stem)
     before = work / "improved_before_widths.pdf"
     shutil.copyfile(pdf, before)
     vera_before = vera
     vera, widths = _fix_widths(pdf, vera, work, "after_enhanced", stem)
-    if widths and not _visual_fidelity(primary, pdf)["identical"]:
+    if widths and not visual_fidelity(primary, pdf)["identical"]:
         shutil.copyfile(before, pdf)
         vera, widths = vera_before, 0
         warnings.append("glyph width corrections would move text by a fraction of a point, so they weren't applied "
@@ -315,7 +315,8 @@ def _document_fixes(path, tagmap: dict | None, opts: JobOptions) -> dict:
             done["title"] = new
         with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
             if not meta.get("pdfuaid:part"):
-                part = 2 if pdf.pdf_version >= "2.0" else 1  # PDF/UA-2 is for PDF 2.0 files
+                from app.tagging.conformance import conformance
+                part = conformance(str(pdf.pdf_version)).part  # PDF/UA-2 is for PDF 2.0 files
                 meta["pdfuaid:part"] = str(part)
                 if part == 2:
                     meta["pdfuaid:rev"] = "2024"
@@ -526,9 +527,7 @@ async def _ai_edits(ai, opts: JobOptions, pdf, original, tagmap_path, tagmap: di
 
 
 # Adobe's tags that can take a reading: text tags with nothing of their own to say, holding only plain Spans (a list
-# item: its label and body)
-_TEXT_ROLES = {"P", "LBody", "LI", "Lbl", "TD", "TH", "Span", "Caption", "Formula", "H", "H1", "H2", "H3", "H4", "H5",
-               "H6", "Quote", "BlockQuote", "Note"}
+# item: its label and body), of the roles in _TEXT_ROLES
 
 
 def _same_text(tag: str, block: str) -> str | None:

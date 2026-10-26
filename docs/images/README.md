@@ -25,6 +25,7 @@ University, northfield.example), processed by the engine with Local AI and shown
 | `admin-attention.png` | Administration → Attention, with the access check | super-admins/README |
 | `admin-groups.png` | Administration → Groups | super-admins/groups-and-people |
 | `admin-settings.png` | Administration → Settings, Branding | super-admins/settings |
+| `service-admin.png` | Administration for a service admin: the menu without Services and AI levels or Settings, and Attention (new 23 October 2026, from the accessibility checks' test app) | service-admins/README |
 | `tag-manager/*.png` | The tag manager: the overview, the tag tree, reading order, the tag menu and its windows, read aloud, areas, figure split, lists, footnotes, saving | README (overview), people/tag-manager/ |
 
 Take them at 1440 px wide in the light theme, with sample documents and made-up names only, and give each a

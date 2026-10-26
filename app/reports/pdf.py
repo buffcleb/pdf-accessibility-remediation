@@ -39,6 +39,28 @@ _ROWS = [
 _SEVERITY = {"high": "High", "review": "Review", "suggest": "Suggestion", "warning": "Note"}
 
 
+# Private use characters: what one stands for depends on the font it came from (a Wingdings arrow U+F0E0, a Symbol
+# bullet U+F0B7, a music font's notes), and the report quotes the document's text without its fonts. No font in the
+# report has them, so each would be drawn as .notdef, which PDF/UA-1 forbids (7.21.8, #600)
+_PRIVATE_USE = re.compile("[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
+
+
+def drawable(page: str) -> str:
+    """The report's HTML with each private use character the document's text brought in shown as a white square (□,
+    U+25A1). Not U+FFFD: the report's font has it, but the PDF WeasyPrint writes maps it back to another character."""
+    return _PRIVATE_USE.sub("\u25a1", page)
+
+
+def pdf2_note(comp: dict) -> str:
+    """What a report says about a file converted to PDF 2.0 for PDF/UA-2 (#445)."""
+    caution = "Some older PDF readers and checkers don't support PDF 2.0 yet."
+    copy = comp.get("after_pdfua2")
+    if copy:  # Both: a PDF/UA-2 copy beside the PDF/UA-1 file
+        verdict = "passes" if copy.get("compliant") else "does not yet fully pass"
+        return f"A second file was made from it as PDF 2.0, for PDF/UA-2: it {verdict} the PDF/UA-2 check. {caution}"
+    return f"The file was converted to PDF 2.0, as PDF/UA-2 needs. {caution}"
+
+
 def _e(v) -> str:
     return html.escape("" if v is None else str(v))
 
@@ -122,6 +144,8 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
                  'accessibility check'
                  + (f": failed checks went from {fb:,} to {fa:,}." if isinstance(fb, int) and isinstance(fa, int) else ".")
                  + "</p>")
+        if comp.get("pdfua2_changes"):
+            s.append(f"<p>{_e(pdf2_note(comp))}</p>")
         if files.get("remediated_visual_fallback"):
             dp = comp.get("destructive_pages") or []
             s.append("<p>Two files were returned: the <strong>remediated PDF</strong>, which passes where possible but looks "
@@ -276,7 +300,7 @@ def write_report_pdf(out_path: Path, meta: dict, result: dict, branding: dict | 
         log.warning("report PDF unavailable: %s", exc)
         return {"compliant": None, "error": "PDF reports aren't available on this engine"}
     try:
-        HTML(string=build_html(meta, result, branding)).write_pdf(str(out_path), pdf_variant="pdf/ua-1")
+        HTML(string=drawable(build_html(meta, result, branding))).write_pdf(str(out_path), pdf_variant="pdf/ua-1")
     except Exception as exc:  # noqa: BLE001 - a report problem never fails the job
         log.exception("report PDF failed")
         return {"compliant": None, "error": f"couldn't write the report PDF: {exc}"[:300]}

@@ -54,6 +54,9 @@ See also the [glossary](../glossary.md).
   the page starts with the same mark. Small numbered lines nothing points at stay as they were. A note under a table
   that starts with a symbol (*, †) used in the table's cells is tagged the same way, and the cell reads "500
   (footnote asterisk)".
+- **Endnotes are tagged as notes** (**New 24 October 2026**, #285): the numbered notes under a **Notes** or
+  **Endnotes** heading, chapter by chapter, with the raised marks in the text pointing at them and read as "endnote 1".
+  [Footnotes](tag-manager/footnotes.md#endnotes)
 - **The AI writes drafts.** Image descriptions and readings of math or other notation are written by AI and
   marked for checking. Charts, diagrams and formulas are the ones most worth a look.
 - **Passing isn't the whole story.** The accessibility check covers the rules a machine can test. A person

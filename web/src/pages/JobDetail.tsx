@@ -3,7 +3,7 @@ import { marked } from "marked";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useSeen } from "../components/seen";
-import { MARK_LABELS, download, get, getText, heldFor, post, put, type DocVersion, type Finding, type FindingMark, type FindingMarks, type Job, type JobFile, type MarkStatus, type RemovalResult, type Versions } from "../api";
+import { MARK_LABELS, download, get, getText, heldFor, post, put, type DocVersion, type Finding, type FindingMark, type FindingMarks, type Job, type JobFile, type MarkStatus, type PdfUa, type RemovalResult, type Versions } from "../api";
 import { parseVeraPdf, VeraPdfView, type VeraReport } from "../components/verapdf";
 import { RunDetails, RunSoFar } from "../components/RunDetails";
 import { RerunDialog } from "../components/RerunDialog";
@@ -17,6 +17,7 @@ import { showUrl } from "../viewer/spot";
 import { DocumentNav } from "../components/neighbours";
 import { listSource, safeFrom } from "../components/listQuery";
 import { ListPager } from "../components/lists";
+import { can } from "../permissions";
 
 const SEVERITY: Record<string, [string, string]> = {
   high: ["High", "bad"],
@@ -37,6 +38,7 @@ const STAGES: Record<string, string> = {
   ai_enrichment: "Writing alt text and reading tables",
   validating_output: "Checking the result",
   verifying_tags: "Reviewing the tags",
+  pdfua2: "Making the PDF/UA-2 file",
   adobe_sending: "Sending to Adobe",
   adobe_tagging: "Adobe is tagging the document",
   adobe_merging: "Putting Adobe's parts back together",
@@ -53,13 +55,14 @@ const STEPS: [string, string[]][] = [
   ["Checking the original", ["validating", "validating_original", "analyzing", "adobe_sending"]],
   ["Tagging", ["tagging", "adobe_tagging", "adobe_merging"]],
   ["Alt text and tables", ["enriching", "ai_enrichment"]],
-  ["Checking the result", ["verifying", "validating_output", "verifying_tags", "reporting"]],
+  ["Checking the result", ["verifying", "validating_output", "pdfua2", "verifying_tags", "reporting"]],
 ];
 
 const FILE_HINTS: Record<string, string> = {
   report_pdf: "What was done, the accessibility check, and what to check.",
   primary: "Passes the check where possible. Use this one.",
   visual_fallback: "Looks identical to your original.",
+  pdfua2: "The same file as PDF 2.0, for PDF/UA-2. Some older PDF readers don't support PDF 2.0 yet.",
   enhanced: "Adobe's file with AI alt text, font fixes, bookmarks and document fixes, looking the same.",
   music_score: "The whole piece as one score, as read by software. Open it in notation software to play it, check it, or make braille music.",
   music_files: "The music one file per line or example, for notation software: play it back to check it against the page.",
@@ -124,8 +127,8 @@ export function JobDetail() {
     ["review", "Needs review", findingsTotal],
     ...(hasReport ? [["report", "Report", null] as [TabKey, string, null]] : []),
     ...(hasCheck ? [["check", "Accessibility check", null] as [TabKey, string, null]] : []),
-    // What the run took and where it fell short: super admins only (#313)
-    ...(me?.is_super_admin ? [["staff", "Run details", null] as [TabKey, string, null]] : []),
+    // What the run took and where it fell short: super admins and service admins only (#313, #564)
+    ...(can(me, "files.staff") ? [["staff", "Run details", null] as [TabKey, string, null]] : []),
     ...(reviewed.length ? [["versions", "Versions", reviewed.length] as [TabKey, string, number]] : []),
   ] : [];
   const asked = params.get("tab") as TabKey | null;
@@ -159,11 +162,12 @@ export function JobDetail() {
   }
 
   // A super admin's re-run (#323): a new document; open it once it's made
-  async function rerun(charge: boolean, reason: string, ignoreExisting: boolean) {
+  async function rerun(charge: boolean, reason: string, ignoreExisting: boolean, pdfua: PdfUa) {
     setActionError(null);
     setRerunBusy(true);
     try {
-      const made = await post<Job>(`/jobs/${j.id}/rerun`, { charge, reason: reason || null, ignore_existing: ignoreExisting });
+      const made = await post<Job>(`/jobs/${j.id}/rerun`, { charge, reason: reason || null, ignore_existing: ignoreExisting,
+        pdfua });
       setRerunOpen(false);
       goTo(`/jobs/${made.id}`, { state: location.state });
     } catch (e) {
@@ -173,7 +177,7 @@ export function JobDetail() {
       setRerunBusy(false);
     }
   }
-  const canRerun = !!me?.is_super_admin && !j.files_deleted && !j.deleted
+  const canRerun = can(me, "documents.rerun_remove") && !j.files_deleted && !j.deleted
     && ["completed", "failed", "canceled"].includes(j.status);
 
   // The document's PDFs first, then the report
@@ -213,6 +217,7 @@ export function JobDetail() {
             {j.report_only ? " · audit only" : ""}
             {j.ai_label ? ` · ${j.ai_label}` : ""}
             {j.ignore_existing ? " · existing tags ignored" : ""}
+            {j.pdfua === "2" ? " · PDF/UA-2" : j.pdfua === "both" ? " · PDF/UA-1 and PDF/UA-2" : ""}
             {j.sent_by_script ? ` · sent by script: ${j.sent_by_script}` : ""}
           </p>
           <Status job={j} stage={stage} />
@@ -231,7 +236,7 @@ export function JobDetail() {
           {canRerun && <button className="btn secondary" onClick={() => setRerunOpen(true)}>Re-run</button>}
         </div>
       </section>
-      {rerunOpen && <RerunDialog job={j} busy={rerunBusy} onRun={(c, why, ignore) => void rerun(c, why, ignore)} onClose={() => setRerunOpen(false)} />}
+      {rerunOpen && <RerunDialog job={j} busy={rerunBusy} onRun={(c, why, ignore, part) => void rerun(c, why, ignore, part)} onClose={() => setRerunOpen(false)} />}
 
       <ErrorNotice error={actionError} />
       {j.deleted && (
@@ -249,7 +254,7 @@ export function JobDetail() {
         </p>
       )}
       <Notes job={j} />
-      {!done && !!me?.is_super_admin && (isActive(j) || j.status === "held") && <RunSoFar job={j} />}
+      {!done && can(me, "files.staff") && (isActive(j) || j.status === "held") && <RunSoFar job={j} />}
 
       {done && (
         <div className="doc-tiles">
@@ -275,9 +280,9 @@ export function JobDetail() {
               onPick={(k) => setTab(k as TabKey, { section: null, rp: null })} idPrefix="doc" />
             <div role="tabpanel" id={`doc-panel-${tab}`} aria-labelledby={`doc-tab-${tab}`} className="doc-panel">
               {tab === "review" && <Review jobId={j.id} findings={r!.review?.findings ?? []} total={findingsTotal} version={verdictVersion} />}
-              {tab === "report" && <ReportPanel job={j} own={own} isSuper={!!me?.is_super_admin} onError={setActionError} getFile={getFile}
+              {tab === "report" && <ReportPanel job={j} own={own} isSuper={can(me, "files.staff")} onError={setActionError} getFile={getFile}
                 onOpenReview={() => setTab("review", { section: null })} />}
-              {tab === "check" && <CheckPanel job={j} own={own} isSuper={!!me?.is_super_admin} onError={setActionError} getFile={getFile} versions={reviewed} />}
+              {tab === "check" && <CheckPanel job={j} own={own} isSuper={can(me, "files.staff")} onError={setActionError} getFile={getFile} versions={reviewed} />}
               {tab === "staff" && <RunDetails job={j} />}
               {tab === "versions" && <VersionsPanel jobId={j.id} own={own} versions={reviewed} onError={setActionError}
                 canEdit={!!versions.data?.can_edit} onChanged={() => void versions.reload()} />}
@@ -292,7 +297,7 @@ export function JobDetail() {
               Hide downloads and help <span aria-hidden="true">»</span></button>}
             {(done || j.files.some((f) => f.kind === "input")) && (
               <div id="doc-downloads" tabIndex={-1} aria-label="Downloads"><Downloads job={j} pdfs={pdfs} main={done ? main : undefined} getFile={getFile} reviewed={reviewed}
-                own={own} isSuper={!!me?.is_super_admin} onChanged={() => void job.reload()} onError={setActionError} /></div>
+                own={own} isSuper={can(me, "files.staff")} removes={can(me, "documents.rerun_remove")} onChanged={() => void job.reload()} onError={setActionError} /></div>
             )}
             {(done || j.status === "failed") && <div id="doc-help" tabIndex={-1} aria-label="Help"><HelpPanel job={j} /></div>}
           </aside>
@@ -427,9 +432,18 @@ function Notes({ job: j }: { job: Job }) {
       {r.destructive_pages.length === 1 ? ` page ${r.destructive_pages[0]} looks`
         : r.destructive_pages.length ? ` pages ${r.destructive_pages.join(", ")} look` : " some pages look"},
       so you also get a visually exact copy.</>, more: <>
-        <strong>Remediated PDF</strong> passes the check and looks slightly different where noted
+        <strong>{j.files.find((f) => f.kind === "primary")?.label ?? "Remediated PDF"}</strong> passes the check and looks slightly different where noted
         {r.fonts_embedded.length > 0 ? " (fonts replaced with metric-identical substitutes)" : ""}. <strong>Visually exact PDF</strong> looks
         identical to your original{r.visual_file_compliant === false ? ", but doesn't fully pass" : ""}.</> });
+  }
+  if (r?.converted_pdf2) {
+    // PDF/UA-2 or Both (#445): the file, or a copy of it, was converted to PDF 2.0
+    notes.push({ key: "pdf2", head: "PDF 2.0:", line: j.pdfua === "both"
+      ? <>you also get a PDF/UA-2 copy, which {r.pdfua2_compliant ? "passes the PDF/UA-2 check"
+        : r.pdfua2_compliant === false ? "doesn't fully pass the PDF/UA-2 check yet" : "wasn't checked"}.</>
+      : <>the file was converted to PDF 2.0, as PDF/UA-2 needs.</>,
+      more: <>Some older PDF readers and checkers don't support PDF 2.0 yet; current Adobe Acrobat and PAC 2024 do.
+        {j.pdfua === "both" ? <> The <strong>PDF/UA-1 (PDF 1.7)</strong> file is for everything else.</> : null}</> });
   }
   if (r?.metrics?.route === "adobe" && !j.report_only) {
     const improved = r.verdict_of === "enhanced" || j.files.some((f) => f.kind === "enhanced");
@@ -569,8 +583,9 @@ const FILE_GROUPS: [string, Record<string, string>][] = [
 /** The Downloads card (#507): every file in one zip, then the files as compact rows grouped by what they're for, each
  * with a "?" that shows what it is. The main file is the big button at the top of the page, so it isn't here again.
  * `pdfs`: the files people come for; `main`: the one the big button gives, when it's shown. */
-function Downloads({ job: j, pdfs, main, getFile, own, isSuper, onChanged, onError, reviewed }: {
+function Downloads({ job: j, pdfs, main, getFile, own, isSuper, removes, onChanged, onError, reviewed }: {
   job: Job; pdfs: JobFile[]; main?: JobFile; getFile: (id: string, name: string) => Promise<void>; own: boolean; isSuper: boolean;
+  removes: boolean;
   onChanged: () => void; onError: (e: unknown) => void; reviewed: DocVersion[];
 }) {
   const [zipping, setZipping] = useState(false);
@@ -645,7 +660,7 @@ function Downloads({ job: j, pdfs, main, getFile, own, isSuper, onChanged, onErr
           {j.removal_at ? null : j.files_expire_at && <p className="muted">Files are kept until {fmtDate(j.files_expire_at, false)}.</p>}
         </div>
       </>}
-      <Removal job={j} own={own} isSuper={isSuper} onChanged={onChanged} onError={onError} />
+      <Removal job={j} own={own} removes={removes} onChanged={onChanged} onError={onError} />
     </section>
   );
 }
@@ -667,10 +682,10 @@ function FileRow({ name, size, hint, onGet }: { name: string; size: number; hint
 
 const FINISHED = ["completed", "failed", "canceled"];
 
-/** Removing the files early: the owner marks the document done (undoable until the hold ends); super admins remove
- * files now or delete the document. */
-function Removal({ job: j, own, isSuper, onChanged, onError }: {
-  job: Job; own: boolean; isSuper: boolean; onChanged: () => void; onError: (e: unknown) => void;
+/** Removing the files early: the owner marks the document done (undoable until the hold ends); super admins and
+ * service admins (`removes`) remove files now or delete the document. */
+function Removal({ job: j, own, removes, onChanged, onError }: {
+  job: Job; own: boolean; removes: boolean; onChanged: () => void; onError: (e: unknown) => void;
 }) {
   const [busy, setBusy] = useState(false);
   if (j.deleted || !FINISHED.includes(j.status)) return null;
@@ -713,16 +728,16 @@ function Removal({ job: j, own, isSuper, onChanged, onError }: {
     <div className="doc-removal">
       {j.removal_at && !j.files_deleted && <>
         <p className="small"><strong>Marked done.</strong> The files will be removed on {fmtDate(j.removal_at)}.</p>
-        {(own || isSuper) && <button type="button" className="btn secondary small" disabled={busy}
+        {(own || removes) && <button type="button" className="btn secondary small" disabled={busy}
           onClick={() => void run(() => post(`/jobs/${j.id}/keep`))}>Keep the files</button>}
       </>}
       {own && !j.removal_requested && !j.files_deleted && (
         <button type="button" className="linkbtn small" disabled={busy} onClick={markDone}>
           I'm done with it: remove the files</button>
       )}
-      {isSuper && (
+      {removes && (
         <details className="doc-admin-removal">
-          <summary className="small">Super admin: remove</summary>
+          <summary className="small">Support: remove</summary>
           {!j.files_deleted && <button type="button" className="btn secondary small" disabled={busy}
             onClick={() => adminRemove(false)}>Remove files now</button>}
           <button type="button" className="btn secondary small danger-text" disabled={busy}
@@ -1045,7 +1060,7 @@ function ReportPanel({ job, own, isSuper, onError, getFile, onOpenReview }: {
 
 const CHECKS: [string, string][] = [
   ["verapdf_before", "Before"], ["verapdf_after_enhanced", "Improved copy"], ["verapdf_after", "After"],
-  ["verapdf_after_visual", "Visually exact file"],
+  ["verapdf_after_visual", "Visually exact file"], ["verapdf_after_pdfua2", "PDF/UA-2 copy"],
 ];
 
 function CheckPanel({ job, own, isSuper = false, onError, getFile, versions = [] }: {

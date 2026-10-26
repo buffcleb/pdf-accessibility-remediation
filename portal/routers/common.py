@@ -52,6 +52,7 @@ class LedgerOut(BaseModel):
     id: int
     created_at: datetime
     group_id: uuid.UUID | None
+    subgroup_id: uuid.UUID | None = None  # #431: the subgroup an entry on its parent's pool is for
     service_key: str
     scope: str
     user_id: uuid.UUID | None
@@ -66,3 +67,11 @@ class LedgerOut(BaseModel):
     pool_after: int
     used_after: int
     reserved_after: int
+
+
+def by_whom(p, group_id: uuid.UUID | None = None) -> dict:
+    """For a change's audit details: made from outside the group's own admins, by a super admin or (#564) a service
+    admin."""
+    outside = group_id is None or group_id not in p.user.admin_group_ids()
+    return {"by_super_admin": p.is_super_admin and outside,
+            **({"by_service_admin": True} if outside and p.user.is_service_admin else {})}

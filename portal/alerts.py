@@ -101,8 +101,12 @@ PROM_FIXES = {
                   "(scaled to none) isn't alerted.",
     "MemoryNearLimit": "A pod over its limit is restarted mid-document. Raise its limit in deploy.env (e.g. "
                        "WORKER_MEMORY_LIMIT) or take fewer documents at once (WORKER_CONCURRENCY).",
-    "VolumeFilling": "Grafana's volumes dashboard shows which. The job folder: old jobs are cleared on their schedule; "
-                     "the database or file store: grow the volume (STORAGE_SIZE settings in deploy.env).",
+    "VolumeFilling": "Raise the volume's size in deploy.env and run scripts/deploy.sh, which grows it; a volume never "
+                     "shrinks (docs/deployment/first-cluster/storage.md#growing-a-volume). By claim: data-postgres-0 "
+                     "is DB_SIZE, data-seaweedfs-0 FILES_SIZE, data-redis-0 REDIS_SIZE, jobdata JOBDATA_SIZE (old "
+                     "jobs are also cleared on their schedule), prometheus-data PROMETHEUS_SIZE (or keep less "
+                     "history: PROMETHEUS_RETENTION), grafana-data GRAFANA_SIZE. Grafana's volumes dashboard shows "
+                     "each one's use.",
     "RedisDown": "kubectl -n NS logs statefulset/redis. Documents wait until it's back.",
     "PostgresDown": "kubectl -n NS logs statefulset/postgres. Nothing works without it.",
     "EngineQueueWaiting": "Every worker is busy. With scaling on, the engine may be at ENGINE_WORKERS_MAX: raise it if "
@@ -235,16 +239,22 @@ def active(db: Session, now: datetime | None = None) -> list[AlertState]:
     return [r for r in rows if ours(r.key) and now - r.started_at >= _grace(r.key, rs)]
 
 
-def _super_admins(db: Session) -> list[str]:
-    rows = db.scalars(select(RoleAssignment).where(RoleAssignment.role == "super_admin"))
+def _active(db: Session, role: str) -> list[str]:
+    rows = db.scalars(select(RoleAssignment).where(RoleAssignment.role == role))
     return sorted({r.user.email for r in rows if r.user.status == "active"})
 
 
-def mail_super_admins(db: Session, key: str, subject: str, text: str) -> None:
+def mail_super_admins(db: Session, key: str, subject: str, text: str, *, service_admins: bool = True) -> None:
+    """To every super admin, at once; and, unless it's for super admins alone, to every service admin (#564) as their
+    Service alerts choice says (portal/notifications.py)."""
     rs = settings_store.load(db)
     footer = f"\n\n{rs.service_name}" + (f", {rs.organization_name}" if rs.organization_name else "") + "\n"
-    outbox.queue(db, [Mail(to=to, subject=subject, text=text + footer) for to in _super_admins(db)],
-                 rs.mail_from_name, "alert")
+    supers = _active(db, "super_admin")
+    outbox.queue(db, [Mail(to=to, subject=subject, text=text + footer) for to in supers], rs.mail_from_name, "alert")
+    if service_admins:
+        others = [to for to in _active(db, "service_admin") if to not in supers]
+        outbox.queue(db, [Mail(to=to, subject=subject, text=text + footer) for to in others], rs.mail_from_name,
+                     "staff_alert")
 
 
 def evaluate(db: Session, engine_asked: bool = False, engine_workers: int | None = None,

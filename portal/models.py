@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, func, text,
+    UniqueConstraint, func, select, text,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 
 from portal.db import Base
 
@@ -53,6 +53,16 @@ class Group(Base):
     ai_describe: Mapped[bool | None] = mapped_column(nullable=True)
     # The group's admins let its people make API tokens for scripts (#518), once super admins allow them
     api_tokens_enabled: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    # Its people may choose PDF/UA-2 or Both for a document (#445), once super admins offer it; and what is
+    # preselected: "1", "2" or "both" (followed only while it's allowed)
+    pdfua_choice: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    pdfua_default: Mapped[str] = mapped_column(String(4), nullable=False, default="1", server_default="1")
+    # A subgroup's parent (#431): one level only, which a trigger keeps (a subgroup has no subgroups). A parent's
+    # admins manage its subgroups, and its lists and reports include theirs
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("groups.id", ondelete="RESTRICT"), nullable=True,
+                                                        index=True)
+    # The settings a subgroup has set itself; the others follow its parent's (portal/inherit.py)
+    overrides: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
     created_at: Mapped[datetime] = _created()
 
     domains: Mapped[list[GroupDomain]] = relationship(back_populates="group", cascade="all, delete-orphan",
@@ -61,13 +71,28 @@ class Group(Base):
                                                     order_by="GroupEmail.email")
     services: Mapped[list[GroupService]] = relationship(back_populates="group", cascade="all, delete-orphan",
                                                         lazy="selectin")
+    parent: Mapped[Group | None] = relationship(remote_side="Group.id", foreign_keys=[parent_id])
 
     __table_args__ = (
         CheckConstraint("status in ('active','disabled')", name="group_status"),
+        CheckConstraint("pdfua_default in ('1','2','both')", name="group_pdfua_default"),
+        CheckConstraint("parent_id is null or parent_id <> id", name="group_not_own_parent"),
     )
 
     def service(self, key: str) -> GroupService | None:
         return next((s for s in self.services if s.service_key == key), None)
+
+    @property
+    def pool(self) -> Group:
+        """The group whose pages its documents use: its parent, for a subgroup (#431)."""
+        return self.parent or self
+
+
+def group_family(db, group_id: uuid.UUID | None) -> list[uuid.UUID]:
+    """A group and its subgroups (#431): what a group's lists, counts and reports cover. A subgroup's is itself."""
+    if group_id is None:
+        return []
+    return [group_id, *db.scalars(select(Group.id).where(Group.parent_id == group_id).order_by(Group.name))]
 
 
 class GroupEmail(Base):
@@ -144,13 +169,38 @@ class User(Base):
     def is_super_admin(self) -> bool:
         return any(r.role == "super_admin" for r in self.roles)
 
-    def admin_group_ids(self) -> set[uuid.UUID]:
+    @property
+    def is_service_admin(self) -> bool:
+        """Helps run every group, without the service's own settings (#564)."""
+        return any(r.role == "service_admin" for r in self.roles)
+
+    @property
+    def across_groups(self) -> bool:
+        """A super admin or a service admin: works in every group, and needn't belong to one."""
+        return self.is_super_admin or self.is_service_admin
+
+    def direct_admin_group_ids(self) -> set[uuid.UUID]:
+        """The groups this person holds the group admin role in."""
         return {r.group_id for r in self.roles if r.role == "group_admin" and r.group_id}
+
+    def admin_group_ids(self) -> set[uuid.UUID]:
+        """The groups this person administers: those they're a group admin of, and their subgroups (#431). Worked out
+        once per person loaded (a request), from the database."""
+        direct = self.direct_admin_group_ids()
+        cached = self.__dict__.get("_admin_groups")
+        if cached is not None and cached[0] == direct:
+            return set(cached[1])
+        out = set(direct)
+        db = object_session(self)
+        if direct and db is not None:
+            out |= set(db.scalars(select(Group.id).where(Group.parent_id.in_(direct))))
+        self.__dict__["_admin_groups"] = (direct, frozenset(out))
+        return out
 
     @property
     def approved(self) -> bool:
         """Can submit work. Admins always can, whatever their approval says."""
-        return self.approval == "approved" or self.is_super_admin or bool(self.admin_group_ids())
+        return self.approval == "approved" or self.across_groups or bool(self.admin_group_ids())
 
     def service(self, key: str) -> UserService | None:
         return next((s for s in self.services if s.service_key == key), None)
@@ -227,7 +277,8 @@ class AiKind(Base):
 
 
 class GroupService(Base):
-    """A group's opt-in to a service and its page pool for it."""
+    """A group's opt-in to a service and its page pool for it. A subgroup's pool is its parent's (#431): its own row
+    counts what it has used and reserved of that pool, up to cap_pages (None: whatever the parent has left)."""
     __tablename__ = "group_services"
 
     group_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
@@ -238,6 +289,7 @@ class GroupService(Base):
     used_pages: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     reserved_pages: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     default_user_cap: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # None = unlimited
+    cap_pages: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # a subgroup's, on its parent's pool
     is_default: Mapped[bool] = mapped_column(nullable=False, default=False)  # preselected at upload
 
     group: Mapped[Group] = relationship(back_populates="services")
@@ -245,6 +297,7 @@ class GroupService(Base):
 
     __table_args__ = (
         CheckConstraint("pool_pages >= 0 and used_pages >= 0 and reserved_pages >= 0", name="group_service_nonneg"),
+        CheckConstraint("cap_pages is null or cap_pages >= 0", name="group_service_cap"),
     )
 
 
@@ -279,11 +332,12 @@ class RoleAssignment(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "(role = 'super_admin' and group_id is null) or (role = 'group_admin' and group_id is not null)",
-            name="role_scope"),
+            "(role in ('super_admin','service_admin') and group_id is null) "
+            "or (role = 'group_admin' and group_id is not null)", name="role_scope"),
         UniqueConstraint("user_id", "role", "group_id", name="role_unique"),
         # NULLs are distinct in a unique constraint, so super_admin needs its own index
         Index("role_one_super_admin", "user_id", unique=True, postgresql_where="role = 'super_admin'"),
+        Index("role_one_service_admin", "user_id", unique=True, postgresql_where="role = 'service_admin'"),
     )
 
 
@@ -433,6 +487,8 @@ class Job(Base):
     full_review: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # The document's own tags are poor: the engine tags it afresh from the page (#396)
     ignore_existing: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    # The PDF/UA part delivered (#445): "1", "2" (as PDF 2.0) or "both" (a PDF/UA-2 copy besides the PDF/UA-1 file)
+    pdfua: Mapped[str] = mapped_column(String(4), nullable=False, default="1", server_default="1")
     # An audit with no AI (its level says so): the engine is told to use none
     no_ai: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # "Let AI decide": the kind is picked by the classifier before the document is sent; what it said is kept
@@ -473,6 +529,7 @@ class Job(Base):
         CheckConstraint("status in ('held','queued','submitted','processing','completed','failed','canceled')",
                         name="job_status"),
         CheckConstraint("pages >= 0 and pages_charged >= 0", name="job_pages_nonneg"),
+        CheckConstraint("pdfua in ('1','2','both')", name="job_pdfua"),
         Index("jobs_group_created_idx", "group_id", "created_at"),
         Index("jobs_created_idx", "created_at"),
         Index("jobs_user_created_idx", "user_id", "created_at"),
@@ -510,6 +567,9 @@ class QuotaLedger(Base):
     # None for entries on a service's global pool
     group_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("groups.id", ondelete="CASCADE"), nullable=True, index=True)
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    # The subgroup whose person or cap an entry is for; group_id is then the parent, whose pool it is (#431)
+    subgroup_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("groups.id", ondelete="SET NULL"), nullable=True,
+                                                          index=True)
     job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     service_key: Mapped[str] = mapped_column(String(64), nullable=False, default="standard", server_default="standard")
     scope: Mapped[str] = mapped_column(String(8), nullable=False, default="group", server_default="group")
@@ -528,7 +588,7 @@ class QuotaLedger(Base):
 
     __table_args__ = (
         # correct: a super admin's correction of one person's usage (pages given back or charged)
-        CheckConstraint("kind in ('topup','adjust','reserve','commit','release','correct')", name="ledger_kind"),
+        CheckConstraint("kind in ('topup','adjust','reserve','commit','release','correct','cap')", name="ledger_kind"),
         CheckConstraint("kind <> 'correct' or (user_id is not null and comment is not null)", name="ledger_correct"),
         # A top-up needs a ticket, or an override with a comment
         CheckConstraint("kind <> 'topup' or ticket_ref is not null or (override and comment is not null)",
@@ -545,6 +605,11 @@ class QuotaLedger(Base):
 VERSION_KINDS = ("original", "primary", "visual_fallback", "enhanced", "reviewed")
 VERSION_STATUSES = ("queued", "submitted", "processing", "ready", "failed")
 
+
+
+# The group a ledger entry is for: the subgroup whose person or limit it is, else the pool's group. A family's
+# entries (group_family) are those with this in it; a subgroup's alone, those with its id (#431).
+LEDGER_GROUP = func.coalesce(QuotaLedger.subgroup_id, QuotaLedger.group_id)
 
 class DocumentVersion(Base):
     """One viewable version of a job's document: the original, each engine output, and every
@@ -742,7 +807,8 @@ class HelpMessage(Base):
 
     __table_args__ = (
         CheckConstraint("kind in ('message','note','event')", name="help_message_kind"),
-        CheckConstraint("author_role in ('person','group_admin','super_admin','system')", name="help_author_role"),
+        CheckConstraint("author_role in ('person','group_admin','service_admin','super_admin','system')",
+                        name="help_author_role"),
     )
 
 

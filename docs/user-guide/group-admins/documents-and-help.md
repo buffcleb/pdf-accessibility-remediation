@@ -18,7 +18,7 @@ its owner does.
   and **Last** are above and below the list; choose how many to show per page at the bottom. The view is in the page's address, so a link to it, or Back from a document, returns to the same
   place.
 - Tick documents and use **Download as a zip** for their files in one zip, as each
-  document's page offers them to you (not the engine's JSON and Markdown reports, which are for super admins). Each
+  document's page offers them to you (not the engine's JSON and Markdown reports, which are for super admins and service admins). Each
   file from someone else's document is recorded in the audit log as a download is.
 - On a document's page, **Previous** and **Next** go through the list as you left it (its order, search and
   filters), so you can work through the group's documents one after another. The **Documents** report does the
@@ -29,7 +29,8 @@ its owner does.
   the original results are never changed.
 - What the AI cost isn't shown to group admins; pages are.
 - Under a document's name, **Files removed** or **Files go …** shows that its owner marked it done (or that a super
-  admin removed its files). Only the owner, or a super admin, can remove a document's files early.
+  admin or service admin removed its files). Only the owner, a super admin or a service admin can remove a
+  document's files early.
 
 ## Help requests
 
@@ -39,7 +40,7 @@ its owner does.
 by document or person, show one status (or **Everything**, the default), and pick a **kind**.
 
 - You can **read** the conversation and **reply**; the person is emailed.
-- Changing the status (taking it, waiting on the person, finishing it) is done by super admins, who handle the
-  requests.
+- Changing the status (taking it, waiting on the person, finishing it) is done by support (super admins and, since
+  23 October 2026, service admins), who handle the requests.
 
 People in your group ask for help from the document's page; see [Getting help](../people/getting-help.md).

@@ -23,3 +23,22 @@ def test_lines_drawn_with_characters_are_decoration(tmp_path):
     assert next(v for k, v in role.items() if k.startswith("ACS"))[0] == "P"
     assert next(v for k, v in role.items() if k.startswith("Chapter"))[0] != "Artifact"
     assert not any(b.role == "Formula" for b in blocks)
+
+
+def test_a_line_with_a_word_is_text_however_long_its_leaders(tmp_path):
+    """#634: a contents entry with long dot leaders, and a form's label with the line to write on, have more dots or
+    underscores than letters, and are still text."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 80), "Introduction " + "." * 60 + " 2", fontsize=11)
+    page.insert_text((72, 120), "Name: " + "_" * 50, fontsize=11)
+    page.insert_text((72, 160), "." * 60, fontsize=11)
+    page.insert_text((72, 200), "Chapter Two " + "." * 50 + " 9", fontsize=18)   # in a heading's size
+    page.insert_text((72, 240), "x" + "-" * 120 + " Fig", fontsize=11)          # a word lost in a long rule
+    src = tmp_path / "leaders.pdf"
+    doc.save(src)
+    role = {b.text.strip()[:6]: b.role for b in prepare_analysis(src).pages[0].blocks}
+    assert role["Introd"] != "Artifact" and role["Name: "] != "Artifact"
+    assert role["......"] == "Artifact"                                    # a rule of dots alone still is
+    assert role["Chapte"] == "P"                                            # a contents entry, not a heading
+    assert role["x-----"] == "Artifact"

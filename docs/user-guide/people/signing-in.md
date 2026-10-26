@@ -35,7 +35,7 @@ organization. The message usually says who.
 
 You join your group automatically, by your email address: everyone at the same organization or department ends
 up in the same group, with the same choices and pages. You don't pick it, and you can't be in two groups. If
-you're in the wrong group, ask your group admin: only a super admin can move you, and your group admin can ask
+you're in the wrong group, ask your group admin: only a super admin or a service admin can move you, and your group admin can ask
 one to.
 
 ## Waiting for approval

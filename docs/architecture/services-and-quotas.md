@@ -22,6 +22,16 @@ costs: free, counted against the level, or made without AI.
 A group's admins (or the super admins, if it has none) are emailed once when its pool runs low, below a share of
 its size or a number of pages (Settings); topping it up re-arms the alert (`portal/pool_alerts.py`, #358).
 
+**Subgroups** (#431, added 26 October 2026) have no pool. A subgroup member's document reserves its pages on the
+global pool, the **parent's** pool, the subgroup's own row (checked against its optional `cap_pages`, refusal scope
+`subgroup`) and the person's limit, all at once. Rows are locked in one order: services, the parent's group rows,
+the subgroup's, the person's. A ledger entry's `group_id` is the pool's group (the parent) and `subgroup_id` names
+the subgroup; reports file an entry under `coalesce(subgroup_id, group_id)` (`LEDGER_GROUP`). Top-ups and pool
+corrections on a subgroup are refused. `services.pool_left` gives what a group can still use (a subgroup's: the
+parent's pages left, within its limit) for remaining pages, balances, Attention, summaries and low-pool emails. A
+subgroup can use a service only when its parent has it on too. Its settings follow the parent's unless it sets its
+own (`portal/inherit.py`, `groups.overrides`).
+
 At upload, a signed or certified PDF is held for the person's confirmation like a service that asks for it, since
 remediating breaks the signature (#339). A dynamic XFA form is refused: it has no standard form to tag (#360).
 

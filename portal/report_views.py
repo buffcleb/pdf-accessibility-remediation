@@ -23,7 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from portal import audit, email_reports, live_reports, outbox, settings_store
+from portal import audit, email_reports, live_reports, outbox, permissions, settings_store
 from portal.config import get_portal_settings
 from portal.email_reports import CATCH_UP, latest_period, period_label
 from portal.errors import ApiError, not_found
@@ -51,11 +51,12 @@ def scope(view: SavedReport) -> list[uuid.UUID] | None | bool:
     if owner is None or owner.status != "active":
         return False
     report = live_reports.REPORTS.get(view.report)
-    if report is None or (report.super_only and not owner.is_super_admin):
+    every = permissions.has(owner, permissions.REPORTS)  # super admins and service admins (#564)
+    if report is None or (report.super_only and not every):
         return False
     if view.group_id is not None:
-        return [view.group_id] if owner.is_super_admin or view.group_id in owner.admin_group_ids() else False
-    if owner.is_super_admin:
+        return [view.group_id] if every or view.group_id in owner.admin_group_ids() else False
+    if every:
         return None
     ids = sorted(owner.admin_group_ids(), key=str)
     return ids or False
@@ -65,7 +66,7 @@ def can_receive(user: User, view: SavedReport, groups: list[uuid.UUID] | None) -
     """Someone may get a view if they could see the same thing in the app."""
     if user.status != "active":
         return False
-    if user.is_super_admin:
+    if permissions.has(user, permissions.REPORTS):
         return True
     report = live_reports.REPORTS.get(view.report)
     if groups is None or report is None or report.super_only:
@@ -78,7 +79,8 @@ def candidates(db: Session, view: SavedReport) -> list[User]:
     groups = scope(view)
     if groups is False:
         return []
-    ids = {r.user_id for r in db.scalars(select(RoleAssignment).where(RoleAssignment.role.in_(("super_admin", "group_admin"))))}
+    ids = {r.user_id for r in db.scalars(select(RoleAssignment).where(
+        RoleAssignment.role.in_(("super_admin", "service_admin", "group_admin"))))}
     users = db.scalars(select(User).where(User.id.in_(ids), User.status == "active").order_by(User.email)).all()
     return [u for u in users if can_receive(u, view, groups)]
 
@@ -206,7 +208,7 @@ def compose(db: Session, view: SavedReport, recipient: User, frequency: str, sta
             groups: list[uuid.UUID] | None, sample: bool = False) -> Mail:
     rs = settings_store.load(db)
     zone = ZoneInfo(rs.report_time_zone)
-    is_super = view.owner.is_super_admin
+    is_super = permissions.has(view.owner, permissions.REPORTS)
     data = live_reports.run(db, view.report, _query(view, start, end, ROWS_IN_EMAIL), groups, is_super)
     shown = [c for c in data["columns"] if c["shown"]]
     label = period_label(frequency, start, end, zone)

@@ -20,14 +20,11 @@ from pikepdf import Array, Dictionary, Name
 from app.pipeline.models import bbox_area, bbox_intersection
 from app.tagging.content_marker import mcid_of
 from app.tagging.mathml_tags import in_mathml
+# The standard roles, RoleMap resolution and the element test live in app.tagging.tree; these names stay importable
+# from here, where the tagging modules have long found them
+from app.tagging.tree import STANDARD_TYPES, items, new_mcr, resolve_role  # noqa: F401 - imported from here too
+from app.tagging.tree import is_elem as _is_struct_elem, new_elem, role_map as _role_map
 
-STANDARD_TYPES = {
-    "Document", "Part", "Art", "Sect", "Div", "BlockQuote", "Caption", "TOC", "TOCI", "Index",
-    "NonStruct", "Private", "P", "H", "H1", "H2", "H3", "H4", "H5", "H6", "L", "LI", "Lbl", "LBody",
-    "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot", "Span", "Quote", "Note", "Reference",
-    "BibEntry", "Code", "Link", "Annot", "Ruby", "RB", "RT", "RP", "Warichu", "WT", "WP",
-    "Figure", "Formula", "Form",
-}
 # Common non-standard roles (Word, InDesign, LaTeX taggers) and the standard role they mean.
 KNOWN_ROLE_MAP = {
     **{r: "Span" for r in ("Strong", "Em", "B", "I", "Bold", "Italic", "Emphasis", "Underline", "Sub", "Sup",
@@ -113,42 +110,20 @@ class ExistingTagReport:
         }
 
 
-def _role_map(root: pikepdf.Object) -> dict[str, str]:
-    rm = root.get("/RoleMap")
-    if not isinstance(rm, Dictionary):
-        return {}
-    return {str(k)[1:]: str(v)[1:] for k, v in rm.items() if isinstance(v, Name)}
-
-
-def resolve_role(role: str, role_map: dict[str, str]) -> str:
-    seen = set()
-    while role not in STANDARD_TYPES and role in role_map and role not in seen:
-        seen.add(role)
-        role = role_map[role]
-    return role
-
-
-def _is_struct_elem(o) -> bool:
-    return isinstance(o, Dictionary) and "/S" in o and o.get("/Type") not in (Name.MCR, Name.OBJR)
-
-
 class ExistingTree:
-    def __init__(self, pdf: pikepdf.Pdf, stream_mcids: dict[ObjGen, set[int]]):
+    def __init__(self, pdf: pikepdf.Pdf, stream_mcids: dict[ObjGen, set[int]],
+                 page_tables: dict[int, list] | None = None):
         self.pdf = pdf
         self.stream_mcids = stream_mcids
         self.report = ExistingTagReport()
         self.root = pdf.Root.get("/StructTreeRoot")
         self.role_map = _role_map(self.root) if self.root is not None else {}
         self.elements: list[ElemInfo] = []
-        self.top: list[ElemInfo] = []
         self._parent_arrays: dict[ObjGen, Array | None] = {}
-        self.links_wrapped = 0  # link annotations attached to a cell or paragraph, now in Link tags
         self.outlines_released = 0  # undescribed Figures that were only the outline of some text
-        self.double_claims = 0  # content the file's own tags claimed more than once (one claim kept)
-        self.double_claim_pages: list[int] = []
-        # The tables found on each page from its ruling lines (page index -> TableRegions), set by the tagger: where
-        # a kept table's merged cells are when the file didn't say (#557)
-        self.page_tables: dict[int, list] = {}
+        # The tables found on each page from its ruling lines (page index -> TableRegions): where a kept table's
+        # merged cells are when the file didn't say (#557)
+        self.page_tables: dict[int, list] = page_tables or {}
         self._describe = None
         self._info: dict[ObjGen, ElemInfo] = {}
 
@@ -164,13 +139,11 @@ class ExistingTree:
         try:
             for kid in self._iter_k(kids):
                 if _is_struct_elem(kid):
-                    info = self._walk(kid, None, None, visited)
-                    if info:
-                        self.top.append(info)
+                    self._walk(kid, None, None, visited)
         except RecursionError:
             # A tree nested deeper than the interpreter follows (no real producer makes one; a broken or hostile
             # file does) can't be audited element by element: it is rebuilt from the layout, like any unusable tree
-            self.elements, self.top = [], []
+            self.elements = []
             r.usable, r.rebuilt_tree = False, True
             r.reason = "structure tree is nested too deeply to be kept"
             return r
@@ -259,26 +232,20 @@ class ExistingTree:
             return
         for e, refs in dropped.values():
             gone = {id(m) for m in refs}
-            self._remove_refs(e, refs)
+            self.remove_refs(e, refs)
             e.mcrefs = [m for m in e.mcrefs if id(m) not in gone]
             # An emptied cell stays for now: its table goes whole in _cascade_empty if no cell holds anything
             if not e.mcrefs and not e.objrefs and not e.children and e.role not in ("TD", "TH", "Document"):
-                self._mark(e, "removed", "its content already belongs to another tag")
+                self.mark(e, "removed", "its content already belongs to another tag")
             else:
                 e.reasons.append("content that already belongs to another tag taken out")
-        self.double_claims, self.double_claim_pages = count, sorted(pages)
         shown = ", ".join(str(n) for n in sorted(pages)[:20]) + (" and others" if len(pages) > 20 else "")
         self.report.findings.append(
             f"{count} piece(s) of content were claimed by more than one of the file's own tags (page(s) {shown}): "
             "one claim was kept and the duplicate tags removed, so the content is read once; check those pages")
 
     def _iter_k(self, k) -> Iterator:
-        if k is None:
-            return
-        if isinstance(k, Array):
-            yield from k
-        else:
-            yield k
+        yield from items(k)
 
     def _walk(self, elem, parent, inherited_pg: ObjGen | None, visited: set) -> ElemInfo | None:
         if elem.is_indirect:
@@ -353,12 +320,17 @@ class ExistingTree:
             self.report.findings.insert(
                 0, f"{self.outlines_released} figure tag(s) with no description were only lines drawn around text (a text "
                 "box's border, an arrow-shaped box): the lines are decoration now and the text is read as before")
+        return referenced
+
+    def finish_report(self) -> None:
+        """Each tag's decision counted in the report, and the first 40 with a decision or a reason as samples, in
+        document order. Once, after the last step that marks a kept tag: the kept-tags route marks some after repair
+        (a paragraph holding a footnote made a Note, a reading written on a tag), and those count too (#622)."""
         for e in self.elements:
             self.report.counts[e.decision] += 1
             if (e.decision != "retained" or e.reasons) and e.decision != "removed":
                 if len(self.report.samples) < 40:
                     self.report.samples.append({"role": e.raw_role, "decision": e.decision, "reasons": e.reasons})
-        return referenced
 
     def _repair_element(self, e: ElemInfo, figure_alt_lookup) -> None:
         if in_mathml(e.obj):
@@ -371,18 +343,18 @@ class ExistingTree:
                 else "P")
             self._add_role_mapping(e.raw_role, target)
             e.role = target
-            self._mark(e, "repaired", f"non-standard role /{e.raw_role} mapped to /{target}")
+            self.mark(e, "repaired", f"non-standard role /{e.raw_role} mapped to /{target}")
 
         dangling = [m for m in e.mcrefs if not m.valid]
         if dangling:
             if not any(m.valid for m in e.mcrefs) and not e.children and not e.objrefs:
-                self._mark(e, "replaced", "all content references dangling")
+                self.mark(e, "replaced", "all content references dangling")
                 return
-            self._remove_refs(e, dangling)
-            self._mark(e, "repaired", f"{len(dangling)} dangling content reference(s) removed")
+            self.remove_refs(e, dangling)
+            self.mark(e, "repaired", f"{len(dangling)} dangling content reference(s) removed")
 
         if not e.mcrefs and not e.children and not e.objrefs and e.role not in ("TD", "TH"):
-            self._mark(e, "removed", "empty element (no content)")
+            self.mark(e, "removed", "empty element (no content)")
             return
 
         if e.role == "LI":
@@ -409,16 +381,16 @@ class ExistingTree:
             if better is OUTLINE:
                 better = None  # it has a description, if an automatic one: it stays a figure
             if better is DECORATIVE:
-                self._mark(e, "artifacted", "decorative figure with Office's automatic alt text: tag removed")
+                self.mark(e, "artifacted", "decorative figure with Office's automatic alt text: tag removed")
                 return
             if better:
                 e.obj.Alt = pikepdf.String(better)
-                self._mark(e, "repaired", "Office's automatic alt text replaced with a new description")
+                self.mark(e, "repaired", "Office's automatic alt text replaced with a new description")
             else:
                 cleaned = OFFICE_AUTO_ALT.sub("", str(e.obj.Alt)).strip()
                 if cleaned:
                     e.obj.Alt = pikepdf.String(cleaned)
-                    self._mark(e, "repaired", "\"Description automatically generated\" note removed from the alt text")
+                    self.mark(e, "repaired", "\"Description automatically generated\" note removed from the alt text")
                 else:
                     del e.obj["/Alt"]
 
@@ -429,11 +401,11 @@ class ExistingTree:
                 self._release_outline(e)
                 return
             if alt is DECORATIVE:
-                self._mark(e, "artifacted", "decorative figure: tag removed, content marked as artifact")
+                self.mark(e, "artifacted", "decorative figure: tag removed, content marked as artifact")
                 return
             if alt:
                 e.obj.Alt = pikepdf.String(alt)
-                self._mark(e, "repaired", "missing Alt added")
+                self.mark(e, "repaired", "missing Alt added")
             else:
                 e.reasons.append("missing Alt (no description available)")
                 self.report.counts["unresolved"] += 1
@@ -446,14 +418,10 @@ class ExistingTree:
                     has_scope = True
             if not has_scope and not self._table_uses_headers(e):
                 scope = self._infer_scope(e)
-                new_attr = Dictionary(O=Name.Table, Scope=Name("/" + scope))
-                if attrs is None:
-                    e.obj.A = new_attr
-                elif isinstance(attrs, Array):
-                    attrs.append(new_attr)
-                else:
-                    e.obj.A = Array([attrs, new_attr])
-                self._mark(e, "repaired", f"TH Scope /{scope} added")
+                # Into the cell's Table attributes, beside a ColSpan or RowSpan already there: PAC reads one Table
+                # dictionary, and a second holding only the Scope left a spanning header with no cells under it
+                self._set_table_attr(e.obj, "/Scope", Name("/" + scope))
+                self.mark(e, "repaired", f"TH Scope /{scope} added")
 
     def _release_outline(self, e: ElemInfo) -> None:
         """A Figure with no description that is only the lines around some text (presentation programs tag every
@@ -462,7 +430,7 @@ class ExistingTree:
         tags becomes a plain grouping, and one holding nothing else is removed."""
         refs = list(e.mcrefs)
         gone = {id(m) for m in refs}
-        self._remove_refs(e, refs)
+        self.remove_refs(e, refs)
         e.mcrefs = [m for m in e.mcrefs if id(m) not in gone]
         self.outlines_released += 1
         if e.children or e.objrefs:
@@ -471,9 +439,9 @@ class ExistingTree:
             for key in ("/Alt", "/A"):  # a Figure's placement attributes mean nothing on a grouping
                 if key in e.obj:
                     del e.obj[key]
-            self._mark(e, "repaired", "figure with no description that was only the outline of its text: now a grouping")
+            self.mark(e, "repaired", "figure with no description that was only the outline of its text: now a grouping")
         else:
-            self._mark(e, "removed", "figure with no description that was only an outline around text: decoration")
+            self.mark(e, "removed", "figure with no description that was only an outline around text: decoration")
 
     def hide(self, mcids: set[tuple], reason: str) -> int:
         """Elements whose content is all in `mcids` ((stream objgen, mcid)) become artifacts; the count."""
@@ -481,7 +449,7 @@ class ExistingTree:
         for e in self.elements:
             valid = [m for m in e.mcrefs if m.valid]
             if valid and not e.objrefs and all((m.owner, m.mcid) in mcids for m in valid):
-                self._mark(e, "artifacted", reason)
+                self.mark(e, "artifacted", reason)
                 n += 1
         return n
 
@@ -498,9 +466,9 @@ class ExistingTree:
                 if e.decision in ("replaced", "removed", "artifacted"):
                     continue
                 if e.role == "Table" and not self._has_content(e, dropped):
-                    for d in self._descendants(e):
+                    for d in self.descendants(e):
                         if d.decision not in ("replaced", "removed", "artifacted"):
-                            self._mark(d, "removed", "a table with nothing in any of its cells")
+                            self.mark(d, "removed", "a table with nothing in any of its cells")
                     changed = True
                     continue
                 if e.mcrefs or e.objrefs or not e.children:
@@ -508,7 +476,7 @@ class ExistingTree:
                 if e.role in ("TD", "TH", "Document"):
                     continue
                 if all(c.decision in ("replaced", "removed", "artifacted") for c in e.children):
-                    self._mark(e, "removed", "empty after its empty children were removed")
+                    self.mark(e, "removed", "empty after its empty children were removed")
                     changed = True
 
     def _has_content(self, e: ElemInfo, dropped: set[ObjGen]) -> bool:
@@ -531,10 +499,7 @@ class ExistingTree:
         return holds(e.obj)
 
     def _new_elem(self, role: str, parent) -> pikepdf.Object:
-        d = Dictionary(Type=Name.StructElem, S=Name("/" + role), P=parent, K=Array())
-        if "/Pg" in parent:
-            d.Pg = parent.Pg
-        return self.pdf.make_indirect(d)
+        return new_elem(self.pdf, role, parent, parent.Pg if "/Pg" in parent else None)
 
     def _wrap_links(self, e: ElemInfo) -> None:
         """PDF/UA 7.18.5: a link annotation belongs in a Link tag. Some producers attach it straight to the table
@@ -566,8 +531,7 @@ class ExistingTree:
                 else:
                     new_k.append(it)
             e.obj.K = Array(new_k)
-        self.links_wrapped += len(links)
-        self._mark(e, "repaired", f"link annotation attached straight to /{e.role}: wrapped in a Link tag")
+        self.mark(e, "repaired", f"link annotation attached straight to /{e.role}: wrapped in a Link tag")
 
     def _repair_list_item(self, e: ElemInfo) -> None:
         """PDF/UA 7.2-20: LI may contain only Lbl and LBody. Anything else is moved into an LBody."""
@@ -587,7 +551,7 @@ class ExistingTree:
                 it.P = body
             body.K.append(it)
         e.obj.K = Array(new_k)
-        self._mark(e, "repaired", "content wrapped in LBody (LI may only contain Lbl/LBody)")
+        self.mark(e, "repaired", "content wrapped in LBody (LI may only contain Lbl/LBody)")
 
     def _repair_list(self, e: ElemInfo) -> None:
         """L may contain only L, LI and Caption; stray content becomes its own LI > LBody."""
@@ -613,12 +577,7 @@ class ExistingTree:
                 body.K.append(it)
             new_k.append(li)
         e.obj.K = Array(new_k)
-        self._mark(e, "repaired", "stray list content wrapped in LI/LBody")
-
-    def _replace_kid(self, parent, old_obj, new_obj) -> None:
-        items = list(self._iter_k(parent.get("/K")))
-        parent.K = Array([new_obj if (_is_struct_elem(it) and it.is_indirect and it.objgen == old_obj.objgen) else it
-                          for it in items])
+        self.mark(e, "repaired", "stray list content wrapped in LI/LBody")
 
     def _wrap_in_list(self, e: ElemInfo) -> None:
         """PDF/UA 7.2-18: Lbl/LBody must sit in an LI (and LI in an L). A run of sibling Lbl/LBody
@@ -653,7 +612,7 @@ class ExistingTree:
         parent.K = Array(sibs[:run_start] + [lst] + sibs[run_end + 1:])
         for x in self.elements:
             if x.obj.is_indirect and x.obj.objgen in self._wrapped and x.decision == "retained":
-                self._mark(x, "repaired", f"/{x.role} outside a list item: grouped into L/LI")
+                self.mark(x, "repaired", f"/{x.role} outside a list item: grouped into L/LI")
 
     def _join_interrupted_lists(self, describe) -> None:
         """A note under a list item ("*If no, use the other form", or an item's second line) is often tagged as a P
@@ -736,7 +695,7 @@ class ExistingTree:
             n.obj.P = body.obj
             n.parent = body.obj
             body.children.append(n)
-            self._mark(n, "repaired", "note under a list item moved into the item")
+            self.mark(n, "repaired", "note under a list item moved into the item")
         rest = list(self._iter_k(second.obj.get("/K")))
         first.obj.K = Array(list(self._iter_k(first.obj.get("/K"))) + rest)
         for c in second.children:
@@ -745,8 +704,8 @@ class ExistingTree:
             first.children.append(c)
         second.children = []
         second.obj.K = Array()
-        self._mark(first, "repaired", "list split by a note joined with the list that continues it")
-        self._mark(second, "removed", "merged into the list before it")
+        self.mark(first, "repaired", "list split by a note joined with the list that continues it")
+        self.mark(second, "removed", "merged into the list before it")
         return True
 
     def _repair_toc(self, e: ElemInfo) -> None:
@@ -766,7 +725,7 @@ class ExistingTree:
             toci.K.append(it)
             new_k.append(toci)
         e.obj.K = Array(new_k)
-        self._mark(e, "repaired", "stray table-of-contents content wrapped in TOCI")
+        self.mark(e, "repaired", "stray table-of-contents content wrapped in TOCI")
 
     def _group_body_rows(self, e: ElemInfo) -> None:
         """PDF/UA 7.2-14: a Table with a THead needs a TBody with rows. Word tags two shapes that break this:
@@ -792,10 +751,10 @@ class ExistingTree:
             e.obj.K = Array([k for k in kids if not (_is_struct_elem(k) and k.is_indirect and k.objgen in dropped)])
             for x in self.elements:
                 if x.obj.is_indirect and x.obj.objgen in dropped:
-                    self._mark(x, "removed", "empty TBody of a table that is only a header row")
+                    self.mark(x, "removed", "empty TBody of a table that is only a header row")
                 elif x.obj.is_indirect and x.obj.objgen == heads[0].objgen:
                     x.role = x.raw_role = "TBody"
-            self._mark(e, "repaired", "a table of header rows only: its THead became the TBody")
+            self.mark(e, "repaired", "a table of header rows only: its THead became the TBody")
             return
         body = self._new_elem("TBody", e.obj)
         new_k, placed = [], False
@@ -809,7 +768,7 @@ class ExistingTree:
             else:
                 new_k.append(k)
         e.obj.K = Array(new_k)
-        self._mark(e, "repaired", f"{len(body.K)} row(s) after the THead grouped into a TBody")
+        self.mark(e, "repaired", f"{len(body.K)} row(s) after the THead grouped into a TBody")
 
     def _pad_table_rows(self, e: ElemInfo) -> None:
         """PDF/UA 7.2-42/43: every row must span the same number of columns (counting row and
@@ -855,7 +814,7 @@ class ExistingTree:
                 row.K = Array(list(self._iter_k(row.get("/K"))) + [self._new_elem("TD", row) for _ in range(target - w)])
                 padded += target - w
         if padded:
-            self._mark(e, "repaired", f"{padded} empty cell(s) added so every row spans {target} columns")
+            self.mark(e, "repaired", f"{padded} empty cell(s) added so every row spans {target} columns")
 
     def _place_by_drawn_table(self, e: ElemInfo, rows: list, span) -> bool:
         """Short rows of a kept table with no spans, placed by the table drawn on the page (#557). Word and Acrobat
@@ -940,11 +899,12 @@ class ExistingTree:
             for og, n in spans.items():
                 self._set_table_attr(self.pdf.get_object(og), key, n)
                 merged += 1
-        self._mark(e, "repaired", f"{merged} merged cell(s) given their span and {added} empty cell(s) put in place, "
+        self.mark(e, "repaired", f"{merged} merged cell(s) given their span and {added} empty cell(s) put in place, "
                    "from the table drawn on the page")
         return True
 
     def _set_table_attr(self, cell, key: str, value) -> None:
+        """Set one Table attribute on a cell, in the Table dictionary it has if it has one."""
         attrs = cell.get("/A")
         for a in self._iter_k(attrs):
             if isinstance(a, Dictionary) and a.get("/O") == Name.Table:
@@ -976,9 +936,9 @@ class ExistingTree:
             if e.mcrefs:
                 problems.append("content attached directly to Table")
             if problems:
-                for d in self._descendants(e):
+                for d in self.descendants(e):
                     d.decision = "replaced"
-                self._mark(e, "replaced", "malformed table: " + "; ".join(sorted(set(problems))[:3]))
+                self.mark(e, "replaced", "malformed table: " + "; ".join(sorted(set(problems))[:3]))
 
     def _figures_from_shapes(self) -> None:
         """Word maps its pictures (InlineShape, Chart and the like) to Sect in the RoleMap. One that holds its content
@@ -994,7 +954,7 @@ class ExistingTree:
             was = e.raw_role
             e.obj.S = Name.Figure
             e.raw_role = e.role = "Figure"
-            self._mark(e, "repaired", f"/{was} (a picture mapped to /Sect): now a Figure")
+            self.mark(e, "repaired", f"/{was} (a picture mapped to /Sect): now a Figure")
 
     def _lift_out_of_text_blocks(self) -> None:
         """A grouping inside a paragraph or heading (#486): InDesign puts an anchored object, such as a form's
@@ -1013,7 +973,7 @@ class ExistingTree:
                 continue
             e.obj.K = Array(items)
             e.children = kids
-            self._mark(e, "repaired", f"{dissolved} section(s) or block(s) inside this /{e.role} made part of it")
+            self.mark(e, "repaired", f"{dissolved} section(s) or block(s) inside this /{e.role} made part of it")
 
     def _dissolve_into(self, src: ElemInfo, into: ElemInfo, top: bool = False) -> tuple[list, list, int]:
         """src's content as items of into's /K: groupings and text blocks (below the top) dissolved into them,
@@ -1033,7 +993,7 @@ class ExistingTree:
                     into.mcrefs += child.mcrefs
                     into.objrefs += child.objrefs
                     child.mcrefs, child.objrefs, child.children = [], [], []
-                    self._mark(child, "removed", f"inside a /{into.role}: its content became part of it")
+                    self.mark(child, "removed", f"inside a /{into.role}: its content became part of it")
                     continue
                 if child is not None:
                     item.P = into.obj
@@ -1047,7 +1007,7 @@ class ExistingTree:
                 except (TypeError, ValueError):
                     items.append(item)
                     continue
-                items.append(Dictionary(Type=Name.MCR, Pg=self.pdf.get_object(src.page), MCID=mcid))
+                items.append(new_mcr(self.pdf.get_object(src.page), mcid))
             elif isinstance(item, Dictionary) and src is not into and "/Pg" not in item and src.page is not None \
                     and src.page != into.page and item.get("/Type") in (Name.MCR, Name.OBJR):
                 item.Pg = self.pdf.get_object(src.page)
@@ -1065,7 +1025,7 @@ class ExistingTree:
             if level > prev + 1:
                 new = prev + 1
                 e.obj.S = Name(f"/H{new}")
-                self._mark(e, "repaired", f"heading level H{level} -> H{new} (no skipped levels)")
+                self.mark(e, "repaired", f"heading level H{level} -> H{new} (no skipped levels)")
                 e.role = e.raw_role = f"H{new}"
                 level = new
             prev = level
@@ -1088,18 +1048,18 @@ class ExistingTree:
                 e.obj[key] = pikepdf.String(cleaned)
             else:
                 del e.obj[key]
-            self._mark(e, "repaired", f"control characters removed from the {what}")
+            self.mark(e, "repaired", f"control characters removed from the {what}")
 
-    def _mark(self, e: ElemInfo, decision: str, reason: str) -> None:
+    def mark(self, e: ElemInfo, decision: str, reason: str) -> None:
         rank = {"retained": 0, "repaired": 1, "removed": 2, "replaced": 2, "artifacted": 2}
         if rank[decision] > rank[e.decision]:
             e.decision = decision
         e.reasons.append(reason)
 
-    def _descendants(self, e: ElemInfo) -> Iterator[ElemInfo]:
+    def descendants(self, e: ElemInfo) -> Iterator[ElemInfo]:
         yield e
         for c in e.children:
-            yield from self._descendants(c)
+            yield from self.descendants(c)
 
     def _role_of(self, obj) -> str:
         return resolve_role(str(obj.get("/S", "/P"))[1:], self.role_map)
@@ -1132,7 +1092,7 @@ class ExistingTree:
             node = self._info_of(node.parent)
         if node is None:
             return False
-        return any("/Headers" in d.obj for d in self._descendants(node) if d.role in ("TD", "TH"))
+        return any("/Headers" in d.obj for d in self.descendants(node) if d.role in ("TD", "TH"))
 
     def _infer_scope(self, e: ElemInfo) -> str:
         parent_row = e.parent
@@ -1142,7 +1102,7 @@ class ExistingTree:
         all_th = all(str(k.get("/S"))[1:] == "TH" for k in siblings)
         return "Column" if all_th else "Row"
 
-    def _remove_refs(self, e: ElemInfo, refs: list[McRef]) -> None:
+    def remove_refs(self, e: ElemInfo, refs: list[McRef]) -> None:
         dead = {(r.owner, r.mcid) for r in refs}
 
         def is_dead(item) -> bool:
@@ -1229,7 +1189,7 @@ class ExistingTree:
             e.obj.K = Array([it for it in self._iter_k(e.obj.get("/K")) if not is_blank(it)])
             e.mcrefs = [m for m in e.mcrefs if (m.owner, m.mcid) not in gone]
             done |= gone
-            self._mark(e, "repaired", f"{len(gone)} run(s) of only spaces made artifacts")
+            self.mark(e, "repaired", f"{len(gone)} run(s) of only spaces made artifacts")
         self.blank_artifacts = done
         return len(done)
 

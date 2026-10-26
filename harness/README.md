@@ -8,6 +8,7 @@ through the engine's API with checks on every result, and measuring OCR accuracy
 | [`make_samples.py`](make_samples.py) | Generates the synthetic sample PDFs (untagged, partly tagged with broken tags, scanned, two-column, tables, unembedded fonts…). The engine's tests use the same samples |
 | [`run_harness.py`](run_harness.py) | Submits every PDF in a folder to the engine, waits for each, checks the results, and writes a report |
 | [`run_folder.py`](run_folder.py) | Runs every PDF in a folder through the pipeline in its own process (no engine API, no queue) and says whether each passes; used by `scripts/regression.sh` |
+| [`roles_dump.py`](roles_dump.py) | Dumps what the engine makes of each document in a folder (every block's role, text hash and notes, each page's reading order) and compares two dumps, or two runs' tag maps: whether a change altered anything, and where |
 | [`ocr_eval.py`](ocr_eval.py) | Damages pages of a text PDF like a poor scan, OCRs them (optionally with AI correction), and measures word accuracy |
 
 All but `run_harness.py` need the engine's Python dependencies (`pip install -r requirements.txt`);
@@ -72,7 +73,10 @@ python harness/run_harness.py samples/regression/full --provider mock --expect-c
 
 `scripts/regression.sh` does the same without a running engine: it runs the quick set through the working tree's
 code in the engine's image (`harness/run_folder.py`; the full set every fifth run, or with `--full`; `--quick` and
-`--every N` change that), prints a line per document, and exits non-zero if any fails. `--provider` and `--model` run
+`--every N` change that), prints a line per document, and exits non-zero if any fails. It runs three documents at a
+time, the longest first, each in a process of its own (`--jobs N` changes how many; 1 runs them one after another):
+the quick set takes about 12 minutes that way, against 31 one at a time. Memory is the limit: Docker Desktop's
+(Settings > Resources) has to hold them all, and a long document's pipeline uses several processes of its own. `--provider` and `--model` run
 it with real AI; those runs are never made longer than asked. The set is git-ignored, so a worktree has none: set
 `REGRESSION_SAMPLES` to the folder in the checkout that has it. `REGRESSION_IMAGE` names another image to run in.
 
@@ -81,6 +85,36 @@ are kept can't be cut without changing what is tested, so its quick copy covers 
 
 Like everything under `samples/`, the folder is git-ignored: real documents are often confidential, so they never
 go into the repository. The automated tests reproduce each problem with a small synthetic document instead.
+
+## Did a change alter any document?
+
+A refactor must change nothing, and a fix should change only what it means to. `roles_dump.py` says which. Dump the
+set with the code before the change and again after it, then compare:
+
+```bash
+python -m harness.roles_dump dump samples/regression/full /tmp/roles-before --jobs 4
+# ...make the change...
+python -m harness.roles_dump dump samples/regression/full /tmp/roles-after --jobs 4
+python -m harness.roles_dump diff /tmp/roles-before /tmp/roles-after
+```
+
+`diff` prints each document that changed with the blocks whose role, text, read-aloud text, notes or box changed, the
+blocks added or removed, and the pages whose reading order or columns changed, and exits 1 if anything did. The dump
+runs the layout analysis only (no AI, no tagging) and holds a hash of each block's text, not the text: the
+regression documents are confidential. `--with-text` writes the text too, for a dump that stays on your computer;
+`diff` then shows the text that changed.
+
+For the tags themselves, keep each document's outputs from two regression runs and compare their tag maps:
+
+```bash
+REGRESSION_KEEP=/tmp/tags-before scripts/regression.sh --full
+# ...make the change...
+REGRESSION_KEEP=/tmp/tags-after scripts/regression.sh --full
+python -m harness.roles_dump tagmaps /tmp/tags-before /tmp/tags-after
+```
+
+Each tag is matched by its place in the tree (`Document[0]/Sect[2]/P[1]`), so a tag added near the top shows every
+later sibling as moved: read the first changes of a document first.
 
 ## OCR accuracy
 

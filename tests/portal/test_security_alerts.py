@@ -120,6 +120,7 @@ def test_events_that_are_told_every_time_and_only_once(db):
     db.commit()
     _event(db, "session.revoked", outcome="refresh_reuse", actor=root, ip="198.51.100.1")
     _event(db, "role.granted", actor=root, details={"role": "super_admin", "email": "new@a.test"})
+    _event(db, "role.granted", actor=root, details={"role": "service_admin", "email": "svc@a.test"})
     _event(db, "role.granted", actor=root, details={"role": "group_admin", "email": "ga@a.test"})  # not alerted
     _event(db, "group.service_updated", actor=root, group=g,
            details={"service": "adobe-test", "enabled": [False, True]})
@@ -129,13 +130,14 @@ def test_events_that_are_told_every_time_and_only_once(db):
     _event(db, "settings.updated", actor=root, details={"record_retention_days": [2555, 3000]})  # longer: fine
     db.commit()
     assert sorted(r for r, _ in _fire(db)) == ["external_on", "external_on", "refresh_reuse", "retention_shortened",
-                                               "super_admin"]
+                                               "service_admin", "super_admin"]
     # Read again on the next check (the events overlap it): not told twice
     assert _fire(db, NOW + timedelta(minutes=1)) == []
     detail = {e.details["rule"]: e.details["detail"] for e in db.scalars(
         select(AuditEvent).where(AuditEvent.action == "security.alert"))}
     assert "file retention days from 30 to 7" in detail["retention_shortened"]
     assert "made new@a.test a super admin" in detail["super_admin"]
+    assert "made svc@a.test a service admin" in detail["service_admin"]
 
 
 def test_attention_shows_them_for_a_day_and_they_can_be_turned_off(db, monkeypatch):

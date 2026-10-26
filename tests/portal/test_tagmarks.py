@@ -6,9 +6,10 @@ import uuid
 
 from sqlalchemy import select
 
+from portal import tagmarks, worker
 from portal.models import DocumentVersion, Job, JobFile
 from portal.storage import get_storage
-from portal.tagmarks import mark_all, mark_original
+from portal.tagmarks import MARKED, mark_all, mark_original
 from tests.portal.test_jobs import API, fake_engine, pdf_bytes, run_worker, setup, topup, upload  # noqa: F401
 
 
@@ -67,8 +68,10 @@ def test_nothing_is_marked_without_original_tags_to_compare():
 
 
 def _put_tagmap(db, version, tagmap):
+    """A tag map stored as before #580: without its marks."""
     f = db.get(JobFile, version.tagmap_file_id)
-    get_storage().put_bytes(f.s3_key, json.dumps(tagmap).encode(), "application/json")
+    f.size_bytes = get_storage().put_bytes(f.s3_key, json.dumps(tagmap).encode(), "application/json")
+    db.commit()
 
 
 def test_the_viewer_gets_the_marks_only_when_the_documents_tags_were_kept(setup):
@@ -100,3 +103,96 @@ def test_the_result_says_whether_the_documents_tags_were_kept():
     assert kept({"present": True, "rebuilt_tree": False}) is True
     assert kept({"present": True, "rebuilt_tree": True}) is False   # unusable tags, tagged afresh
     assert kept({"present": False}) is False and kept(None) is False
+
+
+# #580: the marks are written when a version's tag map is stored, and the viewer gets the file as it is
+
+def _engine_with_kept_tags(s):
+    """The fake engine's tag maps as a tagged upload's: the original's tags, and a remediated map that kept them."""
+    fetch = s["engine"].fetch
+
+    def tagmaps(path, out):
+        if "tagmap" not in path:
+            return fetch(path, out)
+        data = json.dumps(ORIGINAL if "tagmap_original" in path else _remediated()).encode()
+        out.write(data)
+        return len(data)
+    s["engine"].fetch = tagmaps
+
+
+def _kept_tags_job(s):
+    _engine_with_kept_tags(s)
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("tagged.pdf", pdf_bytes(1))).json()[0]["job"]["id"]
+    db = s["db"]
+    run_worker(db)
+    jid = db.get(Job, uuid.UUID(job_id)).engine_job_id
+    s["engine"].complete(jid)
+    s["engine"].jobs[jid]["reports"]["comparison"]["existing_tags"] = {"present": True, "rebuilt_tree": False}
+    run_worker(db)
+    return job_id
+
+
+def _stored(db, job_id, number):
+    v = db.scalar(select(DocumentVersion).where(DocumentVersion.job_id == uuid.UUID(job_id), DocumentVersion.number == number))
+    f = db.get(JobFile, v.tagmap_file_id)
+    data = b"".join(get_storage().get_stream(f.s3_key))
+    assert f.size_bytes == len(data)
+    return data
+
+
+def test_tag_maps_are_stored_with_their_marks_and_served_as_they_are(setup, monkeypatch):
+    s, db = setup, setup["db"]
+    job_id = _kept_tags_job(s)
+    assert db.get(Job, uuid.UUID(job_id)).result_summary["tags_kept"] is True
+    original, primary = _stored(db, job_id, 0), _stored(db, job_id, 1)
+    assert original.startswith(MARKED) and primary.startswith(MARKED)
+    assert {e["i"] for e in json.loads(primary)["elements"] if e.get("orig")} == {0, 1, 2, 3, 5}
+
+    # Nothing is worked out on the request: the stored bytes go out as they are
+    def no(*a):
+        raise AssertionError("marked on the request")
+    monkeypatch.setattr(tagmarks, "mark_original", no)
+    monkeypatch.setattr(tagmarks, "mark_all", no)
+    for number, stored in ((0, original), (1, primary)):
+        r = s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{number}/tagmap")
+        assert r.status_code == 200 and r.content == stored
+        assert r.headers["content-type"] == "application/json" and r.headers["content-length"] == str(len(stored))
+    assert all(e.get("orig") for e in json.loads(original)["elements"])  # the upload's own tags: all of them
+
+
+def test_a_saved_version_is_stored_with_its_marks(setup):
+    s, db = setup, setup["db"]
+    job_id = _kept_tags_job(s)
+    r = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                            json={"based_on": 1, "edits": [{"op": "set_role", "element": 3, "expect_role": "P", "role": "H2"}]})
+    assert r.status_code == 201, r.text
+    number = r.json()["number"]
+    worker.submit_versions(db)
+    ver = db.scalar(select(DocumentVersion).where(DocumentVersion.job_id == uuid.UUID(job_id),
+                                                  DocumentVersion.number == number))
+    s["engine"].complete_edit(ver.engine_job_id)
+    worker.poll_versions(db)
+    stored = _stored(db, job_id, number)
+    assert stored.startswith(MARKED)
+    assert {e["i"] for e in json.loads(stored)["elements"] if e.get("orig")} == {0, 1, 2, 3, 5}
+
+
+def test_tags_not_kept_are_stored_and_served_as_the_engine_made_them(setup):
+    s, db = setup, setup["db"]
+    _engine_with_kept_tags(s)
+    topup(s, s["a"].id, 100)
+    job_id = upload(s["c"]["user"], ("tagged.pdf", pdf_bytes(1))).json()[0]["job"]["id"]
+    run_worker(db)
+    s["engine"].complete(db.get(Job, uuid.UUID(job_id)).engine_job_id)  # no existing tags kept
+    run_worker(db)
+    stored = _stored(db, job_id, 1)
+    assert not stored.startswith(MARKED) and json.loads(stored) == _remediated()
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/1/tagmap").content == stored
+
+
+def test_marked_maps_say_so_in_their_first_bytes():
+    data = tagmarks.dump_marked(mark_all(_remediated()))
+    assert tagmarks.is_marked(data[:len(MARKED)]) and json.loads(data)["orig_marked"] is True
+    assert tagmarks.dump_marked(json.loads(data)) == data  # marking again doesn't add a second key
+    assert not tagmarks.is_marked(json.dumps(_remediated()).encode())

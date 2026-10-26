@@ -11,7 +11,9 @@
 # What `deploy` does, in order: checks the cluster and its storage; makes the namespace, the registry pull secret
 # and the secrets (from deploy/k8s/engine.env and portal.env, split by who reads what); starts Postgres, Redis and SeaweedFS; backs up
 # the portal database if it already exists (scripts/backup.sh, into ./backups); runs the portal's migrations; then
-# rolls out the AI gateway, engine, portal and web app and checks they answer.
+# rolls out the AI gateway, engine, portal and web app and checks they answer. A volume whose size setting went up
+# (DB_SIZE, FILES_SIZE and the rest) is grown first, once it's shown and you agree; one can't shrink
+# (docs/deployment/first-cluster/storage.md#growing-a-volume).
 #
 # Options:
 #   -y, --yes            don't ask before changing the cluster
@@ -273,6 +275,35 @@ if [ "$(portal_setting PORTAL_SIEM_MODE | tr '[:upper:]' '[:lower:]')" = syslog 
   PORTAL_DIRECT_PORTS+=", { port: $(portal_setting PORTAL_SIEM_SYSLOG_PORT | grep -E '^[0-9]+$' || echo 6514) }"
 fi
 export PORTAL_DIRECT_PORTS="$PORTAL_DIRECT_PORTS]"
+# Outbound traffic from everything else (#594): off (as before: only the pods that open documents, and the proxy's
+# users with EGRESS_PROXY=enforce, are limited) or on (default-deny-egress, and each workload reaches only what it
+# uses: 83-egress-deny.yaml). NODE_CIDRS: the nodes' addresses, where Prometheus reads the kubelets; KUBE_API_CIDRS
+# and KUBE_API_PORT: the API servers' own addresses and port (the kubernetes service's endpoints), which policies
+# see instead of the service's cluster address.
+export EGRESS_DENY="${EGRESS_DENY:-off}"
+case "$EGRESS_DENY" in off|on) ;; *) die "EGRESS_DENY is off or on" ;; esac
+NODE_CIDRS="${NODE_CIDRS:-}" KUBE_API_CIDRS="${KUBE_API_CIDRS:-${NODE_CIDRS:-}}"
+export KUBE_API_PORT="${KUBE_API_PORT:-6443}" NODE_TO="" KUBE_API_TO=""
+# As policy destinations: [{ ipBlock: { cidr: "192.0.2.11/32" } }, ...]
+ip_blocks() {
+  local c out="" list
+  IFS=, read -r -a list <<< "$2"
+  for c in "${list[@]}"; do
+    [[ "$c" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] || die "$1 is a comma-separated list of IPv4 addresses or ranges, not \"$c\""
+    [[ "$c" == */* ]] || c="$c/32"
+    out+="{ ipBlock: { cidr: \"$c\" } }, "
+  done
+  echo "[${out%, }]"
+}
+if [ "$EGRESS_DENY" = on ]; then
+  [ -n "$NODE_CIDRS" ] || die "EGRESS_DENY=on needs NODE_CIDRS: the nodes' addresses (kubectl get nodes -o wide)"
+  [[ "$KUBE_API_PORT" =~ ^[0-9]+$ ]] || die "KUBE_API_PORT is a port number"
+  NODE_TO="$(ip_blocks NODE_CIDRS "$NODE_CIDRS")"
+  KUBE_API_TO="$(ip_blocks KUBE_API_CIDRS "$KUBE_API_CIDRS")"
+fi
+# The service the tunnel's public hostname points at (70-cloudflared.yaml)
+TUNNEL_ORIGIN=web; [ "$FRONTEND" = worker ] && TUNNEL_ORIGIN=portal-api
+export TUNNEL_ORIGIN
 # HTTPS at the cluster's own ingress controller (not needed behind the Cloudflare tunnel, which ends TLS itself): the
 # Secret with APP_HOST's certificate, made by cert-manager when CERT_ISSUER names a ClusterIssuer (web-tls unless
 # INGRESS_TLS_SECRET names it), or put there by you. With TLS on, the controller sends plain HTTP on to HTTPS.
@@ -393,6 +424,13 @@ esac
 export MONITORING="${MONITORING:-on}" PROMETHEUS_RETENTION="${PROMETHEUS_RETENTION:-15d}"
 export PROMETHEUS_SIZE="${PROMETHEUS_SIZE:-20Gi}" PROMETHEUS_MEMORY_LIMIT="${PROMETHEUS_MEMORY_LIMIT:-2Gi}"
 export GRAFANA_SIZE="${GRAFANA_SIZE:-1Gi}" MONITORING_STORAGE_CLASS="${MONITORING_STORAGE_CLASS:-$STORAGE_CLASS}"
+VOLUME_ALERT_FREE_PERCENT="${VOLUME_ALERT_FREE_PERCENT:-10}"
+case "$VOLUME_ALERT_FREE_PERCENT" in
+  ''|*[!0-9]*) die "VOLUME_ALERT_FREE_PERCENT is a whole percent, 1 to 90 (10 by default)" ;;
+esac
+if [ "$VOLUME_ALERT_FREE_PERCENT" -lt 1 ] || [ "$VOLUME_ALERT_FREE_PERCENT" -gt 90 ]; then
+  die "VOLUME_ALERT_FREE_PERCENT is a whole percent, 1 to 90 (10 by default)"
+fi
 case "$PROMETHEUS_RETENTION" in
   ''|*[!0-9ywdh]*|[!0-9]*) die "PROMETHEUS_RETENTION is a time such as 15d, 8w or 1y" ;;
 esac
@@ -451,7 +489,14 @@ if [ "$EGRESS_PROXY" != off ]; then
   EGRESS_PROXY_CONFIG_SHA="$(python3 deploy/k8s/egress_hosts.py squid config/litellm.yaml "$K8S/engine.env" "$K8S/portal.env" | shasum -a 256 | cut -c1-16)"
 fi
 MON="$K8S/monitoring"
-PROMETHEUS_CONFIG_SHA="$(cat "$MON/prometheus.yml" "$MON/rules.yml" | shasum -a 256 | cut -c1-16)"
+# The alert rules, with deploy.env's threshold for a volume nearly full (VOLUME_ALERT_FREE_PERCENT)
+alert_rules() {
+  local frac marker='< 0.1  # VOLUME_ALERT_FREE_PERCENT'
+  frac="$(awk -v p="$VOLUME_ALERT_FREE_PERCENT" 'BEGIN { printf "%g", p / 100 }')"
+  grep -qF "$marker" "$MON/rules.yml" || die "monitoring/rules.yml has lost its VOLUME_ALERT_FREE_PERCENT line"
+  sed "s|$marker|< $frac  # VOLUME_ALERT_FREE_PERCENT|" "$MON/rules.yml"
+}
+PROMETHEUS_CONFIG_SHA="$(cat "$MON/prometheus.yml" <(alert_rules) | shasum -a 256 | cut -c1-16)"
 GRAFANA_DASHBOARDS_SHA="$(cat "$MON"/dashboards/*.json | shasum -a 256 | cut -c1-16)"
 # Pods restart when their settings file changes (the checksum is in their template)
 sha_of() { if [ -f "$1" ]; then shasum -a 256 "$1" | cut -c1-16; else echo none; fi; }
@@ -495,12 +540,14 @@ render_all() {
       95-monitoring.yaml) [ "$MONITORING" = on ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
       26-egress-proxy.yaml) [ "$EGRESS_PROXY" != off ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
       82-egress-enforce.yaml) [ "$EGRESS_PROXY" = enforce ] || [ "${RENDER_ALL:-0}" = 1 ] || continue ;;
+      83-egress-deny.yaml|84-egress-direct.yaml) [ "$EGRESS_DENY" = on ] || continue ;;
     esac
     render_file "$f" > "$out/$(basename "$f")" || die "$(basename "$f") uses a setting that isn't set"
   done
   # Prometheus's own config (its rules and Grafana's dashboards go in as they are: they use $ and {{ }} themselves)
   render_file "$MON/prometheus.yml" > "$out/prometheus.yml" \
     || die "monitoring/prometheus.yml uses a setting that isn't set"
+  alert_rules > "$out/rules.yml"
 }
 
 if [ "$CMD" = render ]; then
@@ -594,6 +641,48 @@ for sc in "${classes[@]}"; do
     || die "the cluster has no StorageClass '$sc' (install one, or change it in deploy/k8s/deploy.env)"
 done
 TUNNEL=0; [ -f "$K8S/tunnel.env" ] && grep -q '^TUNNEL_TOKEN=.' "$K8S/tunnel.env" && TUNNEL=1
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+# Volumes whose size in deploy.env went up (#592): grown before anything is applied, since an apply can't change a
+# StatefulSet's volume size (docs/deployment/first-cluster/storage.md#growing-a-volume). deploy/k8s/volume_sizes.py
+# compares each setting with its claim on the cluster; a smaller size, or a class that can't grow one, stops here
+for v in DB_SIZE REDIS_SIZE FILES_SIZE JOBDATA_SIZE; do
+  [ -n "${!v:-}" ] || die "$v isn't set in deploy/k8s/deploy.env"
+done
+volumes=("DB_SIZE=$DB_SIZE:statefulset/postgres" "REDIS_SIZE=$REDIS_SIZE:statefulset/redis"
+  "FILES_SIZE=$FILES_SIZE:statefulset/seaweedfs" "JOBDATA_SIZE=$JOBDATA_SIZE:pvc/jobdata")
+if [ "$MONITORING" = on ]; then
+  volumes+=("PROMETHEUS_SIZE=$PROMETHEUS_SIZE:pvc/prometheus-data:deployment/prometheus"
+    "GRAFANA_SIZE=$GRAFANA_SIZE:pvc/grafana-data:deployment/grafana")
+fi
+[ "$BACKUPS" = cronjob ] && volumes+=("BACKUP_SIZE=$BACKUP_SIZE:pvc/backups")
+"${KC[@]}" "${NS[@]}" get pvc -o json > "$WORK/pvcs.json" || die "couldn't read the volume claims in $NAMESPACE"
+"${KC[@]}" "${NS[@]}" get statefulset -o json > "$WORK/statefulsets.json" || die "couldn't read the StatefulSets in $NAMESPACE"
+"${KC[@]}" get storageclass -o json > "$WORK/classes.json" || die "couldn't read the cluster's storage classes"
+volume_plan="$(python3 "$K8S/volume_sizes.py" plan "$WORK/pvcs.json" "$WORK/statefulsets.json" "$WORK/classes.json" \
+  "${volumes[@]}")" || die "stopped before changing anything: a volume's size in deploy.env can't be applied (above)"
+
+# With EGRESS_DENY=on, Prometheus, kube-state-metrics and the veraPDF restart reach the API only at KUBE_API_CIDRS
+# and KUBE_API_PORT: each of the kubernetes service's endpoints must be in them, or those stop working unnoticed
+if [ "$EGRESS_DENY" = on ]; then
+  api_endpoints="$("${KC[@]}" -n default get endpointslice -l kubernetes.io/service-name=kubernetes \
+    -o jsonpath='{range .items[*]}{range .endpoints[*]}{.addresses[0]}{" "}{end}{":"}{.ports[0].port}{"\n"}{end}')" \
+    || die "couldn't read the kubernetes service's endpoints (to check KUBE_API_CIDRS)"
+  python3 - "$KUBE_API_CIDRS" "$KUBE_API_PORT" "$api_endpoints" <<'PY' || die "EGRESS_DENY=on: set KUBE_API_CIDRS and KUBE_API_PORT in deploy.env to the API servers' addresses and port (above)"
+import ipaddress, sys
+nets = [ipaddress.ip_network(c if "/" in c else c + "/32", strict=False) for c in sys.argv[1].split(",")]
+bad = []
+for row in sys.argv[3].splitlines():
+    addrs, _, port = row.rpartition(":")
+    for a in addrs.split():
+        if port != sys.argv[2] or not any(ipaddress.ip_address(a) in n for n in nets):
+            bad.append(f"{a}:{port}")
+if bad or not sys.argv[3].strip():
+    print(f"the Kubernetes API is at {', '.join(bad)}, outside KUBE_API_CIDRS/KUBE_API_PORT" if bad
+          else "the kubernetes service has no endpoints", file=sys.stderr)
+    sys.exit(1)
+PY
+fi
 
 echo "Deploying to $SERVER, namespace $NAMESPACE, as https://$APP_HOST (web app: $FRONTEND)"
 echo "  engine $ENGINE_TAG, portal $PORTAL_TAG, web $WEB_TAG; storage $STORAGE_CLASS and $SHARED_STORAGE_CLASS;"
@@ -604,6 +693,11 @@ case "$EGRESS_PROXY" in
   enforce) echo "  outbound: through the egress proxy, only these hosts (EGRESS_PROXY=enforce):"
     python3 deploy/k8s/egress_hosts.py hosts config/litellm.yaml "$K8S/engine.env" "$K8S/portal.env" | sed 's/^/    /' ;;
 esac
+if [ "$EGRESS_DENY" = on ]; then
+  echo "  outbound from everything else: only what each pod uses (EGRESS_DENY=on; Kubernetes API at $KUBE_API_CIDRS port $KUBE_API_PORT)"
+else
+  echo "  outbound from everything else: anywhere, apart from the pods that open documents (EGRESS_DENY=off)"
+fi
 echo "  traffic between nodes: $encryption"
 if [ "$AUTOSCALE" = on ]; then
   echo "  scaling with the queue: $ENGINE_WORKERS to $ENGINE_WORKERS_MAX workers ($WORKER_CONCURRENCY documents each), veraPDF up to $VERAPDF_MAX, AI gateway up to $LITELLM_MAX"
@@ -632,13 +726,20 @@ fi
 if [ "$MUSIC_READER" = on ]; then
   echo "  music reading service: $MUSIC_TAG, $([ "$AUTOSCALE" = on ] && echo "started when there is music to read (up to $MUSIC_MAX)" || echo "one pod, always running")"
 fi
+if [ -n "$volume_plan" ]; then
+  echo "  volumes to grow (docs/deployment/first-cluster/storage.md#growing-a-volume):"
+  while IFS=$'\t' read -r step name from to setting _; do
+    case "$step" in
+      grow) echo "    $name: $from to $to ($setting)" ;;
+      recreate) echo "    statefulset/$name made again for $to, its pod and volume left running (delete --cascade=orphan)" ;;
+    esac
+  done <<< "$volume_plan"
+fi
 if [ "$YES" != 1 ]; then
   read -r -p "Go ahead? [y/N] " answer
   [[ "$answer" =~ ^[Yy] ]] || die "stopped"
 fi
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 render_all "$WORK"
 apply() { "${KC[@]}" apply -f "$WORK/$1" >/dev/null && log "applied $1"; }
 # The engine's own key for the AI gateway (#457): limited to the models in config/litellm.yaml, with no right to
@@ -680,6 +781,48 @@ engine_gateway_key() {
   fi
   log "the engine has its own gateway key now (limited to its models), in deploy/k8s/engine.env"
 }
+# The volumes in the plan grown (#592): each claim's request patched (the storage driver grows the disk, then the node
+# its filesystem), each StatefulSet whose volume size changed deleted without its pods and claims (--cascade=orphan)
+# for the apply below to make again, then a wait for each claim's new size. A filesystem that only grows when its pod
+# starts again (FileSystemResizePending) is said, here and at the end
+volume_notes=()
+grow_volumes() {
+  [ -n "$volume_plan" ] || return 0
+  local step name from to setting workload grown=() entry st i restart
+  while IFS=$'\t' read -r step name from to setting workload; do
+    [ "$step" = grow ] || continue
+    "${KC[@]}" "${NS[@]}" patch pvc "$name" --type=merge \
+      -p "{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"$to\"}}}}" >/dev/null \
+      || die "couldn't grow the volume $name to $to ($setting)"
+    log "volume $name: asked for $to (was $from)"
+    grown+=("$name $to ${workload:--}")
+  done <<< "$volume_plan"
+  while IFS=$'\t' read -r step name from to setting _; do
+    [ "$step" = recreate ] || continue
+    "${KC[@]}" "${NS[@]}" delete statefulset "$name" --cascade=orphan >/dev/null \
+      || die "couldn't remove statefulset/$name to make it again with its new volume size"
+    log "statefulset/$name removed, its pod and volume left running: made again for $to below"
+  done <<< "$volume_plan"
+  for entry in ${grown[@]+"${grown[@]}"}; do
+    read -r name to workload <<< "$entry"
+    st=resizing
+    for ((i = 0; i < 24; i++)); do
+      if "${KC[@]}" "${NS[@]}" get pvc "$name" -o json > "$WORK/pvc.json"; then
+        st="$(python3 "$K8S/volume_sizes.py" state "$WORK/pvc.json" "$to")"
+      fi
+      [ "$st" = grown ] && break
+      sleep 5
+    done
+    restart="kubectl -n $NAMESPACE rollout restart $workload"
+    [ "$workload" = - ] && restart="restart the pods that use it"
+    case "$st" in
+      grown) log "volume $name is $to, its filesystem too: nothing to restart" ;;
+      pending) volume_notes+=("volume $name: the disk is $to but its filesystem grows only when its pod starts again (FileSystemResizePending): $restart") ;;
+      *) volume_notes+=("volume $name: the storage hadn't finished growing it to $to after 2 minutes: watch kubectl -n $NAMESPACE get pvc $name; if it then says FileSystemResizePending: $restart") ;;
+    esac
+  done
+  for entry in ${volume_notes[@]+"${volume_notes[@]}"}; do log "$entry"; done
+}
 wait_rollout() { "${KC[@]}" "${NS[@]}" rollout status "$1" --timeout="${2:-300s}" >/dev/null || die "$1 didn't become ready (scripts/deploy.sh status; kubectl -n $NAMESPACE logs $1)"; log "$1 ready"; }
 
 apply 00-namespace.yaml
@@ -717,7 +860,7 @@ if [ "$MONITORING" = on ]; then
   secret pdfrem-monitoring-env "$NAMESPACE" "$K8S/portal.env" \
     --keys "^($MONITORING_KEYS)\$"
   "${KC[@]}" "${NS[@]}" create configmap prometheus-config --from-file=prometheus.yml="$WORK/prometheus.yml" \
-    --from-file=rules.yml="$MON/rules.yml" --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
+    --from-file=rules.yml="$WORK/rules.yml" --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
   "${KC[@]}" "${NS[@]}" create configmap grafana-dashboards --from-file="$MON/dashboards" \
     --dry-run=client -o yaml | "${KC[@]}" apply -f - >/dev/null
 fi
@@ -734,11 +877,22 @@ log "storage, database, queues and file store"
 # First, before any workload starts: what may reach what (see the README, "Network policies and the Redis password"),
 # so on a fresh install no pod runs a moment without them (#453)
 apply 80-network-policies.yaml
+# Default-deny egress (#594). The proxy's users keep their way out (84-egress-direct.yaml) until enforce's policies are
+# in place, so they're never cut off while the mode changes; it's applied first, before the deny
+if [ "$EGRESS_DENY" = on ]; then
+  if [ "$EGRESS_PROXY" != enforce ] || ! "${KC[@]}" "${NS[@]}" get networkpolicy/outbound-through-proxy >/dev/null 2>&1; then
+    apply 84-egress-direct.yaml
+  fi
+  apply 83-egress-deny.yaml
+else
+  "${KC[@]}" "${NS[@]}" delete networkpolicy -l pdfrem/egress-deny --ignore-not-found >/dev/null
+fi
 if [ "$FRONTEND" = worker ]; then
   apply 81-api-origin-policy.yaml
 else
   "${KC[@]}" "${NS[@]}" delete networkpolicy/portal-api-origin --ignore-not-found >/dev/null
 fi
+grow_volumes
 apply 10-jobdata.yaml
 apply 20-postgres.yaml
 apply 21-redis.yaml
@@ -767,6 +921,7 @@ fi
 # Once the proxy is up: the portal, the gateway and the Adobe worker reach the internet only through it
 if [ "$EGRESS_PROXY" = enforce ]; then
   apply 82-egress-enforce.yaml
+  "${KC[@]}" "${NS[@]}" delete networkpolicy/direct-egress --ignore-not-found >/dev/null
 else
   "${KC[@]}" "${NS[@]}" delete networkpolicy/outbound-through-proxy networkpolicy/portal-outbound-through-proxy \
     --ignore-not-found >/dev/null
@@ -914,6 +1069,7 @@ ran="$(date '+%Y-%m-%d %H:%M:%S %z')"
 for v in ENGINE_TAG PORTAL_TAG WEB_TAG MUSIC_TAG FORMULA_TAG; do if [ -n "${!v}" ]; then ran+=" $v=${!v}"; fi; done
 echo "$ran migration=$migration" >> "$K8S/deploy-history"
 
+for entry in ${volume_notes[@]+"${volume_notes[@]}"}; do log "$entry"; done
 if [ "$FRONTEND" = worker ]; then
   log "deployed the cluster side; the API origin is https://$API_ORIGIN_HOST (route it through the tunnel and protect"
   log "it with Cloudflare Access), then publish the web app with scripts/deploy-worker.sh"

@@ -95,13 +95,13 @@ account the restored tables ([restoring](backups-and-migrations.md#restoring)).
 
 ### What a downgrade loses
 
-> **Changed 22 October 2026:** migrations 0045 to 0047 (API tokens, their notices, acknowledged Needs attention
-> items) added.
+> **Changed 23 October 2026:** migration 0048 (service admins) added.
 
 Each migration says what undoing it loses. The recent ones:
 
 | Migration | Undoing it loses | Safe? |
 |---|---|---|
+| 0048 Service admins | **Every service admin role** (those people keep their accounts, as members of their group); help messages they wrote show as a super admin's | Only if nobody is a service admin yet, or they'll be made one again; a service admin with no group must be given one first, or they can't sign in |
 | 0047 Acknowledged Needs attention items | Every acknowledgement: those items show again | Yes |
 | 0046 API token notices | When token owners were told a token expires soon or stopped unused: they may be told again | Yes |
 | 0045 Personal API tokens | **Every API token** (scripts using them get 401), which documents were "sent by script", and each group's tokens switch | Only if nobody uses tokens yet; otherwise people make new ones after going forward again |
@@ -122,9 +122,16 @@ one that raises can't be undone. New migrations say in their docstring what undo
 
 ## 5. The web app
 
-Pages people already have open keep the newer web app until they reload. The first time one opens a part of the app
-it hasn't loaded yet, that part's file is gone, and the page reloads itself once, onto the earlier version (#441).
-Until then, a page may call something the earlier API doesn't have and show an error; reloading fixes it.
+> **Changed 23 October 2026:** pages already open load the earlier version on the next click (#575).
+
+Each web build has an id (the image's tag), in the app and in `/build.json`, which is never cached. Pages people
+already have open keep the newer web app until the person moves to another page or tab: the app then asks for
+`build.json`, sees another build, and loads that page in full, onto the earlier version. It asks only on a move, never
+on a timer, and not while the page has unsaved changes (it waits for the next move once they're saved or discarded).
+A page that still sees another build after reloading (old and new pods both serving, mid-rollout) doesn't reload
+again for a minute. Separately, a part of the app the page hasn't loaded yet, whose file is gone, reloads the page
+once (#441). Until one of these happens, a page may call something the earlier API doesn't have and show an error;
+reloading fixes it.
 
 ## 6. Check
 

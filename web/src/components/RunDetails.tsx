@@ -20,6 +20,7 @@ const STAGES: Record<string, string> = {
   destructive_fixes: "Font substitution",
   flattening: "Flattening pages and tagging them again",
   reporting: "Reports",
+  pdfua2: "Making the PDF/UA-2 file",
   verifying_tags: "Reviewing the tags (and AI review)",
   adobe_sending: "Sending to Adobe",
   adobe_tagging: "Adobe tagging",
@@ -157,6 +158,7 @@ export function RunDetails({ job: j }: { job: Job }) {
       <Facts rows={[
         ["Engine job", (staff.engine_job_id as string) ?? null],
         ["Route", (m.route as string) ?? null],
+        ["Engine version", (m.engine_version as string) ?? null],
         ["Error", j.error_code ? `${j.error_code}${j.error_message ? `: ${j.error_message}` : ""}` : null],
       ]} />
       {warnings.length > 0 && (

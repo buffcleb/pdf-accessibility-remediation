@@ -6,8 +6,8 @@ from pikepdf import Array, Dictionary, Name
 
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
-from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import integrity_errors
 
 
 def _boxes(path):
@@ -56,9 +56,7 @@ def _boxes(path):
 def test_lines_around_text_are_not_figures(tmp_path):
     src, out = _boxes(tmp_path / "in.pdf"), tmp_path / "out.pdf"
     result = tag_document(src, out, prepare_analysis(src), title="Boxes", language="en-US", pdfua_part=1)
-    with pikepdf.open(out) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(out) == []
     elements = build_tagmap(out)["elements"]
     texts = [e["text"] for e in elements if e.get("own") and (e.get("text") or "").strip()]
     assert texts == ["If present, start treatment", "Refer to a specialist", "Yes"]  # every word still read, in order

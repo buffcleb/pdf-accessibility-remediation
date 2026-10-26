@@ -108,6 +108,10 @@ class TextBlock:
     scan_formula: bool = False
     note_mark: str | None = None
     notes: list[str] = field(default_factory=list)
+    # An endnote is a Note too ("endnote 1" when its mark is read aloud); a note's text carried onto the next page is
+    # a block of its own that continues it (the note's block id), tagged as part of the same Note
+    note_kind: str = "footnote"
+    continues: str | None = None
 
 
 def append_block(dst: "TextBlock", src: "TextBlock") -> None:

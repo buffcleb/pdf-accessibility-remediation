@@ -6,21 +6,15 @@ from pikepdf import Array, Dictionary, Name
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
+from tests.engine.pdfs import one_page
 
 
 def _tagged(path):
     """Two paragraphs, each its own P; the second also holds a Link, so it has something of its own."""
-    pdf = pikepdf.new()
-    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica,
-                                        Encoding=Name.WinAnsiEncoding))
     content = [b"/P <</MCID 0>> BDC BT /F1 12 Tf 72 700 Td (The acid H2SO4 is added slowly.) Tj ET EMC",
                b"/P <</MCID 1>> BDC BT /F1 12 Tf 72 640 Td (Rinse with H2O and dry.) Tj ET EMC",
                b"/P <</MCID 2>> BDC BT /F1 12 Tf 72 580 Td (Nothing to read here.) Tj ET EMC"]
-    page = pdf.make_indirect(Dictionary(
-        Type=Name.Page, MediaBox=Array([0, 0, 612, 792]), Resources=Dictionary(Font=Dictionary(F1=font)),
-        Contents=pdf.make_stream(b"\n".join(content))))
-    pdf.Root.Pages = pdf.make_indirect(Dictionary(Type=Name.Pages, Kids=Array([page]), Count=1))
-    page.Parent = pdf.Root.Pages
+    pdf, page = one_page(None, content)
     root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
     doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root))
     ps = [pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.P, P=doc, Pg=page, K=i)) for i in range(3)]

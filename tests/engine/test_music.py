@@ -11,13 +11,11 @@ import pytest
 
 from app.config import get_settings
 from app.pipeline import music, omr
-from app.pipeline.models import PageAnalysis, TextBlock
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
-from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
-
-import pikepdf
+from tests.engine.layout import block, document, page
+from tests.engine.pdfs import integrity_errors
 
 
 def _staff(p, x0, x1, top, gap=5.0, lines=5):
@@ -55,10 +53,7 @@ def test_lined_paper_a_ruled_table_and_short_marks_are_not_staves(tmp_path):
 
 
 def _analysis(blocks=()):
-    page = PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792))
-    page.blocks = [TextBlock(id=f"b{n}", page=0, bbox=bbox, text=text, font_size=10, role="P")
-                   for n, (bbox, text) in enumerate(blocks)]
-    return page
+    return page(*(block(f"b{n}", bbox, text, size=10) for n, (bbox, text) in enumerate(blocks)))
 
 
 def test_staves_joined_by_a_brace_are_one_example_and_distant_ones_are_separate():
@@ -202,9 +197,7 @@ def test_an_example_is_tagged_as_one_figure_with_its_reading(tmp_path, monkeypat
     assert records[0]["read"] and records[0]["measures"] == 2
     dst = tmp_path / "out.pdf"
     tag_document(src, dst, analysis, title="Example", language="en-US")
-    with pikepdf.open(dst) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(dst) == []
     tm = build_tagmap(dst)
     figures = [e for e in tm["elements"] if e["role"] == "Figure"]
     assert len(figures) == 1 and figures[0]["alt"].startswith("Music notation, treble and bass clef")
@@ -357,9 +350,7 @@ def test_each_measure_becomes_a_figure_read_left_to_right(tmp_path, monkeypatch)
     assert texts[0].startswith("Here is a line") and texts[-1].startswith("The text carries on")
     dst = tmp_path / "out.pdf"
     tag_document(src, dst, analysis, title="Line", language="en-US")
-    with pikepdf.open(dst) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(dst) == []
     tagged = [e["alt"] for e in build_tagmap(dst)["elements"] if e["role"] == "Figure"]
     assert len(tagged) == 4 and [("easure %d of 4" % n) in a for n, a in enumerate(tagged, 1)] == [True] * 4
     # A second analysis keeps the measures in that order
@@ -411,10 +402,7 @@ def test_music_that_is_a_picture_is_read_and_stays_one_figure(tmp_path, monkeypa
 
 # --------------------------------------------------------------------------- sheet music: the whole piece
 def _doc_analysis(pages):
-    from app.pipeline.models import DocumentAnalysis
-
-    return DocumentAnalysis(page_count=len(pages), pages=pages, title=None, language=None, has_struct_tree=False,
-                            is_marked=False)
+    return document(*pages)
 
 
 def _numbered(n, blocks=()):

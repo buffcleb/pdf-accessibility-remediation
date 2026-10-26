@@ -86,34 +86,45 @@ never exposed to the internet.
 
 ## 3. Roles and permissions
 
-| Action | User | Group admin (own group) | Super admin |
-|---|---|---|---|
-| Submit PDFs, see own jobs and downloads | ✅ | ✅ | ✅ |
-| See own remaining pages | ✅ | ✅ | ✅ |
-| Create, rename or disable groups; set email domains and single addresses | | | ✅ |
-| Make a user a group admin, or remove admin rights | | | ✅ |
-| Add pages to a pool (top-up), correct a person's usage | | | ✅ |
-| Ask for more pages ("Request pages", which opens the support link) | | ✅ | |
-| Set a user's page cap; set the group's default cap | | ✅ | ✅ |
-| Give the group's services to everyone or person by person | | ✅ | ✅ |
-| Approve or decline new members | | ✅ | ✅ |
-| Disable a user (a group admin can't disable a super admin) | | ✅ | ✅ |
-| Move a user to another group | | | ✅ |
-| View group jobs and open group files (every opening is logged) | | ✅ | ✅ |
-| See dollar costs and the engine's own reports | | | ✅ |
-| Usage reports and CSV export | | own group | all groups |
-| Access (sign-in) reports | | own group | all |
-| Help requests: take part | own | own group | all |
-| Help requests: change status, resolve, refund pages | | | ✅ |
-| Queues, re-running a document, removing files or deleting documents at once | | | ✅ |
-| Export or remove a person's data, sign anyone out of all devices | | | ✅ |
-| Global settings: retention days, messages, limits, email, branding | | | ✅ |
-| Audit log | | own group | all |
+> **Changed 23 October 2026:** the service admin role, between group admin and super admin (#564). Each route asks
+> for a named permission (`portal/permissions.py`); super admins have them all.
+
+| Action | User | Group admin (own group) | Service admin | Super admin |
+|---|---|---|---|---|
+| Submit PDFs, see own jobs and downloads | ✅ | ✅ | ✅ | ✅ |
+| See own remaining pages | ✅ | ✅ | ✅ | ✅ |
+| Create or rename groups; set email domains and single addresses | | | ✅ | ✅ |
+| Disable or enable a group | | | | ✅ |
+| Make a user a group admin, or remove admin rights | | | ✅ | ✅ |
+| Make or remove super admins and service admins | | | | ✅ |
+| Add pages to a group's pool (top-up, override, correction), correct a person's usage | | | ✅ | ✅ |
+| Add pages to a service's global pool | | | | ✅ |
+| Ask for more pages ("Request pages", which opens the support link) | | ✅ | | |
+| Set a user's page cap; set the group's default cap | | ✅ | ✅ | ✅ |
+| Give the group's services to everyone or person by person | | ✅ | ✅ | ✅ |
+| Approve or decline new members | | ✅ | ✅ | ✅ |
+| Disable a user (not a super admin or service admin, unless you're a super admin) | | ✅ | ✅ | ✅ |
+| Move a user to another group; sign anyone out of all devices | | | ✅ | ✅ |
+| View group jobs and open group files (every opening is logged) | | ✅ | all groups | all groups |
+| See dollar costs and the engine's own reports | | | ✅ | ✅ |
+| Usage reports and CSV export | | own group | all groups | all groups |
+| Access (sign-in) reports | | own group | all | all |
+| Help requests: take part | own | own group | all | all |
+| Help requests: change status, resolve, refund pages, internal notes | | | ✅ | ✅ |
+| Queues: view, act on single items; re-run a document; remove files or delete documents at once | | | ✅ | ✅ |
+| Queues: pause and resume | | | | ✅ |
+| Needs attention across groups and services; System (not Grafana) | | | ✅ | ✅ |
+| Grafana | | | | ✅ |
+| Export or remove a person's data | | | | ✅ |
+| Global settings: retention days, messages, limits, email, branding; services and AI levels | | | | ✅ |
+| Audit log | | own group | all | all |
 
 - A group can have several admins.
-- Admins and super admins are also ordinary users.
+- Admins, service admins and super admins are also ordinary users. Service admins, like super admins, needn't
+  belong to a group.
 - Super admins start from a bootstrap list (`PORTAL_BOOTSTRAP_SUPER_ADMINS`, a list of email addresses).
-  After that they're managed in the UI. The last super admin can't be removed.
+  After that they're managed in the UI. The last super admin can't be removed. Service admins are made by super
+  admins in the UI; each one made raises a security alert.
 - **Authorization is enforced in the API on every request.** The group is always taken from the
   stored resource, never from client input. Postgres row-level security is a second line of defence (#350). On
   the cluster the portal connects as a database account that owns no table (#337), and the policies bind it.
@@ -210,6 +221,16 @@ that parallel uploads can't overspend.
 
 Each entry records the service and the scope (global or group). Remaining pages for a group = pool − used −
 reserved. For a user = cap − used − reserved, and never more than the group's remaining pages.
+
+### Subgroups (added 26 October 2026)
+A group can have subgroups, one level deep (#431). A subgroup draws on its parent's pool, per service, with an
+optional cap of its own and no pool; its documents reserve pages on the parent's pool and the subgroup's cap at
+once. The parent's admins manage it (it may also have admins of its own, who see only it); super admins and the
+parent's admins create subgroups. A person is in one group only, the parent or a subgroup. The parent's lists,
+counts and reports include its subgroups', with a Group column and filter. A subgroup's settings (AI for uploads,
+local-only, approval, Describe with AI, show external, the over-quota message) follow the parent's until it sets its
+own; local-only can't be loosened. At sign-in, an address or domain listed on a subgroup is matched before the
+parent's domain. The parent's admins move people between the parent and its subgroups.
 
 ### Top-ups and the ticketing system
 - A **ticket number is required**, plus an optional link and comment.

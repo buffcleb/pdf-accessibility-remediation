@@ -2,13 +2,12 @@
 question and option, internal names are replaced and readable tooltips kept, and a new tree's fields sit beside
 their labels."""
 import asyncio
-import shutil
-import uuid
 
 import pikepdf
 import pymupdf as fitz
 
 from app.pipeline import field_labels
+from tests.engine.pdfs import remediate
 
 
 def _form(path):
@@ -82,15 +81,9 @@ def test_the_ai_names_what_the_page_doesnt(tmp_path):
 
 
 def test_a_remediated_form_carries_the_names_with_fields_beside_their_labels(tmp_path):
-    from app.pipeline.orchestrator import JobOptions, run_remediation
-    from app.storage import JobStore
     from app.verification.tagmap import build_tagmap
 
-    jid = str(uuid.uuid4())
-    store = JobStore(jid, root=tmp_path / "jobs")
-    store.create()
-    shutil.copyfile(_form(tmp_path / "form.pdf"), store.input_pdf)
-    res = asyncio.run(run_remediation(store, JobOptions(stem="f", job_id=jid, provider="mock")))
+    res, store = remediate(tmp_path, _form(tmp_path / "form.pdf"), stem="f")
     out = store.output_dir / res["files"]["remediated_primary"]
     with pikepdf.open(out) as pdf:
         fields = list(pdf.Root.AcroForm.Fields)

@@ -38,6 +38,8 @@ function key(op: TagEdit): string | null {
       return `headers:${op.element}`;
     case "link_note":
       return `note:${op.element}`;
+    case "set_toc_target":
+      return `toctarget:${op.element}`;
     case "set_field_label":
       return `fieldlabel:${op.element}`;
     case "set_doc_title":
@@ -214,6 +216,9 @@ export function describe(op: TagEdit, map: TagMap): string {
     case "link_note":
       return op.note === null ? `${what} no longer points at a footnote${page}`
         : `${what} points at the footnote “${(map.elements[op.note]?.text ?? `element ${op.note}`).slice(0, 30)}”${page}`;
+    case "set_toc_target":
+      return op.target === null ? `${what} goes to no heading${page}`
+        : `${what} goes to the heading “${(map.elements[op.target]?.text ?? `element ${op.target}`).slice(0, 30)}”${page}`;
     case "set_headers": {
       const names = op.headers.map((h) => `“${(map.elements[h]?.text ?? `element ${h}`).slice(0, 20)}”`).join(", ");
       return op.headers.length ? `${what} read with ${names}${page}` : `Headers removed from ${what}${page}`;
@@ -237,7 +242,7 @@ export const ROLE_NAMES: Record<string, string> = {
   P: "Paragraph", H1: "Heading 1", H2: "Heading 2", H3: "Heading 3", H4: "Heading 4", H5: "Heading 5", H6: "Heading 6",
   Figure: "Figure", Formula: "Formula", L: "List", LI: "List item", Lbl: "List label", LBody: "List item body",
   Table: "Table", TR: "Table row", TH: "Header cell", TD: "Data cell", Link: "Link", Caption: "Caption",
-  Sect: "Section", Div: "Division", Document: "Document", Span: "Span", Note: "Note", Quote: "Quote",
+  Sect: "Section", Div: "Division", Document: "Document", Span: "Span", Note: "Note", FENote: "Note", Quote: "Quote",
 };
 
 export function roleClass(role: string): string {
@@ -383,6 +388,7 @@ export function editMarks(map: TagMap, ops: TagEdit[]): Map<number, string[]> {
       case "make_toc": add(op.element, "table of contents"); break;
       case "set_headers": add(op.element, "headers"); break;
       case "link_note": add(op.element, op.note === null ? "footnote link removed" : "points at a footnote"); break;
+      case "set_toc_target": add(op.element, op.target === null ? "goes to no heading" : "goes to a heading"); break;
       case "set_field_label": add(op.element, "field label"); break;
       case "rebuild_table": add(op.element, "table edited"); break;
       case "build_table": for (const i of [op.element, ...(op.absorb ?? [])]) add(i, "made into a table"); break;

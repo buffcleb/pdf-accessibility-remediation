@@ -6,21 +6,15 @@ from pikepdf import Array, Dictionary, Name
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
+from tests.engine.pdfs import one_page
 
 ABSURD = 5000
 
 
 def _table_pdf(path, col_span: int):
-    pdf = pikepdf.new()
-    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica,
-                                        Encoding=Name.WinAnsiEncoding))
     cells = [("Name", 72, 700), ("Dose", 200, 700), ("Aspirin", 72, 670), ("100 mg", 200, 670)]
     content = [f"/TD <</MCID {i}>> BDC BT /F1 12 Tf {x} {y} Td ({t}) Tj ET EMC".encode() for i, (t, x, y) in enumerate(cells)]
-    page = pdf.make_indirect(Dictionary(
-        Type=Name.Page, MediaBox=Array([0, 0, 612, 792]), Resources=Dictionary(Font=Dictionary(F1=font)),
-        Contents=pdf.make_stream(b"\n".join(content))))
-    pdf.Root.Pages = pdf.make_indirect(Dictionary(Type=Name.Pages, Kids=Array([page]), Count=1))
-    page.Parent = pdf.Root.Pages
+    pdf, page = one_page(None, content)
     root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
     doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root))
     table = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Table, P=doc, Pg=page))

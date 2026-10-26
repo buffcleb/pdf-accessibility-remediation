@@ -7,6 +7,7 @@ import {
   get, post, postForm, type DocVersion, type Group, type HelpRequest, type HelpStatus, type HelpSummary, type Paged, type Versions,
 } from "../../api";
 import { useAuth } from "../../auth";
+import { isStaffRole } from "../../permissions";
 import { HELP_KINDS, HelpOutcome, HelpStatusPill, HelpThread, kindLabel } from "../../components/help";
 import { ErrorNotice, Loading, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
@@ -148,7 +149,7 @@ export function HelpDetail() {
   if (req.loading && !req.data) return <Loading />;
   if (!req.data) return <ErrorNotice error={req.error} />;
   const r = req.data;
-  const isSuper = r.role === "super_admin";
+  const staff = isStaffRole(r.role);  // support: a super admin or a service admin
   const active = r.status === "open" || r.status === "in_progress" || r.status === "waiting";
 
   async function act(path: string, body: unknown) {
@@ -164,8 +165,8 @@ export function HelpDetail() {
   const viewer = r.job_id ? `/jobs/${r.job_id}/tags${r.version_number !== null ? `?v=${r.version_number}` : ""}` : null;
   return (
     <>
-      <p className="small"><Link to={isSuper ? "/admin/help" : r.group_id ? `/admin/groups/${r.group_id}/help` : "/admin"}>
-        ← {isSuper ? "Help requests" : "The group's help requests"}</Link></p>
+      <p className="small"><Link to={staff ? "/admin/help" : r.group_id ? `/admin/groups/${r.group_id}/help` : "/admin"}>
+        ← {staff ? "Help requests" : "The group's help requests"}</Link></p>
       <div className="page-head">
         <div>
           <h1>{r.filename}</h1>
@@ -175,7 +176,7 @@ export function HelpDetail() {
       </div>
       <div className="help-layout">
         <section className="panel" aria-label="Conversation">
-          <HelpThread req={r} onChange={(x) => { req.setData(x); void reloadMe(); }} label={isSuper ? `Reply to ${r.user_email}` : "Reply"} />
+          <HelpThread req={r} onChange={(x) => { req.setData(x); void reloadMe(); }} label={staff ? `Reply to ${r.user_email}` : "Reply"} />
         </section>
         <aside className="panel help-facts" aria-label="About the request">
           <h2>Request</h2>
@@ -191,7 +192,7 @@ export function HelpDetail() {
             {r.job_id && <Link className="btn secondary small" to={`/jobs/${r.job_id}`}
               state={{ back: location.pathname, backLabel: "the help request" }}>Open the document</Link>}
           </div>
-          {isSuper && (
+          {staff && (
             <>
               <div className="actions">
                 {r.assignee_email !== me?.email
@@ -212,15 +213,15 @@ export function HelpDetail() {
           )}
           {!active && <HelpOutcome req={r} />}
           {r.can_reopen && <button className="btn secondary small" onClick={() => void act("reopen", undefined)}>Reopen</button>}
-          {isSuper && (
+          {staff && (
             <label className="check">
               <input type="checkbox" checked={r.saved} onChange={(e) => void act("save", { saved: e.target.checked })} />
               <span>Keep past retention <span className="muted small">(moves it to the Saved view)</span></span>
             </label>
           )}
-          {isSuper && active && r.job_id && <CorrectedUpload r={r} onDone={(x) => req.setData(x)} />}
-          {isSuper && active && <ResolvePanel r={r} onDone={(x) => { req.setData(x); void reloadMe(); }} />}
-          {!isSuper && <p className="muted small">Super admins handle the request and change its status; you can read and reply.</p>}
+          {staff && active && r.job_id && <CorrectedUpload r={r} onDone={(x) => req.setData(x)} />}
+          {staff && active && <ResolvePanel r={r} onDone={(x) => { req.setData(x); void reloadMe(); }} />}
+          {!staff && <p className="muted small">Support (super admins and service admins) handle the request and change its status; you can read and reply.</p>}
           <ErrorNotice error={error} />
         </aside>
       </div>

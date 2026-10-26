@@ -190,8 +190,8 @@ def make_user(db: Session, email: str, group: Group | None, *, role: str | None 
     u = User(email=email, group_id=group.id if group else None)
     db.add(u)
     db.flush()
-    if role == "super_admin":
-        db.add(RoleAssignment(user_id=u.id, role="super_admin"))
+    if role in ("super_admin", "service_admin"):
+        db.add(RoleAssignment(user_id=u.id, role=role))
     if admin_of is not None:
         db.add(RoleAssignment(user_id=u.id, role="group_admin", group_id=admin_of.id))
     db.commit()

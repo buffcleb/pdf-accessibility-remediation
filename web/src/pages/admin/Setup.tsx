@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { get, patch, post, put, type AccessCheck, type Group, type Service, type User } from "../../api";
 import { useAuth } from "../../auth";
+import { acrossGroups, can } from "../../permissions";
 import { AccessCheckView } from "../../components/attention";
 import { ErrorNotice, Loading, Notice, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { useUnsavedChanges } from "../../components/unsaved";
@@ -13,9 +14,13 @@ const STEPS = ["Service and group", "Who gets it", "Pages", "Default limit", "Ch
 export function OfferService() {
   useTitle("Offer a service to a group");
   const { me, config } = useAuth();
-  const isSuper = !!me?.is_super_admin;
-  const groups = useLoad(() => get<Group[]>(isSuper ? "/admin/groups" : "/groups"), [isSuper]);
-  const services = useLoad(() => (isSuper ? get<Service[]>("/admin/services") : Promise.resolve(null)), [isSuper]);
+  // Every group and service (super admins, service admins); switching a service on for everyone (super admins);
+  // putting pages in the pool (both)
+  const across = acrossGroups(me);
+  const switches = !!me?.is_super_admin;
+  const addsPages = can(me, "pages");
+  const groups = useLoad(() => get<Group[]>(across ? "/admin/groups" : "/groups"), [across]);
+  const services = useLoad(() => (across ? get<Service[]>("/admin/services") : Promise.resolve(null)), [across]);
   const [step, setStep] = useState(0);
   const [groupId, setGroupId] = useState("");
   const [key, setKey] = useState("");
@@ -29,25 +34,25 @@ export function OfferService() {
   const [error, setError] = useState<unknown>(null);
   const [done, setDone] = useState<{ check: AccessCheck | null; checkError: unknown } | null>(null);
   useUnsavedChanges(!done && (step > 0 || key !== ""));
-  const onlyGroup = !isSuper && groups.data?.length === 1 ? groups.data[0].id : "";
+  const onlyGroup = !across && groups.data?.length === 1 ? groups.data[0].id : "";
   const memberGroup = groupId || onlyGroup;
   const members = useLoad(() => (memberGroup ? get<User[]>(`/groups/${memberGroup}/users?limit=1000`) : Promise.resolve([] as User[])), [memberGroup]);
 
   if (groups.loading && !groups.data) return <Loading />;
   if (!groups.data) return <ErrorNotice error={groups.error} />;
-  const group = groups.data.find((g) => g.id === groupId) ?? (!isSuper && groups.data.length === 1 ? groups.data[0] : null);
+  const group = groups.data.find((g) => g.id === groupId) ?? (!across && groups.data.length === 1 ? groups.data[0] : null);
   const gs = group?.services.find((x) => x.key === key) ?? null;
-  const svcList = isSuper ? (services.data ?? []).map((s) => ({ key: s.key, label: s.label, on: s.enabled, external: s.external, metered: s.metered }))
+  const svcList = across ? (services.data ?? []).map((s) => ({ key: s.key, label: s.label, on: s.enabled, external: s.external, metered: s.metered }))
     : (group?.services ?? []).filter((x) => x.globally_enabled).map((x) => ({ key: x.key, label: x.label, on: x.globally_enabled, external: x.external, metered: x.metered }));
   const svc = svcList.find((x) => x.key === key) ?? null;
   const blocked = !!(svc?.external && group?.local_only);
   const active = (members.data ?? []).filter((u) => u.status === "active");
   const people = everyone ? active.length : chosen.size;
-  const pool = (gs?.balance.remaining_pages ?? 0) + (isSuper ? Number(pages || 0) : 0);
+  const pool = (gs?.balance.remaining_pages ?? 0) + (addsPages ? Number(pages || 0) : 0);
   const capN = cap === "" ? null : Number(cap);
-  const canNext = step === 0 ? !!(group && svc && !blocked && (svc.on || (isSuper && switchOn)))
+  const canNext = step === 0 ? !!(group && svc && !blocked && (svc.on || (switches && switchOn)))
     : step === 1 ? everyone || chosen.size > 0
-      : step === 2 ? !isSuper || pages === "" || (Number(pages) > 0 && ticket.trim().length > 0)
+      : step === 2 ? !addsPages || pages === "" || (Number(pages) > 0 && ticket.trim().length > 0)
         : true;
 
   async function finish() {
@@ -55,14 +60,14 @@ export function OfferService() {
     setBusy(true);
     setError(null);
     try {
-      if (isSuper && !svc.on) await patch(`/admin/services/${encodeURIComponent(svc.key)}`, { enabled: true });
+      if (switches && !svc.on) await patch(`/admin/services/${encodeURIComponent(svc.key)}`, { enabled: true });
       const body: Record<string, unknown> = { enabled: true, all_users: everyone };
       if (svc.metered) body.default_user_cap = capN;
       await patch(`/groups/${group.id}/services/${encodeURIComponent(svc.key)}`, body);
       if (!everyone) {
         for (const id of chosen) await put(`/groups/${group.id}/users/${id}/services/${encodeURIComponent(svc.key)}`, { granted: true });
       }
-      if (isSuper && svc.metered && Number(pages) > 0) {
+      if (addsPages && svc.metered && Number(pages) > 0) {
         await post(`/admin/groups/${group.id}/topups`, { service: svc.key, pages: Number(pages), ticket_ref: ticket.trim() });
       }
       const sample = everyone ? active[0] : active.find((u) => chosen.has(u.id));
@@ -116,14 +121,14 @@ export function OfferService() {
                   {groups.data.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
                 </select></div>
               <div className="field"><label htmlFor="w-svc">Service</label>
-                <select id="w-svc" value={key} onChange={(e) => setKey(e.target.value)} disabled={!group && !isSuper}>
+                <select id="w-svc" value={key} onChange={(e) => setKey(e.target.value)} disabled={!group && !across}>
                   <option value="">Choose…</option>
                   {svcList.filter((x) => x.key !== "standard").map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}
                 </select></div>
             </div>
-            {group && !isSuper && svcList.filter((x) => x.key !== "standard").length === 0 && (
+            {group && !across && svcList.filter((x) => x.key !== "standard").length === 0 && (
               <Notice kind="info">No other services are switched on yet. A super admin switches services on; ask them if your group needs one.</Notice>)}
-            {svc && !svc.on && (isSuper
+            {svc && !svc.on && (switches
               ? <label className="check"><input type="checkbox" checked={switchOn} onChange={(e) => setSwitchOn(e.target.checked)} />
                 <span>{svc.label} is switched off for everyone: switch it on</span></label>
               : <Notice kind="warn">{svc.label} is switched off for everyone. A super admin has to switch it on first.</Notice>)}
@@ -148,7 +153,7 @@ export function OfferService() {
             )}
           </>
         )}
-        {step === 2 && (!svc!.metered ? <p>{svc!.label} has no page limits: use is counted, never limited. Nothing to add.</p> : isSuper ? (
+        {step === 2 && (!svc!.metered ? <p>{svc!.label} has no page limits: use is counted, never limited. Nothing to add.</p> : addsPages ? (
           <>
             <p>A group needs pages in its pool, or everyone sees 0 left whatever their limit. {group!.name} has {fmtNum(gs?.balance.remaining_pages ?? 0)} {svc!.label} pages now.</p>
             <div className="form-row">
@@ -175,9 +180,9 @@ export function OfferService() {
         ))}
         {step === 4 && (
           <ul>
-            {isSuper && !svc!.on && <li>Switch {svc!.label} on for everyone</li>}
+            {switches && !svc!.on && <li>Switch {svc!.label} on for everyone</li>}
             <li>{gs?.enabled ? "Keep" : "Turn"} {svc!.label} on for {group!.name}, for {everyone ? "everyone" : `${chosen.size} chosen ${chosen.size === 1 ? "person" : "people"}`}</li>
-            {isSuper && svc!.metered && Number(pages) > 0 && <li>Add {fmtNum(Number(pages))} pages to the group's pool (ticket {ticket})</li>}
+            {addsPages && svc!.metered && Number(pages) > 0 && <li>Add {fmtNum(Number(pages))} pages to the group's pool (ticket {ticket})</li>}
             {svc!.metered && <li>Default limit: {capN === null ? "no personal limit" : `${fmtNum(capN)} pages per person`}</li>}
             <li>Then check that one of them can use it</li>
           </ul>

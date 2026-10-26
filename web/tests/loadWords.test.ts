@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ANNOUNCE_EVERY, LARGE_NOTE, READING_TAGS, amount, announceNow, downloading, drawingPage, fraction, isLarge,
+  pageLoading, tagsLoading, type Loading,
 } from "../src/components/loadWords";
 
 const MB = 1024 * 1024;
@@ -48,4 +49,32 @@ test("screen readers hear a change at most every few seconds", () => {
   assert.ok(!announceNow({ text: "a", at: 0 }, "a", ANNOUNCE_EVERY * 2));      // nothing new
   assert.ok(!announceNow({ text: "a", at: 0 }, "b", ANNOUNCE_EVERY - 1));      // too soon: held back
   assert.ok(announceNow({ text: "a", at: 0 }, "b", ANNOUNCE_EVERY));
+});
+
+// #579: the tag map loads on its own, so the tree waits only for it, and the page view for both
+const start: Loading = { pdf: { received: 0, total: null }, tags: { received: 0, total: null }, reading: false, pages: null };
+
+test("the tree waits for the tags alone", () => {
+  const load = { ...start, pdf: { received: 10 * MB, total: 70 * MB }, tags: { received: 1 * MB, total: 4 * MB } };
+  assert.deepEqual(tagsLoading(load), { lines: ["Downloading the tags (1 of 4 MB)"], fraction: 0.25 });
+  assert.deepEqual(tagsLoading(null), { lines: ["Downloading the tags"], fraction: null });
+  // gzipped: the size isn't known, so a spinner and the bytes so far
+  assert.deepEqual(tagsLoading({ ...load, tags: { received: 2 * MB, total: null } }),
+    { lines: ["Downloading the tags (2 MB so far)"], fraction: null });
+});
+
+test("the page view waits for both, then reads", () => {
+  const load = { ...start, pdf: { received: 12 * MB, total: 48 * MB }, tags: { received: 0, total: null } };
+  assert.deepEqual(pageLoading(load).lines, ["Downloading the document (12 of 48 MB)", "Downloading the tags"]);
+  // the recorded size stands in for a download that doesn't say
+  assert.deepEqual(pageLoading({ ...load, pdf: { received: 12 * MB, total: null } }, 48 * MB).lines[0],
+    "Downloading the document (12 of 48 MB)");
+  // the PDF in and being opened, the tags still coming: only the tags are waited for
+  assert.deepEqual(pageLoading({ ...load, reading: true, tags: { received: 1 * MB, total: 2 * MB } }),
+    { lines: ["Downloading the tags (1 of 2 MB)"], fraction: 0.5 });
+  // both in
+  assert.deepEqual(pageLoading({ ...load, reading: true, pages: 332 }), { lines: [READING_TAGS], fraction: null });
+  // the tags in first: the document is still downloading
+  assert.deepEqual(pageLoading({ ...load, pages: 332, tags: { received: 2 * MB, total: 2 * MB } }).lines,
+    ["Downloading the document (12 of 48 MB)", "Downloading the tags (2 of 2 MB)"]);
 });

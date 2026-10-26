@@ -115,3 +115,67 @@ def test_a_blank_box_in_the_drawing_gets_an_empty_cell_in_its_place(tmp_path):
 def test_with_no_table_drawn_the_short_row_is_padded_at_the_end(tmp_path):
     rows = _run(tmp_path, drawn=False)
     assert [t for t, _ in rows[2]] == ["Pear", "Green", ""]
+
+
+def _titled_table_pdf(path):
+    """A two-column ruled table under a title row drawn across both columns, the title tagged TH alone in its row."""
+    pdf = pikepdf.new()
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica,
+                                        Encoding=Name.WinAnsiEncoding))
+    cols, rows = [60, 260, 460], [730, 700, 670, 640]
+    texts = [[("Table 1. Fruit and colour", 0, "TH")], [("Apple", 0, "TD"), ("Red", 1, "TD")],
+             [("Pear", 0, "TD"), ("Green", 1, "TD")]]
+    content, placed, mcid = [], [], 0
+    for r, row in enumerate(texts):
+        ids = []
+        for text, col, role in row:
+            content.append(f"/{role} <</MCID {mcid}>> BDC BT /F1 10 Tf {cols[col] + 6} {rows[r + 1] + 10} Td ({text}) "
+                           "Tj ET EMC")
+            ids.append((mcid, role))
+            mcid += 1
+        placed.append(ids)
+    lines = [f"{cols[0]} {rows[3]} {cols[2] - cols[0]} {rows[0] - rows[3]} re S",
+             f"{cols[1]} {rows[1]} m {cols[1]} {rows[3]} l S"]
+    lines += [f"{cols[0]} {y} m {cols[2]} {y} l S" for y in rows[1:3]]
+    content.append("/Artifact BMC 0 G 1 w " + " ".join(lines) + " EMC")
+    page = pdf.make_indirect(Dictionary(
+        Type=Name.Page, MediaBox=Array([0, 0, 612, 792]), Resources=Dictionary(Font=Dictionary(F1=font)),
+        Contents=pdf.make_stream("\n".join(content).encode())))
+    pdf.Root.Pages = pdf.make_indirect(Dictionary(Type=Name.Pages, Kids=Array([page]), Count=1))
+    page.Parent = pdf.Root.Pages
+    root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
+    doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root))
+    table = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Table, P=doc, Pg=page))
+    trs, cells = [], []
+    for ids in placed:
+        tr = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.TR, P=table, Pg=page))
+        row = [pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name("/" + role), P=tr, Pg=page, K=i))
+               for i, role in ids]
+        tr.K = Array(row)
+        trs.append(tr)
+        cells += row
+    table.K = Array(trs)
+    doc.K, root.K = Array([table]), Array([doc])
+    root.ParentTree = pdf.make_indirect(Dictionary(Nums=Array([0, Array(cells)])))
+    page.StructParents = 0
+    pdf.Root.StructTreeRoot = root
+    pdf.Root.MarkInfo = Dictionary(Marked=True)
+    pdf.save(path)
+
+
+def test_a_spanning_header_keeps_its_span_and_scope_in_one_table_dictionary(tmp_path):
+    """PAC reads one Table attribute dictionary per cell: the Scope written in a second one, beside the ColSpan, left
+    the title's header cell with "no associated subcells" (6 errors on the 332-page guideline after #559)."""
+    src, out = tmp_path / "in.pdf", tmp_path / "out.pdf"
+    _titled_table_pdf(src)
+    tag_document(src, out, prepare_analysis(src), title="Fruit", language="en-US", pdfua_part=1)
+    with pikepdf.open(out) as pdf:
+        findings, _ = check_integrity(pdf)
+        assert [f for f in findings if f.severity == "error"] == []
+        ths = [o for o in pdf.objects if isinstance(o, Dictionary) and o.get("/S") == Name.TH]
+        assert len(ths) == 1
+        attrs = ths[0].get("/A")
+        tables = [a for a in (list(attrs) if isinstance(attrs, Array) else [attrs])
+                  if isinstance(a, Dictionary) and a.get("/O") == Name.Table]
+        assert len(tables) == 1
+        assert int(tables[0].ColSpan) == 2 and "/Scope" in tables[0]

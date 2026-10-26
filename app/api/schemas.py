@@ -20,6 +20,9 @@ class RemediationFlags(BaseModel):
     validator: Literal["service", "command_line"] | None = Field(
         default=None, description="veraPDF's running service or its command line; default: the service when configured")
     verapdf_ua2: bool = Field(default=True, description="Also check PDF/UA-2 (shown for information)")
+    pdfua: Literal["1", "2", "both"] = Field(
+        default="1", description="The PDF/UA part delivered: 1 (PDF/UA-1), 2 (the file as PDF 2.0, PDF/UA-2) or both "
+        "(a PDF/UA-2 copy of the main file besides it). A PDF 2.0 document can only be PDF/UA-2")
     report_branding: dict[str, str] | None = Field(
         default=None, description="For the PDF report: service_name, organization, accent_color (#rrggbb), ai_label")
 
@@ -47,6 +50,7 @@ class Files(BaseModel):
     remediated_primary: str | None = None
     remediated_visual_fallback: str | None = None
     enhanced: str | None = None  # Adobe route with AI: Adobe's file plus AI alt text (a separate copy)
+    remediated_pdfua2: str | None = None  # flags.pdfua "both": the main file as PDF 2.0, PDF/UA-2 (#445)
 
 
 class Reports(BaseModel):

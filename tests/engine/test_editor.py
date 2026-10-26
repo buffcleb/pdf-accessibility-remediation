@@ -10,6 +10,7 @@ from app.tagging.editor import EditError, apply_edits, validate_ops
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import integrity_errors
 
 
 def _tag(samples, tmp_path_factory, name):
@@ -32,12 +33,6 @@ def table(samples, tmp_path_factory):
     return _tag(samples, tmp_path_factory, "table_doc")
 
 
-def _errors(path):
-    with pikepdf.open(path) as pdf:
-        findings, _ = check_integrity(pdf)
-    return [f for f in findings if f.severity == "error"]
-
-
 def _pixels(path):
     with fitz.open(path) as doc:
         return [p.get_pixmap(dpi=60).samples for p in doc]
@@ -50,7 +45,7 @@ def _first(tm, role):
 def _edit(src, tmp_path, ops):
     dst = tmp_path / "edited.pdf"
     log = apply_edits(src, dst, ops)
-    assert _errors(dst) == [], "edit broke the tag tree"
+    assert integrity_errors(dst) == [], "edit broke the tag tree"
     assert _pixels(dst) == _pixels(src), "edit changed how the page looks"
     return dst, log
 
@@ -236,7 +231,7 @@ def test_merge_then_split_round_trip_stays_valid(report, tmp_path):
     merged = next(e for e in mid["elements"] if e.get("parts") and e["role"] == "P" and len(e["parts"]) >= 3)
     out = tmp_path / "split.pdf"
     apply_edits(dst, out, [{"op": "split", "element": merged["i"], "expect_role": "P", "at": len(merged["parts"]) - 1}])
-    assert _errors(out) == []
+    assert integrity_errors(out) == []
     assert _pixels(out) == _pixels(report)
 
 
@@ -516,7 +511,7 @@ def test_a_link_in_an_entry_stays_inside_its_reference(tmp_path):
     lst = _first(build_tagmap(listed), "L")
     dst = tmp_path / "toc.pdf"
     apply_edits(listed, dst, [{"op": "make_toc", "element": lst["i"], "expect_role": "L"}])
-    assert _errors(dst) == []
+    assert integrity_errors(dst) == []
     after = build_tagmap(dst)
     links = [e for e in after["elements"] if e["role"] == "Link"]
     assert len(links) == 2 and all(after["elements"][k["parent"]]["role"] == "Reference" for k in links)
@@ -1193,7 +1188,7 @@ def test_two_header_rows_name_their_headers_and_a_caption_comes_and_goes(table, 
     dst2 = tmp_path / "nocap.pdf"
     apply_edits(dst, dst2, [{"op": "rebuild_table", "element": t2["i"], "expect_role": "Table",
                              "rows": _as_is(after, t2["i"]), "caption": None}])
-    assert _errors(dst2) == []
+    assert integrity_errors(dst2) == []
     again = build_tagmap(dst2)
     t3 = _first(again, "Table")
     before = again["elements"][again["elements"][t3["i"]]["parent"]]["kids"]

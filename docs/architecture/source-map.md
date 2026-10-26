@@ -43,7 +43,7 @@ app/                         the remediation engine
                 structure_rules.py   tags at the right level, and figures' placement and boxes, as PAC checks
                 mathml_tags.py, mathml_embed.py   a document's own MathML kept; MathML put on Formula tags (PDF 2.0)
                 table_headers.py, bookmarks.py   cells linked to their headers; bookmarks from the headings
-                editor.py, role_rules.py   tag edits, and which role changes are valid
+                editor/, role_rules.py   tag edits (one module per kind), and which role changes are valid
                 placement.py, reorder.py   where added tags go among kept ones; kept tags put in reading order
                 empty_spans.py, legend.py  Spans around nothing, folded away; marks a page's legend explains
                 form_marks.py, blank_fonts.py   check marks redrawn as shapes; fonts that draw nothing
@@ -59,6 +59,7 @@ app/                         the remediation engine
 
 portal/                      the portal API and worker
   main.py, config.py, db.py, deps.py, errors.py
+  permissions.py             what each admin role may do, named once for the routes (#564)
   models.py, migrations/     tables and Alembic migrations
   identity.py, approval.py   who may sign in and which group they join; member approval
   services.py, quota.py      who can use what; page accounting per service (the ledger)
@@ -72,7 +73,7 @@ portal/                      the portal API and worker
   api_tokens.py              personal API tokens for scripts
   malware.py                 uploads streamed to ClamAV before they're stored
   export.py, paging.py       zips of many documents, made as they're sent; one page of a list
-  alerts.py, pool_alerts.py  the service's alerts to super admins; a group's pool running low
+  alerts.py, pool_alerts.py  the service's alerts to super admins and service admins; a group's pool running low
   metrics.py, prometheus.py, workloads.py   the portal's Prometheus metrics; reading Prometheus; the System page's pods
   workload_catalog.py        what each workload is and where it comes from (the pods' details)
   privacy.py, removal.py     a person's data exported or removed; documents' files removed early, documents deleted
@@ -101,7 +102,8 @@ config/litellm.yaml          the AI gateway's models
 docker/                      the music reader (audiveris), the formula reader (formula), mathcat-cli (mathcat),
                              the web image's nginx (web)
 deploy/k8s/                  Kubernetes manifests and settings templates (23-redis-portal: the portal's own Redis;
-                             26-egress-proxy and 82-egress-enforce: outbound traffic; 27-clamav: malware scanning;
+                             26-egress-proxy, 82-egress-enforce, 83-egress-deny and 84-egress-direct: outbound
+                             traffic; 27-clamav: malware scanning;
                              35-verapdf: the veraPDF service and its hourly restart; 37-formula: the formula reader;
                              45-autoscale: scaling with the queue; 62-traefik-api-origin: the API origin on Traefik;
                              80-network-policies; 90-backup: the nightly backup; 95-monitoring and monitoring/:
@@ -114,6 +116,7 @@ scripts/                     build.sh (and its Trivy scan), deploy.sh, deploy-wo
                              rotate-secret.sh, check_cluster_encryption.sh (read-only), sign-in-code.sh,
                              audit-deps.sh (pip-audit and npm audit, for CI and the weekly audit),
                              regression.sh (the regression documents), a11y.sh (axe over the web app), publish.sh
-harness/                     make_samples.py (synthetic PDFs), run_harness.py (batch tester), run_folder.py, ocr_eval.py
+harness/                     make_samples.py (synthetic PDFs), run_harness.py (batch tester), run_folder.py, ocr_eval.py,
+                             roles_dump.py (did a change alter any document: roles and tag maps compared)
 tests/                       engine/ and portal/ test suites; a11y/ (the web app's accessibility checks)
 ```

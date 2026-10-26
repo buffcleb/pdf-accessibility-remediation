@@ -12,7 +12,7 @@ export type MenuAct = "split-text" | "delete" | "read" | "report" | "show" | "ty
 export type MenuItem = {
   id: string;
   label: string;
-  group: "type" | "shape" | "list" | "order" | "note" | "artifact" | "area" | "more";
+  group: "type" | "shape" | "list" | "order" | "note" | "toc" | "artifact" | "area" | "more";
   note?: string;       // what else choosing it does ("the text is wrapped in a list with one item")
   disabled?: string;   // why it can't be chosen now
   ops?: TagEdit[];     // the unsaved changes as they would be after choosing it
@@ -23,10 +23,12 @@ export type MenuItem = {
 export const MENU_ROLES = ["P", "H1", "H2", "H3", "H4", "H5", "H6", "L", "Caption", "Figure", "Formula"];
 
 /** Text tags that can become a list item as they are (the engine's LIST_ITEM_FROM). */
-export const LIST_ITEM_FROM = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "Code", "BibEntry"];
+export const LIST_ITEM_FROM = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "FENote", "Code", "BibEntry"];
+/** A footnote or endnote: PDF 1.7's Note, or PDF 2.0's FENote, as a PDF/UA-2 file has them (#633). */
+export const isNote = (role: string) => role === "Note" || role === "FENote";
 /** Tags that can be made an artifact, with everything in them (#364): text and figures, and the groups that hold
  * them. A cell, a list's parts or a link would leave the structure around them broken. */
-const ARTIFACT_FROM = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "Code", "Quote", "Span",
+const ARTIFACT_FROM = ["H", "H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "FENote", "Code", "Quote", "Span",
   "Figure", "Formula", "Div", "Sect", "Art", "Part"];
 const ARTIFACT_KINDS: { as: "layout" | "header" | "footer" | "page_number"; label: string; note: string }[] = [
   { as: "layout", label: "Decoration", note: "A rule, a border, an ornament: screen readers skip it." },
@@ -62,9 +64,34 @@ function outermostList(map: TagMap, e: TagElement): TagElement | null {
 
 /** The note a tag points at, with a pending change applied, or null. */
 export function pointsAt(map: TagMap, ops: TagEdit[], i: number): number | null {
-  let out: number | null = map.elements[i]?.refs?.find((r) => map.elements[r]?.role === "Note") ?? null;
+  let out: number | null = map.elements[i]?.refs?.find((r) => isNote(map.elements[r]?.role ?? "")) ?? null;
   for (const op of ops) if (op.op === "link_note" && op.element === i) out = op.note;
   return out;
+}
+
+/** The heading a contents entry goes to, with a pending change applied, or null (#631). */
+export function goesTo(map: TagMap, ops: TagEdit[], i: number): number | null {
+  let out: number | null = map.elements[i]?.refs?.[0] ?? null;
+  for (const op of ops) if (op.op === "set_toc_target" && op.element === i) out = op.target;
+  return out;
+}
+
+/** A contents entry's or heading's words, without dot leaders, the page number after them or a number before. */
+export function titleWords(text: string | undefined): string[] {
+  const t = (text ?? "").replace(/(?:[.\u2026\u00b7_]\s*){2,}/g, " ").trim()
+    .replace(/\s+(?:\d{1,4}|[ivxlc]{1,6})$/i, "").replace(/^(?:\d{1,3}(?:\.\d{1,3})*\.?|[a-z]\.|[ivxlc]{1,6}\.)\s+/i, "");
+  return t.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+/** The headings a contents entry may go to, the likeliest first: the most words in common with the entry, then in
+ * document order. */
+export function headingChoices(map: TagMap, ops: TagEdit[], i: number, limit = 12): TagElement[] {
+  const over = overrides(ops, map);
+  const roleOf = (e: TagElement) => over.get(e.i)?.role ?? e.role;
+  const mine = new Set(titleWords(map.elements[i]?.text));
+  const shared = (e: TagElement) => titleWords(e.text).filter((w) => mine.has(w)).length;
+  return map.elements.filter((e) => /^H[1-6]?$/.test(roleOf(e)))
+    .map((e) => ({ e, n: shared(e) })).sort((a, b) => b.n - a.n || a.e.i - b.e.i).slice(0, limit).map((x) => x.e);
 }
 
 /** The selected tags in the order they're read (tags with no place in it last, in tree order). */
@@ -273,9 +300,9 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
     // A footnote the rules didn't link: the mark (or the text it's in) points at its note
     const over = overrides(ops, map);
     const roleOf2 = (e: TagElement) => over.get(e.i)?.role ?? e.role;
-    if (roleOf2(one) !== "Note") {
+    if (!isNote(roleOf2(one)) && roleOf2(one) !== "TOCI") {
       const near = (e: TagElement) => Math.abs((e.page ?? 0) - (one.page ?? 0));
-      const notes = map.elements.filter((e) => roleOf2(e) === "Note" && e.i !== one.i && near(e) <= 1)
+      const notes = map.elements.filter((e) => isNote(roleOf2(e)) && e.i !== one.i && near(e) <= 1)
         .sort((a, b) => near(a) - near(b) || a.i - b.i).slice(0, 12);
       const now = pointsAt(map, ops, one.i);
       for (const n of notes) {
@@ -286,6 +313,19 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
       if (now !== null) {
         items.push({ id: "note:none", group: "note", label: "Doesn't point at a footnote", disabled: readOnly,
           ops: addEdit(ops, { op: "link_note", element: one.i, expect_role: one.role, note: null }) });
+      }
+    }
+    // A table of contents entry goes to its heading (#631): the headings with most words in common first
+    if (roleOf2(one) === "TOCI") {
+      const now = goesTo(map, ops, one.i);
+      for (const h of headingChoices(map, ops, one.i)) {
+        items.push({ id: `toc:${h.i}`, group: "toc", label: `Goes to “${(h.text ?? "a heading").slice(0, 40)}”${h.page !== one.page ? ` (page ${h.page})` : ""}`,
+          disabled: readOnly ?? (now === h.i ? "It already goes to this heading." : undefined),
+          ops: addEdit(ops, { op: "set_toc_target", element: one.i, expect_role: one.role, target: h.i }) });
+      }
+      if (now !== null) {
+        items.push({ id: "toc:none", group: "toc", label: "Goes to no heading", disabled: readOnly,
+          ops: addEdit(ops, { op: "set_toc_target", element: one.i, expect_role: one.role, target: null }) });
       }
     }
     items.push({ id: "edit", group: "more", label: canEdit ? "Edit tag…" : "Tag details…", act: "edit",
@@ -336,8 +376,8 @@ export function menuAndTypes(items: MenuItem[]): { menu: MenuItem[]; types: Menu
  * kind with a single choice ("Change type…") and the everyday actions under "More" are on the top level itself. */
 export type MenuEntry = { kind: "item"; item: MenuItem } | { kind: "group"; group: MenuItem["group"]; label: string; items: MenuItem[]; none: boolean };
 
-export const GROUP_NAMES: Record<MenuItem["group"], string> = { type: "Type", shape: "Merge and split", list: "Lists and tables", order: "Reading order", note: "Footnote", artifact: "Mark as artifact", area: "Areas", more: "More" };
-const GROUP_ORDER: MenuItem["group"][] = ["type", "shape", "list", "order", "note", "artifact", "area", "more"];
+export const GROUP_NAMES: Record<MenuItem["group"], string> = { type: "Type", shape: "Merge and split", list: "Lists and tables", order: "Reading order", note: "Footnote", toc: "Goes to", artifact: "Mark as artifact", area: "Areas", more: "More" };
+const GROUP_ORDER: MenuItem["group"][] = ["type", "shape", "list", "order", "note", "toc", "artifact", "area", "more"];
 const FLAT: MenuItem["group"][] = ["area", "more"];
 
 export function menuEntries(items: MenuItem[]): MenuEntry[][] {

@@ -2,8 +2,11 @@
 
 [Guide for super admins](README.md) › Help requests
 
+> **Changed 23 October 2026:** [service admins](../service-admins/README.md) handle requests too, as support, with everything on
+> this page; the emails go to them as well (#564).
+
 **Administration → Help requests** has every request, a page at a time, oldest wait first (click **Waiting** or
-**Document** to sort). A badge counts the ones waiting on a super admin: new, or the person replied. Show what needs
+**Document** to sort). A badge counts the ones waiting on support: new, or the person replied. Show what needs
 you, what isn't finished, one status or everything; pick a kind, a group under **Filters**, or search by document or
 person.
 

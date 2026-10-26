@@ -1,16 +1,14 @@
 """Headings on flattened pages: the second look reads a heading and the paragraph under it as one block."""
-from app.pipeline.models import DocumentAnalysis, PageAnalysis, TextBlock
 from app.pipeline.transfer import transfer_enrichment
+from tests.engine.layout import block, document, page
 
 
 def _page(blocks):
-    page = PageAnalysis(number=0, width=600, height=800, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 800), blocks=blocks)
-    return DocumentAnalysis(page_count=1, pages=[page], title=None, language=None, has_struct_tree=False,
-                            is_marked=False)
+    return document(page(*blocks, width=600, height=800))
 
 
 def _block(i, bbox, text, role="P", bold=False):
-    return TextBlock(id=f"b{i}", page=0, bbox=bbox, text=text, font_size=11, role=role, bold=bold)
+    return block(f"b{i}", bbox, text, role, bold=bold)
 
 
 def test_a_block_holding_a_heading_and_its_paragraph_is_divided_where_they_were():

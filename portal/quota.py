@@ -2,11 +2,13 @@
 
 Every service has a page pool at three levels: global (optional), per group, and a cap per user. A job
 reserves its pages on every service it uses (its processing service and, later, its AI tier) at all
-three levels at once, or not at all.
+three levels at once, or not at all. A subgroup has no pool of its own (#431): its documents use its
+parent's, up to the subgroup's own cap when it has one, and its own rows count what it has used.
 
 Every change goes through here and writes ledger entries in the same transaction. Rows are locked
-(SELECT ... FOR UPDATE) in one fixed order, services by key, then the group's service rows, then the
-user's, so parallel uploads and job completions can't overspend, lose updates or deadlock.
+(SELECT ... FOR UPDATE) in one fixed order, services by key, then the group's service rows (a parent's
+before its subgroup's), then the user's, so parallel uploads and job completions can't overspend, lose
+updates or deadlock.
 """
 from __future__ import annotations
 
@@ -57,6 +59,20 @@ def _lock_group_services(db: Session, group_id: uuid.UUID, keys: list[str]) -> d
     return {r.service_key: r for r in rows}
 
 
+def _lock_pools(db: Session, group: Group, keys: list[str]
+                ) -> tuple[dict[str, GroupService], dict[str, GroupService]]:
+    """The rows of the pool a group's documents use, and the group's own rows: the same rows for a group, its
+    parent's then its own for a subgroup (each created if missing, so their counts can move)."""
+    if group.parent_id is None:
+        gss = _lock_group_services(db, group.id, keys)
+        return gss, gss
+    for g in (group.pool, group):
+        for key in keys:
+            svc.group_service(db, g, key, create=True)
+    db.flush()
+    return _lock_group_services(db, group.parent_id, keys), _lock_group_services(db, group.id, keys)
+
+
 def _lock_user_services(db: Session, user: User, keys: list[str]) -> dict[str, UserService]:
     """The user's rows for these services, created if missing (a new row starts at zero)."""
     missing = [k for k in keys if user.service(k) is None]
@@ -74,12 +90,14 @@ def _lock_user_services(db: Session, user: User, keys: list[str]) -> dict[str, U
 
 def _entry(db: Session, *, service: str, scope: str, kind: str, pages: int, actor: Actor,
            gs: GroupService | None = None, s: Service | None = None, user: User | None = None,
+           sub: GroupService | None = None,
            job_id: uuid.UUID | None = None, ticket_ref: str | None = None, ticket_url: str | None = None,
            override: bool = False, comment: str | None = None) -> QuotaLedger:
     pool, used, reserved = ((gs.pool_pages, gs.used_pages, gs.reserved_pages) if scope == "group"
                             else (s.pool_pages or 0, s.used_pages, s.reserved_pages))
     entry = QuotaLedger(
         group_id=gs.group_id if scope == "group" else None, user_id=user.id if user else None, job_id=job_id,
+        subgroup_id=sub.group_id if sub is not None and sub is not gs else None,
         service_key=service, scope=scope, kind=kind, pages=pages, ticket_ref=ticket_ref, ticket_url=ticket_url,
         override=override, comment=comment, actor_id=actor.id, actor_email=actor.email, ip=actor.ip,
         pool_after=pool, used_after=used, reserved_after=reserved)
@@ -93,7 +111,8 @@ def group_remaining(gs: GroupService) -> int:
 
 def over_quota_message(db: Session, group: Group) -> tuple[str, str | None]:
     runtime = settings_store.load(db)
-    return group.over_quota_message or runtime.over_quota_message, runtime.support_url
+    return (group.over_quota_message or group.pool.over_quota_message or runtime.over_quota_message,
+            runtime.support_url)
 
 
 def check_access(db: Session, user: User, keys: list[str], pages: int) -> None:
@@ -116,9 +135,10 @@ def reserve(db: Session, user: User, pages: int, job_id: uuid.UUID, keys: list[s
         raise ApiError(403, "group_disabled", "Your group isn't active.")
     check_access(db, user, keys, pages)
     services = _lock_services(db, keys)
-    gss = _lock_group_services(db, group.id, keys)
+    gss, subs = _lock_pools(db, group, keys)
     uss = _lock_user_services(db, user, keys)
     msg, support = over_quota_message(db, group)
+    whose = "Your group" if group.parent_id is None else f"{group.pool.name}, whose pages your group uses,"
     for key in keys:
         s, gs, us = services[key], gss[key], uss[key]
         if not s.metered:
@@ -128,8 +148,13 @@ def reserve(db: Session, user: User, pages: int, job_id: uuid.UUID, keys: list[s
                             max(0, s.pool_pages - s.used_pages - s.reserved_pages), pages, support, key)
         if pages > group_remaining(gs):
             left = max(0, group_remaining(gs))
-            raise OverQuota(f"Your group has {left:,} {s.label} page{'' if left == 1 else 's'} left and this document "
+            raise OverQuota(f"{whose} has {left:,} {s.label} page{'' if left == 1 else 's'} left and this document "
                             f"needs {pages:,}. " + msg, "group", left, pages, support, key)
+        sub_left = svc.subgroup_left(subs[key]) if group.parent_id else None
+        if sub_left is not None and pages > sub_left:
+            left = max(0, sub_left)
+            raise OverQuota(f"Your group has {left:,} {s.label} page{'' if left == 1 else 's'} left of its limit and "
+                            f"this document needs {pages:,}. " + msg, "subgroup", left, pages, support, key)
         cap = svc.effective_cap(user, key)
         if cap is not None and pages > cap - us.used_pages - us.reserved_pages:
             left = max(0, cap - us.used_pages - us.reserved_pages)
@@ -137,12 +162,14 @@ def reserve(db: Session, user: User, pages: int, job_id: uuid.UUID, keys: list[s
                             f"document needs {pages:,}. " + msg, "user", left, pages, support, key)
     actor = Actor(user.id, user.email)
     for key in keys:
-        s, gs, us = services[key], gss[key], uss[key]
+        s, gs, sub, us = services[key], gss[key], subs[key], uss[key]
         s.reserved_pages += pages
         gs.reserved_pages += pages
+        if sub is not gs:
+            sub.reserved_pages += pages
         us.reserved_pages += pages
         _entry(db, service=key, scope="group", kind="reserve", pages=pages, actor=actor, gs=gs, user=user,
-               job_id=job_id)
+               job_id=job_id, sub=sub)
 
 
 def _settle(db: Session, job: Job, kind: str, reason: str | None) -> None:
@@ -151,22 +178,22 @@ def _settle(db: Session, job: Job, kind: str, reason: str | None) -> None:
         return
     p = job.pages_charged
     services = _lock_services(db, keys)
-    gss = _lock_group_services(db, job.group_id, keys)
+    group = db.get(Group, job.group_id)
+    gss, subs = (_lock_pools(db, group, keys) if group is not None and group.parent_id
+                 else (_lock_group_services(db, job.group_id, keys),) * 2)
     user = db.get(User, job.user_id)
     uss = _lock_user_services(db, user, keys)
     for key in keys:
-        s, gs, us = services.get(key), gss.get(key), uss[key]
+        s, gs, sub, us = services.get(key), gss.get(key), subs.get(key), uss[key]
         if s is None or gs is None:
             continue
-        s.reserved_pages = max(0, s.reserved_pages - p)
-        gs.reserved_pages = max(0, gs.reserved_pages - p)
-        us.reserved_pages = max(0, us.reserved_pages - p)
-        if kind == "commit":
-            s.used_pages += p
-            gs.used_pages += p
-            us.used_pages += p
+        rows = [gs] if sub is None or sub is gs else [gs, sub]
+        for row in (s, *rows, us):
+            row.reserved_pages = max(0, row.reserved_pages - p)
+            if kind == "commit":
+                row.used_pages += p
         _entry(db, service=key, scope="group", kind=kind, pages=p, actor=SYSTEM, gs=gs, user=user, job_id=job.id,
-               comment=reason)
+               comment=reason, sub=sub)
 
 
 def release_service(db: Session, job: Job, key: str, reason: str) -> None:
@@ -209,6 +236,34 @@ def _service_or_404(db: Session, key: str, lock: bool = False) -> Service:
     return s
 
 
+def _pool_group(db: Session, group_id: uuid.UUID) -> Group:
+    """A group whose pool pages may be added to or taken from: not a subgroup, whose pages are its parent's."""
+    group = db.get(Group, group_id)
+    if group is None:
+        raise ApiError(404, "not_found", "Group not found.")
+    if group.parent_id is not None:
+        raise ApiError(422, "subgroup_pool", f"{group.name} uses {group.pool.name}'s pages. Add them to "
+                                             f"{group.pool.name}, or change {group.name}'s limit.")
+    return group
+
+
+def set_subgroup_cap(db: Session, group: Group, cap: int | None, actor: Actor, *, comment: str | None = None,
+                     service: str = svc.STANDARD) -> QuotaLedger:
+    """Set (or, with None, take off) a subgroup's limit on its parent's pool for a service. It may go below what
+    the subgroup has used: new documents wait for room then, and those already reserved carry on."""
+    if group.parent_id is None:
+        raise ApiError(422, "not_subgroup", "Only a subgroup has a limit on its parent's pages.")
+    if cap is not None and cap < 0:
+        raise ApiError(422, "invalid_pages", "Enter zero or more pages, or leave the limit empty.")
+    _service_or_404(db, service, lock=True)
+    pools, subs = _lock_pools(db, group, [service])
+    sub = subs[service]
+    change = (cap or 0) - (sub.cap_pages or 0)
+    sub.cap_pages = cap
+    return _entry(db, service=service, scope="group", kind="cap", pages=change, actor=actor, gs=pools[service],
+                  sub=sub, comment=(comment or "").strip() or ("No limit" if cap is None else f"Limit {cap:,} pages"))
+
+
 def topup(db: Session, group_id: uuid.UUID | None, pages: int, actor: Actor, *, ticket_ref: str | None,
           ticket_url: str | None, override: bool, comment: str | None, service: str = svc.STANDARD) -> QuotaLedger:
     """Add pages to a group's pool for a service, or to the service's global pool (group_id None)."""
@@ -222,9 +277,7 @@ def topup(db: Session, group_id: uuid.UUID | None, pages: int, actor: Actor, *, 
         s.pool_pages += pages
         return _entry(db, service=service, scope="global", kind="topup", pages=pages, actor=actor, s=s,
                       ticket_ref=ticket_ref, ticket_url=ticket_url, override=override, comment=comment)
-    group = db.get(Group, group_id)
-    if group is None:
-        raise ApiError(404, "not_found", "Group not found.")
+    group = _pool_group(db, group_id)
     svc.group_service(db, group, service, create=True)
     db.flush()
     gs = _lock_group_services(db, group_id, [service])[service]
@@ -252,9 +305,7 @@ def adjust(db: Session, group_id: uuid.UUID | None, pages: int, actor: Actor, *,
         s.pool_pages += pages
         return _entry(db, service=service, scope="global", kind="adjust", pages=pages, actor=actor, s=s,
                       ticket_ref=ticket_ref, comment=comment)
-    group = db.get(Group, group_id)
-    if group is None:
-        raise ApiError(404, "not_found", "Group not found.")
+    group = _pool_group(db, group_id)
     svc.group_service(db, group, service, create=True)
     db.flush()
     gs = _lock_group_services(db, group_id, [service])[service]
@@ -281,9 +332,12 @@ def correct_usage(db: Session, user: User, pages: int, actor: Actor, *, comment:
         raise ApiError(422, "no_group", "This person isn't in a group, so they have no usage to correct.")
     s = _service_or_404(db, service, lock=True)
     group = db.get(Group, user.group_id)
-    svc.group_service(db, group, service, create=True)
-    db.flush()
-    gs = _lock_group_services(db, group.id, [service])[service]
+    gss, subs = _lock_pools(db, group, [service])
+    if group.parent_id is None:
+        svc.group_service(db, group, service, create=True)
+        db.flush()
+        gss = subs = _lock_group_services(db, group.id, [service])
+    gs, sub = gss[service], subs[service]
     us = _lock_user_services(db, user, [service])[service]
     before = us.used_pages
     if pages < 0 and -pages > us.used_pages:
@@ -294,9 +348,11 @@ def correct_usage(db: Session, user: User, pages: int, actor: Actor, *, comment:
                                          "to charge. Add pages to its pool first.")
     us.used_pages += pages
     gs.used_pages = max(0, gs.used_pages + pages)
+    if sub is not gs:
+        sub.used_pages = max(0, sub.used_pages + pages)
     s.used_pages = max(0, s.used_pages + pages)
     entry = _entry(db, service=service, scope="group", kind="correct", pages=pages, actor=actor, gs=gs, user=user,
-                   ticket_ref=(ticket_ref or "").strip() or None, comment=comment)
+                   ticket_ref=(ticket_ref or "").strip() or None, comment=comment, sub=sub)
     return entry, before, us.used_pages
 
 

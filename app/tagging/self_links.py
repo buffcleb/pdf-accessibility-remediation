@@ -8,6 +8,8 @@ from __future__ import annotations
 import pikepdf
 from pikepdf import Array, Dictionary, Name
 
+from app.tagging.tree import kids as _kids
+
 NEAR = 4  # points: a destination this close to the link's own box is the link itself
 
 
@@ -66,13 +68,6 @@ def points_to_itself(pdf: pikepdf.Pdf, page: Dictionary, annot: Dictionary) -> b
         top = _num(dest[2])
         return top is not None and lo - NEAR <= top <= hi + NEAR
     return False
-
-
-def _kids(e: Dictionary) -> list:
-    k = e.get("/K")
-    if k is None:
-        return []
-    return list(k) if isinstance(k, Array) else [k]
 
 
 def _is_objr_for(item, annot: Dictionary) -> bool:

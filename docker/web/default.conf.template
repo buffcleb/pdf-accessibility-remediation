@@ -11,6 +11,16 @@ server {
     add_header Referrer-Policy "no-referrer" always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
+    # JSON compressed here, not in the portal (#578): nginx does it in C, out of the API's event loop, and by type, so
+    # PDFs and zips (already compressed) pass through as they are and downloads still stream. A guideline's tag map:
+    # 16.9 MB, 2.7 MB gzipped. The portal never compresses, so nothing is compressed twice.
+    gzip on;
+    gzip_types application/json;
+    gzip_proxied any;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_vary on;
+
     location /api/ {
         proxy_pass ${PORTAL_API_UPSTREAM};
         proxy_set_header Host $host;
@@ -27,6 +37,13 @@ server {
 
     # Optional locations written at start-up: Grafana, when GRAFANA_UPSTREAM is set (16-grafana.sh, #397)
     include /etc/nginx/conf.d/locations/*.conf;
+
+    # The build's id, which open pages compare when the person moves on (newBuild.tsx): never cached
+    location = /build.json {
+        add_header Cache-Control "no-store" always;
+        add_header Content-Security-Policy "default-src 'none'" always;
+        try_files $uri =404;
+    }
 
     location = /config.json {
         add_header Cache-Control "no-store" always;

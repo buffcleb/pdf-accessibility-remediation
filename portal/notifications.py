@@ -3,6 +3,7 @@
   documents  a document is done, couldn't be processed, or was canceled by support
   help       news on their help requests (replies, status changes, reminders); for support, new requests and replies
   admin      notices for admins (someone waiting for approval)
+  alerts     for service admins (#564): the service's own alerts, which super admins always get at once
 
 Each person chooses "each" (as it happens), "daily" (one summary a day) or "off", in Settings; without a choice,
 the service default applies (Settings → Email). Sign-in codes, the email telling someone they were approved or
@@ -42,9 +43,13 @@ CATEGORIES = {
     "documents": ("Your documents", "When a document is done, couldn't be processed, or was canceled by support."),
     "help": ("Help requests", "Replies and changes on help requests, and reminders when one is waiting for you."),
     "admin": ("Admin notices", "When someone in a group you look after is waiting for approval."),
+    "alerts": ("Service alerts", "When something is wrong with the service, such as work that's stuck or email that "
+                                 "isn't going out, and when it clears."),
 }
 # Outbox kinds and the setting that governs them; any other kind is always sent at once
-KIND_CATEGORY = {"job": "documents", "help": "help", "approval": "admin"}
+KIND_CATEGORY = {"job": "documents", "help": "help", "approval": "admin", "staff_alert": "alerts"}
+# Without a choice, and with no service default of its own (Settings → Email): as it happens
+NO_DEFAULT = "each"
 
 
 def _now() -> datetime:
@@ -53,15 +58,17 @@ def _now() -> datetime:
 
 def applies(user: User) -> list[str]:
     kinds = ["documents", "help"]
-    if user.is_super_admin or user.admin_group_ids():
+    if user.across_groups or user.admin_group_ids():
         kinds.append("admin")
+    if user.is_service_admin and not user.is_super_admin:
+        kinds.append("alerts")
     return kinds
 
 
 def choice(db: Session, user: User | None, category: str) -> str:
     if user is not None and (user.notify_prefs or {}).get(category) in CHOICES:
         return user.notify_prefs[category]
-    return getattr(settings_store.load(db), f"notify_default_{category}")
+    return getattr(settings_store.load(db), f"notify_default_{category}", NO_DEFAULT)
 
 
 def choices(db: Session, user: User) -> dict[str, str]:

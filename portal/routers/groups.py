@@ -1,4 +1,5 @@
-"""Group-admin routes, scoped to groups the caller administers (super admins may use them for any group)."""
+"""Group-admin routes, scoped to groups the caller administers (super admins and service admins may use them for any
+group)."""
 from __future__ import annotations
 
 import uuid
@@ -7,16 +8,17 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import false, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
-from portal import approval, audit, paging, services
+from portal import approval, audit, inherit, paging, quota, services
 from portal.db import get_db
 from portal.deps import Principal, current_principal, group_for_admin
 from portal.errors import ApiError, not_found
-from portal.models import AuditEvent, Group, GroupDomain, RoleAssignment, User, UserService
+from portal.models import AuditEvent, Group, GroupDomain, RoleAssignment, User, UserService, group_family
 from portal.paging import Page
-from portal.routers.admin import revoke_sessions
-from portal.routers.common import AuditOut, audit_query
+from portal.permissions import ALL_GROUPS
+from portal.routers.admin import new_group, revoke_sessions, subgroup_parent
+from portal.routers.common import AuditOut, audit_query, by_whom
 from portal.schemas import GroupOut, UserOut, group_out, user_out
 
 router = APIRouter(prefix="/groups", tags=["group admin"])
@@ -28,13 +30,15 @@ class MemberUpdate(BaseModel):
     cap_pages: int | None = Field(None, ge=0, le=10_000_000)
     # "Describe with AI" for this person; null follows the group
     ai_describe: bool | None = None
+    # Move them between a group and its subgroups (#431), for admins of both; elsewhere is a super admin's move
+    group_id: uuid.UUID | None = None
 
 
 @router.get("", response_model=list[GroupOut])
 def my_admin_groups(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
-    """Groups the caller administers (all groups for super admins)."""
+    """Groups the caller administers (all groups for super admins and service admins)."""
     stmt = select(Group).order_by(Group.name)
-    if not p.is_super_admin:
+    if not p.can(ALL_GROUPS):
         ids = p.user.admin_group_ids()
         if not ids:
             return []
@@ -50,10 +54,10 @@ def browse_groups(q: str = Query("", max_length=200), status: str | None = Query
                   sort: str = Query("name", max_length=20), page: int = Query(1, ge=1, le=100_000),
                   page_size: int = Query(25, ge=1, le=200), p: Principal = Depends(current_principal),
                   db: Session = Depends(get_db)):
-    """The groups the caller administers (every group for super admins), a page at a time (#514): search by name or
+    """The groups the caller administers (every group for super admins and service admins), a page at a time (#514): search by name or
     email domain, filter by status, sort by name or when it was made."""
     stmt = select(Group)
-    if not p.is_super_admin:
+    if not p.can(ALL_GROUPS):
         stmt = stmt.where(Group.id.in_(p.user.admin_group_ids() or [uuid.UUID(int=0)]))
     if q.strip():
         pattern = paging.like(q)
@@ -61,12 +65,38 @@ def browse_groups(q: str = Query("", max_length=200), status: str | None = Query
                               Group.id.in_(select(GroupDomain.group_id).where(GroupDomain.domain.like(pattern, escape="\\")))))
     if status:
         stmt = stmt.where(Group.status == status)
-    return paging.page_of(db, stmt, paging.order_by(sort, GROUP_SORTS, Group.id), page, page_size, group_out)
+    order = paging.order_by(sort, GROUP_SORTS, Group.id)
+    if sort.lstrip("-") == "name":  # a tree (#431): each parent, then its subgroups under it
+        parent = aliased(Group)
+        family = func.coalesce(select(func.lower(parent.name)).where(parent.id == Group.parent_id).scalar_subquery(),
+                               func.lower(Group.name))
+        order = [family.desc() if sort.startswith("-") else family.asc(), Group.parent_id.is_not(None),
+                 func.lower(Group.name), Group.id]
+    return paging.page_of(db, stmt, order, page, page_size, group_out)
 
 
 @router.get("/{group_id}", response_model=GroupOut)
 def group_overview(group_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     return group_out(group_for_admin(group_id, p, db))
+
+
+class SubgroupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/{group_id}/subgroups", response_model=GroupOut, status_code=201)
+def create_subgroup(group_id: uuid.UUID, body: SubgroupIn, request: Request, p: Principal = Depends(current_principal),
+                    db: Session = Depends(get_db)):
+    """A subgroup of this group (#431), by its admins (super admins and service admins too). It draws on the
+    group's pages, and the group's admins manage it; its own email domains are a super admin's to add."""
+    parent = subgroup_parent(db, group_for_admin(group_id, p, db).id)
+    group = new_group(db, body.name, parent=parent)
+    audit.record(db, request, "group.created", actor=p.user, target_type="group", target_id=group.id,
+                 group_id=group.id, details={"name": group.name, "parent": str(parent.id), "local_only": group.local_only,
+                                             "require_approval": group.require_approval})
+    db.commit()
+    db.refresh(group)
+    return group_out(group)
 
 
 @router.get("/{group_id}/users", response_model=list[UserOut])
@@ -76,7 +106,7 @@ def group_users(group_id: uuid.UUID, q: str | None = Query(None, max_length=200)
                 limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0),
                 p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     group = group_for_admin(group_id, p, db)
-    stmt = select(User).where(User.group_id == group.id)
+    stmt = select(User).where(User.group_id.in_(group_family(db, group.id)))  # its subgroups' people too (#431)
     if approval_state:
         stmt = stmt.where(User.approval == approval_state)
     if q:
@@ -102,7 +132,8 @@ def group_people(group_id: uuid.UUID, q: str = Query("", max_length=200),
     disabled, declined, the group's admins) and, with `service`, by whether they have it; sort by email, last sign-in
     or when they joined."""
     group = group_for_admin(group_id, p, db)
-    stmt = select(User).where(User.group_id == group.id, User.approval != "pending")
+    family = group_family(db, group.id)  # its subgroups' people too, each with their group (#431)
+    stmt = select(User).where(User.group_id.in_(family), User.approval != "pending")
     if q.strip():
         pattern = paging.like(q)
         stmt = stmt.where(or_(User.email.like(pattern, escape="\\"), func.lower(User.name).like(pattern, escape="\\")))
@@ -112,7 +143,7 @@ def group_people(group_id: uuid.UUID, q: str = Query("", max_length=200),
         stmt = stmt.where(User.approval == "declined")
     elif status == "admin":
         stmt = stmt.where(User.id.in_(select(RoleAssignment.user_id).where(
-            RoleAssignment.role == "group_admin", RoleAssignment.group_id == group.id)))
+            RoleAssignment.role == "group_admin", RoleAssignment.group_id.in_(family))))
     if service and has is not None:
         gs = group.service(service)
         if gs is None:
@@ -130,7 +161,7 @@ def update_member(group_id: uuid.UUID, user_id: uuid.UUID, body: MemberUpdate, r
                   p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     group = group_for_admin(group_id, p, db)
     user = db.get(User, user_id)
-    if user is None or user.group_id != group.id:
+    if user is None or user.group_id not in group_family(db, group.id):
         raise not_found("User")
     sent = body.model_dump(exclude_unset=True)
     if "status" in sent:
@@ -138,9 +169,11 @@ def update_member(group_id: uuid.UUID, user_id: uuid.UUID, body: MemberUpdate, r
             raise ApiError(422, "invalid", "status cannot be empty.")
         if user.id == p.user.id:
             raise ApiError(422, "self_disable", "You can't change your own account status.")
-        if user.is_super_admin and not p.is_super_admin:
-            raise ApiError(403, "forbidden", "Only a super admin can disable a super admin.")
+        if user.across_groups and not p.is_super_admin:
+            raise ApiError(403, "forbidden", "Only a super admin can disable a super admin or a service admin.")
     changes = {}
+    if sent.get("group_id") is not None and sent["group_id"] != user.group_id:
+        changes["group_id"] = _move(db, p, group, user, sent["group_id"])
     if "cap_pages" in sent:  # the standard service's cap
         us = services.user_service(db, user, services.STANDARD, create=True)
         if us.cap_pages != sent["cap_pages"]:
@@ -158,7 +191,7 @@ def update_member(group_id: uuid.UUID, user_id: uuid.UUID, body: MemberUpdate, r
         action = "quota.cap_set" if set(changes) == {"cap_pages"} else "user.updated"
         audit.record(db, request, action, actor=p.user, target_type="user", target_id=user.id,
                      group_id=group.id, details={"email": user.email, **changes,
-                                                 "by_super_admin": p.is_super_admin and group.id not in p.user.admin_group_ids()})
+                                                 **by_whom(p, group.id)})
     db.commit()
     db.refresh(user)
     return user_out(user)
@@ -174,6 +207,12 @@ class GroupSettings(BaseModel):
     ai_describe: bool | None = None  # "Describe with AI" for its people; null follows the service default
     # Its people may make API tokens for scripts (#518), when super admins allow them; off stops existing tokens
     api_tokens_enabled: bool | None = None
+    # Its people may choose PDF/UA-2 or Both (#445), when super admins offer it; and what's preselected
+    pdfua_choice: bool | None = None
+    pdfua_default: str | None = Field(None, pattern="^(1|2|both)$")
+    # A subgroup's settings to take from its parent again (#431: ai, local_only, require_approval, ai_describe,
+    # show_external, over_quota_message); one it sets above it overrides from then on
+    inherit: list[str] | None = Field(None, max_length=10)
 
 
 @router.patch("/{group_id}", response_model=GroupOut)
@@ -184,6 +223,9 @@ def update_group_settings(group_id: uuid.UUID, body: GroupSettings, request: Req
     waiting stay waiting until someone approves or declines them."""
     group = group_for_admin(group_id, p, db)
     sent = body.model_dump(exclude_unset=True)
+    follow = sent.pop("inherit", None) or []
+    if set(follow) & {inherit.SETTING_OF.get(k) for k in sent}:
+        raise ApiError(422, "invalid", "A setting can't be set and taken from the parent at once.")
     if "ai_level" in sent:
         sent["ai_level"] = sent["ai_level"] or None
     if "ai_kind" in sent:
@@ -201,13 +243,28 @@ def update_group_settings(group_id: uuid.UUID, body: GroupSettings, request: Req
         elif kind and kind not in {k.key for k in services.kinds(db, level)}:
             raise ApiError(422, "unknown_kind", "That kind of document isn't offered with this AI level.")
         sent["ai_level"], sent["ai_kind"] = level, kind
-    for field, value in sent.items():
-        if value is None and field in ("local_only", "require_approval", "ai_mode", "show_external", "api_tokens_enabled"):
+    changed = set()
+    for field, value in list(sent.items()):
+        if value is None and field in ("local_only", "require_approval", "ai_mode", "show_external", "api_tokens_enabled",
+                                       "pdfua_choice", "pdfua_default"):
+            del sent[field]
             continue
+        if field == "local_only":  # a subgroup can't loosen its parent's (#431)
+            inherit.check_local_only(db, group, value)
         if value != getattr(group, field):
             audit.record(db, request, "group.updated", actor=p.user, target_type="group", target_id=group.id,
                          group_id=group.id, details={field: [getattr(group, field), value]})
             setattr(group, field, value)
+            changed.add(field)
+    inherit.overridden(group, set(sent))  # what a subgroup sets is its own from now on
+    if follow:
+        before = list(group.overrides or [])
+        if back := inherit.follow(db, group, follow):
+            audit.record(db, request, "group.updated", actor=p.user, target_type="group", target_id=group.id,
+                         group_id=group.id, details={"follows_parent": back, "overrides": [before, group.overrides]})
+    if subs := inherit.pass_down(db, group, changed):
+        audit.record(db, request, "group.updated", actor=p.user, target_type="group", target_id=group.id,
+                     group_id=group.id, details={"passed_to_subgroups": subs, "settings": sorted(changed)})
     db.commit()
     return group_out(group)
 
@@ -216,9 +273,31 @@ class Decline(BaseModel):
     reason: str | None = Field(None, max_length=1000)
 
 
+def _move(db: Session, p: Principal, group: Group, user: User, to_id: uuid.UUID) -> list[str]:
+    """Move a person between a group and its subgroups (#431). Whoever moves them administers both groups; their
+    admin rights stay behind, and their past usage with the old group, as when a super admin moves someone."""
+    top = group.parent_id or group.id
+    to = db.get(Group, to_id)
+    if to is None or to.id not in group_family(db, top):
+        raise ApiError(422, "outside_family", "People can be moved only between a group and its subgroups. "
+                                              "A super admin can move them to another group.")
+    if not (p.can_admin_group(to.id) and p.can_admin_group(user.group_id)):
+        raise ApiError(403, "forbidden", f"Only an administrator of both groups can move someone into {to.name}.")
+    if user.id == p.user.id:
+        raise ApiError(422, "self_move", "You can't move yourself; another administrator can.")
+    if user.across_groups and not p.is_super_admin:
+        raise ApiError(403, "forbidden", "Only a super admin can move a super admin or a service admin.")
+    for role in [r for r in user.roles if r.role == "group_admin"]:
+        db.delete(role)
+    before = str(user.group_id)
+    user.group_id = to.id
+    return [before, str(to.id)]
+
+
 def _member(db: Session, group: Group, user_id: uuid.UUID) -> User:
+    """A person in the group or one of its subgroups (#431), for its admins."""
     user = db.get(User, user_id)
-    if user is None or user.group_id != group.id:
+    if user is None or user.group_id not in group_family(db, group.id):
         raise not_found("User")
     return user
 
@@ -256,6 +335,8 @@ class GroupServiceUpdate(BaseModel):
     all_users: bool | None = None  # grant to every member instead of person by person
     default_user_cap: int | None = Field(None, ge=0, le=100_000_000)
     is_default: bool | None = None  # preselected at upload
+    # A subgroup's limit on its parent's pool (#431; null: none), set by those who run the parent
+    cap_pages: int | None = Field(None, ge=0, le=100_000_000)
 
 
 @router.patch("/{group_id}/services/{key}", response_model=GroupOut)
@@ -277,6 +358,22 @@ def update_group_service(group_id: uuid.UUID, key: str, body: GroupServiceUpdate
                                               "to an external provider) can't be enabled. Turn local-only off first.")
     if key == services.STANDARD and sent.get("enabled") is False:
         raise ApiError(422, "standard_required", "The standard service can't be switched off for a group.")
+    parent = group.pool if group.parent_id else None
+    if sent.get("enabled") and parent is not None and not ((pgs := parent.service(key)) and pgs.enabled):
+        raise ApiError(422, "parent_not_enabled", f"{parent.name} hasn't enabled {service.label}, so its subgroups "
+                                                  "can't use it.")
+    if "cap_pages" in sent:
+        cap = sent.pop("cap_pages")
+        if parent is None:
+            raise ApiError(422, "not_subgroup", "Only a subgroup has a limit on its parent's pages.")
+        if not p.can_admin_group(parent.id):  # not the subgroup's own admins: the pages are the parent's
+            raise ApiError(403, "forbidden", f"Only {parent.name}'s administrators can change this limit.")
+        before = (gs := services.group_service(db, group, key)) and gs.cap_pages
+        if before != cap:
+            quota.set_subgroup_cap(db, group, cap, quota.Actor(p.user.id, p.user.email, audit.client_ip(request)),
+                                   service=key)
+            audit.record(db, request, "group.service_updated", actor=p.user, target_type="group", target_id=group.id,
+                         group_id=group.id, details={"service": key, "cap_pages": [before, cap]})
     gs = services.group_service(db, group, key, create=True)
     changes = {}
     for k, v in sent.items():
@@ -322,7 +419,7 @@ def update_user_service(group_id: uuid.UUID, user_id: uuid.UUID, key: str, body:
         action = "quota.cap_set" if set(changes) == {"cap_pages"} else "user.service_updated"
         audit.record(db, request, action, actor=p.user, target_type="user", target_id=user.id, group_id=group.id,
                      details={"email": user.email, "service": key, **changes,
-                              "by_super_admin": p.is_super_admin and group.id not in p.user.admin_group_ids()})
+                              **by_whom(p, group.id)})
     db.commit()
     db.refresh(user)
     return user_out(user)
@@ -335,16 +432,16 @@ def group_audit(group_id: uuid.UUID, action: str | None = Query(None, max_length
                 p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     group = group_for_admin(group_id, p, db)
     stmt = audit_query(action=action, actor_id=actor_id, since=since, until=until, before_id=before_id)
-    stmt = stmt.where(AuditEvent.group_id == group.id)
+    stmt = stmt.where(AuditEvent.group_id.in_(group_family(db, group.id)))
     return [AuditOut.model_validate(e, from_attributes=True) for e in db.scalars(stmt.limit(limit))]
 
 
 @router.get("/{group_id}/attention")
 def group_attention(group_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """What needs this group's administrators' attention."""
-    from portal.attention import attention
+    from portal.attention import Family, attention
     group = group_for_admin(group_id, p, db)
-    return [i.to_dict() for i in attention(db, [group.id])]
+    return [i.to_dict() for i in attention(db, Family(group_family(db, group.id)))]
 
 
 class AckIn(BaseModel):
@@ -354,24 +451,24 @@ class AckIn(BaseModel):
 @router.get("/{group_id}/attention/acknowledged")
 def group_acknowledged(group_id: uuid.UUID, p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """The items this group's admins have acknowledged (#538)."""
-    from portal.attention import acknowledged
-    return acknowledged(db, [group_for_admin(group_id, p, db).id])
+    from portal.attention import Family, acknowledged
+    return acknowledged(db, Family(group_family(db, group_for_admin(group_id, p, db).id)))
 
 
 @router.post("/{group_id}/attention/acknowledge")
 def group_acknowledge(group_id: uuid.UUID, body: AckIn, request: Request, p: Principal = Depends(current_principal),
                       db: Session = Depends(get_db)):
     """Acknowledge an item for every admin of the group, until something new joins it (#538)."""
-    from portal.attention import acknowledge, acked
-    ids = [group_for_admin(group_id, p, db).id]
+    from portal.attention import Family, acknowledge, acked
+    ids = Family(group_family(db, group_for_admin(group_id, p, db).id))
     return acked(db, request, p, ids, acknowledge(db, ids, body.key, p.user.email), body.key)
 
 
 @router.delete("/{group_id}/attention/acknowledge")
 def group_unacknowledge(group_id: uuid.UUID, request: Request, key: str = Query(min_length=1, max_length=200),
                         p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
-    from portal.attention import unacked, unacknowledge
-    ids = [group_for_admin(group_id, p, db).id]
+    from portal.attention import Family, unacked, unacknowledge
+    ids = Family(group_family(db, group_for_admin(group_id, p, db).id))
     return unacked(db, request, p, ids, unacknowledge(db, ids, key), key)
 
 
@@ -384,7 +481,7 @@ def group_access_check(group_id: uuid.UUID, email: str = Query(..., max_length=3
     from portal.attention import explain_access
     from portal.identity import lookup_email
     group = group_for_admin(group_id, p, db)
-    user = db.scalar(select(User).where(User.email == lookup_email(email), User.group_id == group.id))
+    user = db.scalar(select(User).where(User.email == lookup_email(email), User.group_id.in_(group_family(db, group.id))))
     if user is None:
         raise not_found("User")
     s = svc.get_service(db, service)

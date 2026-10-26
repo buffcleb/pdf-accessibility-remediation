@@ -190,15 +190,15 @@ def test_a_paragraph_that_needs_its_own_reading_says_the_mark_in_it(tmp_path):
 
 def test_only_the_raised_mark_is_said_as_a_footnote_and_only_when_it_has_one():
     from app.pipeline.models import TextBlock
-    from app.pipeline.structure import _say_footnote_marks
+    from app.pipeline.structure.notes import say_footnote_marks
 
     b = TextBlock(id="b", page=0, bbox=(0, 0, 1, 1), text="Fit R1 as in the tests on soils1 and soils2 here.",
                   font_size=11, marks=["1", "2"], mark_after=["soils", "soils"])
-    _say_footnote_marks(b, {"1"})        # only footnote 1 is on the page
+    say_footnote_marks(b, {"1"})        # only footnote 1 is on the page
     assert b.actual_text == "Fit R1 as in the tests on soils (footnote 1) and soils2 here."
     untouched = TextBlock(id="c", page=0, bbox=(0, 0, 1, 1), text="On soils1.", font_size=11, marks=["1"],
                           mark_after=["soils"])
-    _say_footnote_marks(untouched, set())
+    say_footnote_marks(untouched, set())
     assert untouched.actual_text is None
 
 
@@ -345,6 +345,9 @@ def test_footnotes_reach_the_documents_own_tags_when_they_are_kept(tmp_path):
     result = tag_document(src, out, prepare_analysis(src), title="Notes", language="en-US")
     assert result.existing_tags.get("usable"), result.existing_tags     # the document's own tags were kept
     assert result.kept_notes == 1 and result.kept_note_refs == 1
+    # The paragraph made a Note counts as a repaired tag in the report, though it was changed after repair (#622)
+    made = [s for s in result.existing_tags["samples"] if any("footnote held as a paragraph" in r for r in s["reasons"])]
+    assert [s["decision"] for s in made] == ["repaired"] and result.existing_tags["repaired"] >= 1
     with pikepdf.open(out) as pdf:
         findings, index = check_integrity(pdf)
         assert [f for f in findings if f.severity == "error"] == []

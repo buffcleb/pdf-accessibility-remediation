@@ -44,10 +44,13 @@ Click a document's name to open its page.
 > **Changed 22 October 2026:** the line under the name also says when a script sent the document, and a document
 > still waiting can be canceled from here.
 
-- The name, page count and when it was submitted, then the AI level, "audit only", "existing tags ignored" or
-  "sent by script" (with the token's name) when they apply.
+- The name, page count and when it was submitted, then the AI level, "audit only", "existing tags ignored",
+  "PDF/UA-2" or "PDF/UA-1 and PDF/UA-2" (the standard you chose, **New 24 October 2026**) or "sent by script" (with
+  the token's name) when they apply.
 - **One verdict**, for example **✓ Passes PDF/UA-1**, with "Failed checks: 120 → 0". A PDF 2.0 document (as
-  LaTeX's tagging and other recent tools write them) can only be PDF/UA-2, so its verdict says **PDF/UA-2**.
+  LaTeX's tagging and other recent tools write them) can only be PDF/UA-2, so its verdict says **PDF/UA-2**; so does
+  a document you had delivered as PDF/UA-2. With **Both**, the verdict is the PDF/UA-1 file's; the PDF/UA-2 copy's is
+  in a note.
 - **Download** for the main file and **Open in tag manager**.
 - Opened from your list, **Previous** and **Next** (named by the document they open) go to the documents either
   side of it, in the list's order and with its search and filters, on to the list's next page too; "2 of 41" says
@@ -60,7 +63,8 @@ Click a document's name to open its page.
 
 Short notes, one line each, for anything worth knowing, with **Why?** for the detail. For example: two files
 (see below), tagged by Adobe, the AI used *General* instead of the kind you chose, no AI was needed, the kind
-picked by *Let AI decide*, or that an outside service was used.
+picked by *Let AI decide*, or that an outside service was used. **New 24 October 2026:** **PDF 2.0** when you
+chose PDF/UA-2 (the file was converted to PDF 2.0) or Both (whether the PDF/UA-2 copy passes its check).
 
 ### Three tiles
 
@@ -72,7 +76,8 @@ tab. A check only has two: **Failing** and **To review**.
 - **Needs review:** what a person should check (below).
 - **Report:** the remediation report, in sections (Summary, Changes, Still failing, For review, Details), with
   **Download the report**.
-- **Accessibility check:** the PDF/UA-1 check (PDF/UA-2 for a PDF 2.0 document) rule by rule, before and after.
+- **Accessibility check:** the PDF/UA-1 check (PDF/UA-2 for a PDF 2.0 document, or one delivered as PDF/UA-2) rule
+  by rule, before and after. With **Both**, **PDF/UA-2 copy** is the copy's own check, by PDF/UA-2.
   Each version saved from the tag manager (Human reviewed 1, 2, …) has a tab of its own there too, with the rules it
   still fails. The "failed checks" count beside a version, in the tag manager, Versions and Downloads, links to it.
 - **Versions:** your saved edits and corrected files, when there are any.
@@ -142,6 +147,10 @@ text. Then you get **two**:
 | **…compliant modified** | Passes more or all checks. Fonts may be swapped for look-alikes with the same spacing, and on rare pages the page is turned into an image with an invisible, tagged text layer | When passing matters more than exact rendering |
 
 The report says exactly what changed in the modified file, and on which pages.
+
+**PDF/UA-1 and PDF/UA-2** (**New 24 October 2026**): with **Both**, the main **Download** is **PDF/UA-1 (PDF 1.7)**,
+and **PDF/UA-2 (PDF 2.0)** is among the files. Use PDF/UA-2 where it's asked for and the readers people use handle
+PDF 2.0; otherwise PDF/UA-1. They have the same tags and look the same.
 
 **Tagged by Adobe**, with AI alt text (the default): use the **improved copy**, for example *Adobe + AI alt text*. It's
 Adobe's file, looking exactly the same, with the alt text and fixes Adobe leaves out. It's the big **Download** button,

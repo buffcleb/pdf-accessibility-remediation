@@ -3,7 +3,7 @@
 Three reports, each for those it applies to *when it's sent*:
   my_month         everyone: their documents, pages used and left, and anything waiting for them
   group_summary    group admins: each group's pools, most active people, pass rate, help requests, approvals
-  service_summary  super admins: usage by group and service, AI and Adobe cost, daily limits, quality, help queue
+  service_summary  super admins and service admins: usage by group and service, AI and Adobe cost, daily limits, quality, help queue
 
 Everyone gets theirs monthly unless they change it (Settings → Email reports in the app, or the unsubscribe link in
 each email). A person's reports with the same frequency go out together, as one email, once per period: the
@@ -70,7 +70,7 @@ def eligible(user: User) -> list[str]:
     roles = {r.role for r in user.roles}
     if "group_admin" in roles:
         kinds.append("group_summary")
-    if "super_admin" in roles:
+    if roles & {"super_admin", "service_admin"}:
         kinds.append("service_summary")
     return kinds
 
@@ -249,15 +249,16 @@ def my_month(db: Session, user: User, start: datetime, end: datetime) -> Section
 
 
 def group_summary(db: Session, user: User, start: datetime, end: datetime) -> list[Section]:
-    group_ids = [r.group_id for r in user.roles if r.role == "group_admin" and r.group_id]
+    group_ids = list(user.admin_group_ids())  # its subgroups too, each a section of its own (#431)
     labels = {s.key: s for s in svc.all_services(db)}
     rs = settings_store.load(db)
     out = []
     for g in db.scalars(select(Group).where(Group.id.in_(group_ids)).order_by(Group.name)):
         sec = Section(g.name if len(group_ids) > 1 else f"Your group: {g.name}",
                       link=("Open the group", _url(f"/admin/groups/{g.id}")))
-        used = dict(_used(db, [QuotaLedger.group_id == g.id, QuotaLedger.scope == "group"], start, end,
-                          [QuotaLedger.service_key]))
+        # A parent's entries cover its subgroups' documents too (they use its pool); a subgroup's are its own
+        mine = QuotaLedger.group_id == g.id if g.parent_id is None else QuotaLedger.subgroup_id == g.id
+        used = dict(_used(db, [mine, QuotaLedger.scope == "group"], start, end, [QuotaLedger.service_key]))
         rows = []
         for gs in db.scalars(select(GroupService).where(GroupService.group_id == g.id, GroupService.enabled.is_(True))):
             s = labels.get(gs.service_key)
@@ -266,18 +267,18 @@ def group_summary(db: Session, user: User, start: datetime, end: datetime) -> li
             if not s.metered:
                 rows.append([s.label, _n(used.get(s.key)), "no limit", "–"])
                 continue
-            left = gs.pool_pages - gs.used_pages - gs.reserved_pages
-            rows.append([s.label, _n(used.get(s.key)), _n(gs.pool_pages), _n(max(0, left))])
+            size, left = svc.pool_left(g, gs.service_key) or (0, 0)  # a subgroup's: its parent's, within its limit
+            rows.append([s.label, _n(used.get(s.key)), _n(size), _n(max(0, left))])
             if left <= 0:
                 sec.warnings.append(f"{s.label}: the group's pages have run out.")
-            elif _low(left, gs.pool_pages, rs):
-                sec.warnings.append(f"{s.label}: only {_n(left)} of {_n(gs.pool_pages)} pages left.")
+            elif _low(left, size, rs):
+                sec.warnings.append(f"{s.label}: only {_n(left)} of {_n(size)} pages left.")
         if rows:
             sec.tables.append(Table("Pages", ["Processing option", "Used in this period", "Pool", "Left now"], rows,
                                     {1, 2, 3}))
         people = db.execute(select(User.email, func.sum(QuotaLedger.pages).label("p")).join(
             User, User.id == QuotaLedger.user_id).where(
-            QuotaLedger.group_id == g.id, QuotaLedger.kind == "commit", QuotaLedger.created_at >= start,
+            mine, QuotaLedger.kind == "commit", QuotaLedger.created_at >= start,
             QuotaLedger.created_at < end).group_by(User.email).order_by(func.sum(QuotaLedger.pages).desc()).limit(TOP)).all()
         if people:
             sec.tables.append(Table("Most active people", ["Person", "Pages"], [[e, _n(p)] for e, p in people], {1}))

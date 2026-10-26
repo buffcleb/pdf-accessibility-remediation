@@ -31,8 +31,8 @@ from portal.security.tokens import keyed_hash
 PREFIX = "pdfr_"
 SCOPES = ("submit", "status", "download")
 # What a "chosen files" download may include: the document's files people come for (STAFF_ONLY_FILES never)
-DOWNLOAD_KINDS = ("primary", "enhanced", "visual_fallback", "report_pdf", "input", "music_files", "music_score",
-                  "math_list", "math_files", "math_nemeth", "math_ueb")
+DOWNLOAD_KINDS = ("primary", "enhanced", "visual_fallback", "pdfua2", "report_pdf", "input", "music_files",
+                  "music_score", "math_list", "math_files", "math_nemeth", "math_ueb")
 _PURPOSE = "api_token"
 _TOUCH_EVERY = timedelta(minutes=5)  # last_used_at isn't rewritten on every request
 

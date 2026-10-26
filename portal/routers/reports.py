@@ -13,9 +13,10 @@ from sqlalchemy.orm import Session
 
 from portal import audit, live_reports, services, settings_store
 from portal.db import get_db
-from portal.deps import Principal, current_principal, group_for_admin, require_any_admin, require_super_admin
+from portal.deps import Principal, current_principal, group_for_admin, require, require_any_admin
 from portal.errors import not_found
-from portal.models import AuditEvent, Group, Job, QuotaLedger, User
+from portal.models import LEDGER_GROUP, AuditEvent, Group, Job, QuotaLedger, User, group_family
+from portal.permissions import COSTS, REPORTS as ALL_REPORTS, STAFF_FILES
 from portal.routers.common import LedgerOut
 from portal.routers.jobs import (
     DocumentsPage, ExportPlanOut, ExportRequest, JobOut, Neighbours, documents_page, documents_query, export_plan,
@@ -59,7 +60,7 @@ def group_jobs(group_id: uuid.UUID, status: str | None = Query(None, max_length=
                limit: int = Query(100, ge=1, le=1000), before: datetime | None = None,
                p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     group = group_for_admin(group_id, p, db)
-    stmt = select(Job).where(Job.group_id == group.id, Job.deleted_at.is_(None))
+    stmt = select(Job).where(Job.group_id.in_(group_family(db, group.id)), Job.deleted_at.is_(None))
     if status:
         stmt = stmt.where(Job.status == status)
     if user_id:
@@ -67,8 +68,8 @@ def group_jobs(group_id: uuid.UUID, status: str | None = Query(None, max_length=
     if before:
         stmt = stmt.where(Job.created_at < before)
     runtime = settings_store.load(db)
-    # Cost is for super admins only: what groups are charged isn't the per-page cost
-    return [job_out(j, runtime, with_user=True, show_cost=p.is_super_admin)
+    # Cost is for super admins and service admins only: what groups are charged isn't the per-page cost
+    return [job_out(j, runtime, with_user=True, show_cost=p.can(COSTS), staff=p.can(STAFF_FILES))
             for j in db.scalars(stmt.order_by(Job.created_at.desc()).limit(limit))]
 
 
@@ -82,10 +83,10 @@ def group_documents(group_id: uuid.UUID, q: str = Query("", max_length=200), sta
     """A group's documents for its admins, a page at a time, searched, filtered and sorted like a person's own
     list; the search also finds a person by email. A group with thousands of documents showed only its newest 200."""
     group = group_for_admin(group_id, p, db)
-    # Cost is for super admins only: what groups are charged isn't the per-page cost
-    return documents_page(db, [Job.group_id == group.id], q=q, status=status, result=result, service=service,
+    # Cost is for super admins and service admins only: what groups are charged isn't the per-page cost
+    return documents_page(db, [Job.group_id.in_(group_family(db, group.id))], q=q, status=status, result=result, service=service,
                           audit=audit, since=since, until=until, sort=sort, page=page, page_size=page_size,
-                          people=True, show_cost=p.is_super_admin, via=via)
+                          people=True, show_cost=p.can(COSTS), staff=p.can(STAFF_FILES), via=via)
 
 
 @router.get("/groups/{group_id}/documents/neighbours/{job_id}", response_model=Neighbours)
@@ -99,7 +100,7 @@ def group_document_neighbours(group_id: uuid.UUID, job_id: uuid.UUID, q: str = Q
                               p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     """Previous and Next on a document's page, opened from a group's documents: the same filters and sort."""
     group = group_for_admin(group_id, p, db)
-    where, order = documents_query([Job.group_id == group.id], q=q, status=status, result=result, service=service,
+    where, order = documents_query([Job.group_id.in_(group_family(db, group.id))], q=q, status=status, result=result, service=service,
                                    audit=audit, since=since, until=until, sort=sort, people=True, via=via)
     return neighbours(db, job_id, select(Job).where(*where), order)
 
@@ -109,7 +110,7 @@ def group_export_plan(group_id: uuid.UUID, body: ExportRequest, p: Principal = D
                       db: Session = Depends(get_db)):
     """What exporting these of a group's documents would hold, for its admins: shown before downloading."""
     group = group_for_admin(group_id, p, db)
-    return export_plan_out(*export_plan(db, p, [Job.group_id == group.id], body, people=True))
+    return export_plan_out(*export_plan(db, p, [Job.group_id.in_(group_family(db, group.id))], body, people=True))
 
 
 @router.post("/groups/{group_id}/documents/export", dependencies=[Depends(per_person("document_export"))])
@@ -118,7 +119,7 @@ def group_export(group_id: uuid.UUID, body: ExportRequest, request: Request, p: 
     """A group's chosen documents (or everything its list shows), as one zip, for its admins. Each file from someone
     else's document is recorded as a download is."""
     group = group_for_admin(group_id, p, db)
-    return export_zip(db, request, p, [Job.group_id == group.id], body, people=True, group_id=group.id)
+    return export_zip(db, request, p, [Job.group_id.in_(group_family(db, group.id))], body, people=True, group_id=group.id)
 
 
 @router.get("/groups/{group_id}/ledger", response_model=list[LedgerOut])
@@ -126,7 +127,7 @@ def group_ledger(group_id: uuid.UUID, kind: str | None = Query(None, max_length=
                  limit: int = Query(100, ge=1, le=1000), p: Principal = Depends(current_principal),
                  db: Session = Depends(get_db)):
     group = group_for_admin(group_id, p, db)
-    stmt = select(QuotaLedger).where(QuotaLedger.group_id == group.id)
+    stmt = select(QuotaLedger).where(LEDGER_GROUP.in_(group_family(db, group.id)))
     if kind:
         stmt = stmt.where(QuotaLedger.kind == kind)
     if before_id:
@@ -176,10 +177,10 @@ ACCESS_HEADER = ["time", "group", "email", "event", "outcome", "ip", "user_agent
 
 
 def _ledger_rows(db: Session, group_ids, since, until) -> list[list]:
-    stmt = _period(select(QuotaLedger, Group.name).outerjoin(Group, Group.id == QuotaLedger.group_id),
+    stmt = _period(select(QuotaLedger, Group.name).outerjoin(Group, Group.id == LEDGER_GROUP),
                    QuotaLedger.created_at, since, until)
     if group_ids is not None:
-        stmt = stmt.where(QuotaLedger.group_id.in_(group_ids))
+        stmt = stmt.where(LEDGER_GROUP.in_(group_ids))
     emails = dict(db.execute(select(User.id, User.email)).all())
     return [[e.id, _iso(e.created_at), e.service_key, e.scope, gname or "", e.kind, e.pages,
              emails.get(e.user_id, ""), e.job_id or "", e.ticket_ref or "", e.ticket_url or "",
@@ -214,7 +215,7 @@ def group_report(group_id: uuid.UUID, name: str, request: Request, since: dateti
     if name not in REPORTS:
         raise not_found("Report")
     header, build = REPORTS[name]
-    rows = build(db, [group.id], since, until)
+    rows = build(db, group_family(db, group.id), since, until)  # its subgroups' too (#431)
     audit.record(db, request, "report.exported", actor=p.user, target_type="group", target_id=group.id,
                  group_id=group.id, details={"report": name, "rows": len(rows), "since": _iso(since),
                                              "until": _iso(until)})
@@ -224,7 +225,7 @@ def group_report(group_id: uuid.UUID, name: str, request: Request, since: dateti
 
 @router.get("/admin/reports/{name}.csv", dependencies=[Depends(per_person("export"))])
 def all_report(name: str, request: Request, since: datetime | None = None, until: datetime | None = None,
-               p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+               p: Principal = Depends(require(ALL_REPORTS)), db: Session = Depends(get_db)):
     if name == "groups":
         rows = []
         for g in db.scalars(select(Group).order_by(Group.name)):
@@ -254,10 +255,11 @@ def all_report(name: str, request: Request, since: datetime | None = None, until
 # --- live reports --------------------------------------------------------------------------------
 
 def _live_scope(p: Principal, db: Session, group_id: uuid.UUID | None) -> list[uuid.UUID] | None:
-    """Super admins: every group, or the one asked for. Group admins: their groups, or one of them."""
+    """Super admins and service admins: every group, or the one asked for. Group admins: their groups, or one of them.
+    A group's include its subgroups' (#431)."""
     if group_id is not None:
-        return [group_for_admin(group_id, p, db).id]
-    if p.is_super_admin:
+        return group_family(db, group_for_admin(group_id, p, db).id)
+    if p.can(ALL_REPORTS):
         return None
     ids = sorted(p.user.admin_group_ids(), key=str)
     if not ids:
@@ -276,7 +278,7 @@ def _live_query(request: Request, since: datetime | None, until: datetime | None
 @router.get("/reports")
 def list_live_reports(p: Principal = Depends(require_any_admin)):
     return [{"name": r.name, "label": r.label, "description": r.description}
-            for r in live_reports.available(p.is_super_admin)]
+            for r in live_reports.available(p.can(ALL_REPORTS))]
 
 
 @router.get("/reports/{name}.csv", dependencies=[Depends(per_person("export"))])
@@ -287,7 +289,7 @@ def export_live_report(name: str, request: Request, since: datetime | None = Non
     """The report as shown in the app: the same filters, search, sort and columns. Audited."""
     scope = _live_scope(p, db, group_id)
     query = _live_query(request, since, until, q, sort, 1, live_reports.MAX_PAGE, cols)
-    header, rows, label = live_reports.export(db, name, query, scope, p.is_super_admin)
+    header, rows, label = live_reports.export(db, name, query, scope, p.can(ALL_REPORTS))
     audit.record(db, request, "report.exported", actor=p.user, target_type="group" if group_id else None,
                  target_id=group_id, group_id=group_id,
                  details={"report": name, "rows": len(rows), "since": _iso(since), "until": _iso(until),
@@ -305,9 +307,9 @@ def live_report_neighbours(name: str, job_id: uuid.UUID, request: Request, since
     search and sort, and only the documents this admin can open."""
     scope = _live_scope(p, db, group_id)
     stmt, order, id_col, name_col = live_reports.document_order(
-        db, name, _live_query(request, since, until, q, sort, 1, 1, None), scope, p.is_super_admin)
-    if not p.is_super_admin:
-        stmt = stmt.where(Job.deleted_at.is_(None))  # a deleted document is gone for everyone but super admins
+        db, name, _live_query(request, since, until, q, sort, 1, 1, None), scope, p.can(ALL_REPORTS))
+    if not p.can(STAFF_FILES):
+        stmt = stmt.where(Job.deleted_at.is_(None))  # a deleted document is gone for everyone but support (as _visible_job)
     return neighbours(db, job_id, stmt, order, id_col=id_col, name_col=name_col)
 
 
@@ -319,4 +321,4 @@ def live_report(name: str, request: Request, since: datetime | None = None, unti
     """One page of a report, with totals and headline numbers over every matching row. Viewing isn't audited."""
     scope = _live_scope(p, db, group_id)
     return live_reports.run(db, name, _live_query(request, since, until, q, sort, page, page_size, cols), scope,
-                            p.is_super_admin)
+                            p.can(ALL_REPORTS))

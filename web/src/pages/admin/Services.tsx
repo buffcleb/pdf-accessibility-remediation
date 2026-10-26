@@ -204,7 +204,8 @@ export function ServiceDetail() {
                 <legend>Audits <span className="muted small">(Check only: a report without changing the file)</span></legend>
                 {([["free", "Use AI, free", "The AI writes alt text and reads tables, reading order and notation for the report, as in a remediation; no pages are counted, so nothing limits what checks cost."],
                   ["charge", "Use AI and count its pages", "Each page counts against this level's pages (not the processing pages)."],
-                  ["off", "No AI", "Audits are made without AI and use no pages."]] as const).map(([v, l, d]) => (
+                  ["off", "No AI", "Audits are made without AI and use no pages."],
+                  ["disabled", "Disabled", "Check only isn't offered with this level: people choose another level to check, or remediate."]] as const).map(([v, l, d]) => (
                   <label className="check" key={v}>
                     <input type="radio" name="sd-audit" checked={s.audit_ai === v} onChange={() => set({ audit_ai: v })} />
                     <span>{l} <span className="muted small">{d}</span></span>

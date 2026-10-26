@@ -16,7 +16,7 @@ on each.
 For each service, three levels must all have pages for an upload to go ahead:
 
 1. **The service's global pool** (if a super admin set one): shared by every group.
-2. **Your group's pool:** topped up by super admins.
+2. **Your group's pool:** topped up by super admins and service admins.
 3. **Each person's limit:** their own, or your group's default.
 
 When any level is short, the upload is refused with a message saying which service and which level ran out.
@@ -51,7 +51,8 @@ turned on.
 
 ## Getting more pages
 
-Group admins can't add pages to the pool; super admins do, usually against a ticket. **Request pages** on the
+Group admins can't add pages to the pool; super admins and service admins do, usually against a ticket (changed 23
+October 2026: service admins too, #564). **Request pages** on the
 service's row opens a short dialog with your service's link for this (**Request pages**) or its help email. Say the
 group, the service, how many pages, and why.
 
@@ -64,6 +65,6 @@ ledger** on the Overview tab and in the **Page ledger** report.
 
 1. choose the service (and your group);
 2. who gets it;
-3. pages for the pool (super admins only: group admins skip this and request pages);
+3. pages for the pool (super admins and service admins only: group admins skip this and request pages);
 4. the default limit per person;
 5. **Save all**. It finishes by checking that one of the people can actually use it.

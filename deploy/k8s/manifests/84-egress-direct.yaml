@@ -1,0 +1,17 @@
+# With EGRESS_DENY=on and EGRESS_PROXY off or log (#594): the portal, the AI gateway, the Adobe worker and ClamAV
+# keep reaching out as they did before default-deny-egress (83-egress-deny.yaml): directly with off, through the
+# proxy with log (and the portal's mail and syslog directly). EGRESS_PROXY=enforce is what limits them: deploy.sh
+# removes this once 82-egress-enforce.yaml is in place, and puts it back before that's removed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: direct-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [portal-api, portal-worker, litellm, engine-adobe-worker, clamav] }
+  policyTypes: [Egress]
+  egress:
+    - {}

@@ -26,6 +26,17 @@ The first super admins come from the `PORTAL_BOOTSTRAP_SUPER_ADMINS` setting (a 
 becomes a super admin the first time it signs in. After that, super admins make others super admins in
 **People (all groups) → Manage**. The last super admin can't be removed.
 
+## Service admins
+
+> **New 23 October 2026:** service admins (#564).
+
+A **service admin** helps you run every group: they add pages, answer help requests, act on single queue items,
+see every report (costs included) and the System pages. Settings, Services and AI levels, disabling a group, pausing a
+queue, Grafana, a person's data, and making super admins and service admins stay with you, as do super admins' and
+service admins' own accounts. Make someone one in **People (all groups) → Manage → Make service admin** (a super
+admin is one already, and more). Each time, every super admin gets a security alert. [Their
+guide](../service-admins/README.md) has the full list.
+
 ## The Administration menu
 
 As a super admin, the menu on the left has: **Attention**, **Groups**, **Help requests**, **Services and AI

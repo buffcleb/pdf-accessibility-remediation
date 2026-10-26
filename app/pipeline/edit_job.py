@@ -12,7 +12,8 @@ from collections.abc import Callable
 
 import pikepdf
 
-from app.pipeline.orchestrator import _bookmarks, _move_xml, _snapshot, _tagmap_file, _validate, _visual_fidelity
+from app.pipeline.outputs import add_bookmarks, move_xml, snapshot, tagmap_file, validate, visual_fidelity
+from app.pipeline.run_result import RunResult
 from app.storage import JobStore
 from app.tagging.editor import apply_edits
 from app.validation.audit import audit_pdf
@@ -80,29 +81,29 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
         raise IntegrityError("reviewed", rep.errors)
     # Edits can change the headings: bookmarks the engine made follow them, and a file with none gets them. A
     # document's own working bookmarks are never touched, and a file checked without edits stays as it is
-    bookmarks = (await _bookmarks(dst, rep.tagmap))[0] if ops else None
+    bookmarks = (await add_bookmarks(dst, rep.tagmap))[0] if ops else None
 
     # The file and its tag map are final now: published before the checks that follow, so the version can be opened
     # while veraPDF and the pixel comparison run (#428). The tag tree passed its integrity check above
-    tagmap = await _tagmap_file(out, stem, "primary", dst, rep.tagmap)
+    tagmap = await tagmap_file(out, stem, "primary", dst, rep.tagmap)
     store.write_partial({"files": {"remediated_primary": dst.name}, "tag_map": tagmap})
 
     progress("validating", 70)
-    vera = await asyncio.to_thread(_validate, dst, work, "after", stem)
-    snapshot = _snapshot(await asyncio.to_thread(audit_pdf, dst), vera)
+    vera = await asyncio.to_thread(validate, dst, work, "after", stem)
+    snap = snapshot(await asyncio.to_thread(audit_pdf, dst), vera)
     # A corrected file is compared with the version it replaces; an edit with the file it started from
     reference = work / "reference.pdf" if meta.get("reference") else None
     compared = reference if reference and reference.exists() else None
-    fidelity = await asyncio.to_thread(_visual_fidelity, compared or store.input_pdf, dst, edited=compared is None)
+    fidelity = await asyncio.to_thread(visual_fidelity, compared or store.input_pdf, dst, edited=compared is None)
 
-    result = {
-        "files": {"remediated_primary": dst.name, "remediated_visual_fallback": None},
-        "metrics": {"pages_processed": snapshot.get("pages"), "edits_applied": len(log),
-                    "processing_time_seconds": round(time.monotonic() - started, 2)},
-        "reports": {
+    result = RunResult(
+        files={"remediated_primary": dst.name, "remediated_visual_fallback": None},
+        metrics={"pages_processed": snap.get("pages"), "edits_applied": len(log),
+                 "processing_time_seconds": round(time.monotonic() - started, 2)},
+        reports={
             "verapdf_before": None,
-            "verapdf_after": {"primary": _move_xml(vera, out, f"{stem}_verapdf_after")},
-            "comparison": {"before": None, "after": snapshot, "visual_fidelity": fidelity, "bookmarks": bookmarks},
+            "verapdf_after": {"primary": move_xml(vera, out, f"{stem}_verapdf_after")},
+            "comparison": {"before": None, "after": snap, "visual_fidelity": fidelity, "bookmarks": bookmarks},
             "remediation_summary": (f"Applied {len(log)} tag edit(s)." if ops else
                                     "Checked a corrected file." if reference else "Re-reviewed without changes.")
             + (" AI review: flagged items and a sample." if review == "sampled" else
@@ -114,9 +115,9 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
             "tag_verification": {"primary": rep.to_dict()},
             "tag_maps": {"primary": tagmap},
         },
-        "warnings": [] if fidelity.get("identical") else
+        warnings=[] if fidelity.get("identical") else
         [f"Pages {fidelity.get('differing_pages')} render differently "
          + ("from the version it replaces." if reference else "after the edits.")],
-    }
+    ).to_dict()
     progress("completed", 100)
     return result

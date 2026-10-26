@@ -20,16 +20,11 @@ from pikepdf import Array, Dictionary
 from app.pipeline.models import DocumentAnalysis, bbox_area, bbox_intersection
 from app.tagging.content_marker import mcid_of
 from app.tagging.existing_tags import _is_struct_elem, resolve_role
+from app.tagging.tree import items as _items
 
 CONTAINERS = {"Document", "Part", "Art", "Sect", "Div", "NonStruct", "BlockQuote", "Aside"}
 DISAGREEMENT = 0.15  # reorder a run of siblings only when at least this share of its pairs is out of reading order
 MIN_RUN = 3
-
-
-def _items(k) -> list:
-    if k is None:
-        return []
-    return list(k) if isinstance(k, Array) else [k]
 
 
 class Reorderer:

@@ -2,7 +2,6 @@
 and every such reading is flagged for review."""
 import asyncio
 
-import pymupdf as fitz
 import pytest
 
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 from app.pipeline.fonts import _CANDIDATES
 from app.pipeline.models import TextBlock
 from app.pipeline.notation import consistent, need
+from tests.engine.layout import draw_pdf
 
 FONT = next((f for f in _CANDIDATES if Path(f).is_file()), None)
 needs_font = pytest.mark.skipif(FONT is None, reason="no font with math symbols to embed")
@@ -17,13 +17,7 @@ needs_font = pytest.mark.skipif(FONT is None, reason="no font with math symbols 
 
 def _page_with(path, lines):
     """A page with (x, y, text) lines in an embedded font that has math symbols (∑, ∫)."""
-    doc = fitz.open()
-    p = doc.new_page(width=595, height=842)
-    p.insert_font(fontname="emb", fontfile=FONT)
-    for x, y, text in lines:
-        p.insert_text((x, y), text, fontsize=11, fontname="emb")
-    doc.save(path)
-    return path
+    return draw_pdf(path, lines, width=595, height=842, fontfile=FONT)
 
 
 def _b(text, role="Formula", scripts=False):

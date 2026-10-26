@@ -39,7 +39,11 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; }
-body { background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 16px; line-height: 1.5; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 16px; line-height: 1.5;
+  overflow-wrap: break-word; }
+/* Long emails, file names, digests and URLs (#571): break-word wraps them where they'd run out of their box and
+   changes nothing else. A table cell stays as wide as its longest one, so a wide table scrolls in its .table-wrap.
+   In flex and grid, where an item is as wide as its longest word, the rules marked #571 below let it narrow. */
 a { color: var(--accent); }
 h1, h2, h3 { line-height: 1.25; text-wrap: balance; margin: 0; }
 h1 { font-size: 1.75rem; }
@@ -78,6 +82,7 @@ main:focus { outline: none; }
 main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; display: flex; flex-direction: column; gap: 24px; }
 .page-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
 .page-head .sub { color: var(--muted); }
+.page-head > * { min-width: 0; }  /* a long file or group name wraps (#571) */
 
 /* Surfaces */
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
@@ -98,6 +103,7 @@ input[type="text"], input[type="email"], input[type="number"], input[type="searc
 textarea { min-height: 80px; resize: vertical; }
 input[aria-invalid="true"] { border-color: var(--bad); }
 .check { display: flex; gap: 8px; align-items: flex-start; font-weight: 400; }
+.check > span { min-width: 0; }  /* (#571) */
 .check input { margin-top: 4px; }
 .form-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
 .form-row > .field { flex: 1 1 200px; }
@@ -107,7 +113,7 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .btn.small { padding: 4px 10px; font-size: 0.9rem; }
 .btn:disabled, .btn[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
 .linkbtn { font: inherit; background: none; border: 0; padding: 0; color: var(--accent); text-decoration: underline; cursor: pointer; }
-.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; overflow-wrap: anywhere; }  /* "Send to <email>" (#571) */
 
 /* Upload */
 .dropzone { border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px; text-align: center; display: flex; flex-direction: column; gap: 10px; align-items: center; }
@@ -135,6 +141,9 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .ai-picker > .small { flex-basis: 100%; }
 .upload-more summary { cursor: pointer; color: var(--accent); font-weight: 600; width: max-content; max-width: 100%; }
 .upload-more[open] summary { margin-bottom: 8px; }
+/* The accessibility standard (#445): a set of choices among the options */
+.upload-more fieldset.choice-set { border: 0; padding: 0; margin: 0 0 10px; }
+.upload-more fieldset.choice-set legend { font-weight: 600; margin-bottom: 4px; }
 .upload-actions { margin-top: 4px; }
 .upload-hint { margin: -6px 0 0; }
 .upload-wait { margin: 0; max-width: 70ch; }
@@ -183,7 +192,8 @@ td.when { white-space: nowrap; }  /* a date and time on one line: the wide colum
 .muted { color: var(--muted); }
 .small { font-size: 0.9rem; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-.chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--line); border-radius: 99px; padding: 2px 4px 2px 10px; font-size: 0.9rem; }
+.chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--line); border-radius: 99px; padding: 2px 4px 2px 10px; font-size: 0.9rem;
+  max-width: 100%; overflow-wrap: anywhere; }  /* a long email domain (#571) */
 .chip button { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 1rem; padding: 0 6px; border-radius: 99px; }
 
 /* Rendered report */
@@ -739,11 +749,12 @@ button.pod-box[aria-pressed="true"] { outline: 3px solid var(--fg); outline-offs
 .pod-detail { flex: 1 1 100%; }
 .pod-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0; }
 .pod-facts dt { color: var(--muted); }
-.pod-facts dd { margin: 0; }
+.pod-facts dd { margin: 0; min-width: 0; }  /* a digest wraps in its column (#571) */
 .pod-about, .pod-commands { margin: 8px 0; }
 .pod-about h4, .pod-commands h4 { margin: 10px 0 4px; font-size: 0.95em; }
 .pod-about ul, .pod-commands ul { margin: 0; padding-left: 0; list-style: none; }
 .pod-about li { margin: 2px 0; }
+.pod-about code { overflow-wrap: anywhere; }  /* image@digest, one long token (#571) */
 .pod-digest { overflow-wrap: anywhere; }
 .pod-commands li { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
 .pod-command { display: flex; align-items: flex-start; gap: 8px; }
@@ -1107,3 +1118,10 @@ th.select-col, td.select-col { width: 2.2rem; text-align: center; }
 .help-badge { text-decoration: none; white-space: nowrap; }
 .help-badge:hover .pill, .help-badge:focus-visible .pill { text-decoration: underline; }
 .app-error { max-width: 640px; margin: 48px auto; padding: 0 16px; }
+
+/* Subgroups (#431): indented under their parent in the groups list; the group or subgroup picker */
+.subgroup-cell { padding-left: 28px; }
+.subgroup-mark { color: var(--muted); margin-left: -18px; }
+.family-picker { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.family-picker .field { margin: 0; }
+.follows { margin: 4px 0 12px; }

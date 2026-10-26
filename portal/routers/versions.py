@@ -2,6 +2,7 @@
 versions saved from tag edits. Engine outputs are never changed; each save makes a new version."""
 from __future__ import annotations
 
+import itertools
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from portal.db import get_db
 from portal.deps import Principal, current_principal
 from portal.errors import ApiError, not_found
 from portal.models import DocumentVersion, FindingMark, Job, JobFile, TagDraft
+from portal.permissions import COSTS
 from portal.routers.jobs import _file, _record_access, _visible_job
 from portal.security.ratelimit import RateLimiter, get_rate_limiter, per_person
 from portal.storage import get_storage, safe_name
@@ -28,7 +30,8 @@ router = APIRouter(tags=["versions"])
 
 OPS = {"set_role", "set_alt", "set_actual_text", "set_decorative", "set_lang", "set_cell", "move", "merge", "split",
        "assign", "tag_artifacts", "delete", "make_list", "indent", "outdent", "build_list", "take_pieces", "cut_area", "make_toc",
-       "set_headers", "link_note", "set_field_label", "set_doc_title", "set_doc_lang", "rebuild_table", "build_table"}
+       "set_headers", "link_note", "set_toc_target", "set_field_label", "set_doc_title", "set_doc_lang",
+       "rebuild_table", "build_table"}
 DOC_OPS = {"set_doc_title", "set_doc_lang"}  # the document's title and language: no element (#363)
 MAX_EDITS = 5000
 MAX_EDITS_BYTES = 8 * 1024 * 1024  # all of one save's or draft's edits together, as JSON
@@ -174,23 +177,35 @@ def version_pdf(job_id: uuid.UUID, number: int, request: Request, reason: str | 
 def version_tagmap(job_id: uuid.UUID, number: int, request: Request, p: Principal = Depends(current_principal),
                    db: Session = Depends(get_db)):
     f = _version_file(db, request, p, job_id, number, "tagmap")
-    data = b"".join(get_storage().get_stream(f.s3_key))
+    stream = iter(get_storage().get_stream(f.s3_key))
+    size = {"Content-Length": str(f.size_bytes)}
     # Where the document came tagged and its tags were kept, say which tags were its own
     job = db.get(Job, job_id)
-    if job is not None and (job.result_summary or {}).get("tags_kept"):
-        try:
-            tagmap = json.loads(data)
-            first = db.scalar(select(DocumentVersion).where(DocumentVersion.job_id == job_id,
-                                                            DocumentVersion.kind == "original"))
-            if first is not None and first.number == number:
-                tagmarks.mark_all(tagmap)
-            elif first is not None and first.tagmap_file_id is not None:
-                original = db.get(JobFile, first.tagmap_file_id)
-                if original is not None:
-                    tagmarks.mark_original(tagmap, json.loads(b"".join(get_storage().get_stream(original.s3_key))))
-            data = json.dumps(tagmap, separators=(",", ":")).encode()
-        except (ValueError, KeyError, TypeError):
-            pass  # an old or odd tag map: served as it is, unmarked
+    if job is None or not (job.result_summary or {}).get("tags_kept"):
+        return StreamingResponse(stream, media_type="application/json", headers=size)
+    head = b""
+    for chunk in stream:
+        head += chunk
+        if len(head) >= len(tagmarks.MARKED):
+            break
+    if tagmarks.is_marked(head):
+        # Marked when it was stored (#580): served as it is
+        return StreamingResponse(itertools.chain([head], stream), media_type="application/json", headers=size)
+    # Stored before that: marked now, as it's read
+    data = head + b"".join(stream)
+    try:
+        tagmap = json.loads(data)
+        first = db.scalar(select(DocumentVersion).where(DocumentVersion.job_id == job_id,
+                                                        DocumentVersion.kind == "original"))
+        if first is not None and first.number == number:
+            tagmarks.mark_all(tagmap)
+        elif first is not None and first.tagmap_file_id is not None:
+            original = db.get(JobFile, first.tagmap_file_id)
+            if original is not None:
+                tagmarks.mark_original(tagmap, json.loads(b"".join(get_storage().get_stream(original.s3_key))))
+        data = json.dumps(tagmap, separators=(",", ":")).encode()
+    except (ValueError, KeyError, TypeError):
+        pass  # an old or odd tag map: served as it is, unmarked
     return Response(data, media_type="application/json")
 
 
@@ -473,7 +488,7 @@ def describe_area(job_id: uuid.UUID, number: int, body: DescribeRequest, request
                  group_id=job.group_id, details={"version": v.number, "page": body.page, "model": out.get("model")})
     db.commit()
     return {"alt": out.get("alt") or "", "kind": out.get("kind"), "decorative": bool(out.get("decorative")),
-            **({"cost_usd": round(cost, 6)} if p.is_super_admin else {})}
+            **({"cost_usd": round(cost, 6)} if p.can(COSTS) else {})}
 
 
 class ReviewRequest(BaseModel):

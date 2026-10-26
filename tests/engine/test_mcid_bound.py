@@ -7,22 +7,16 @@ from pikepdf import Array, Dictionary, Name
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
+from tests.engine.pdfs import one_page
 
 ABSURD = 3_000_000  # enough to show the problem on main in seconds, small enough for a test machine
 
 
 def _tagged(path, ids):
-    pdf = pikepdf.new()
-    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica,
-                                        Encoding=Name.WinAnsiEncoding))
     lines = ["Dosing", "Give the first dose in the morning.", "Check the level after five days."]
     content = [f"/P <</MCID {mcid}>> BDC BT /F1 12 Tf 72 {700 - 30 * i} Td ({t}) Tj ET EMC".encode()
                for i, (mcid, t) in enumerate(zip(ids, lines))]
-    page = pdf.make_indirect(Dictionary(
-        Type=Name.Page, MediaBox=Array([0, 0, 612, 792]), Resources=Dictionary(Font=Dictionary(F1=font)),
-        Contents=pdf.make_stream(b"\n".join(content))))
-    pdf.Root.Pages = pdf.make_indirect(Dictionary(Type=Name.Pages, Kids=Array([page]), Count=1))
-    page.Parent = pdf.Root.Pages
+    pdf, page = one_page(None, content)
     root = pdf.make_indirect(Dictionary(Type=Name.StructTreeRoot))
     doc = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.Document, P=root))
     elems = [pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name(r), P=doc, Pg=page, K=mcid))

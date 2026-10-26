@@ -10,8 +10,7 @@ A caption or a sentence beside the graph stays text. A dotted rule (specks in a 
 """
 from __future__ import annotations
 
-import re
-
+from app.pipeline.markers import DRAWING_CAPTION
 from app.pipeline.models import BBox, ImageRegion, TextBlock, bbox_area, bbox_intersection, bbox_union
 
 _SPECK = 6.0     # points: a picture smaller than this each way is a speck
@@ -20,13 +19,12 @@ _REACH = 2       # cells: specks this near belong together (two curves of one gr
 _MIN_SPECKS = 60
 _MIN_SIZE = (36.0, 24.0)  # a region narrower or flatter than this is a dotted rule
 _LABEL_PAD = 14.0
-_CAPTION = re.compile(r"^\s*(?:fig(?:ure)?\.?|table|chart|graph|plate|example)\s*\d", re.IGNORECASE)
 
 
 def _is_label(block: TextBlock) -> bool:
     """A value on an axis, a curve's name: short, and not a caption or a sentence."""
     text = (block.text or "").strip()
-    if not text or _CAPTION.match(text):
+    if not text or DRAWING_CAPTION.match(text):
         return False
     return len(text.split()) <= 4 and len(text) <= 40
 

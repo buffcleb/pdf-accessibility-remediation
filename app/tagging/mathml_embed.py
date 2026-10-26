@@ -21,6 +21,7 @@ from pathlib import Path
 import pikepdf
 from pikepdf import Array, Dictionary, Name, String
 
+from app.tagging.conformance import conformance
 from app.tagging.mathml_tags import formula_mathml
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ def embed(path: Path, formulas: list[dict]) -> int:
     from app.verification.semantic import SemanticChecker
 
     with pikepdf.open(path, allow_overwriting_input=True) as pdf:
-        if str(pdf.pdf_version) < "2.0":
+        if not conformance(str(pdf.pdf_version)).mathml:
             return 0
         _, index = check_integrity(pdf)
         if not index.elements:

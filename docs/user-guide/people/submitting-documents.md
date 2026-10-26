@@ -86,7 +86,9 @@ review list, but no remediated file. Use it to see how far a document is from ac
 someone else made accessible.
 
 The line under the buttons says what a check uses. Usually it's free; an AI level can also be set to count its
-pages for checks, or to check without AI.
+pages for checks, or to check without AI. **Changed 23 October 2026:** an AI level can also not offer checks at all:
+then **Check only** is greyed out while that level is chosen, and the line under the buttons says so. Choose another
+AI level to check.
 
 ## More options
 
@@ -95,6 +97,17 @@ as paragraphs, a jumbled reading order, tables as plain text). Normally a docume
 since they're usually its author's; with this ticked they're set aside and the document is tagged afresh from what's
 on the page. The report says the tags were ignored at your request, and the document's page shows "existing tags
 ignored". It changes nothing for **Check only**, and it costs the same.
+
+**Accessibility standard** (**New 24 October 2026**, #445) is there when your group offers PDF/UA-2, with your
+group's choice already picked:
+- **PDF/UA-1**, the standard most checkers and policies mean, and the one you get otherwise.
+- **PDF/UA-2 (as PDF 2.0)**: the newer standard. Your file is delivered as PDF 2.0, which PDF/UA-2 needs. Current Adobe
+  Acrobat and PAC 2024 read PDF 2.0; some older PDF readers and checkers don't yet.
+- **Both**: a PDF/UA-1 file and a PDF/UA-2 copy of it, from one run, each checked by its own standard. It costs the
+  same as one.
+
+It's for **Remediate** only: **Check only** checks by PDF/UA-1 (PDF/UA-2 for a PDF 2.0 file), and Adobe Autotag
+delivers PDF/UA-1. A PDF that is already PDF 2.0 can only be PDF/UA-2, whatever you pick.
 
 **Review every figure with AI** has the AI checker look at every figure and formula,
 instead of the ones flagged as doubtful plus a sample. It's slower and uses more AI; use it for documents where

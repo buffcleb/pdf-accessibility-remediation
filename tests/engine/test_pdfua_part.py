@@ -5,7 +5,8 @@ import pikepdf
 import pymupdf as fitz
 
 from app.pipeline.analyzer import analyze_document
-from app.pipeline.orchestrator import _rules, _snapshot
+from app.pipeline.orchestrator import _rules
+from app.pipeline.outputs import snapshot
 from app.reports.markdown import render_job_markdown
 from app.reports.pdf import build_html
 from app.tagging.tagger import PDF2_NS, tag_document
@@ -44,9 +45,9 @@ def test_pdf_ua_2_gives_the_verdict_for_a_pdf_2_file_and_ua_1_still_runs(monkeyp
 def test_the_verdict_names_its_part_and_repairs_go_by_ua1():
     ua2 = VeraResult(flavour="ua2", available=True, compliant=True)
     ua1 = VeraResult(flavour="ua1", available=True, compliant=False)
-    snap = _snapshot({}, {"ua2": ua2, "ua1": ua1})
+    snap = snapshot({}, {"ua2": ua2, "ua1": ua1})
     assert (snap["pdfua_part"], snap["compliant"]) == (2, True)
-    assert _snapshot({}, {"ua1": ua1, "ua2": ua2})["pdfua_part"] == 1
+    assert snapshot({}, {"ua1": ua1, "ua2": ua2})["pdfua_part"] == 1
     assert _rules({"ua2": ua2, "ua1": ua1}) is ua1 and _rules({"ua2": ua2}) is ua2
 
 

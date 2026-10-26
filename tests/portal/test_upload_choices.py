@@ -34,7 +34,8 @@ def test_a_group_sets_one_ai_level_for_everything(setup):
     premium = _tier(s, "Premium AI", "commercial", metered=False)
     _kind(s, premium, "Math and science", "local-vision")
     assert s["c"]["user"].get(f"{API}/upload-options").json() == {
-        "ai_mode": "choose", "ai_level": None, "ai_kind": None, "show_external": False, "malware_scan": False}
+        "ai_mode": "choose", "ai_level": None, "ai_kind": None, "show_external": False, "malware_scan": False,
+        "pdfua_choices": ["1"], "pdfua_default": "1"}
     # The level has to be one the group uses, and the kind one the level offers
     assert _group(s, ai_mode="fixed").json()["detail"]["error"] == "level_required"
     assert _group(s, ai_mode="fixed", ai_level=premium, ai_kind="forms").json()["detail"]["error"] == "unknown_kind"
@@ -43,7 +44,7 @@ def test_a_group_sets_one_ai_level_for_everything(setup):
     assert r.json()["ai_mode"] == "fixed" and r.json()["show_external"] is True
     assert s["c"]["user"].get(f"{API}/upload-options").json() == {
         "ai_mode": "fixed", "ai_level": premium, "ai_kind": "math-and-science", "show_external": True,
-        "malware_scan": False}
+        "malware_scan": False, "pdfua_choices": ["1"], "pdfua_default": "1"}
     # What people ask for is set aside
     job = _jobs(s, ai_tier=basic, ai_kind="general")[0]
     assert job["ai_tier"] == premium and job["ai_kind"] == "math-and-science"
@@ -94,6 +95,15 @@ def test_an_audit_follows_its_levels_setting(setup):
     run_worker(db)
     assert s["engine"].no_ais == [False, False, True]
     # Remediating isn't affected
+    assert _jobs(s)[0]["ai_tier"] == level
+
+    # #586: checks turned off for the level: a check with it is refused, saying so; remediating still goes ahead
+    assert sup.patch(f"{API}/admin/services/{level}", json={"audit_ai": "disabled"}).status_code == 200
+    assert next(x for x in s["c"]["user"].get(f"{API}/services").json() if x["key"] == level)[
+        "audit_ai"] == "disabled"
+    refused = _post(s, report_only="true")
+    assert refused.status_code == 422 and refused.json()["detail"]["error"] == "check_not_offered"
+    assert "Premium AI" in refused.json()["detail"]["message"]
     assert _jobs(s)[0]["ai_tier"] == level
 
     assert sup.patch(f"{API}/admin/services/{level}", json={"audit_ai": "sometimes"}).status_code == 422

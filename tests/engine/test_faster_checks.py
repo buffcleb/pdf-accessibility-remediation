@@ -5,7 +5,7 @@ import pikepdf
 import pymupdf as fitz
 
 from app.config import get_settings
-from app.pipeline.orchestrator import _drawing, _visual_fidelity
+from app.pipeline.outputs import drawing, visual_fidelity
 from app.verification import contrast
 from app.verification.semantic import Content, glyph_text
 
@@ -39,23 +39,23 @@ def test_an_edits_unchanged_pages_arent_drawn_to_compare(tmp_path, monkeypatch):
     with pikepdf.open(src) as pdf:  # only the tag tree side changes: a title, as the tag editor's own edits would
         pdf.docinfo["/Title"] = "Edited"
         pdf.save(same)
-    assert _drawing(src) == _drawing(same)
+    assert drawing(src) == drawing(same)
     drawn = []
     real = fitz.Page.get_pixmap
     monkeypatch.setattr(fitz.Page, "get_pixmap", lambda self, *a, **k: drawn.append(self.number) or real(self, *a, **k))
-    assert _visual_fidelity(src, same, edited=True)["identical"] is True
+    assert visual_fidelity(src, same, edited=True)["identical"] is True
     assert drawn == []
     # A page whose drawing did change is drawn, and a real difference is found
     changed = tmp_path / "changed.pdf"
     doc = fitz.open(src)
     doc[3].insert_text((72, 300), "An extra line.", fontsize=11)
     doc.save(changed)
-    result = _visual_fidelity(src, changed, edited=True)
+    result = visual_fidelity(src, changed, edited=True)
     assert result["identical"] is False and result["differing_pages"] == [4]
     assert set(drawn) == {3}
     # Not an edit (a corrected file): every page is drawn
     drawn.clear()
-    _visual_fidelity(src, same)
+    visual_fidelity(src, same)
     assert sorted(set(drawn)) == list(range(6))
 
 

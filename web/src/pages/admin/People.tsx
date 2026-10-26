@@ -6,14 +6,17 @@ import { ErrorNotice, Loading, Notice, fmtDate, fmtNum, useLoad, useTitle } from
 import { AdminDialog } from "../../components/AdminDialog";
 import { ListBar, ListPager, SortHeading, type Chip } from "../../components/lists";
 import { useUnsavedChanges } from "../../components/unsaved";
+import { can, roleLabel } from "../../permissions";
 import { ServicePicker } from "./shared";
 
-const ROLES: [string, string][] = [["super_admin", "Super admins"], ["group_admin", "Group admins"], ["member", "Members"]];
+const ROLES: [string, string][] = [["super_admin", "Super admins"], ["service_admin", "Service admins"],
+  ["group_admin", "Group admins"], ["member", "Members"]];
 const STATUSES: [string, string][] = [["active", "Active"], ["disabled", "Disabled"], ["pending", "Waiting for approval"],
   ["declined", "Declined"], ["removed", "Data removed"]];
 
-/** Everyone, across groups: move people, make super admins, disable accounts, correct usage. Limits are edited in
- * each group's People tab. */
+/** Everyone, across groups: move people, make super admins and service admins, disable accounts, correct usage.
+ * Limits are edited in each group's People tab. Service admins (#564) see it too, without the roles, people's data,
+ * or super admins' and service admins' own accounts. */
 export function PeopleAll() {
   useTitle("People");
   const { me, reloadMe } = useAuth();
@@ -63,7 +66,8 @@ export function PeopleAll() {
     <>
       <h1>People (all groups)</h1>
       <p className="muted">Personal page limits are set in each group's <strong>People</strong> tab; follow the group link. Open
-        <strong> Manage</strong> to move someone, correct their usage, disable their account or make them a super admin.</p>
+        <strong> Manage</strong> to move someone, correct their usage{can(me, "roles")
+          ? ", disable their account or make them a super admin or service admin" : " or disable their account"}.</p>
       <ListBar label="Search and filter people" searchId="uq" query={params.get("q") ?? ""} placeholder="Search by email or name"
         onQuery={(q) => update({ q: q || null })} chips={chips} active={!!params.get("group")}
         onRemove={(key) => update({ [key]: null })}
@@ -100,7 +104,7 @@ export function PeopleAll() {
               <th scope="col"><span className="visually-hidden">Manage</span></th></tr></thead>
             <tbody>
               {users.data.items.map((u) => {
-                const isSuper = u.roles.some((r) => r.role === "super_admin");
+                const role = roleLabel(u.roles);
                 const group = groups.data?.find((g) => g.id === u.group_id);
                 return (
                   <Fragment key={u.id}>
@@ -109,7 +113,7 @@ export function PeopleAll() {
                         : u.status !== "active" && <> <span className="pill muted">Disabled</span></>}
                         {u.approval === "pending" && <> <span className="pill warn">Waiting for approval</span></>}
                         {u.approval === "declined" && <> <span className="pill warn">Declined</span></>}
-                        {isSuper && <> <span className="pill info">Super admin</span></>}</td>
+                        {role && <> <span className="pill info">{role}</span></>}</td>
                       <td style={{ whiteSpace: "nowrap" }}>{u.group_id
                         ? <Link to={`/admin/groups/${u.group_id}/people`}>{group?.name ?? "Group"}</Link>
                         : <span className="muted">No group</span>}</td>
@@ -135,6 +139,9 @@ export function PeopleAll() {
         const u = users.data?.items.find((x) => x.id === open);
         if (!u) return null;
         const isSuper = u.roles.some((r) => r.role === "super_admin");
+        const isService = !isSuper && u.roles.some((r) => r.role === "service_admin");
+        // Super admins' and service admins' own accounts are super admins' to change
+        const theirs = !(isSuper || isService) || !!me?.is_super_admin;
         return (
           <AdminDialog title={`Manage ${u.email}`} onClose={() => setOpen(null)}>
             <ErrorNotice error={error} />
@@ -150,11 +157,14 @@ export function PeopleAll() {
               )}
               {u.removed_at && <p className="small muted">Their data was removed on {fmtDate(u.removed_at)}. The
                 records stay, without them; nothing else can be changed here.</p>}
-              {!u.removed_at && <MoveGroup user={u} groups={groups.data ?? []} onMove={(id) => act(() => patch(`/admin/users/${u.id}`, { group_id: id }))} />}
-              {u.group_id && !u.removed_at && <UserPages user={u} onChange={(x) => users.data && users.setData({ ...users.data, items: users.data.items.map((y) => (y.id === x.id ? x : y)) })} />}
-              {!u.removed_at && <PersonalData user={u} self={u.id === me?.id} onError={setError}
+              {!u.removed_at && theirs && <MoveGroup user={u} groups={groups.data ?? []} onMove={(id) => act(() => patch(`/admin/users/${u.id}`, { group_id: id }))} />}
+              {u.group_id && !u.removed_at && can(me, "pages") && <UserPages user={u} onChange={(x) => users.data && users.setData({ ...users.data, items: users.data.items.map((y) => (y.id === x.id ? x : y)) })} />}
+              {!u.removed_at && can(me, "people.data") && <PersonalData user={u} self={u.id === me?.id} onError={setError}
                 onRemoved={() => void users.reload()} />}
-              {u.id !== me?.id && !u.removed_at && (
+              {u.id !== me?.id && !u.removed_at && !theirs && (
+                <p className="small muted">Only super admins change a {isSuper ? "super" : "service"} admin's account.</p>
+              )}
+              {u.id !== me?.id && !u.removed_at && theirs && (
                 <div className="person-section">
                   <h3>Account</h3>
                   <div className="actions">
@@ -162,9 +172,17 @@ export function PeopleAll() {
                       onClick={() => void act(() => patch(`/admin/users/${u.id}`, { status: u.status === "active" ? "disabled" : "active" }))}>
                       {u.status === "active" ? "Disable account" : "Enable account"}
                     </button>
-                    <button className="btn secondary small" onClick={() => void act(() => isSuper ? del(`/admin/users/${u.id}/super-admin`) : post(`/admin/users/${u.id}/super-admin`))}>
-                      {isSuper ? "Remove super admin" : "Make super admin"}
-                    </button>
+                    {can(me, "roles") && (
+                      <button className="btn secondary small" onClick={() => void act(() => isSuper ? del(`/admin/users/${u.id}/super-admin`) : post(`/admin/users/${u.id}/super-admin`))}>
+                        {isSuper ? "Remove super admin" : "Make super admin"}
+                      </button>
+                    )}
+                    {can(me, "roles") && !isSuper && (
+                      <button className="btn secondary small" title="Helps run every group, without the service's own settings"
+                        onClick={() => void act(() => isService ? del(`/admin/users/${u.id}/service-admin`) : post(`/admin/users/${u.id}/service-admin`))}>
+                        {isService ? "Remove service admin" : "Make service admin"}
+                      </button>
+                    )}
                     <button className="btn secondary small" onClick={() => {
                       if (window.confirm(`Sign ${u.email} out of every browser and device? They'll need a new code to sign in.`)) {
                         void act(() => post(`/admin/users/${u.id}/sessions/end`));

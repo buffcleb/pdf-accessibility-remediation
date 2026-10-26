@@ -1,5 +1,6 @@
 """#403: MathML a document's own tags carry, as LaTeX's tagging writes it: an associated MathML file on the Formula,
-or MathML structure elements under it. Kept as written, and read by rule for a Formula with no read-aloud text."""
+or MathML structure elements under it (#421: rebuilt from the elements, their text from the page). Kept as written,
+and read by rule for a Formula with no read-aloud text."""
 import pikepdf
 import pymupdf as fitz
 import pytest
@@ -104,10 +105,13 @@ def test_kept_formulas_are_read_from_their_mathml_and_their_mathml_is_kept(tmp_p
     out = tmp_path / "out.pdf"
     result = tag_document(src, out, analyze_document(src), title="t", language="en-US")
     assert result.existing_tags["usable"]
-    assert result.formulas_read_from_mathml == 1  # the one whose MathML is a file; elements alone aren't read yet
-    (doc,) = result.document_formulas
+    assert result.formulas_read_from_mathml == 2  # the one whose MathML is a file, and the one of elements (#421)
+    doc, elements = sorted(result.document_formulas, key=lambda d: d["bbox"][1])
     assert (doc["page"], doc["source"], doc["spoken"]) == (0, "document", "x is equal to 1 half")
     assert doc["mathml"].startswith("<math") and doc["rule"]["nemeth"]
+    # #421: the other's MathML, rebuilt from its elements with their text from the page, is read and listed too
+    assert (elements["page"], elements["source"], elements["spoken"]) == (0, "document", "x is equal to 1 half")
+    assert "<mi>y = 3</mi>" in elements["mathml"] and elements["rule"]["nemeth"]
     with pikepdf.open(out) as pdf:
         formulas = _formulas(pdf)
         assert len(formulas) == 2  # neither became a Div
@@ -115,6 +119,7 @@ def test_kept_formulas_are_read_from_their_mathml_and_their_mathml_is_kept(tmp_p
         assert str(with_file.Alt) == "x is equal to 1 half" and formula_mathml(with_file)[0] == QUADRATIC
         with_elements = next(f for f in formulas if "/AF" not in f)
         assert in_mathml(with_elements.K[0]) and in_mathml(with_elements.K[0].K[0])
+        assert str(with_elements.Alt) == "x is equal to 1 half"  # it had no read-aloud text: now its MathML's
         rolemap = pdf.Root.StructTreeRoot.get("/RoleMap") or {}
         assert not {"/math", "/mi"} & {str(k) for k in rolemap.keys()}  # their namespace says what they are
         errors, _ = check_integrity(pdf)
@@ -132,3 +137,28 @@ def test_an_ai_reading_of_the_same_formula_gives_way_to_the_documents_mathml():
     assert mathml.add_document_formulas(formulas, notation, [doc]) == 1
     assert [f["name"] for f in formulas] == ["page-001_tagged-1.mml", "page-001_formula-2.mml"]
     assert notation == [{"page": 0, "bbox": [100, 400, 200, 420], "spoken": "other"}]
+
+
+def test_mathml_is_rebuilt_from_its_elements():
+    """#421: names from the roles, nesting from the tree, attributes from /A, each leaf's text from its marked content
+    (or its ActualText); with no math element on top, one is put around them."""
+    from app.tagging.mathml_tags import mathml_from_elements
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+    pg = pdf.pages[0].obj
+    ns = Dictionary(Type=Name.Namespace, NS=String(MATHML_NS))
+
+    def el(role, k, **extra):
+        return Dictionary(Type=Name.StructElem, S=Name("/" + role), NS=ns, K=k, **extra)
+    frac = el("mfrac", Array([el("mn", 1), el("mn", Dictionary(Type=Name.MCR, Pg=pg, MCID=2))]))
+    math = el("math", Array([el("mi", 0), el("mo", Array(), ActualText=String("=")), frac]),
+              A=Dictionary(O=Name("/MathML-3"), display=String("block")))
+    formula = Dictionary(Type=Name.StructElem, S=Name.Formula, Pg=pg, K=Array([math]))
+    text = {0: "x", 1: "1", 2: "2"}
+    got = mathml_from_elements(formula, lambda page, mcid: text[mcid] if page.objgen == pg.objgen else "?")
+    assert got == (f'<math xmlns="{MATHML_NS}" display="block"><mi>x</mi><mo>=</mo>'
+                   '<mfrac><mn>1</mn><mn>2</mn></mfrac></math>')
+    assert mathml.clean(got) is not None
+    bare = Dictionary(Type=Name.StructElem, S=Name.Formula, Pg=pg, K=Array([el("mi", 0)]))
+    assert mathml_from_elements(bare, lambda page, mcid: "y") == f'<math xmlns="{MATHML_NS}"><mi>y</mi></math>'
+    assert mathml_from_elements(Dictionary(S=Name.Formula, K=0), lambda page, mcid: "") is None

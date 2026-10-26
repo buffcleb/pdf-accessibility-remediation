@@ -48,3 +48,14 @@ test("the top of each pane and the editing panel's tabs stay in view", () => {
   // The viewer's box can't be scrolled by the page itself, which would slide the panes' tops out of sight
   assert.ok(/main\.viewer \{ height: calc\(100vh - var\(--topbar-h\)\); padding-bottom: 12px; overflow: hidden; overflow: clip; \}/.test(flat));
 });
+
+test("long emails, file names and digests wrap rather than run out of their box (#571)", () => {
+  assert.ok(/\nbody \{[^}]*overflow-wrap: break-word/.test(css));
+  // In flex and grid an item is as wide as its longest word unless told otherwise
+  assert.ok(/\.page-head > \* \{[^}]*min-width: 0/.test(css));
+  assert.ok(/\.pod-facts dd \{[^}]*min-width: 0/.test(css));
+  assert.ok(/\.pod-about code \{[^}]*overflow-wrap: anywhere/.test(css));
+  assert.ok(/\.chip \{[^}]*overflow-wrap: anywhere/.test(css));
+  // Not for every table cell: a wide table scrolls in its own box instead of breaking every word
+  assert.ok(!/overflow-wrap: anywhere/.test(css.match(/\nth, td \{[^}]*\}/)?.[0] ?? "anywhere"));
+});

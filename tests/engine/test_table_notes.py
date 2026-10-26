@@ -5,7 +5,7 @@ import pymupdf as fitz
 
 from app.pipeline.models import TableCell, TableRegion
 from app.pipeline.orchestrator import prepare_analysis
-from app.pipeline.structure import _say_table_marks
+from app.pipeline.structure.notes import say_table_marks
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
@@ -36,8 +36,8 @@ def _tagged(tmp_path, note="* Adjusted for weight in children under twelve.", no
     pa.tables = [TableRegion(id="p0t0", page=0, bbox=(X0, Y0, X0 + 2 * W, bottom), n_rows=3, n_cols=2, cells=cells)]
     pa.reading_order = [b.id for b in sorted(pa.blocks, key=lambda b: b.bbox[1]) if b.bbox[1] < Y0] + ["p0t0"] + \
         [b.id for b in sorted(pa.blocks, key=lambda b: b.bbox[1]) if b.bbox[1] >= bottom]
-    from app.pipeline.structure import _mark_table_notes
-    _mark_table_notes(analysis)   # (roles are assigned before the table is set here, so the step runs again)
+    from app.pipeline.structure.notes import mark_table_notes
+    mark_table_notes(analysis)   # (roles are assigned before the table is set here, so the step runs again)
     out = tmp_path / "doses_tagged.pdf"
     tag_document(src, out, analysis, title="Doses", language="en-US")
     return out, analysis
@@ -66,9 +66,9 @@ def test_what_isnt_a_table_note(tmp_path):
 
 
 def test_how_a_cells_symbols_are_said():
-    assert _say_table_marks("500*", {"*": "n"}) == "500 (footnote asterisk)"
-    assert _say_table_marks("Dose† and **", {"†": "n"}) == "Dose (footnote dagger) and **"   # ** has no note
-    assert _say_table_marks("*", {"*": "n"}) == "footnote asterisk"
+    assert say_table_marks("500*", {"*": "n"}) == "500 (footnote asterisk)"
+    assert say_table_marks("Dose† and **", {"†": "n"}) == "Dose (footnote dagger) and **"   # ** has no note
+    assert say_table_marks("*", {"*": "n"}) == "footnote asterisk"
 
 
 def test_table_notes_reach_the_documents_own_tags_when_they_are_kept(tmp_path):
@@ -89,8 +89,8 @@ def test_table_notes_reach_the_documents_own_tags_when_they_are_kept(tmp_path):
              for r, row in enumerate(GRID) for c, t in enumerate(row)]
     pa.blocks = [b for b in pa.blocks if not (Y0 - 2 <= b.bbox[1] < bottom)]
     pa.tables = [TableRegion(id="p0t0", page=0, bbox=(X0, Y0, X0 + 2 * W, bottom), n_rows=3, n_cols=2, cells=cells)]
-    from app.pipeline.structure import _mark_table_notes
-    _mark_table_notes(analysis)
+    from app.pipeline.structure.notes import mark_table_notes
+    mark_table_notes(analysis)
     out = tmp_path / "kept.pdf"
     result = tag_document(src, out, analysis, title="Doses", language="en-US")
     assert result.existing_tags.get("usable") and result.kept_notes == 1 and result.kept_note_refs == 1

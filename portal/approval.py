@@ -81,12 +81,14 @@ def decline(db: Session, request: Request, user: User, actor: User, reason: str 
 # --- emails ----------------------------------------------------------------------------------------
 
 def _admins_of(db: Session, group: Group) -> list[str]:
-    """The group's active admins; if it has none, the super admins, so a request is never lost."""
+    """The group's active admins, and a subgroup's parent's, who manage it too (#431); if there are none, the super
+    admins and service admins, so a request is never lost."""
     def active(rows):
         return sorted({r.user.email for r in rows if r.user.status == "active"})
-    admins = active(db.scalars(select(RoleAssignment).where(RoleAssignment.role == "group_admin",
-                                                            RoleAssignment.group_id == group.id)))
-    return admins or active(db.scalars(select(RoleAssignment).where(RoleAssignment.role == "super_admin")))
+    admins = active(db.scalars(select(RoleAssignment).where(
+        RoleAssignment.role == "group_admin", RoleAssignment.group_id.in_([g for g in (group.id, group.parent_id) if g]))))
+    return admins or active(db.scalars(select(RoleAssignment).where(
+        RoleAssignment.role.in_(("super_admin", "service_admin")))))
 
 
 def _signature(db: Session) -> str:

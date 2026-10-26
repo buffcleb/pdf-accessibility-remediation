@@ -9,7 +9,8 @@ import pymupdf as fitz
 from app.ai.base import ChatResult, TokenUsage
 from app.ai.mock import MockProvider
 from app.pipeline.enrichment import EnrichmentStats, _tables
-from app.pipeline.models import DocumentAnalysis, PageAnalysis, TableCell, TableRegion
+from app.pipeline.models import DocumentAnalysis, TableCell, TableRegion
+from tests.engine.layout import document, page
 
 ABSURD = 5_000_000
 
@@ -26,10 +27,7 @@ def _analysis() -> DocumentAnalysis:
                        text="Head" if r == 0 else ("" if (r, c) != (1, 0) else "Only"))
              for r in range(3) for c in range(2)]
     table = TableRegion(id="p0t0", page=0, bbox=(50.0, 50.0, 250.0, 110.0), n_rows=3, n_cols=2, cells=cells)
-    page = PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792))
-    page.tables = [table]
-    return DocumentAnalysis(page_count=1, pages=[page], title=None, language=None, has_struct_tree=False,
-                            is_marked=False)
+    return document(page(table))
 
 
 def test_a_span_past_the_table_is_clamped_to_it(tmp_path):

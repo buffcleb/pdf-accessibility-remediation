@@ -15,6 +15,8 @@ last 7 days, and how long the oldest item has waited.
 
 ## Pausing
 
+> **Changed 23 October 2026:** pausing and resuming are for super admins only; service admins see the queues and act on single items (#564).
+
 **Pause** (with an optional reason) lets work already started finish and starts nothing new until **Resume**.
 
 - Documents that use a paused service wait in its queue and go ahead on resume. They're never sent another way.
@@ -82,7 +84,9 @@ audit log with the re-run (`job.rerun`). A document whose files have been delete
 whose tags turned out poor. It starts as the original was run, ticked or not.
 
 The document page also has a **Run details** tab for super admins: what the run cost and used, the limits it
-reached, time by stage, and the engine's side (its job ID, route, error and warnings).
+reached, time by stage, and the engine's side (its job ID, route, error and warnings). **Changed 24 October 2026:**
+it also shows the **Engine version** that processed the document (the engine image's tag, usually the commit), so you
+can tell whether a fix had reached the engine when the document ran. Documents processed before then don't have it.
 
 Before a document is done (waiting, processing, or waiting for its owner to confirm), its page has a short **Run
 details** card for super admins instead:

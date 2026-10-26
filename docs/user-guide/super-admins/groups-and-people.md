@@ -37,6 +37,26 @@ For people who don't share an organization's email domain (individuals with pers
 group such as **Individuals** with no email domains, and add each person under **People allowed by address**. It
 works like any other group: its own services, page pool, limits and admins.
 
+### Subgroups
+
+> **New 26 October 2026** (#431).
+
+A group can have **subgroups**, one level deep: groups inside it whose people use its pages and follow its settings
+until a subgroup sets its own. **Add a subgroup** is beside a group's name on its page (or give **Parent** when
+creating one through the API); the groups list shows each subgroup under its parent. Its email domains and addresses
+are yours to add, on its **Group settings**, as for any group: an address or domain listed on a subgroup is matched
+before the parent's domain. Its admins are added as for any group, and the parent's admins manage it too.
+
+- **Pages** are added to the parent only: a top-up or pool correction on a subgroup is refused. A subgroup can have a
+  **limit** per service on the parent's pool (**Services and pages → Set limit**), which you, service admins and the
+  parent's admins set.
+- **Local only** on a parent is on for all its subgroups, and they can't turn it off.
+- **Moving people:** the parent's admins can move people between the parent and its subgroups. Moving them anywhere
+  else is still yours, in **People (all groups)**.
+- A subgroup can't have subgroups of its own.
+
+The group admins' guide has the details: [Subgroups](../group-admins/subgroups.md).
+
 ## Pages and top-ups
 
 Each service has a **pool** per group, and optionally a **global pool** shared by every group (set on the service's
@@ -55,8 +75,10 @@ or the AI it was charged for turned out not to be needed.
 
 ## People (all groups)
 
+> **Changed 23 October 2026:** service admins: the role filter, and **Make service admin** (#564).
+
 **People (all groups)** lists everyone, with their group and use, a page at a time. Search by email or name, pick a
-group, and under **Filters** a role (super admins, group admins, members) or status (active, disabled, waiting for
+group, and under **Filters** a role (super admins, service admins, group admins, members) or status (active, disabled, waiting for
 approval, declined, data removed); sort by person, group or last sign-in. **Manage** opens a dialog to:
 
 - **move** them to another group (their past use stays with the old group);
@@ -64,6 +86,9 @@ approval, declined, data removed); sort by person, group or last sign-in. **Mana
   and the audit log. (Use this when a document didn't come out usable, for example.)
 - **disable** their account (it ends their sessions; their documents stay);
 - **make them a super admin**, or remove it;
+- **make them a [service admin](../service-admins/README.md)**, or remove it: they help run every group, without
+  the service's own settings. A super admin can't also be one; making a service admin a super admin replaces it.
+  Someone without a group needs one before the role can be removed;
 - **Sign out everywhere:** every session in every browser and device ends, for a lost device or an account
   someone else may be using. It's audited; they need a new code to sign in.
 

@@ -19,7 +19,10 @@
   session), and travel in an `HttpOnly; Secure; SameSite=Strict` cookie scoped to the refresh endpoint.
 - Sessions time out when idle and after an absolute limit, both configurable.
 - **Roles are checked on every endpoint**, and a resource's group is always taken from the database, never from the
-  request.
+  request. Since 23 October 2026 (#564) each route asks for a named permission (`portal/permissions.py`): super
+  admins have them all, [service admins](../user-guide/service-admins/README.md) those for running groups, never
+  the service's settings, roles or people's data. A test lists every route with the check it makes, so a new one
+  can't be added without deciding who may use it.
 - A break-glass command issues a sign-in code when email fails; each use is audited, never the code.
 - **Asking for a code gives the same answer for every address the service would take** (#359): an existing
   account, a disabled one and a new address in a group's domain all get "code sent", at the same speed, and the
@@ -30,8 +33,8 @@
 - **An optional bot check** (Cloudflare Turnstile, `portal/security/botcheck.py`) on "Email me a code", so scripts
   can't use it to send mail. Off unless its keys are set; if Cloudflare can't be reached it lets the request through
   by default (`PORTAL_TURNSTILE_FAIL_OPEN`), and the rate limits still apply.
-- **Sign out of all devices** revokes every session of a person (`/auth/logout-all`); a super admin can do it for
-  anyone (#354).
+- **Sign out of all devices** revokes every session of a person (`/auth/logout-all`); a super admin or a service admin can do
+  it for anyone else (#354; a service admin not for super admins or other service admins).
 - **Proxy headers** (the caller's address, for rate limits and the audit log) count only on connections from the
   proxies listed in `PORTAL_TRUSTED_PROXIES`, so nobody can pick a fresh rate-limit bucket by setting a header (#336).
 - **Personal API tokens** (#518) let a script send its owner's documents. They're off until super admins and the
@@ -63,6 +66,11 @@
   The gateway, the Adobe worker, the portal and (with malware scanning on) ClamAV reach the internet directly, or,
   with `EGRESS_PROXY=enforce`, only through an egress proxy that lets through the hosts this deployment uses and
   nothing else (#453, [deploy/k8s/README.md](../../deploy/k8s/README.md#outbound-traffic-the-egress-proxy)).
+- **Egress can be denied by default too** (`EGRESS_DENY=on`, #594; new 24 October 2026, off by default until it has
+  run on the lab): then no other pod reaches out except to what it uses. The file store, the database, both Redis
+  and veraPDF reach only DNS; cloudflared only Cloudflare's edge and the web pod; monitoring only what it reads and
+  the Kubernetes API; the backup and migration jobs only the database and the file store
+  ([default deny](../../deploy/k8s/README.md#outbound-traffic-default-deny)).
 - **Ingress is denied by default** (`default-deny-ingress`), and every pod is let in only from its own clients; the
   policies are applied before any workload starts (#453). The engine's queue and the portal's rate limits are in two
   Redis, each with its own password, so neither side can reach the other's (#472).
@@ -119,11 +127,11 @@ Row-level security (#350, migration 0044) checks group boundaries a second time,
 - For each transaction the API says whose request it is (`portal/rls.py`): the person, their group and the groups
   they administer. A row outside those is not there for the query, and a write can't put one there.
 - While someone signs in, only the account with that address is there. A request nobody signed in to sees none.
-- People see the super admins' accounts too, as super admins answer help requests.
+- People see the super admins' and service admins' accounts too, as they answer help requests.
 - Anyone may add to the audit log; reading it is scoped like the rest.
-- Super admins, the portal worker, the status check and metrics work across groups, so they bypass the policies.
-  The bypass is audited (`rls.bypass`): a super admin's once per sign-in and kind of request (the route, never its
-  IDs), the rest once per process. Once per request would fill the log.
+- Super admins, service admins (#564), the portal worker, the status check and metrics work across groups, so they
+  bypass the policies. The bypass is audited (`rls.bypass`): a super admin's or a service admin's once per sign-in
+  and kind of request (the route, never its IDs, and their role), the rest once per process. Once per request would fill the log.
 - The settings are transaction-local, so a pooled connection carries nothing over to the next request.
 - The policies bind `portal_app`. The owner, `portal`, isn't bound (it owns the tables, and FORCE isn't set), so
   the migrations, the backup's dump and a restore see every row.
@@ -143,7 +151,7 @@ queue actions, help requests and tag edits are recorded, with the group attached
 exports are audited too.
 
 The portal watches the audit log for patterns worth a look (repeated wrong codes, one IP trying many addresses, bulk
-downloads of others' documents, a refresh token used twice, a new super admin, an upload refused for malware and
+downloads of others' documents, a refresh token used twice, a new super admin or service admin, an upload refused for malware and
 others) and emails super admins ([security alerts](../operations/monitoring.md#security-alerts)). The log can also
 go to a campus SIEM, by syslog over TLS, by HTTPS or through a pull API ([the SIEM export](../operations/siem.md)).
 
@@ -173,7 +181,7 @@ produces passes PDF/UA-1.
 
 `scripts/a11y.sh` checks it (#369): axe-core in a headless browser over the main pages (sign-in, a person's
 documents, a document's page and its tag manager, settings, a group's pages and the admin area), as a person, a
-group admin and a super admin, in light and dark, against WCAG 2.2 A and AA. The pages show invented people and
+group admin, a service admin and a super admin, in light and dark, against WCAG 2.2 A and AA. The pages show invented people and
 documents (`tests/a11y/serve.py`). It runs locally, and in CI only when started by hand (**Accessibility checks**).
 Automated checks find only part of what a person using assistive technology would: they're a floor, not a
 sign-off.

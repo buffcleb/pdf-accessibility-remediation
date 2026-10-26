@@ -89,10 +89,10 @@ def _unique(name: str, taken: set[str]) -> str:
     return out
 
 
-def downloadable(job: Job, is_super_admin: bool) -> list[JobFile]:
+def downloadable(job: Job, staff: bool) -> list[JobFile]:
     """The job's files its page offers this viewer."""
     return [f for f in job.files if not f.kind.startswith(HIDDEN_PREFIXES)
-            and (is_super_admin or f.kind not in STAFF_ONLY_FILES)]
+            and (staff or f.kind not in STAFF_ONLY_FILES)]
 
 
 def newest_version(db: Session, job: Job) -> tuple[DocumentVersion, JobFile] | None:
@@ -114,7 +114,7 @@ def _gone(job: Job, retention_days: int) -> str:
     return f"Its files were removed on {when} (files are kept {retention_days} days)."
 
 
-def plan(db: Session, jobs: list[Job], *, is_super_admin: bool, time_zone: str, retention_days: int) -> Plan:
+def plan(db: Session, jobs: list[Job], *, staff: bool, time_zone: str, retention_days: int) -> Plan:
     """What the zip will hold: one folder per document, named from its date and file name ("2026-10-21 syllabus"),
     so two uploads of the same name don't collide."""
     try:
@@ -126,7 +126,7 @@ def plan(db: Session, jobs: list[Job], *, is_super_admin: bool, time_zone: str, 
         if job.files_deleted_at is not None:
             left_out.append((job, _gone(job, retention_days)))
             continue
-        files = downloadable(job, is_super_admin)
+        files = downloadable(job, staff)
         newest = newest_version(db, job)
         if not files and newest is None:
             left_out.append((job, "No files yet."))

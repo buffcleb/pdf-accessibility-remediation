@@ -80,7 +80,7 @@ def _clear_refresh_cookie(response: Response) -> None:
 def _blocked_message(db: Session, user: User) -> str | None:
     if user.status != "active":
         return settings_store.load(db).account_disabled_message
-    if not user.is_super_admin and (user.group is None or user.group.status != "active"):
+    if not user.across_groups and (user.group is None or user.group.status != "active"):
         return settings_store.load(db).account_disabled_message
     return None
 

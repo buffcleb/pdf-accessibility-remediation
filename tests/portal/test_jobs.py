@@ -68,9 +68,10 @@ class FakeEngine:
         return list(self.models)
 
     def submit(self, filename, fileobj, report_only, ai=None, full_review=False, route="standard", branding=None,
-               no_ai=False, validator=None, ignore_existing=False):
+               no_ai=False, validator=None, ignore_existing=False, pdfua="1"):
         jid = uuid.uuid4().hex
         self.ignore_existing = getattr(self, "ignore_existing", []) + [ignore_existing]
+        self.pdfuas = getattr(self, "pdfuas", []) + [pdfua]
         self.validators = getattr(self, "validators", []) + [validator]
         self.submitted.append((filename, report_only))
         self.routes.append(route)
@@ -276,7 +277,8 @@ def test_upload_reserves_and_completion_commits(setup):
     me = s["c"]["user"].get(f"{API}/me").json()
     assert me["used_pages"] == 3 and me["reserved_pages"] == 0
     grp = s["c"]["admin_a"].get(f"{API}/groups/{a}").json()["balance"]
-    assert grp == {"pool_pages": 100, "used_pages": 3, "reserved_pages": 0, "remaining_pages": 97}
+    assert grp == {"pool_pages": 100, "used_pages": 3, "reserved_pages": 0, "remaining_pages": 97,
+                   "cap_pages": None, "shared": False}
     mail = get_mailer().outbox[-1]
     assert mail.to == "user@a.test" and mail.subject == "Done: Report Q3.pdf" and job_id in mail.text
 
@@ -852,3 +854,61 @@ def test_existing_tags_can_be_ignored_at_upload_and_on_a_rerun(setup):
     assert again["ignore_existing"] is True                     # as the original was run
     off = s["c"]["super"].post(f"{API}/jobs/{job_id}/rerun", json={"ignore_existing": False}).json()
     assert off["ignore_existing"] is False
+
+
+def test_pdfua_2_is_chosen_top_down(setup):
+    """#445: super admins offer PDF/UA-2 for the service, a group's admins let its people choose it (and set what's
+    preselected), and people choose per document. Asking for it before it's allowed is refused; a check only is
+    PDF/UA-1; a re-run keeps the choice or changes it; the engine is told."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    user, admin, sup = s["c"]["user"], s["c"]["admin_a"], s["c"]["super"]
+    files = [("files", ("doc.pdf", pdf_bytes(1), "application/pdf"))]
+    assert user.get(f"{API}/upload-options").json()["pdfua_choices"] == ["1"]
+    r = user.post(f"{API}/jobs", files=files, data={"pdfua": "2"})
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "pdfua_not_allowed"
+    # The group allows it, but the service doesn't offer it yet: still PDF/UA-1 only
+    assert admin.patch(f"{API}/groups/{s['a'].id}", json={"pdfua_choice": True, "pdfua_default": "both"}).status_code == 200
+    assert user.get(f"{API}/upload-options").json() == {**user.get(f"{API}/upload-options").json(),
+                                                        "pdfua_choices": ["1"], "pdfua_default": "1"}
+    assert sup.patch(f"{API}/admin/settings", json={"pdfua2_enabled": True}).status_code == 200
+    opts = user.get(f"{API}/upload-options").json()
+    assert (opts["pdfua_choices"], opts["pdfua_default"]) == (["1", "2", "both"], "both")
+    def doc(n):  # a different file each time: an identical one still in progress is refused (#560)
+        return [("files", (f"doc{n}.pdf", pdf_bytes(n), "application/pdf"))]
+    (both,) = user.post(f"{API}/jobs", files=doc(2)).json()               # nothing asked: the group's default
+    (two,) = user.post(f"{API}/jobs", files=doc(3), data={"pdfua": "2"}).json()
+    (check,) = user.post(f"{API}/jobs", files=doc(4), data={"pdfua": "2", "report_only": "true"}).json()
+    assert [j["job"]["pdfua"] for j in (both, two, check)] == ["both", "2", "1"]
+    run_worker(s["db"])
+    assert s["engine"].pdfuas == ["both", "2", "1"]
+    job_id = both["job"]["id"]
+    assert sup.post(f"{API}/jobs/{job_id}/rerun", json={}).json()["pdfua"] == "both"
+    assert sup.post(f"{API}/jobs/{job_id}/rerun", json={"pdfua": "1"}).json()["pdfua"] == "1"
+    bad = admin.patch(f"{API}/groups/{s['a'].id}", json={"pdfua_default": "3"})
+    assert bad.status_code == 422
+
+
+def test_both_lists_the_pdfua_2_copy_with_its_verdict(setup):
+    """#445: a Both document's PDF/UA-2 copy is a download of its own, labelled with its part beside the PDF/UA-1
+    file, with its verdict in the summary."""
+    s = setup
+    topup(s, s["a"].id, 100)
+    s["c"]["super"].patch(f"{API}/admin/settings", json={"pdfua2_enabled": True})
+    s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}", json={"pdfua_choice": True})
+    (r,) = s["c"]["user"].post(f"{API}/jobs", files=[("files", ("doc.pdf", pdf_bytes(1), "application/pdf"))],
+                               data={"pdfua": "both"}).json()
+    run_worker(s["db"])
+    job = s["db"].get(Job, uuid.UUID(r["job"]["id"]))
+    s["engine"].complete(job.engine_job_id)
+    base = f"/api/v1/jobs/{job.engine_job_id}/files"
+    done = s["engine"].jobs[job.engine_job_id]
+    done["files"]["remediated_pdfua2"] = f"{base}/doc_compliant_pdfua2.pdf"
+    done["reports"]["verapdf_after"]["pdfua2"] = f"{base}/doc_verapdf_after_pdfua2_ua2.xml"
+    done["reports"]["comparison"]["after_pdfua2"] = {"compliant": True, "pdfua_part": 2}
+    done["reports"]["comparison"]["pdfua2_changes"] = ["saved as PDF 2.0, labelled PDF/UA-2"]
+    run_worker(s["db"])
+    out = s["c"]["user"].get(f"{API}/jobs/{job.id}").json()
+    labels = {f["kind"]: f["label"] for f in out["files"]}
+    assert labels["pdfua2"] == "PDF/UA-2 (PDF 2.0)" and labels["primary"] == "PDF/UA-1 (PDF 1.7)"
+    assert out["result"]["pdfua2_compliant"] is True and out["result"]["converted_pdf2"] is True

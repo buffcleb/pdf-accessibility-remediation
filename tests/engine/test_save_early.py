@@ -28,14 +28,14 @@ def _store(tmp_path, monkeypatch):
 def test_the_file_and_tag_map_are_published_before_the_checks(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch)
     seen = {}
-    real = edit_job._validate
+    real = edit_job.validate
 
     def validate(*a, **k):  # veraPDF: by now the version could already be opened
         seen["partial"] = store.read_partial()
         seen["result"] = store.read_result()
         return real(*a, **k)
 
-    monkeypatch.setattr(edit_job, "_validate", validate)
+    monkeypatch.setattr(edit_job, "validate", validate)
     result = asyncio.run(edit_job.run_edit(store, lambda s, p: None))
     partial = seen["partial"]
     assert seen["result"] is None

@@ -16,24 +16,26 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import re
 import json
 import logging
 import shutil
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Callable
 
+import pikepdf
 import pymupdf as fitz
 
 from app.ai.base import AIError
 from app.ai.registry import get_provider
 from app.config import get_settings
-from app.pipeline.analyzer import analyze_document, capped_dpi
+from app.pipeline.analyzer import analyze_document
 from app.pipeline.enrichment import EnrichmentStats, enrich, render_slots
 from app.pipeline.models import DocumentAnalysis
+from app.pipeline.outputs import (Progress, StageClock, add_bookmarks, current_clock, delta, move_xml, snapshot, tagmap_file,
+                                  validate, verdict_line, visual_fidelity, write_json_report, xml_name)
+from app.pipeline.run_result import RunResult, ai_usage, timed
 from app.pipeline.ocr import block_confidence, ocr_lines, tesseract_available, tesseract_cli, write_ocr_layer
 from app.pipeline.ocr_ai import correct_lines
 from app.pipeline import field_labels, limits, mathml, music, protection, scan_figures
@@ -42,7 +44,6 @@ from app.pipeline.language import document_language
 from app.pipeline.structure import assign_roles, detect_columns, heuristic_reading_order
 from app.pipeline.transfer import transfer_enrichment
 from app.storage import JobStore
-from app.tagging.bookmarks import write_bookmarks
 from app.tagging.destructive import DESTRUCTIVE_CLAUSES, flatten_pages
 from app.tagging.font_embed import embed_standard_fonts
 from app.tagging.font_unicode import add_missing_tounicode
@@ -50,16 +51,13 @@ from app.tagging.form_marks import redraw_dingbat_marks
 from app.tagging.font_metrics import fix_width_mismatches
 from app.tagging.tagger import TagResult, apply_written_alts, tag_document, write_figure_alts
 from app.validation.audit import audit_pdf
-from app.validation.verapdf import VeraResult, run_verapdf
-from app.validation.verapdf import flavours as verapdf_flavours
-from app.validation.verapdf import pdfua_part
+from app.validation.verapdf import VeraResult
 from app.verification.model import IntegrityError
 from app.verification.tagmap import build_tagmap
 from app.verification.verify import VerifyOptions, verify_output
 
 log = logging.getLogger(__name__)
 
-Progress = Callable[[str, int], None]
 
 
 class AIProviderUnavailable(RuntimeError):
@@ -85,6 +83,7 @@ class JobOptions:
     notation_ai: bool = True  # the AI reads specialist notation the layout rules can't
     ocr_ai: bool = True  # the AI corrects OCR words Tesseract was unsure of
     ignore_existing: bool = False  # the document's own tags are poor: tag it afresh from the page (#396)
+    pdfua: str = "1"  # "1", "2" (delivered as PDF 2.0, PDF/UA-2) or "both" (a PDF/UA-2 copy too) (#445)
 
     @classmethod
     def from_meta(cls, meta: dict) -> "JobOptions":
@@ -107,6 +106,7 @@ class JobOptions:
             notation_ai=flags.get("notation_ai", True) is not False,
             ocr_ai=flags.get("ocr_ai", True) is not False,
             ignore_existing=bool(flags.get("ignore_existing")),
+            pdfua=str(flags.get("pdfua") or "1"),
         )
 
 
@@ -127,148 +127,6 @@ def prepare_analysis(path: Path) -> DocumentAnalysis:
         p.columns = detect_columns(p)
         p.reading_order = heuristic_reading_order(p)
     return analysis
-
-
-class StageClock:
-    """Where a document's time goes: seconds per stage (a stage runs from one progress mark to the next; one
-    visited twice adds up), and within them the time spent waiting for the validator."""
-
-    def __init__(self, progress: Progress):
-        self._progress = progress
-        self._stage: str | None = None
-        self._since = time.monotonic()
-        self.stages: dict[str, float] = {}
-        self.parts: dict[str, float] = {}
-
-    def __call__(self, stage: str, pct: int) -> None:
-        self._close()
-        self._stage = stage
-        self._progress(stage, pct)
-
-    def _close(self) -> None:
-        now = time.monotonic()
-        if self._stage is not None:
-            self.stages[self._stage] = self.stages.get(self._stage, 0.0) + now - self._since
-        self._since = now
-
-    def add(self, part: str, seconds: float) -> None:
-        self.parts[part] = self.parts.get(part, 0.0) + seconds
-
-    def seconds(self) -> dict:
-        """So far, in the order the stages were first reached; the stage in progress counts up to now."""
-        self._close()
-        out = {k: round(v, 1) for k, v in self.stages.items() if k != "completed"}
-        if self.parts:
-            out["of_which"] = {k: round(v, 1) for k, v in self.parts.items()}
-        return out
-
-
-# The clock of the document being processed (threads started with asyncio.to_thread see the same one)
-_clock: contextvars.ContextVar[StageClock | None] = contextvars.ContextVar("stage_clock", default=None)
-
-
-def _validate(pdf: Path, out_dir: Path, label: str, stem: str) -> dict[str, VeraResult]:
-    """Each profile (PDF/UA-1, and PDF/UA-2 for information) checked, at the same time when the veraPDF service is
-    there (it runs several copies; each check waits on it, not on this process): about a minute and a half less on a
-    500-page document, which is checked six to eight times."""
-    import contextvars
-    from concurrent.futures import ThreadPoolExecutor
-
-    from app.validation.verapdf import uses_service
-
-    flavours = verapdf_flavours(pdfua_part(pdf))  # the verdict by the part the file can conform to (#409)
-    started = time.monotonic()
-
-    def one(fl: str) -> VeraResult:
-        return run_verapdf(pdf, out_dir / f"{stem}_verapdf_{label}_{fl}.xml", fl)
-    if len(flavours) > 1 and uses_service():
-        # Each in a copy of this job's context: its validator choices (job_validator) live there
-        with ThreadPoolExecutor(max_workers=len(flavours)) as pool:
-            futures = [pool.submit(contextvars.copy_context().run, one, fl) for fl in flavours]
-            results = {fl: f.result() for fl, f in zip(flavours, futures)}
-    else:
-        results = {fl: one(fl) for fl in flavours}
-    if (clock := _clock.get()) is not None:
-        clock.add("validator", time.monotonic() - started)
-    return results
-
-
-def _snapshot(audit: dict, vera: dict[str, VeraResult]) -> dict:
-    primary = next(iter(vera.values()), None)
-    snap = {
-        # Which PDF/UA the verdict is by: 2 for a PDF 2.0 file, else 1 (#409)
-        "pdfua_part": 2 if next(iter(vera), None) == "ua2" else 1,
-        "compliant": primary.compliant if primary and primary.available else None,
-        "failed_rules": primary.failed_rules if primary else None,
-        "failed_checks": primary.failed_checks if primary else None,
-        "verapdf": {
-            fl: ({"compliant": v.compliant, "passed_rules": v.passed_rules, "failed_rules": v.failed_rules,
-                  "failed_checks": v.failed_checks, "profile": v.profile,
-                  "failed_clauses": sorted(v.failed_clauses),
-                  "failures": [{"clause": f.clause, "test": f.test, "description": f.description,
-                                "failed_checks": f.failed_checks, "pages": [p + 1 for p in f.pages][:20]}
-                               for f in v.failures[:25]]} if v.available and not v.error
-                 else {"error": v.error or "unavailable"})
-            for fl, v in vera.items()
-        },
-    }
-    snap.update(audit)
-    return snap
-
-
-def _drawing(path: Path) -> list[str]:
-    """Each page's drawing instructions, as a fingerprint: its content streams and the Form XObjects it draws (and the
-    forms they draw), byte for byte. Two pages with the same fingerprint, in a file and the file the tag editor made
-    from it (which changes only content streams and the tag tree), draw the same."""
-    import hashlib
-
-    import pikepdf
-
-    out = []
-    with pikepdf.open(path) as pdf:
-        for page in pdf.pages:
-            h = hashlib.sha1()
-            try:
-                h.update(page.obj.Contents.read_bytes() if isinstance(page.obj.get("/Contents"), pikepdf.Stream)
-                         else b"".join(c.read_bytes() for c in page.obj.get("/Contents") or []))
-                seen, todo = set(), [page.obj.get("/Resources")]
-                while todo:
-                    res = todo.pop()
-                    xo = res.get("/XObject") if isinstance(res, pikepdf.Dictionary) else None
-                    for name in sorted(xo.keys()) if isinstance(xo, pikepdf.Dictionary) else []:
-                        x = xo[name]
-                        if not isinstance(x, pikepdf.Stream) or x.get("/Subtype") != "/Form" or x.objgen in seen:
-                            continue
-                        seen.add(x.objgen)
-                        h.update(name.encode() + x.read_raw_bytes())
-                        todo.append(x.get("/Resources"))
-                out.append(h.hexdigest())
-            except (pikepdf.PdfError, AttributeError, TypeError, ValueError):
-                out.append(f"unreadable-{len(out)}")  # never the same as another file's: it's drawn and compared
-    return out
-
-
-def _visual_fidelity(a: Path, b: Path, dpi: int = 50, edited: bool = False) -> dict:
-    """Whether every page of b draws the same as a's, compared at a low resolution. edited: b is the tag editor's
-    output of a, so a page whose drawing instructions are unchanged draws the same and isn't drawn to compare (#428)."""
-    same = []
-    if edited:
-        fa, fb = _drawing(a), _drawing(b)
-        same = [len(fa) == len(fb) and x == y for x, y in zip(fa, fb)]
-    da, db = fitz.open(a), fitz.open(b)
-    try:
-        differing = []
-        for i in range(min(da.page_count, db.page_count)):
-            if i < len(same) and same[i]:
-                continue
-            d = capped_dpi(da[i], dpi)  # the same for both: the pages are the same size
-            if da[i].get_pixmap(dpi=d, alpha=False).samples != db[i].get_pixmap(dpi=d, alpha=False).samples:
-                differing.append(i + 1)
-        return {"pages_compared": da.page_count, "pages_identical": da.page_count - len(differing),
-                "differing_pages": differing[:50], "identical": not differing and da.page_count == db.page_count}
-    finally:
-        da.close()
-        db.close()
 
 
 TITLE_MAX = 1000  # a title from the file's own metadata is its producer's to write; past this it isn't a title
@@ -392,11 +250,69 @@ async def _math_outputs(out, stem: str, enrichment) -> tuple[list[dict], dict[st
 
 
 # --------------------------------------------------------------------------- main
+async def _ocr(base: Path, analysis: DocumentAnalysis, scanned: list[int], ai, opts: JobOptions,
+               enrichment: EnrichmentStats, work: Path, progress: Progress) -> tuple[Path, DocumentAnalysis, int, int]:
+    """The scanned pages read by OCR (the AI correcting the words Tesseract was unsure of), their figures drawn again
+    on their own, and the document analysed again: the file to go on with, its analysis, the pages given a text layer
+    and the figures separated."""
+    settings = get_settings()
+    scan_figure_count = 0
+    ocr_path = work / "ocr.pdf"
+    # The AI corrects the words Tesseract was unsure of before the text layer is written
+    ocr_ai = (ai is not None and opts.ocr_ai and settings.ocr_ai_enabled and settings.ocr_engine != "pymupdf"
+              and tesseract_cli() is not None)
+    pictures: dict[int, list] = {}  # what OCR read as letters but looks like a picture
+    # Scanned pages with text of their own (values typed onto a form), noted before the OCR layer is added
+    with fitz.open(base) as before_ocr:
+        typed_on = {pno for pno in scanned if before_ocr[pno].get_text("text").strip()}
+    ocr_records = await asyncio.to_thread(ocr_lines, str(base), scanned, True, pictures)
+    if ocr_ai:
+        progress("ai_ocr", 22)
+        async with ai:
+            try:
+                await ai.preflight()
+            except AIError as exc:
+                raise AIProviderUnavailable(f"AI provider '{opts.provider}' is not usable: {exc}") from exc
+            await correct_lines(ai, str(base), ocr_records, enrichment)
+    ocr_count = await asyncio.to_thread(write_ocr_layer, str(base), str(ocr_path), ocr_records)
+    base = ocr_path
+    # Figures printed on the scan (charts, photos) are drawn again on their own, clipped, so they can be
+    # tagged and described while the rest of the scan is background. The pages look exactly the same.
+    text_boxes: dict[int, list] = {}
+    for rec in ocr_records:
+        text_boxes.setdefault(rec.page, []).append(rec.bbox)
+    figures_path = work / "scan_figures.pdf"
+    try:
+        # Not on a page with typed text: a figure is drawn again on top of the page, which would cover the typed
+        # values with the paper of the scan (and a filled-in form's rules aren't a figure)
+        scan_regions = await asyncio.to_thread(scan_figures.separate, str(base), str(figures_path),
+                                               [p for p in scanned if p not in typed_on], text_boxes, pictures)
+    except Exception as exc:  # noqa: BLE001 - a problem here only means the figures stay untagged
+        log.warning("figures on scanned pages not separated: %s", exc)
+        scan_regions = {}
+    if scan_regions:
+        base = figures_path
+    analysis = await asyncio.to_thread(prepare_analysis, base)
+    # How sure the OCR was of each block's words: a scanned formula reads with low confidence (notation)
+    block_confidence([p for p in analysis.pages if p.number in scanned], ocr_records)
+    # The OCR text now carries the content; the page scan itself becomes a background artifact.
+    for p in analysis.pages:
+        if p.number in scanned:
+            for img in p.images:
+                if _covers_page(img.bbox, p.width, p.height):
+                    img.decorative = True
+            if scan_regions.get(p.number):
+                scan_figure_count += scan_figures.add_to_page(p, scan_regions[p.number])
+                p.reading_order = heuristic_reading_order(p)
+            p.reading_order = [e for e in p.reading_order if not (
+                (el := p.element(e)) is not None and getattr(el, "decorative", False))]
+    return base, analysis, ocr_count, scan_figure_count
+
 async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress = lambda s, p: None) -> dict:
     settings = get_settings()
     started = time.monotonic()
     progress = clock = StageClock(progress)
-    _clock.set(clock)
+    current_clock.set(clock)
     work, out, stem = store.work_dir, store.output_dir, opts.stem
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -405,12 +321,12 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     # The viewer's tag map of the original needs nothing the pipeline produces and costs about as much as a
     # verification pass (it reads every page back through pdfplumber). Built on its own thread from the start, it
     # runs while the job waits on the validator and on the AI instead of adding its time at the end.
-    original_map = asyncio.create_task(_tagmap_file(out, stem, "original", src))
+    original_map = asyncio.create_task(tagmap_file(out, stem, "original", src))
 
     # 1. before -------------------------------------------------------------------------
     progress("validating_original", 5)
     before_audit = await asyncio.to_thread(audit_pdf, src)
-    before_vera = await asyncio.to_thread(_validate, src, out, "before", stem)
+    before_vera = await asyncio.to_thread(validate, src, out, "before", stem)
     if not _primary(before_vera):
         warnings.append(f"veraPDF unavailable: {next(iter(before_vera.values())).error}")
 
@@ -435,55 +351,8 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     scan_figure_count = 0
     if scanned:
         if settings.ocr_enabled and tesseract_available():
-            ocr_path = work / "ocr.pdf"
-            # The AI corrects the words Tesseract was unsure of before the text layer is written
-            ocr_ai = (ai is not None and opts.ocr_ai and settings.ocr_ai_enabled and settings.ocr_engine != "pymupdf"
-                      and tesseract_cli() is not None)
-            pictures: dict[int, list] = {}  # what OCR read as letters but looks like a picture
-            # Scanned pages with text of their own (values typed onto a form), noted before the OCR layer is added
-            with fitz.open(base) as before_ocr:
-                typed_on = {pno for pno in scanned if before_ocr[pno].get_text("text").strip()}
-            ocr_records = await asyncio.to_thread(ocr_lines, str(base), scanned, True, pictures)
-            if ocr_ai:
-                progress("ai_ocr", 22)
-                async with ai:
-                    try:
-                        await ai.preflight()
-                    except AIError as exc:
-                        raise AIProviderUnavailable(f"AI provider '{opts.provider}' is not usable: {exc}") from exc
-                    await correct_lines(ai, str(base), ocr_records, enrichment)
-            ocr_count = await asyncio.to_thread(write_ocr_layer, str(base), str(ocr_path), ocr_records)
-            base = ocr_path
-            # Figures printed on the scan (charts, photos) are drawn again on their own, clipped, so they can be
-            # tagged and described while the rest of the scan is background. The pages look exactly the same.
-            text_boxes: dict[int, list] = {}
-            for rec in ocr_records:
-                text_boxes.setdefault(rec.page, []).append(rec.bbox)
-            figures_path = work / "scan_figures.pdf"
-            try:
-                # Not on a page with typed text: a figure is drawn again on top of the page, which would cover the typed
-                # values with the paper of the scan (and a filled-in form's rules aren't a figure)
-                scan_regions = await asyncio.to_thread(scan_figures.separate, str(base), str(figures_path),
-                                                       [p for p in scanned if p not in typed_on], text_boxes, pictures)
-            except Exception as exc:  # noqa: BLE001 - a problem here only means the figures stay untagged
-                log.warning("figures on scanned pages not separated: %s", exc)
-                scan_regions = {}
-            if scan_regions:
-                base = figures_path
-            analysis = await asyncio.to_thread(prepare_analysis, base)
-            # How sure the OCR was of each block's words: a scanned formula reads with low confidence (notation)
-            block_confidence([p for p in analysis.pages if p.number in scanned], ocr_records)
-            # The OCR text now carries the content; the page scan itself becomes a background artifact.
-            for p in analysis.pages:
-                if p.number in scanned:
-                    for img in p.images:
-                        if _covers_page(img.bbox, p.width, p.height):
-                            img.decorative = True
-                    if scan_regions.get(p.number):
-                        scan_figure_count += scan_figures.add_to_page(p, scan_regions[p.number])
-                        p.reading_order = heuristic_reading_order(p)
-                    p.reading_order = [e for e in p.reading_order if not (
-                        (el := p.element(e)) is not None and getattr(el, "decorative", False))]
+            base, analysis, ocr_count, scan_figure_count = await _ocr(base, analysis, scanned, ai, opts, enrichment, work,
+                                                                      progress)
         else:
             warnings.append(f"{len(scanned)} scanned page(s) without a text layer; OCR is unavailable")
 
@@ -552,11 +421,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
 
     metrics = {
         "pages_processed": analysis.page_count,
-        "ai_tokens_used": {"prompt_tokens": ai.usage.prompt_tokens if ai else 0,
-                           "completion_tokens": ai.usage.completion_tokens if ai else 0},
-        "ai_cost_usd": round(ai.usage.cost_usd, 6) if ai else 0.0,
-        "ai_calls": ai.calls if ai else 0,
-        "ai_failures": ai.failures if ai else 0,
+        **ai_usage(ai),
         "ai_provider": opts.provider,
         "ai_model": ai.model if ai else None,
         "images_described": enrichment.images_described,
@@ -574,7 +439,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         "ocr_ai_lines_transcribed": sum(1 for o in enrichment.ocr if o["mode"] == "transcribe"),
         "ocr_ai_rejected": enrichment.ocr_rejected,
     }
-    before_snapshot = _snapshot(before_audit, before_vera)
+    before_snapshot = snapshot(before_audit, before_vera)
 
     if opts.report_only:
         summary = _report_only_summary(analysis, before_snapshot, enrichment)
@@ -586,15 +451,14 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                                                          judge_model=opts.judge_model))
             verification = {"original": rep.to_dict()}
         tag_maps = {"original": await original_map}
-        metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
-        metrics["stage_seconds"] = clock.seconds()
+        timed(metrics, started, clock)
         metrics["limits_hit"] = limits.collect(enrichment.limits_hit, verification, enrichment.findings,
                                                metrics.get("pages_processed"))
-        result = {
-            "files": {"remediated_primary": None, "remediated_visual_fallback": None},
-            "metrics": metrics,
-            "reports": {
-                "verapdf_before": _xml_name(before_vera),
+        result = RunResult(
+            files={"remediated_primary": None, "remediated_visual_fallback": None},
+            metrics=metrics,
+            reports={
+                "verapdf_before": xml_name(before_vera),
                 "verapdf_after": None,
                 "comparison": {"before": before_snapshot, "after": None,
                                "ai_audit": _ai_audit(analysis, enrichment)},
@@ -603,9 +467,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
                 "tag_verification": verification,
                 "tag_maps": tag_maps,
             },
-            "warnings": warnings,
-        }
-        _write_json_report(out, stem, result, store)
+            warnings=warnings,
+        ).to_dict()
+        write_json_report(out, stem, result, store)
         return result
 
     # 4. visual (non-destructive) ----------------------------------------------------------
@@ -616,10 +480,15 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         warnings.append(language_note)
     visual = work / "visual.pdf"
     visual_region_alts: list = []
-    tag_visual = await asyncio.to_thread(
-        tag_document, base, visual, analysis, title=title, language=language, field_labels=fields_named,
-        ignore_existing=opts.ignore_existing,
-        pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables)
+
+    async def tag(pdf: Path, dst: Path, analysis: DocumentAnalysis, layout_tables, region_alts=None) -> TagResult:
+        """The document tagged, as every stage tags it: the same title, language, field names and options."""
+        return await asyncio.to_thread(
+            tag_document, pdf, dst, analysis, title=title, language=language, field_labels=fields_named,
+            ignore_existing=opts.ignore_existing, pdfua_part=settings.pdfua_part, layout_tables=layout_tables,
+            region_alts=region_alts)
+
+    tag_visual = await tag(base, visual, analysis, enrichment.layout_tables)
     if tag_visual.passages_lang:
         warnings.append(f"Language: {tag_visual.passages_lang} passage(s) in another language than the document's were "
                         "tagged with their own.")
@@ -628,18 +497,11 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         progress("ai_existing_figures", 62)
         async with ai:
             region_alts = await _describe_regions(ai, base, tag_visual.figures_needing_alt, enrichment)
-        metrics["ai_tokens_used"] = {"prompt_tokens": ai.usage.prompt_tokens,
-                                     "completion_tokens": ai.usage.completion_tokens}
-        metrics["ai_cost_usd"] = round(ai.usage.cost_usd, 6)
-        metrics["ai_calls"] = ai.calls
-        metrics["ai_failures"] = ai.failures
+        metrics.update(ai_usage(ai))
         if region_alts and any(decorative for _, _, _, decorative in region_alts):
             # A figure judged decorative loses its tag and its content becomes an artifact: that takes the content
             # marker, so the document is tagged again with every verdict
-            tag_visual = await asyncio.to_thread(
-                tag_document, base, visual, analysis, title=title, language=language, field_labels=fields_named,
-                ignore_existing=opts.ignore_existing,
-                pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables, region_alts=region_alts)
+            tag_visual = await tag(base, visual, analysis, enrichment.layout_tables, region_alts)
         elif region_alts:
             # Descriptions alone go straight onto the tags they describe; nothing else about the file changes
             written = await asyncio.to_thread(write_figure_alts, visual, tag_visual.figure_handles,
@@ -653,7 +515,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         mathml.add_document_formulas(enrichment.formulas, enrichment.notation, tag_visual.document_formulas)
     await _embed_math(visual, enrichment)
     progress("validating_output", 70)
-    vera_visual = await asyncio.to_thread(_validate, visual, work, "after_visual", stem)
+    vera_visual = await asyncio.to_thread(validate, visual, work, "after_visual", stem)
     # Width corrections are exact on paper, but many of them can shift glyphs by a fraction of a
     # point in real renderers. Keep them in the visual file only if the pages stay pixel-identical;
     # otherwise move them to the modified file.
@@ -667,7 +529,7 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     vera_visual, widths_fixed = await asyncio.to_thread(_fix_widths, visual, vera_visual, work, "after_visual", stem)
     fidelity: dict | None = None  # of the visual file as it will be returned; the comparison renders every page
     if widths_fixed:
-        fidelity = await asyncio.to_thread(_visual_fidelity, src, visual)
+        fidelity = await asyncio.to_thread(visual_fidelity, src, visual)
     if fidelity is not None and not fidelity["identical"]:
         fidelity = None
         wf = work / "visual_widthfixed.pdf"
@@ -706,12 +568,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         if fonts_embedded:
             stage_src = emb
             fonts_candidate = work / "modified_fonts.pdf"
-            tag_modified = await asyncio.to_thread(
-                tag_document, stage_src, fonts_candidate, analysis, title=title, language=language, field_labels=fields_named,
-                ignore_existing=opts.ignore_existing,
-                pdfua_part=settings.pdfua_part, layout_tables=enrichment.layout_tables, region_alts=visual_region_alts)
+            tag_modified = await tag(stage_src, fonts_candidate, analysis, enrichment.layout_tables, visual_region_alts)
             await _embed_math(fonts_candidate, enrichment)
-            vera_modified = await asyncio.to_thread(_validate, fonts_candidate, work, "after_modified_fonts", stem)
+            vera_modified = await asyncio.to_thread(validate, fonts_candidate, work, "after_modified_fonts", stem)
             vera_modified, _ = await asyncio.to_thread(_fix_glyph_lists, fonts_candidate, vera_modified, work,
                                                        "after_modified_fonts", stem)
             vera_modified, _ = await asyncio.to_thread(_fix_widths, fonts_candidate, vera_modified, work,
@@ -736,12 +595,9 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             music.carry_over(analysis, analysis_mod)
             layout_mod = transfer_enrichment(analysis, analysis_mod, set(destructive_pages), enrichment.layout_tables,
                                              notation=enrichment.notation)
-            tag_modified = await asyncio.to_thread(
-                tag_document, flat, candidate, analysis_mod, title=title, language=language, field_labels=fields_named,
-                ignore_existing=opts.ignore_existing,
-                pdfua_part=settings.pdfua_part, layout_tables=layout_mod, region_alts=visual_region_alts)
+            tag_modified = await tag(flat, candidate, analysis_mod, layout_mod, visual_region_alts)
             await _embed_math(candidate, enrichment)
-            vera_modified = await asyncio.to_thread(_validate, candidate, work, "after_modified", stem)
+            vera_modified = await asyncio.to_thread(validate, candidate, work, "after_modified", stem)
             vera_modified, _ = await asyncio.to_thread(_fix_glyph_lists, candidate, vera_modified, work,
                                                        "after_modified", stem)
             vera_modified, _ = await asyncio.to_thread(_fix_widths, candidate, vera_modified, work, "after_modified", stem)
@@ -768,15 +624,64 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         shutil.copyfile(modified, out / primary_name)
         shutil.copyfile(visual, out / fallback_name)
         files = {"remediated_primary": primary_name, "remediated_visual_fallback": fallback_name}
-        vera_after["primary"] = _move_xml(vera_modified, out, f"{stem}_verapdf_after")
-        vera_after["visual_fallback"] = _move_xml(vera_visual, out, f"{stem}_verapdf_after_visual")
+        vera_after["primary"] = move_xml(vera_modified, out, f"{stem}_verapdf_after")
+        vera_after["visual_fallback"] = move_xml(vera_visual, out, f"{stem}_verapdf_after_visual")
         primary_vera, primary_path = vera_modified, out / primary_name
     else:
         primary_name = f"{stem}_remediated.pdf"
         shutil.copyfile(visual, out / primary_name)
         files["remediated_primary"] = primary_name
-        vera_after["primary"] = _move_xml(vera_visual, out, f"{stem}_verapdf_after")
+        vera_after["primary"] = move_xml(vera_visual, out, f"{stem}_verapdf_after")
         primary_vera, primary_path = vera_visual, out / primary_name
+
+    # PDF/UA-2 (#445): the finished files made PDF 2.0 and PDF/UA-2, in place ("2"), or a PDF/UA-2 copy of the main
+    # file beside it ("both"), each checked again. A document that came as PDF 2.0 is PDF/UA-2 already, but its own
+    # tags, when kept, still need what PDF/UA-2 asks of a PDF/UA-1 file (#413): the same step, in place, whatever was
+    # chosen; what it changed is noted apart, as nothing was converted
+    pdfua2: dict = {}
+    pdf2_repairs: dict = {}
+    toc_guesses: dict[str, list] = {}  # by output: contents entries pointed at a heading by their text, to check
+    native2 = _pdf_version(out / files["remediated_primary"]) >= "2.0"
+    if native2:
+        progress("pdfua2", 91)
+        if opts.pdfua in ("2", "both"):
+            warnings.append("the document is PDF 2.0, which can only be PDF/UA-2: it is delivered as PDF/UA-2 only")
+        for key, label in (("remediated_primary", "primary"), ("remediated_visual_fallback", "visual_fallback")):
+            if files.get(key):
+                changes, vera2 = await asyncio.to_thread(_as_pdfua2, out / files[key], out / files[key], work, stem,
+                                                         label, toc_guesses.setdefault(label, []))
+                pdf2_repairs[label] = changes[1:]  # not the first line: it was PDF 2.0 and PDF/UA-2 already
+                vera_after[label] = move_xml(vera2, out, f"{stem}_verapdf_after"
+                                             + ("" if label == "primary" else "_visual"))
+                if label == "primary":
+                    primary_vera = vera2
+                else:
+                    vera_visual = vera2
+        if modified is None:
+            vera_visual = primary_vera
+    elif opts.pdfua in ("2", "both"):
+        progress("pdfua2", 91)
+        if opts.pdfua == "2":
+            for key, label in (("remediated_primary", "primary"), ("remediated_visual_fallback", "visual_fallback")):
+                if files.get(key):
+                    pdfua2[label], vera2 = await asyncio.to_thread(
+                        _as_pdfua2, out / files[key], out / files[key], work, stem, label,
+                        toc_guesses.setdefault(label, []))
+                    vera_after[label] = move_xml(vera2, out, f"{stem}_verapdf_after"
+                                                  + ("" if label == "primary" else "_visual"))
+                    if label == "primary":
+                        primary_vera = vera2
+                    else:
+                        vera_visual = vera2
+            if modified is None:
+                vera_visual = primary_vera
+        else:
+            name = f"{stem}_compliant_pdfua2.pdf"
+            pdfua2["primary"], vera2 = await asyncio.to_thread(_as_pdfua2, out / files["remediated_primary"],
+                                                                out / name, work, stem, "primary_pdfua2")
+            files["remediated_pdfua2"] = name
+            vera_after["pdfua2"] = move_xml(vera2, out, f"{stem}_verapdf_after_pdfua2")
+            pdfua2["snapshot"] = snapshot(await asyncio.to_thread(audit_pdf, out / name), vera2)
 
     verification = None
     # Tag maps for the portal's viewer: the original and every output
@@ -796,12 +701,12 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         if files.get("remediated_visual_fallback"):
             outputs.append(("visual_fallback", out / files["remediated_visual_fallback"]))
         for label, path in outputs:
-            rep = await verify_output(path, vopts)
+            rep = await verify_output(path, replace(vopts, toc_guesses=toc_guesses.get(label, [])))
             if not rep.integrity_passed:
                 raise IntegrityError(label, rep.errors)
             verification[label] = rep.to_dict()
-            bookmarks[label], data = await _bookmarks(path, rep.tagmap)
-            tag_maps[label] = await _tagmap_file(out, stem, label, path, data)
+            bookmarks[label], data = await add_bookmarks(path, rep.tagmap)
+            tag_maps[label] = await tagmap_file(out, stem, label, path, data)
             if rep.ai.get("error") and rep.ai["error"] not in " ".join(warnings):
                 warnings.append(f"AI review did not run: {rep.ai['error']}")
             if rep.ai.get("ai_tokens_used"):
@@ -813,17 +718,17 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
 
     for label, key in (("primary", "remediated_primary"), ("visual_fallback", "remediated_visual_fallback")):
         if files.get(key) and label not in tag_maps:
-            bookmarks[label], data = await _bookmarks(out / files[key], None)
-            tag_maps[label] = await _tagmap_file(out, stem, label, out / files[key], data)
+            bookmarks[label], data = await add_bookmarks(out / files[key], None)
+            tag_maps[label] = await tagmap_file(out, stem, label, out / files[key], data)
 
     after_audit = await asyncio.to_thread(audit_pdf, primary_path)
-    after_snapshot = _snapshot(after_audit, primary_vera)
+    after_snapshot = snapshot(after_audit, primary_vera)
     comparison = {
         "before": before_snapshot,
         "after": after_snapshot,
-        "delta": _delta(before_snapshot, after_snapshot),
+        "delta": delta(before_snapshot, after_snapshot),
         "existing_tags": tag_visual.existing_tags,
-        "visual_fidelity": fidelity or await asyncio.to_thread(_visual_fidelity, src, visual),
+        "visual_fidelity": fidelity or await asyncio.to_thread(visual_fidelity, src, visual),
         "glyph_widths_compensated": widths_fixed,
         "glyph_widths_modified_only": widths_subpixel[2] if widths_subpixel else 0,
         "glyph_lists_removed": glyph_lists_fixed,
@@ -831,8 +736,18 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         "form_marks_redrawn": form_marks,
         "bookmarks": bookmarks.get("primary"),
     }
+    if pdfua2:
+        # What making it PDF/UA-2 changed; with "both", the PDF/UA-2 copy's own verdict
+        comparison["pdfua2_changes"] = pdfua2.get("primary")
+        if "snapshot" in pdfua2:
+            comparison["after_pdfua2"] = pdfua2["snapshot"]
+    if any(pdf2_repairs.values()):
+        # A PDF 2.0 document's own tags given what PDF/UA-2 asks (#413)
+        comparison["pdf2_repairs"] = pdf2_repairs.get("primary")
     if modified is not None:
-        comparison["after_visual_fallback"] = _snapshot(await asyncio.to_thread(audit_pdf, visual), vera_visual)
+        in_place = (opts.pdfua == "2" and pdfua2) or (native2 and "visual_fallback" in pdf2_repairs)
+        visual_now = out / files["remediated_visual_fallback"] if in_place else visual
+        comparison["after_visual_fallback"] = snapshot(await asyncio.to_thread(audit_pdf, visual_now), vera_visual)
         comparison["destructive_pages"] = [p + 1 for p in destructive_pages]
         comparison["fonts_embedded"] = fonts_embedded
 
@@ -840,17 +755,15 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
     # summary, which counts them
     math_formulas, math_files = await _math_outputs(out, stem, enrichment)
 
-    metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
-    metrics["stage_seconds"] = clock.seconds()
     metrics["limits_hit"] = limits.collect(enrichment.limits_hit, verification, enrichment.findings,
                                            metrics.get("pages_processed"))
     summary = _summary(analysis, tag_visual, tag_modified, enrichment, before_snapshot, after_snapshot,
                        comparison, destructive_pages, warnings, title, language)
-    result = {
-        "files": files,
-        "metrics": metrics,
-        "reports": {
-            "verapdf_before": _xml_name(before_vera),
+    result = RunResult(
+        files=files,
+        metrics=metrics,
+        reports={
+            "verapdf_before": xml_name(before_vera),
             "verapdf_after": vera_after if any(vera_after.values()) else None,
             "comparison": comparison,
             "remediation_summary": summary,
@@ -874,14 +787,13 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             "math_disagreements": mathml.disagreements(math_formulas) or None,
             **{k: math_files.get(k) for k in ("math_files", "math_list", "math_nemeth", "math_ueb")},
         },
-        "warnings": warnings,
-    }
+        warnings=warnings,
+    ).to_dict()
     # The whole run up to here; writing the reports comes after and can't be in them
-    metrics["processing_time_seconds"] = round(time.monotonic() - started, 2)
-    metrics["stage_seconds"] = clock.seconds()
+    timed(metrics, started, clock)
     log.info("job %s: %d pages in %.0f s; by stage: %s", opts.job_id, metrics.get("pages_processed") or 0,
              metrics["processing_time_seconds"], json.dumps(metrics["stage_seconds"]))
-    _write_json_report(out, stem, result, store)
+    write_json_report(out, stem, result, store)
     progress("completed", 100)
     return result
 
@@ -903,8 +815,6 @@ def analysis_has_tags(pdf: Path) -> bool:
 
     with pikepdf.open(pdf) as doc:
         return "/StructTreeRoot" in doc.Root
-
-
 
 
 async def _describe_regions(ai, pdf_path: Path, regions: list, enrichment: EnrichmentStats) -> list:
@@ -992,7 +902,7 @@ def _fix_glyph_lists(pdf: Path, vera: dict[str, VeraResult], work: Path, label: 
     if not fixed:
         return vera, []
     tmp.replace(pdf)
-    return _validate(pdf, work, label, stem), fixed
+    return validate(pdf, work, label, stem), fixed
 
 
 def _fix_widths(pdf: Path, vera: dict[str, VeraResult], work: Path, label: str, stem: str
@@ -1010,7 +920,7 @@ def _fix_widths(pdf: Path, vera: dict[str, VeraResult], work: Path, label: str, 
             break
         tmp.replace(pdf)
         total += n
-        vera = _validate(pdf, work, label, stem)
+        vera = validate(pdf, work, label, stem)
     return vera, total
 
 
@@ -1045,33 +955,21 @@ def _structure_loss(visual: Path, candidate: Path) -> str | None:
     return None
 
 
-def _xml_name(vera: dict[str, VeraResult]) -> str | None:
-    r = next(iter(vera.values()), None)
-    return Path(r.xml_path).name if r and r.xml_path else None
+def _pdf_version(path: Path) -> str:
+    with pikepdf.open(path) as pdf:
+        return str(pdf.pdf_version)
 
 
-def _move_xml(vera: dict[str, VeraResult] | None, out: Path, prefix: str) -> str | None:
-    if not vera:
-        return None
-    primary_name = None
-    for i, (fl, r) in enumerate(vera.items()):
-        if r.xml_path and Path(r.xml_path).exists():
-            name = f"{prefix}_{fl}.xml"
-            shutil.copyfile(r.xml_path, out / name)
-            if i == 0:
-                primary_name = name
-    return primary_name
-
-
-def _delta(before: dict, after: dict) -> dict:
-    keys = ["failed_rules", "failed_checks", "struct_elements", "figures_missing_alt", "tables_without_headers",
-            "heading_level_skips", "content_tagged_ratio", "annotations_untagged", "font_problems"]
-    out = {}
-    for k in keys:
-        b, a = before.get(k), after.get(k)
-        if isinstance(b, (int, float)) and isinstance(a, (int, float)):
-            out[k] = {"before": b, "after": a, "change": round(a - b, 4)}
-    return out
+def _as_pdfua2(src: Path, dst: Path, work: Path, stem: str, label: str,
+               guessed: list | None = None) -> tuple[list[str], dict[str, VeraResult]]:
+    """A finished PDF/UA-1 file as PDF/UA-2 (app.tagging.pdfua2), written to dst (src itself for in place) and
+    checked: what changed, and veraPDF's results (PDF/UA-2's first). guessed gets the contents entries pointed at a
+    heading by their text (pdfua2.upgrade)."""
+    from app.tagging.pdfua2 import upgrade
+    tmp = work / f"pdfua2_{label}.pdf"
+    changes = upgrade(src, tmp, guessed)
+    shutil.copyfile(tmp, dst)
+    return changes, validate(dst, work, f"after_{label}_pdfua2", stem)
 
 
 def _ai_audit(analysis: DocumentAnalysis, enrichment: EnrichmentStats) -> dict:
@@ -1089,7 +987,7 @@ def _ai_audit(analysis: DocumentAnalysis, enrichment: EnrichmentStats) -> dict:
 
 
 def _report_only_summary(analysis, before: dict, enrichment: EnrichmentStats) -> str:
-    lines = ["Report only: no changes were applied.", _verdict_line("Original", before)]
+    lines = ["Report only: no changes were applied.", verdict_line("Original", before)]
     lines.append(f"Tagged: {'yes' if before.get('tagged') else 'no'}; "
                  f"{before.get('content_tagged_ratio', 0):.0%} of content is tagged or marked as artifact.")
     figs = sum(1 for p in analysis.pages for i in p.images if not i.decorative)
@@ -1098,13 +996,6 @@ def _report_only_summary(analysis, before: dict, enrichment: EnrichmentStats) ->
     if enrichment.images_described:
         lines.append(f"AI drafted alt text for {enrichment.images_described} figure(s) (see comparison.ai_audit).")
     return "\n".join(lines)
-
-
-def _verdict_line(label: str, snap: dict) -> str:
-    if snap.get("compliant") is None:
-        return f"{label}: veraPDF verdict unavailable."
-    status = "PASSES" if snap["compliant"] else "FAILS"
-    return f"{label}: {status} PDF/UA validation ({snap['failed_rules']} failed rules, {snap['failed_checks']} failed checks)."
 
 
 def music_summary(records: list[dict]) -> str:
@@ -1129,7 +1020,7 @@ def music_summary(records: list[dict]) -> str:
 
 def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats, before: dict, after: dict,
              comparison: dict, destructive_pages: list[int], warnings: list[str], title: str, language: str) -> str:
-    lines = [_verdict_line("Before", before), _verdict_line("After", after)]
+    lines = [verdict_line("Before", before), verdict_line("After", after)]
     bm = comparison.get("bookmarks") or {}
     if bm.get("bookmarks"):
         lines.append(f"Bookmarks: {bm['bookmarks']} made from the headings"
@@ -1265,55 +1156,17 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
             "_compliant_modified.pdf (primary) and _compliant_visual.pdf (visually exact)."
         )
     remaining = after.get("verapdf", {})
+    copy = comparison.get("after_pdfua2")
     for fl, v in remaining.items():
         clauses = v.get("failed_clauses") or []
-        if clauses:
+        if clauses and fl == "ua2" and copy:
+            # Both (#445): the PDF/UA-1 file can't be PDF/UA-2 (it's PDF 1.7); the copy made for that is judged apart
+            lines.append(f"PDF/UA-2 of the PDF/UA-1 file, for information (clauses): {', '.join(clauses[:15])}; the "
+                         f"PDF/UA-2 copy {'passes' if copy.get('compliant') else 'does not yet fully pass'}.")
+        elif clauses:
             lines.append(f"Remaining {fl} failures (clauses): {', '.join(clauses[:15])}.")
     for w in warnings:
         lines.append(f"Warning: {w}")
     return "\n".join(lines)
 
 
-async def _bookmarks(path: Path, tagmap: dict | None) -> tuple[dict, dict | None]:
-    """Write bookmarks from the headings into an output (see app/tagging/bookmarks.py). Returns what was done and the
-    tag map, built here when the caller had none. Bookmarks are a help, not a requirement: a failure is logged."""
-    try:
-        if tagmap is None:
-            tagmap = await asyncio.to_thread(build_tagmap, path)
-        return await asyncio.to_thread(write_bookmarks, path, tagmap), tagmap
-    except Exception as exc:  # noqa: BLE001
-        log.warning("bookmarks for %s failed: %s", path.name, exc)
-        return {"bookmarks": 0, "outline": "failed"}, tagmap
-
-
-async def _tagmap_file(out: Path, stem: str, label: str, pdf_path: Path, data: dict | None = None) -> str | None:
-    """Write the viewer's tag map for one file; returns its name, or None if it couldn't be built."""
-    try:
-        if data is None:
-            data = await asyncio.to_thread(build_tagmap, pdf_path)
-    except Exception as exc:  # noqa: BLE001 - the viewer is optional; never fail a job over it
-        log.warning("tag map for %s failed: %s", label, exc)
-        return None
-    name = f"{stem}_tagmap_{label}.json"
-    (out / name).write_text(json.dumps(data, separators=(",", ":")))
-    return name
-
-
-def _write_json_report(out: Path, stem: str, result: dict, store: JobStore | None = None) -> None:
-    from app.reports.markdown import render_job_markdown
-
-    name, md_name = f"{stem}_remediation_report.json", f"{stem}_remediation_report.md"
-    result["full_report"] = name
-    result["markdown_report"] = md_name
-    (out / name).write_text(json.dumps(result, indent=2, default=str))
-    meta = (store.read_meta() if store else None) or {"filename": f"{stem}.pdf"}
-    # Links in the file are sibling file names, so they resolve when the outputs are downloaded together.
-    (out / md_name).write_text(render_job_markdown(store.job_id if store else "", meta, "completed", result))
-    # The same report for people: an accessible (PDF/UA-1) PDF, checked like any other output
-    from app.reports.pdf import write_report_pdf
-    pdf_name = f"{stem}_remediation_report.pdf"
-    check = write_report_pdf(out / pdf_name, meta, result, (meta.get("flags") or {}).get("report_branding"))
-    if (out / pdf_name).exists():
-        result["report_pdf"] = pdf_name
-        result["report_pdf_compliant"] = check.get("compliant")
-        (out / name).write_text(json.dumps(result, indent=2, default=str))

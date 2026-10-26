@@ -21,8 +21,6 @@ _UNREADABLE = re.compile("[�-\U000f0000-\U000ffffd]")
 _BIG_OPERATORS = set("∑∏∐∫∬∭∮∯∰√∛∜⋀⋁⋂⋃⨁⨂")
 _ACCENTS = re.compile("[̀-ͯ⃐-⃿]|(?<![A-Za-z])[¯ˉˆ˜][A-Za-z](?![A-Za-z])")  # combining marks, or a bar, hat or tilde set before its letter
 _CHEM_ARROWS = set("⇌⇋⇄⇆⟶⟵⟷→←↔⇀⇁")
-# Two or more element symbols with counts, e.g. H2SO4, Ca(OH)2, C6H12O6 (as extracted: digits inline)
-_CHEM_FORMULA = re.compile(r"\b(?:\(?[A-Z][a-z]?\d*\)?\d*){2,}\b")
 _ELEMENTS = set("""H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br
 Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta
 W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am""".split())

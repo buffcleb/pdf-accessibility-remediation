@@ -96,11 +96,15 @@ def explain_access(db: Session, user: User, service: Service) -> AccessCheck:
             add("global_pages", "Pages left for the whole service", left > 0,
                 f"{max(0, left):,} of {service.pool_pages:,} left",
                 f"Add pages to {service.label}'s global pool (Services and AI levels → {service.label} → Pages).")
-        if gs is not None:
-            left = quota.group_remaining(gs)
-            add("group_pages", f"Pages left in {group.name}'s pool", left > 0,
-                f"{max(0, left):,} of {gs.pool_pages:,} left" + ("" if left > 0 else
+        if (pl := svc.pool_left(group, service.key)) is not None:
+            size, left = pl  # a subgroup's: its parent's pool, within its own limit (#431)
+            parent = group.pool if group.parent_id else None
+            add("group_pages", f"Pages left for {group.name}, from {parent.name}'s pool" if parent
+                else f"Pages left in {group.name}'s pool", left > 0,
+                f"{max(0, left):,} of {size:,} left" + ("" if left > 0 else
                                                                    ": personal limits can't give pages the group hasn't got"),
+                f"Add {service.label} pages to {parent.name}, or raise {group.name}'s limit (Groups → {group.name} → "
+                "Services and pages)." if parent else
                 f"Add {service.label} pages to the group, or request them (Groups → {group.name} → Services and pages).")
         cap = svc.effective_cap(user, service.key)
         if cap is not None:
@@ -224,11 +228,16 @@ def _documents_link(db: Session, jobs: list[Job], everyone: bool, days: int | No
     return f"/admin/reports?report=documents&{q}range={days or 30}d", "Show them in the Documents report"
 
 
+class Family(list):
+    """A group and its subgroups (#431): one group's list, acknowledged as that group's (its first id)."""
+
+
 def scope_of(group_ids: list[uuid.UUID] | None) -> str | None:
-    """Whose list it is, for acknowledging: super admins' ("all"), or one group's admins' (its id)."""
+    """Whose list it is, for acknowledging: super admins' ("all"), or one group's admins' (its id; with its
+    subgroups, a Family)."""
     if group_ids is None:
         return "all"
-    return str(group_ids[0]) if len(group_ids) == 1 else None
+    return str(group_ids[0]) if len(group_ids) == 1 or isinstance(group_ids, Family) else None
 
 
 def attention(db: Session, group_ids: list[uuid.UUID] | None = None, with_acknowledged: bool = False) -> list[Item]:
@@ -320,17 +329,17 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None, with_acknow
                 User.group_id == g.id, User.status == "active")) if (us := u.service(s.key)) and us.granted)
             if users_with == 0:
                 continue
-            left = quota.group_remaining(gs)
+            size, left = svc.pool_left(g, s.key) or (0, 0)  # a subgroup's: its parent's, within its limit
             who = f"{users_with} {'person' if users_with == 1 else 'people'} can use it"
             if left <= 0:
                 items.append(Item("bad", "group_pool_empty", f"{g.name}: no {s.label} pages left",
-                                  f"{who}, but the group's pool is empty ({gs.pool_pages:,} pages, all used or "
+                                  f"{who}, but the group's pool is empty ({size:,} pages, all used or "
                                   "held). Personal limits don't add pages, so they all see 0 left.",
                                   str(g.id), g.name, s.key, fix="Add pages to the group, or request them (its Services and pages).",
                                   link=f"/admin/groups/{g.id}/services", link_label="Open Services and pages"))
-            elif _low(left, gs.pool_pages, rs):
+            elif _low(left, size, rs):
                 items.append(Item("warn", "group_pool_low", f"{g.name}: {s.label} running low",
-                                  f"{left:,} of {gs.pool_pages:,} pages left; {who}.", str(g.id), g.name, s.key,
+                                  f"{left:,} of {size:,} pages left; {who}.", str(g.id), g.name, s.key,
                                   fix="Add pages to the group, or request them (its Services and pages).",
                                   link=f"/admin/groups/{g.id}/services", link_label="Open Services and pages"))
             # Personal limits that promise more than the pool holds
@@ -344,7 +353,7 @@ def attention(db: Session, group_ids: list[uuid.UUID] | None = None, with_acknow
                     own_left = None if cap is None else cap - ((us.used_pages + us.reserved_pages) if us else 0)
                     if own_left is None or own_left > left:
                         over += 1
-                if over and _low(left, gs.pool_pages, rs):
+                if over and _low(left, size, rs):
                     items.append(Item("info", "limits_exceed_pool", f"{g.name}: {s.label} limits exceed the pool",
                                       f"{over} {'person has' if over == 1 else 'people have'} a limit larger than the "
                                       f"{left:,} pages left in the group's pool; the pool runs out first.",

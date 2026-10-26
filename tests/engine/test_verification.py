@@ -12,6 +12,7 @@ from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
 from app.verification.semantic import check_semantics
 from app.verification.verify import VerifyOptions, verify_output
+from tests.engine.pdfs import integrity_errors
 
 
 @pytest.fixture(scope="module")
@@ -23,12 +24,6 @@ def good(samples, tmp_path_factory):
             i.alt = "Bar chart of remediation progress by quarter"
     tag_document(samples / "simple_report.pdf", out, analysis, title="T", language="en-US")
     return out
-
-
-def _errors(path):
-    with pikepdf.open(path) as pdf:
-        findings, _ = check_integrity(pdf)
-    return [f for f in findings if f.severity == "error"]
 
 
 def _elements_with_mcid(pdf):
@@ -46,7 +41,7 @@ def _elements_with_mcid(pdf):
 
 
 def test_clean_output_has_no_integrity_errors(good):
-    assert _errors(good) == []
+    assert integrity_errors(good) == []
 
 
 def _mutate(good, tmp_path, fn, name="bad.pdf"):
@@ -113,7 +108,7 @@ DEFECTS = {
 def test_seeded_defect_is_caught(good, tmp_path, name):
     mutate, expected = DEFECTS[name]
     bad = _mutate(good, tmp_path, mutate)
-    errors = _errors(bad)
+    errors = integrity_errors(bad)
     assert errors, f"{name}: not detected"
     assert any(expected.lower() in (e.issue + " " + (e.detail or "")).lower() for e in errors), \
         f"{name}: got {[e.issue for e in errors]}"
@@ -233,7 +228,7 @@ def test_bad_ai_merge_cannot_orphan_table_content(samples, tmp_path):
     assert any("ignored AI merge" in f for f in stats.findings)
     out = tmp_path / "t.pdf"
     tag_document(src, out, analysis, title="T", language="en-US")
-    assert _errors(out) == []
+    assert integrity_errors(out) == []
 
 
 def test_normalisation_never_drops_cells_with_content():

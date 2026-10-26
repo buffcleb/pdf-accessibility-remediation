@@ -21,7 +21,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from portal.errors import ApiError
 from portal.models import (
-    AiKind, AuditEvent, Group, GroupService, HelpRequest, Job, MailOutbox, QuotaLedger, ReportSend, Service, User, UserService,
+    LEDGER_GROUP, AiKind, AuditEvent, Group, GroupService, HelpRequest, Job, MailOutbox, QuotaLedger, ReportSend, Service, User, UserService,
 )
 
 MAX_PAGE = 200
@@ -37,7 +37,7 @@ class Col:
     kind: str = "text"  # text | num | money | date | bool | hours
     total: bool = False  # summed over every matching row
     default: bool = True  # shown unless the viewer hides it
-    super_only: bool = False
+    super_only: bool = False  # for those who see every report (reports.all): super admins and service admins (#564)
     link: str | None = None  # job | group | person | help: the app turns the value into a link
 
 
@@ -94,7 +94,7 @@ class Report:
     headline: Callable[[Session, Select], list[dict]] | None = None
     cols_fn: Callable[[Ctx], list[Col]] | None = None  # columns that depend on the request (period, date range)
     group_by: list[str] | None = None  # grouped reports: the columns (by key) that make one row
-    super_only: bool = False
+    super_only: bool = False  # as Col.super_only
     chart: Chart | None = None
 
 
@@ -289,7 +289,7 @@ def _ledger_headline(db: Session, sub) -> list[dict]:
 
 LEDGER = Report(
     name="ledger", label="Page ledger", description="Every top-up, use, refund and correction, with tickets and reasons.",
-    base=lambda ctx: (select().select_from(QuotaLedger).outerjoin(Group, Group.id == QuotaLedger.group_id)
+    base=lambda ctx: (select().select_from(QuotaLedger).outerjoin(Group, Group.id == LEDGER_GROUP)
                       .outerjoin(_Person, _Person.c.id == QuotaLedger.user_id)),
     cols=[
         Col("created_at", "When", QuotaLedger.created_at, "date"),
@@ -306,16 +306,17 @@ LEDGER = Report(
         Col("pool_after", "Pool after", QuotaLedger.pool_after, "num", default=False),
         Col("used_after", "Used after", QuotaLedger.used_after, "num", default=False),
     ],
-    group_col=QuotaLedger.group_id, date_col=QuotaLedger.created_at,
+    group_col=LEDGER_GROUP, date_col=QuotaLedger.created_at,
     search=[QuotaLedger.ticket_ref, QuotaLedger.comment, _Person.c.email, QuotaLedger.actor_email],
     filters=[
         Filter("kind", "Entry", _eq(QuotaLedger.kind), [("topup", "Top-up"), ("adjust", "Pool correction"),
                                                          ("reserve", "Held for a document"), ("commit", "Used"),
-                                                         ("release", "Released"), ("correct", "Usage correction")]),
+                                                         ("release", "Released"), ("correct", "Usage correction"),
+                                                         ("cap", "Subgroup limit")]),
         Filter("service", "Service", _eq(QuotaLedger.service_key), _services),
         Filter("override", "Override", _yes_no(QuotaLedger.override), YES_NO),
     ],
-    sort="-created_at", links={"group_id": QuotaLedger.group_id, "job_id": QuotaLedger.job_id, "user_id": QuotaLedger.user_id},
+    sort="-created_at", links={"group_id": LEDGER_GROUP, "job_id": QuotaLedger.job_id, "user_id": QuotaLedger.user_id},
     search_hint="ticket, reason or person",
     headline=_ledger_headline,
 )
@@ -368,7 +369,7 @@ SIGN_INS = Report(
 MAIL_KINDS = {"sign_in": "Sign-in code", "job": "Document", "help": "Help request", "digest": "Daily summary",
               "approval": "Approval request", "account": "Account decision", "report": "Email report",
               "report_view": "Scheduled report view", "report_preview": "Report preview", "test": "Test email",
-              "api_token": "API token"}
+              "api_token": "API token", "alert": "Alert", "staff_alert": "Alert (to a service admin)"}
 MAIL_STATUSES = {"sent": "Sent", "failed": "Failed", "queued": "Waiting or retrying", "held": "Held (email paused)",
                  "seen": "Not sent: already seen in the portal", "combined": "Combined into a daily summary",
                  "canceled": "Canceled"}
@@ -948,6 +949,9 @@ def _build(db: Session, report: Report, query: Query, group_ids: list[uuid.UUID]
                                         *[e.label(f"_{k}") for k, e in report.links.items()])
     if group_ids is not None:
         stmt = stmt.where(report.group_col.in_(group_ids))
+        one = _in_group(query, group_ids)
+        if one is not None:  # one of them: a parent's report narrowed to a subgroup (#431)
+            stmt = stmt.where(report.group_col == one)
     if report.date_col is not None:
         if query.since:
             stmt = stmt.where(report.date_col >= query.since)
@@ -1036,6 +1040,28 @@ def _chart(db: Session, report: Report, cols: list[Col], sub) -> dict | None:
             "measures": [{"key": m.key, "label": m.label, "unit": m.unit} for m, _ in measures], "points": points}
 
 
+IN_GROUP = "in_group"
+
+
+def _in_group(query: Query, group_ids: list[uuid.UUID]) -> uuid.UUID | None:
+    """The group a report covering several was narrowed to, when it's one of them."""
+    value = query.filters.get(IN_GROUP)
+    return next((g for g in group_ids if str(g) == value), None) if value and len(group_ids) > 1 else None
+
+
+def _group_filter(db: Session, group_ids: list[uuid.UUID] | None) -> list[dict]:
+    """A report covering several groups (a parent and its subgroups, #431; or the groups someone administers) can
+    be narrowed to one of them; it's offered first."""
+    if group_ids is None or len(group_ids) < 2:
+        return []
+    names = db.execute(select(Group.id, Group.name, Group.parent_id).where(Group.id.in_(group_ids))).all()
+    by_id = {i: n for i, n, _ in names}
+    # Each parent, then its subgroups under it
+    order = sorted(names, key=lambda r: ((by_id.get(r[2]) or r[1]).lower(), r[2] is not None, r[1].lower()))
+    return [{"key": IN_GROUP, "label": "Group",
+             "options": [{"value": str(i), "label": f"{n} (subgroup)" if pid in by_id else n} for i, n, pid in order]}]
+
+
 def run(db: Session, name: str, query: Query, group_ids: list[uuid.UUID] | None, is_super: bool) -> dict:
     report = _report(name, is_super)
     stmt, cols = _build(db, report, query, group_ids, is_super)
@@ -1060,7 +1086,7 @@ def run(db: Session, name: str, query: Query, group_ids: list[uuid.UUID] | None,
         "chart": _chart(db, report, cols, sub),
         "period": period_for(query) if any(f.key == "by" for f in report.filters) else None,
         "sort": query.sort or report.sort,
-        "filters": [{"key": f.key, "label": f.label,
+        "filters": _group_filter(db, group_ids) + [{"key": f.key, "label": f.label,
                      "options": [{"value": v, "label": lbl} for v, lbl in (f.options(db) if callable(f.options) else f.options)]}
                     for f in report.filters],
     }

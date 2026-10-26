@@ -14,6 +14,7 @@ Counted over the last hour:
 Each time it happens:
 - refresh_reuse: a session's refresh token used twice (a stolen cookie; the session is already ended);
 - super_admin: someone made a super admin;
+- service_admin: someone made a service admin (#564);
 - external_on: a group given an AI level or Adobe (documents leave the service), or its local-only turned off;
 - retention_shortened: documents or records kept for less time than before;
 - malware_blocked: an upload refused by the malware scanner (#455).
@@ -49,6 +50,7 @@ TITLES = {
     "bulk_downloads": "One person downloading many of other people's documents",
     "refresh_reuse": "A stolen session cookie may have been used",
     "super_admin": "A new super admin",
+    "service_admin": "A new service admin",
     "external_on": "Documents from a group may now leave the service",
     "retention_shortened": "Documents or records are kept for less time",
     "malware_blocked": "An upload was refused: the malware scanner found something in it",
@@ -67,6 +69,8 @@ FIXES = {
     "refresh_reuse": "The session has been ended. Ask the person whether they signed in somewhere they shouldn't "
                      "have, and sign them out everywhere (Administration > People).",
     "super_admin": "Check it was intended. A super admin can see and change everything.",
+    "service_admin": "Check it was intended. A service admin can see every group's documents and people, and add "
+                     "pages.",
     "external_on": "Check it was intended and that the group may send its documents to the provider.",
     "retention_shortened": "Check it was intended: documents and records older than this are deleted at the next "
                            "clean-up.",
@@ -179,9 +183,10 @@ def _each_time(db: Session, since: datetime) -> list[Found]:
                                                        f"{when}" + (f", from {ev.ip}" if ev.ip else "") +
                              ". The session was ended.", who, group_id=ev.group_id,
                              ip=str(ev.ip) if ev.ip else None))
-        elif ev.action == "role.granted" and d.get("role") == "super_admin":
-            out.append(Found("super_admin", subject, f"{who} made {d.get('email') or 'someone'} a super admin, {when}.",
-                             d.get("email") or who, group_id=ev.group_id))
+        elif ev.action == "role.granted" and d.get("role") in ("super_admin", "service_admin"):
+            role = d["role"]
+            out.append(Found(role, subject, f"{who} made {d.get('email') or 'someone'} a {role.replace('_', ' ')}, "
+                                            f"{when}.", d.get("email") or who, group_id=ev.group_id))
         elif ev.action == "group.service_updated" and d.get("service") in external \
                 and _changed(d, "enabled") == (False, True):
             out.append(Found("external_on", subject, f"{who} turned on {d['service']} for a group, {when}: its "
@@ -253,7 +258,7 @@ def evaluate(db: Session, now: datetime | None = None) -> list[Found]:
                            f"{link(f.search)}" for f in fired)
         text += (f"\n\nIf it looks like an incident: {RUNBOOK} (contain first, then keep the evidence). These are "
                  "also on Administration > Attention for a day.")
-        mail_super_admins(db, "security", subject, text)
+        mail_super_admins(db, "security", subject, text, service_admins=False)  # super admins only
         log.warning("security alerts: %s", ", ".join(f"{f.rule} ({f.subject})" for f in fired))
     return fired
 

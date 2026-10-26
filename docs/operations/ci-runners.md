@@ -58,6 +58,8 @@ all six jobs run whatever changed.
 > **Changed 22 October 2026:** the engine, portal and shell-script jobs also run for the deployment files their tests
 > read (#467), and one documentation page runs the engine tests.
 
+> **New 23 October 2026:** the settings reference job (#588).
+
 Each job runs only when files it tests have changed:
 
 | Job | Runs when these change |
@@ -67,6 +69,7 @@ Each job runs only when files it tests have changed:
 | Web build | `web/` |
 | Shell scripts | `scripts/`, `docker/web/*.sh`, `deploy/node/` (shellcheck over them) |
 | SQL built from strings | `app/`, `portal/` (Bandit's B608 only: a query made by formatting text fails the job; a line that must build SQL from constants says why and ends `# nosec B608`) |
+| Settings reference | `app/`, `portal/`, `deploy/`, `config/`, `scripts/`, `docker/`, the Compose files, `Dockerfile.web`, `docs/` (`scripts/settings_reference.py --check`: a setting without a description, a link on [the settings reference](settings-reference.md) that leads nowhere, or the page not regenerated fails the job) |
 | Dependency audit | the requirements files, `web/package-lock.json`, `docker/web/`, `scripts/audit-deps.sh` (known advisories against what they resolve to; a hit fails the job, and the fix is a version bump or, for one that doesn't apply, a named exception in `scripts/audit-deps.sh`) |
 
 A change to the workflow itself runs all six. A change to documentation alone runs none (except

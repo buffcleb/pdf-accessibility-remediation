@@ -128,7 +128,8 @@ def pdfua_part(path) -> int:
                 version = f.read(16).decode("latin-1").split("%PDF-", 1)[-1][:3]
         except OSError:
             version = "1.7"
-    return 2 if version >= "2.0" else get_settings().pdfua_part
+    from app.tagging.conformance import conformance
+    return conformance(version).part
 
 
 def flavours(part: int = 1) -> list[str]:

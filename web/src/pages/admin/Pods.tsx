@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { get } from "../../api";
-import { LiveRegion, Notice, fmtNum, useLoad } from "../../components/ui";
+import { ErrorNotice, LiveRegion, Loading, Notice, fmtNum, useLoad } from "../../components/ui";
 import { POD_STATES, age, cores, memory, pin, podSummary, release, rowNote, shortDigest, slots, use, versionRows,
   type Pod, type PodState, type Workload, type Workloads } from "./podRows";
 import { podCommands } from "./podCommands";
@@ -54,42 +54,51 @@ export function PodView() {
           </div>
         ))}
       </div>
-      <Versions workloads={d.workloads} />
     </section>
   );
 }
 
-/** Every workload's release in one table, for checking against an advisory (#541). */
-function Versions({ workloads }: { workloads: Workload[] }) {
-  const rows = versionRows(workloads);
-  if (rows.length === 0) return null;
+/** System › Versions (#570): every workload's release in one table, for checking against an advisory (#541). */
+export function VersionsView() {
+  const data = useLoad(() => get<Workloads>("/admin/monitoring/workloads"), [], always, 15000);
+  if (!data.data) return data.loading ? <Loading /> : <ErrorNotice error={data.error} />;
+  const d = data.data;
+  if (!d.monitoring) return null;
+  if (!d.reachable) {
+    return <Notice kind="bad" title="The versions can't be shown">{d.error ?? "Prometheus didn't answer."}</Notice>;
+  }
+  const rows = versionRows(d.workloads);
   return (
-    <>
-      <h3 id="versions-heading">Versions</h3>
-      <p className="muted small">The release each workload runs, from its image's tag (this service's own images:
-        the commit they were built from), or as PostgreSQL and Redis report it. The full digest is in each pod's
-        <strong> About</strong>.</p>
-      <div className="table-wrap">
-        <table aria-labelledby="versions-heading">
-          <thead><tr>
-            <th scope="col">Workload</th><th scope="col">Release</th><th scope="col">Digest</th>
-            <th scope="col">Pinned</th>
-          </tr></thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={`${r.workload}/${r.container.name}/${r.container.digest}/${r.container.image}`}>
-                <td>{r.workload}{r.container.name !== r.workload && <span className="muted"> ({r.container.name})</span>}
-                  {rows.filter((x) => x.workload === r.workload && x.container.name === r.container.name).length > 1
-                    && <span className="muted small"> {r.pods} pod{r.pods === 1 ? "" : "s"}</span>}</td>
-                <td>{release(r.container)}</td>
-                <td><code>{shortDigest(r.container.digest)}</code></td>
-                <td>{r.container.matches === false ? <strong>{pin(r.container)}</strong> : pin(r.container)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </>
+    <section aria-labelledby="versions-heading">
+      <h2 id="versions-heading">Versions</h2>
+      {rows.length === 0 ? <p className="muted">No workload has reported its images yet.</p> : (
+        <>
+          <p className="muted small">The release each workload runs, from its image's tag (this service's own images:
+            the commit they were built from), or as PostgreSQL and Redis report it. The full digest is in each pod's
+            <strong> About</strong>.</p>
+          <div className="table-wrap">
+            <table aria-labelledby="versions-heading">
+              <thead><tr>
+                <th scope="col">Workload</th><th scope="col">Release</th><th scope="col">Digest</th>
+                <th scope="col">Pinned</th>
+              </tr></thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={`${r.workload}/${r.container.name}/${r.container.digest}/${r.container.image}`}>
+                    <td>{r.workload}{r.container.name !== r.workload && <span className="muted"> ({r.container.name})</span>}
+                      {rows.filter((x) => x.workload === r.workload && x.container.name === r.container.name).length > 1
+                        && <span className="muted small"> {r.pods} pod{r.pods === 1 ? "" : "s"}</span>}</td>
+                    <td>{release(r.container)}</td>
+                    <td><code>{shortDigest(r.container.digest)}</code></td>
+                    <td>{r.container.matches === false ? <strong>{pin(r.container)}</strong> : pin(r.container)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 

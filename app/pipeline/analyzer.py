@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pymupdf as fitz
 
-from app.pipeline.structure import BULLET_ONLY, BULLET_START, FOOTNOTE_MARK
+from app.pipeline.markers import BULLET_ONLY, BULLET_START, FOOTNOTE_MARK, LABEL_RUN
+from app.pipeline.symbol_chars import unicode_for
 from app.pipeline import plots, schemes
 from app.pipeline.models import (
     append_block,
@@ -77,8 +78,11 @@ def render_png(doc: fitz.Document, page_no: int, dpi: int = 150, clip: BBox | No
 
 # --------------------------------------------------------------------------- text
 # --------------------------------------------------------------------------- text blocks
-# A list label standing alone as a run: (a)  a)  1.  (iv)
-_LABEL_RUN = re.compile(r"^\s*\(?([a-zA-Z]|[ivxlcIVXLC]{1,5}|\d{1,3})[.)]\s*$")
+# Lines of one block differ in text size by at most this many points; and the gap from one line of a paragraph to the
+# next, as a share of the text size
+_STYLE_SIZE_TOL = 0.6
+_LINE_GAP = (-0.3, 0.8)
+
 # A superscript reads as a power after a number, a single-letter variable or a closing bracket.
 _DOTS = ".,\u00b7"
 _POWER_BASE = re.compile(r"(\d|(^|[^A-Za-z])[A-Za-z]|\))\s*$")
@@ -93,7 +97,8 @@ class _Run:
 
     def __init__(self, span: dict, char: dict, seq: int):
         self.x0, self.y0, self.x1, self.y1 = _rect(char["bbox"])
-        self.text = char["c"]
+        # A Symbol or Wingdings character the document's own map gives as a private use code point, as Unicode (#605)
+        self.text = unicode_for(span["font"], char["c"])
         self.size = float(span["size"])
         self.bold = bool(span["flags"] & _BOLD_FLAG) or "bold" in span["font"].lower()
         self.base = float(char["origin"][1])
@@ -162,6 +167,7 @@ def _visual_lines(runs: list[_Run]) -> list[_VLine]:
             min(same, key=lambda ln: abs(r.base - ln.base)).add(r)
             continue
         lines.append(_VLine(r))
+    lines = _join_shifted(lines)
     # Spaces only mark word boundaries: they join the nearest line, never start one
     for r in spaces:
         cands = [ln for ln in lines if ln.x0 - ln.size <= r.x0 <= ln.x1 + ln.size]
@@ -172,6 +178,60 @@ def _visual_lines(runs: list[_Run]) -> list[_VLine]:
     for ln in lines:
         ln.runs.sort(key=lambda r: (r.ox, r.seq))
     return sorted(lines, key=lambda ln: (ln.base, ln.x0))
+
+
+def _join_shifted(lines: list[_VLine]) -> list[_VLine]:
+    """Scripts typeset at full size and moved off the line by a text rise ("N" then "2(g)" lowered a third of a
+    character, where another line of the same document uses a smaller font): too far from the baseline to be the
+    same line, too large to be taken for a script, so they became a line of their own and split the formula. A
+    line of the same size whose baseline is a third to a half of a character off another's, starting inside it or
+    right where it ends, joins it as its scripts. Lines of text are always a whole line apart."""
+    out: list[_VLine] = []
+    for ln in sorted(lines, key=lambda ln: (ln.x0, -len(ln.runs))):
+        host = None
+        for h in out:
+            # The same size: a text rise moves text without scaling it. (A footnote mark a point smaller, raised
+            # beside its note, is the footnotes' business, not a script of the note's first line.)
+            if abs(h.size - ln.size) > 0.05 * max(h.size, ln.size) or not 0.3 * h.size < abs(ln.base - h.base) <= 0.5 * h.size:
+                continue
+            inside = any(r.x0 >= ln.x0 for r in h.runs)  # the host's text goes on after the shifted part starts
+            touching = 0 <= ln.x0 - h.x1 <= 0.6 * h.size
+            if not (inside or touching):
+                continue
+            # A short raised or lowered start ("2" then the line): the line is ln, the start its script
+            swap = not inside and len(h.runs) < len(ln.runs)
+            script, line = (h, ln) if swap else (ln, h)
+            if _glued(script.runs, line.runs, h.size):
+                host = h
+                break
+        if host is None:
+            out.append(ln)
+            continue
+        if swap:
+            out.remove(host)
+            host, ln = ln, host
+            out.append(host)
+        for r in ln.runs:
+            r.script = r.script or ("sub" if r.base > host.base else "sup")
+            host.add(r)
+    return out
+
+
+def _glued(shifted: list[_Run], line: list[_Run], size: float) -> bool:
+    """Whether each piece of the shifted text touches a character of the line, as a script does: starting where
+    one ends ("N" + "2(g)"), or ending where one starts (a raised "2" before a line). Labels set above or below an
+    arrow in a reaction or block diagram sit apart from the text beside them: they stay lines of their own."""
+    gap = 0.35 * size
+    ends = [r.x1 for r in line]
+    starts = [r.x0 for r in line]
+    pieces: list[list[_Run]] = []
+    for r in sorted(shifted, key=lambda r: r.x0):
+        if pieces and r.x0 - pieces[-1][-1].x1 <= gap:
+            pieces[-1].append(r)
+        else:
+            pieces.append([r])
+    return all(any(abs(p[0].x0 - e) <= gap for e in ends) or any(abs(st - p[-1].x1) <= gap for st in starts)
+               for p in pieces)
 
 
 def _words(runs: list[_Run]) -> list[list[_Run]]:
@@ -257,6 +317,23 @@ def _word_text(word: list[_Run], spoken: bool) -> str:
     return out
 
 
+def _centred_over(above: list[_Run], below: list[_Run], width: float, size: float) -> bool:
+    """The line above is centred on the page (as far in from the margin the line below starts at as it stops short of
+    the other margin, at least 3 em each side), and the line below starts at that margin."""
+    a = [r for r in above if r.text.strip()]
+    b = [r for r in below if r.text.strip()]
+    if not a or not b:
+        return False
+    a0, a1, margin = min(r.x0 for r in a), max(r.x1 for r in a), min(r.x0 for r in b)
+    left, right = a0 - margin, (width - margin) - a1
+    return min(left, right) >= 3 * size and abs(left - right) <= max(size, 0.1 * left)
+
+
+def _leads_with_mark(piece: list[_Run]) -> bool:
+    """The line starts with a raised footnote mark, with words after it."""
+    return any(r.script == "sup" for r in piece) and _raised_marks([piece])[3] is not None
+
+
 def _raised_marks(pieces: list[list[_Run]]) -> tuple[list[str], list[str], list[tuple], str | None]:
     """The footnote-like marks raised after words in these lines ("results¹", "noted.*"; not after a digit, where a
     raised number is a power), the text each is written right after ("results", "noted."), where each is drawn, and
@@ -321,7 +398,7 @@ def _join(runs: list[_Run], spoken: bool) -> str:
 def _split_inline_items(line: _VLine) -> list[list[_Run]]:
     """'(a) 346 000 000   (b) 2710   (c) 0.000543' on one line is three list items, not one."""
     words = _words(line.runs)
-    if len(words) < 3 or not _LABEL_RUN.match("".join(r.text for r in words[0])):
+    if len(words) < 3 or not LABEL_RUN.match("".join(r.text for r in words[0])):
         return [line.runs]
     # The gap is measured against the line's ordinary text size: tall brackets or symbols in the line
     # would otherwise ask for a much wider gap than the text needs
@@ -330,7 +407,7 @@ def _split_inline_items(line: _VLine) -> list[list[_Run]]:
     cuts = []
     for k in range(1, len(words)):
         w = words[k]
-        if any(r.script for r in w) or not _LABEL_RUN.match("".join(r.text for r in w)):
+        if any(r.script for r in w) or not LABEL_RUN.match("".join(r.text for r in w)):
             continue
         if w[0].x0 - words[k - 1][-1].x1 >= 0.9 * size:  # well beyond a word space (about 0.25 em)
             cuts.append(w[0].x0)
@@ -730,19 +807,16 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
             continue
         groups: list[list[list[_Run]]] = []
         for piece in pieces:
-            text = _join(piece, spoken=False)
-            size, bold = _style(piece)
             if groups:
                 first = _join(groups[-1][0], spoken=False)
                 if len(groups[-1]) == 1 and BULLET_ONLY.match(first):
                     groups[-1].append(piece)  # bullet glyph on its own line: text follows
                     continue
-                psize, pbold = _style(groups[-1][-1])
-                starts_item = BULLET_START.match(text) or BULLET_ONLY.match(text)
-                same_row = abs(piece[0].base - groups[-1][-1][0].base) < 0.3 * max(size, 1.0)
-                if not starts_item and not same_row and abs(psize - size) <= 0.6 and pbold == bold:
+                rule = _starts_new_block(groups[-1], piece, page.rect.width)
+                if rule is None:
                     groups[-1].append(piece)
                     continue
+                log.debug("page %d: new block (%s)", page_no + 1, rule)
             groups.append([piece])
         for g in groups:
             text = _clean(" ".join(_join(pc, spoken=False) for pc in g))
@@ -804,21 +878,46 @@ def _attach_bullets(blocks: list[TextBlock]) -> list[TextBlock]:
     return out
 
 
+def _starts_new_block(group: list[list[_Run]], piece: list[_Run], page_width: float) -> str | None:
+    """Why a visual line starts a new block instead of continuing group (the block's lines so far): the name of the
+    first rule that holds, or None when it continues the block."""
+    text = _join(piece, spoken=False)
+    size, bold = _style(piece)
+    psize, pbold = _style(group[-1])
+    rules = (
+        ("list marker", lambda: BULLET_START.match(text) or BULLET_ONLY.match(text)),
+        # Notes set one after another: a line that starts with its own raised number ("³Da dun") under a note that
+        # did too is the next note (#598)
+        ("next note", lambda: _leads_with_mark(piece) and _leads_with_mark(group[0])),
+        # A bold centred line (a title) over a bold line at the margin ("Part 1: ..."): two headings, not one (#604)
+        ("centred title over margin line",
+         lambda: bold and pbold and len(group) == 1 and _centred_over(group[0], piece, page_width, size)),
+        ("same row", lambda: abs(piece[0].base - group[-1][0].base) < 0.3 * max(size, 1.0)),
+        ("style change", lambda: abs(psize - size) > _STYLE_SIZE_TOL or pbold != bold),
+    )
+    return next((name for name, holds in rules if holds()), None)
+
+
+def _continues_paragraph(prev: TextBlock, b: TextBlock) -> bool:
+    """Whether block b, the next one down, is the next line of prev's paragraph: the same style, the same left
+    edge, a line's gap below it, and neither a list item nor the next of a run of notes."""
+    size = max(prev.font_size, b.font_size, 1.0)
+    gap = b.bbox[1] - prev.bbox[3]
+    same_style = prev.bold == b.bold and abs(prev.font_size - b.font_size) <= max(_STYLE_SIZE_TOL, 0.12 * size)
+    aligned = abs(b.bbox[0] - prev.bbox[0]) <= 6
+    return (same_style and aligned and _LINE_GAP[0] * size <= gap <= _LINE_GAP[1] * size
+            and not BULLET_START.match(b.text) and not BULLET_ONLY.match(b.text)
+            and not (b.lead_mark and prev.lead_mark))  # two notes, each starting with its raised number
+
+
 def _merge_paragraph_lines(blocks: list[TextBlock]) -> list[TextBlock]:
     """Join consecutive single-style, left-aligned, tightly spaced blocks (one-line-per-block
     producers and OCR) into paragraphs. List items and style changes always start a new block."""
     out: list[TextBlock] = []
     for b in blocks:
-        prev = out[-1] if out else None
-        if prev is not None:
-            size = max(prev.font_size, b.font_size, 1.0)
-            gap = b.bbox[1] - prev.bbox[3]
-            same_style = prev.bold == b.bold and abs(prev.font_size - b.font_size) <= max(0.6, 0.12 * size)
-            aligned = abs(b.bbox[0] - prev.bbox[0]) <= 6
-            if (same_style and aligned and -0.3 * size <= gap <= 0.8 * size
-                    and not BULLET_START.match(b.text) and not BULLET_ONLY.match(b.text)):
-                append_block(prev, b)
-                continue
+        if out and _continues_paragraph(out[-1], b):
+            append_block(out[-1], b)
+            continue
         out.append(b)
     return out
 

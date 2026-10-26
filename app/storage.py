@@ -73,6 +73,10 @@ class JobStore:
         return self._read_json("job.json")
 
     def write_result(self, result: dict) -> None:
+        """result.json, with the version of the engine that made it (Run details)."""
+        version = get_settings().engine_version
+        if version:
+            result.setdefault("metrics", {})["engine_version"] = version
         self._write_json("result.json", result)
 
     def read_result(self) -> dict | None:

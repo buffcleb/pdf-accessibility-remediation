@@ -7,8 +7,8 @@ from pikepdf import Array, Dictionary, Name, String
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.bookmarks import headings, nest, outline_state, write_bookmarks
 from app.tagging.tagger import tag_document
-from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import integrity_errors
 
 BODY = "Some ordinary text in the chapter that is long enough to be a paragraph of body text."
 
@@ -35,12 +35,6 @@ def _toc(path):
         return [(lvl, title, page, dest.get("to")) for lvl, title, page, dest in doc.get_toc(simple=False)]
 
 
-def _errors(path):
-    with pikepdf.open(path) as pdf:
-        findings, _ = check_integrity(pdf)
-    return [f for f in findings if f.severity == "error"]
-
-
 def test_headings_become_nested_bookmarks_that_go_to_each_heading(chapters):
     tm = build_tagmap(chapters)
     assert write_bookmarks(chapters, tm) == {"bookmarks": 6, "outline": "none"}
@@ -52,7 +46,7 @@ def test_headings_become_nested_bookmarks_that_go_to_each_heading(chapters):
     tops = {e["text"][:9]: e["boxes"][0]["bbox"][1] for e in tm["elements"] if e["role"] in ("H1", "H2")}
     for _, title, _, to in toc:
         assert tops[title[:9]] - 4 <= to.y <= tops[title[:9]]
-    assert _errors(chapters) == []
+    assert integrity_errors(chapters) == []
     with pikepdf.open(chapters) as pdf:   # chapters open closed, showing their sections when opened
         first = pdf.Root.Outlines.First
         assert int(pdf.Root.Outlines.Count) == 3 and int(first.Count) == -1

@@ -64,6 +64,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --from=mathcat /mathcat-cli /usr/local/bin/mathcat-cli
 COPY app ./app
+# The image's tag (scripts/build.sh), recorded with every result
+ARG ENGINE_VERSION=""
+ENV ENGINE_VERSION=$ENGINE_VERSION
 RUN useradd --system --uid 10001 --home /srv appuser && mkdir -p /data && chown appuser /data
 # Fontconfig (used when pages are rendered) keeps a cache: give it somewhere it can write, or every render logs
 # "No writable cache directories"

@@ -12,6 +12,18 @@ import pikepdf
 from pikepdf import Array, ContentStreamInstruction, Dictionary, Name
 
 from app.tagging.mathml_tags import in_mathml as _in_mathml
+
+# The standard structure types of PDF 2.0's own namespace (ISO 32000-2, 14.8.4), beside PDF 1.7's
+_PDF2_NS = "http://iso.org/pdf2/ssn"
+_PDF2_TYPES = {"Document", "DocumentFragment", "Part", "Sect", "Div", "Aside", "NonStruct", "P", "H", "Title",
+               "FENote", "Sub", "Lbl", "Em", "Strong", "Span", "Link", "Annot", "Form", "Ruby", "RB", "RT", "RP",
+               "Warichu", "WT", "WP", "L", "LI", "LBody", "Table", "TR", "TH", "TD", "THead", "TBody", "TFoot",
+               "Caption", "Figure", "Formula", "Artifact"} | {f"H{n}" for n in range(1, 7)}
+
+
+def _pdf2_standard(obj, role: str) -> bool:
+    ns = obj.get("/NS") if isinstance(obj, pikepdf.Dictionary) else None
+    return role in _PDF2_TYPES and isinstance(ns, pikepdf.Dictionary) and str(ns.get("/NS", "")) == _PDF2_NS
 from app.verification.model import Finding
 
 STANDARD = {
@@ -29,7 +41,6 @@ ALLOWED_KIDS = {
     "LI": {"Lbl", "LBody"},
     "TOC": {"TOC", "TOCI", "Caption"},
 }
-CHECKS = ("content_marks", "references", "parent_tree", "annotations", "parents", "roles", "nesting")
 
 ObjGen = tuple[int, int]
 
@@ -212,7 +223,8 @@ class IntegrityChecker:
             elems.append(e)
             if parent_idx is not None:
                 elems[parent_idx].kids.append(e.index)
-            if role not in STANDARD and not _in_mathml(obj):  # MathML says what it is by its namespace (#403)
+            # MathML says what it is by its namespace (#403), and so do PDF 2.0's types in theirs (FENote, #445)
+            if role not in STANDARD and not _in_mathml(obj) and not _pdf2_standard(obj, role):
                 self.err("structure type is not standard and not role-mapped", role=raw, element=e.index,
                          page=(e.page + 1) if e.page is not None else None)
             p = obj.get("/P")

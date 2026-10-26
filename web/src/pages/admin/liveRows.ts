@@ -20,7 +20,7 @@ const STAGES: Record<string, string> = {
   ai_ocr: "AI: correcting the text of scanned pages", ai_enrichment: "AI: alt text, tables and notation",
   tagging: "Adding tags", ai_existing_figures: "AI: describing figures already tagged",
   validating_output: "Checking the result", destructive_fixes: "Fixing what the check found",
-  flattening: "Flattening pages", reporting: "Writing the report", verifying_tags: "AI: reviewing the tags",
+  flattening: "Flattening pages", reporting: "Writing the report", pdfua2: "Making the PDF/UA-2 file", verifying_tags: "AI: reviewing the tags",
   adobe_sending: "Sending to Adobe", adobe_tagging: "Adobe is tagging", adobe_merging: "Putting Adobe's parts together",
   worker_lost: "Worker lost: waiting to be retried",
 };

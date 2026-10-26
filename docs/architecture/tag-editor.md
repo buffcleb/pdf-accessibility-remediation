@@ -41,7 +41,8 @@ tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-m
   dialog (`ListBuilder.tsx`, logic in `outline.ts`) groups the tag map's parts into lines by position, guesses rows
   from numbering or bullets and depth from each row's left edge, and keeps levels valid as rows change.
 - **Footnote links.** `link_note` sets what a tag points at (`/Ref`) to one note, giving the note an `ID` if it has
-  none, or removes it (`note: null`). The tag map lists each tag's `/Ref` targets (`refs`); the menu's Footnote group
+  none, or removes it (`note: null`). A note is `Note` or, in a PDF/UA-2 file, `FENote` (`NOTES`, `isNote`); an
+  `FENote` also names what points at it in its own `/Ref` (8.2.5.14), and stops naming a tag pointed elsewhere (#633). The tag map lists each tag's `/Ref` targets (`refs`); the menu's Footnote group
   offers the notes on the tag's page and the pages either side (`menu.ts`, `pointsAt`).
 - **A cell's headers.** The tag map gives each cell the header cells its `Headers` names (`headers`, element
   indices). `set_headers` sets them, giving each header an `ID` if it has none; `set_cell` keeps a linked table's
@@ -49,6 +50,13 @@ tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-m
   heads by its scope, found from the table's rows and spans). Either rebuilds the `IDTree`. The edit form's checklist
   (`cells.ts`) offers the table's own TH cells, with pending type changes applied. A TH whose scope changes isn't
   relinked.
+- **Contents entry targets.** `set_toc_target` sets the heading a `TOCI` goes to (`/Ref`, PDF/UA-2 8.2.5.8), or
+  removes it (`target: null`); the target can't be part of a table of contents itself. The menu's Goes to group
+  offers the headings with most words in common with the entry first (`menu.ts`, `headingChoices`, `goesTo`). The
+  PDF/UA-2 step (`pdfua2.upgrade`) names an entry's target from its link, else from the one heading with the same
+  words; verification flags those guesses ("pointed at a heading by its text", carried to reviewed versions as an
+  `ai_read` of kind `toc-target` until a person sets that entry) and, in a PDF 2.0 file, each entry with no target
+  ("goes nowhere") (#631).
 - **Table of contents from a list.** `make_toc` retypes an outermost list in place: `L` to `TOC` (its List
   attributes dropped), `LI` to `TOCI` with its `Lbl` kept, and each `LBody` to a `Reference`. A list nested in a body
   moves out of it to follow that `Reference` in the same entry, as a `TOC`; text after such a list gets a
@@ -81,11 +89,13 @@ tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-m
   `onlyPage`; the tree is filtered with `tagsOnPage`). The tree pane can list the tags in reading order instead.
   Every view draws from the same pending edits (`pageOrder`, `draftTree`), so a move made in one shows in all;
   `undoMoves` takes back one tag's moves.
-- **Original tags.** When a document's tags were kept (`tags_kept` in the job's result), the portal marks, as it
-  serves a version's tag map, the tags that were in the uploaded file (`portal/tagmarks.py`): a tag that holds a
+- **Original tags.** **Changed 23 October 2026:** When a document's tags were kept (`tags_kept` in the job's
+  result), the portal marks the tags that were in the uploaded file (`portal/tagmarks.py`): a tag that holds a
   piece of content the original's tags held (same page and number, same place, same words), or the same form field
-  or link, and any group holding one. It's worked out from the original version's tag map each time, so it holds
-  for edited versions and changes no file.
+  or link, and any group holding one. It's worked out from the original version's tag map once, when a version's
+  tag map is stored (the engine's outputs, and each saved version), and written into that file, which starts with
+  `{"orig_marked":true,` so the viewer's request can serve it as it is without reading it (#580). Tag maps stored
+  before this are marked as they're read, as before.
 - **Read aloud** (`web/src/viewer/speech.ts`, `Reader.tsx`) turns the tag map into what a screen reader would say,
   in reading order with pending edits applied, and speaks it with the browser's Web Speech API (no service, no cost).
   Each tag's own text is in the tag map in full (`say`, where it differs from the shortened `text`). The wording is
@@ -96,7 +106,7 @@ tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-m
 - **Review items on the page.** Every review item that has a page has **Show**, which opens that page with the area
   it's about highlighted (`SpotLayer.tsx`, #426).
 - **Every save is a new version.** Engine outputs are never changed. The edit is applied by the engine
-  (`app/tagging/editor.py`), on the base version's PDF, and checked like an original output: integrity (which fails the
+  (`app/tagging/editor/`), on the base version's PDF, and checked like an original output: integrity (which fails the
   save), the semantic checks, veraPDF, and pixel identity with the base version. The new version opens as soon as its
   file and tag map are final, while its checks still run (the engine's `partial` answer, #428), marked as still
   being checked.

@@ -18,3 +18,6 @@ py3langid==0.4.0
 latex2mathml==3.81.1  # formulas as MathML, from the AI's LaTeX (#403)
 fonttools==4.67.0  # Adobe Glyph List (glyph name -> Unicode)
 weasyprint==70.0  # the PDF report (PDF/UA-1); needs Pango from the OS
+# brotli comes through fonttools[woff] (weasyprint). 1.2.0 has GHSA-9v8h-qqgm-4m35 (CRITICAL), which held every engine
+# image at build.sh's scan; 1.2.1 (2026-10-22) is under the two-week rule, an exception agreed on 2026-10-24
+brotli==1.2.1

@@ -16,11 +16,11 @@ In the portal, **Attention** and **Queues** (super admins) show what's waiting, 
 
 ### Alerts
 
-> **Changed 22 October 2026:** two alerts for the optional malware scanner; on **Attention**, alerts can't be
-> acknowledged away (summaries and notices can, #538).
+> **Changed 23 October 2026:** service admins get these emails too, unless they turn **Service alerts** off in
+> their Settings (#564). Security alerts stay with super admins.
 
-The portal checks itself about once a minute and emails every super admin when something is wrong, with a reminder
-while it lasts and a note when it clears; **Attention** shows the same. The times are in **Settings › Alerts**
+The portal checks itself about once a minute and emails every super admin and service admin when something is wrong,
+with a reminder while it lasts and a note when it clears; **Attention** shows the same. The times are in **Settings › Alerts**
 ([settings](../user-guide/super-admins/settings.md)):
 
 | Alert | When |
@@ -38,6 +38,10 @@ With monitoring on, Prometheus's own alerts (a pod crashing, a volume filling, m
 the same way, each with what to do; [the super admins' guide](../user-guide/super-admins/system.md#alerts) lists
 them.
 
+> **Changed 23 October 2026:** "A volume is nearly full" names the setting for each volume (`DB_SIZE`, `FILES_SIZE`
+> and the rest) and links [growing a volume](../deployment/first-cluster/storage.md#growing-a-volume): raise the
+> setting in `deploy.env` and run `scripts/deploy.sh`, which grows it (#592).
+
 **Attention** also lets a super admin (and a group's admins, on their own list) **acknowledge** a summary or notice
 they've dealt with, for everyone who sees that list, until something new joins it (#538, migration 0047). The
 service's alerts and help requests waiting can't be acknowledged: they go when they're fixed or answered.
@@ -47,7 +51,7 @@ service's alerts and help requests waiting can't be acknowledged: they go when t
 > **Changed 22 October 2026:** an upload refused by the malware scanner is a security alert too (#455).
 
 The same check looks at the audit log for patterns someone should look at (#456). Each is emailed to every super
-admin (several found at once come in one email), shown on **Attention** for a day, and recorded in the audit log as
+admin, and not to service admins (several found at once come in one email), shown on **Attention** for a day, and recorded in the audit log as
 `security.alert`, so a SIEM reading the log gets it too ([the SIEM export](siem.md)). The email says what happened, when and from where, what to
 do, and links to the audit log searched for it. The numbers are in **Settings › Security alerts**:
 
@@ -60,6 +64,7 @@ do, and links to the audit log searched for it. The numbers are in **Settings �
 | One person downloading many of other people's documents | 25 files in an hour |
 | A stolen session cookie may have been used | Every time a refresh token is used twice (the session is ended at once) |
 | A new super admin | Every time |
+| A new service admin | Every time (new 23 October 2026, #564) |
 | Documents from a group may now leave the service | An AI level or Adobe turned on for a group, or its local-only turned off |
 | Documents or records are kept for less time | Either retention period shortened |
 | An upload was refused: the malware scanner found something in it | Every time ([malware scanning](malware-scanning.md)) |
@@ -149,6 +154,7 @@ docker run --rm --entrypoint promtool -v "$PWD/deploy/k8s/monitoring:/m:ro" -w /
 | `PROMETHEUS_MEMORY_LIMIT` | `2Gi` | |
 | `GRAFANA_SIZE` | `1Gi` | Grafana's volume: its users and the dashboards made in it |
 | `MONITORING_STORAGE_CLASS` | `STORAGE_CLASS` | For both volumes |
+| `VOLUME_ALERT_FREE_PERCENT` | `10` | **New 23 October 2026.** "A volume is nearly full" fires when a volume has less than this percent free for 30 minutes (1 to 90; 20 is common) |
 
 The images are pinned by digest in `scripts/deploy.sh` (`PROMETHEUS_IMAGE`, `GRAFANA_IMAGE`, `KSM_IMAGE`,
 `REDIS_EXPORTER_IMAGE`, `POSTGRES_EXPORTER_IMAGE`; each can be set in `deploy.env`). Its passwords

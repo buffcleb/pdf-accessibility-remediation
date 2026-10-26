@@ -76,6 +76,114 @@ About 10 GB to start.
 - An NFS provisioner in the cluster (csi-driver-nfs, or nfs-subdir-external-provisioner) makes a folder on it for the
   service.
 
+## Growing a volume
+
+> **New 23 October 2026** (#592): `scripts/deploy.sh` grows a volume when its size setting goes up.
+
+Volumes don't grow by themselves. When one fills (the "A volume is nearly full" alert, or Grafana's volumes
+dashboard), raise its size in `deploy/k8s/deploy.env` and run `scripts/deploy.sh`.
+
+| Setting | Volume (its claim) | Kind | To start |
+|---|---|---|---|
+| `DB_SIZE` | Postgres: `data-postgres-0` | StatefulSet | 10Gi |
+| `REDIS_SIZE` | Redis (the queue): `data-redis-0` | StatefulSet | 1Gi |
+| `FILES_SIZE` | SeaweedFS (the stored documents): `data-seaweedfs-0` | StatefulSet | 50Gi |
+| `JOBDATA_SIZE` | The engine's job folder: `jobdata` | Claim | 50Gi |
+| `PROMETHEUS_SIZE` | Prometheus's history: `prometheus-data` | Claim | 20Gi |
+| `GRAFANA_SIZE` | Grafana: `grafana-data` | Claim | 1Gi |
+| (none) | ClamAV's signatures: `clamav-db`, with malware scanning on | Claim | 2Gi, fixed: they need well under 1 GB |
+| `BACKUP_SIZE` | The backup share: `backups` | Made by hand | Only a label: the NAS share's own size is what counts |
+
+**The supported way.** Raise the setting (sizes such as `100Gi`) and run `scripts/deploy.sh`. Before it changes
+anything it compares each setting with the claim on the cluster and lists what will grow beside the rest of its plan,
+for example:
+
+```text
+  volumes to grow (docs/deployment/first-cluster/storage.md#growing-a-volume):
+    data-seaweedfs-0: 50Gi to 100Gi (FILES_SIZE)
+    statefulset/seaweedfs made again for 100Gi, its pod and volume left running (delete --cascade=orphan)
+```
+
+Once you answer yes (or straight away with `-y`), it:
+
+1. checks the claim's storage class allows growing (`allowVolumeExpansion: true`), and stops before changing anything
+   if it doesn't ([below](#when-the-class-cant-grow-a-volume));
+2. asks for the new size on the claim;
+3. for Postgres, Redis and SeaweedFS, deletes the StatefulSet with `--cascade=orphan`, which leaves its pod and volume
+   running, so the apply that follows makes it again with the new size (Kubernetes refuses to change a StatefulSet's
+   volume size in place: that's why raising one of these used to break the deploy);
+4. waits up to two minutes for the claim to report the new size, and says either "its filesystem too: nothing to
+   restart", or that the filesystem grows only when its pod starts again, with the command to restart it (said again
+   at the end of the deploy).
+
+A size the same as the claim's, written another way (`51200Mi` for `50Gi`), changes nothing.
+
+**While a volume grows.** The storage system enlarges the disk, then the node enlarges the filesystem on it. Most
+drivers do both while the pod runs, with no interruption. Some grow the filesystem only when the volume is next
+mounted: the claim then shows the condition `FileSystemResizePending`, and the pod needs a restart (a few seconds
+down for Postgres, Redis or SeaweedFS):
+
+```bash
+kubectl -n pdf-remediation get pvc data-seaweedfs-0 -o jsonpath='{.status.capacity.storage} {.status.conditions[*].type}{"\n"}'
+```
+
+```bash
+kubectl -n pdf-remediation rollout restart statefulset/seaweedfs
+```
+
+**Volumes never shrink.** Kubernetes can't make a volume smaller. A size below the claim's stops the deploy before
+it changes anything, and says the size to set back. To use less space, move to a new, smaller volume with a backup and
+a restore, as below.
+
+### By hand, when deploy.sh can't be used
+
+The same steps, for one volume (here the stored documents, to 100Gi; the namespace is `NAMESPACE` in `deploy.env`):
+
+1. The claim's class, and whether it allows growing:
+
+   ```bash
+   kubectl -n pdf-remediation get pvc data-seaweedfs-0 -o jsonpath='{.spec.storageClassName}{"\n"}'
+   ```
+
+   ```bash
+   kubectl get storageclass CLASS -o jsonpath='{.allowVolumeExpansion}{"\n"}'
+   ```
+
+   `true` is needed. Anything else: see [below](#when-the-class-cant-grow-a-volume).
+2. The new size on the claim:
+
+   ```bash
+   kubectl -n pdf-remediation patch pvc data-seaweedfs-0 --type=merge -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+   ```
+
+3. For Postgres, Redis or SeaweedFS only, the StatefulSet removed without its pod and volume:
+
+   ```bash
+   kubectl -n pdf-remediation delete statefulset seaweedfs --cascade=orphan
+   ```
+
+4. The same size in `deploy.env` (`FILES_SIZE=100Gi`), then `scripts/deploy.sh`, which makes the StatefulSet again
+   and finds nothing left to grow. Until it runs, nothing restarts a crashed Postgres, Redis or SeaweedFS pod, so
+   don't leave it long.
+5. Watch the claim as above, and restart the pod if it says `FileSystemResizePending`.
+
+### When the class can't grow a volume
+
+Some classes don't allow it (`allowVolumeExpansion` unset or `false`); many NFS provisioners are like this. For the
+job folder on NFS that rarely matters: the size is a label, and the share's own free space is what counts. For a
+database volume:
+
+- Ask whoever runs the storage whether the class can allow it. For many CSI drivers it's one line on the class
+  (`allowVolumeExpansion: true`, changed with `kubectl patch storageclass`), and the class's volumes can grow from then
+  on.
+- Otherwise, move the data to a bigger, new volume: [back up](../../operations/backups-and-migrations.md#backing-up)
+  (`scripts/backup.sh`), remove the StatefulSet and its claim (with a **Retain** class the old disk stays, as a
+  fallback), set the bigger size in `deploy.env`, run `scripts/deploy.sh` to make an empty volume, and
+  [restore](../../operations/backups-and-migrations.md#restoring) (`scripts/restore.sh --db`, `--files` for the stored
+  documents). Try it on a test copy first ([trying a restore](../../operations/backups-and-migrations.md#trying-a-restore)).
+
+`scripts/deploy.sh` says which class stopped it and sets nothing; set the size back until the class allows growing.
+
 ## Backups
 
 Two choices ([backups](../../operations/backups-and-migrations.md)):

@@ -7,6 +7,7 @@ from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from tests.engine.pdfs import integrity_errors
 
 
 def _tagged_twice(path, parent_tree_names="first"):
@@ -50,9 +51,7 @@ def _run(tmp_path, **kw):
 
 def test_content_claimed_twice_is_read_once(tmp_path):
     out, result = _run(tmp_path)
-    with pikepdf.open(out) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(out) == []
     texts = [e["text"] for e in build_tagmap(out)["elements"] if e.get("own") and (e.get("text") or "").strip()]
     assert texts == ["Dosing", "Give the first dose in the morning.", "Check the level after five days."]
     assert any("claimed by more than one" in f and "page(s) 1" in f for f in result.existing_tags["findings"])
@@ -174,9 +173,7 @@ def test_the_emptied_copy_of_a_table_tagged_twice_goes_whole(tmp_path):
     src, out = tmp_path / "in.pdf", tmp_path / "out.pdf"
     _table_tagged_twice(src)
     tag_document(src, out, prepare_analysis(src), title="Fruit", language="en-US", pdfua_part=1)
-    with pikepdf.open(out) as pdf:
-        findings, _ = check_integrity(pdf)
-    assert [f for f in findings if f.severity == "error"] == []
+    assert integrity_errors(out) == []
     elements, tables = _tables(out)
     assert len(tables) == 1
     assert [e["role"] for e in elements].count("TR") == 2 and [e["role"] for e in elements].count("TD") == 4

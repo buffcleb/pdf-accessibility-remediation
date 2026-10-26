@@ -1,19 +1,12 @@
 from pathlib import Path
 
 import pikepdf
-import pymupdf as fitz
 import pytest
 
 from app.pipeline.orchestrator import prepare_analysis
 from app.tagging.tagger import tag_document
 from app.validation.audit import audit_pdf
-
-
-def _pixels_equal(a: Path, b: Path) -> bool:
-    da, db = fitz.open(a), fitz.open(b)
-    return da.page_count == db.page_count and all(
-        da[i].get_pixmap(dpi=72).samples == db[i].get_pixmap(dpi=72).samples for i in range(da.page_count)
-    )
+from tests.engine.pdfs import same_render
 
 
 def _parent_tree_consistent(path: Path) -> None:
@@ -48,7 +41,7 @@ def test_tagging_is_pixel_identical_and_complete(samples, tmp_path, name):
     out = tmp_path / "out.pdf"
     tag_document(src, out, analysis, title="Test", language="en-US")
 
-    assert _pixels_equal(src, out)
+    assert same_render(src, out)
     _parent_tree_consistent(out)
     audit = audit_pdf(out)
     assert audit["tagged"] and audit["marked"]

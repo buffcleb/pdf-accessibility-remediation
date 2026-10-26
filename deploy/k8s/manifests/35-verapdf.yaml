@@ -101,6 +101,8 @@ spec:
       backoffLimit: 2
       ttlSecondsAfterFinished: 3600
       template:
+        metadata:
+          labels: { app: verapdf-restart }  # its egress policy (83-egress-deny.yaml)
         spec:
           serviceAccountName: verapdf-restarter
           restartPolicy: OnFailure

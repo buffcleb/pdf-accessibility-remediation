@@ -32,6 +32,7 @@ jobs:
       scripts: ${{ steps.filter.outputs.scripts }}
       deps: ${{ steps.filter.outputs.deps }}
       python: ${{ steps.filter.outputs.python }}
+      settings: ${{ steps.filter.outputs.settings }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -73,6 +74,18 @@ jobs:
               - '.github/workflows/**'
               - 'app/**'
               - 'portal/**'
+            # Everything docs/operations/settings-reference.md is made from, and the pages it links to
+            settings:
+              - '.github/workflows/**'
+              - 'app/**'
+              - 'portal/**'
+              - 'deploy/**'
+              - 'config/**'
+              - 'scripts/**'
+              - 'docker/**'
+              - 'docker-compose*.yml'
+              - 'Dockerfile.web'
+              - 'docs/**'
             deps:
               - '.github/workflows/**'
               - 'scripts/audit-deps.sh'
@@ -222,6 +235,22 @@ jobs:
       # Only Bandit's SQL check (B608): a query built by formatting a string fails the run. Values go to SQLAlchemy
       # as bound parameters; a line that really must build SQL text from constants says why and ends # nosec B608.
       - run: bandit -r app portal -t B608 -q
+
+  settings:
+    name: Settings reference
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.settings == 'true'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Only what the two settings classes need; the engine tests run the same check (test_settings_reference.py)
+      - run: pip install $(grep -E '^pydantic(-settings)?==' requirements.txt)
+      # Fails when a setting has no description, a link on the page leads nowhere, or the page wasn't regenerated
+      - run: python scripts/settings_reference.py --check
 
   deps:
     name: Dependency audit

@@ -6,7 +6,8 @@ import pymupdf as fitz
 
 from app.pipeline.models import PageAnalysis, TextBlock
 from app.pipeline.orchestrator import _covers_page
-from app.pipeline.structure import _is_heading_candidate, detect_columns, heuristic_reading_order
+from app.pipeline.structure import detect_columns, heuristic_reading_order
+from app.pipeline.structure.headings import is_heading_candidate
 from app.verification.integrity import check_integrity
 from app.verification.semantic import SemanticChecker
 
@@ -76,10 +77,10 @@ def test_a_heading_below_both_columns_is_read_after_them():
 
 def test_a_row_of_controls_is_not_a_heading():
     big = dict(page=0, bbox=(0, 0, 200, 16), font_size=16)
-    assert not _is_heading_candidate(TextBlock(id="a", text="[- 1 serving + | © 1hour 22 m", **big), 11)
-    assert _is_heading_candidate(TextBlock(id="b", text="Ingredients", **big), 11)
-    assert _is_heading_candidate(TextBlock(id="c", text="C++ and C#: an introduction", **big), 11)
-    assert _is_heading_candidate(TextBlock(id="d", text="2.1 Cost (in $) – a summary", **big), 11)
+    assert not is_heading_candidate(TextBlock(id="a", text="[- 1 serving + | © 1hour 22 m", **big), 11)
+    assert is_heading_candidate(TextBlock(id="b", text="Ingredients", **big), 11)
+    assert is_heading_candidate(TextBlock(id="c", text="C++ and C#: an introduction", **big), 11)
+    assert is_heading_candidate(TextBlock(id="d", text="2.1 Cost (in $) – a summary", **big), 11)
 
 
 def test_a_scan_is_the_page_however_it_is_placed():

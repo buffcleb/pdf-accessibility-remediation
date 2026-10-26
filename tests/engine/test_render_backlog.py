@@ -9,7 +9,8 @@ from app.ai.mock import MockProvider
 from app.config import get_settings
 from app.pipeline import enrichment
 from app.pipeline.enrichment import EnrichmentStats, _images
-from app.pipeline.models import DocumentAnalysis, ImageRegion, PageAnalysis
+from app.pipeline.models import DocumentAnalysis, ImageRegion
+from tests.engine.layout import document, page
 
 
 class _Backlog:
@@ -21,10 +22,8 @@ class _Backlog:
 
 
 def _analysis(n: int) -> DocumentAnalysis:
-    page = PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792))
-    page.images = [ImageRegion(id=f"p0i{k}", page=0, bbox=(10.0 + 20 * k, 10.0, 25.0 + 20 * k, 25.0), xref=0)
-                   for k in range(n)]
-    return DocumentAnalysis(page_count=1, pages=[page], title=None, language=None, has_struct_tree=False, is_marked=False)
+    return document(page(*(ImageRegion(id=f"p0i{k}", page=0, bbox=(10.0 + 20 * k, 10.0, 25.0 + 20 * k, 25.0), xref=0)
+                           for k in range(n))))
 
 
 def test_renders_never_run_ahead_of_the_calls(tmp_path, monkeypatch):

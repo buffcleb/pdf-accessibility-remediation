@@ -44,7 +44,8 @@ AI level it uses. Your group has a pool; you may also have your own limit.
 
 **PDF/UA.** The ISO standard for accessible PDF (ISO 14289). PDF/UA-1 is the version this service aims at. A PDF 2.0
 file (as LaTeX's tagging and other recent tools write them) can only be PDF/UA-2, so it's checked and labelled as
-PDF/UA-2 instead.
+PDF/UA-2 instead. Where your group offers it, other documents can be delivered as PDF/UA-2 too (converted to PDF
+2.0), or as both: see [Submitting documents](people/submitting-documents.md#more-options).
 
 **Processing option (service).** How documents are tagged: *Standard* (this service's own engine) or, if your
 administrators offer it, *Adobe Autotag* (Adobe PDF Services).

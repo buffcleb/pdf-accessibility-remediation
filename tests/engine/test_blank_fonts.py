@@ -4,10 +4,10 @@ glyph, and nothing on the page changes."""
 import io
 
 import pikepdf
-import pymupdf as fitz
 from pikepdf import Array, Dictionary, Name
 
 from app.tagging.blank_fonts import _only_an_empty_missing_glyph, fill_blank_fonts
+from tests.engine.pdfs import same_render
 
 
 def _cff(glyphs: dict) -> bytes:
@@ -80,8 +80,7 @@ def test_the_font_gets_an_empty_glyph_and_the_page_is_unchanged(tmp_path):
         assert cid.CIDToGIDMap.read_bytes()[:4] == b"\x00\x01\x00\x01"  # no character is the missing glyph (0) now
         assert fill_blank_fonts(pdf) == []  # and a second pass finds nothing to do
         pdf.save(out)
-    with fitz.open(src) as a, fitz.open(out) as b:
-        assert a[0].get_pixmap(dpi=72).samples == b[0].get_pixmap(dpi=72).samples
+    assert same_render(src, out)
 
 
 def test_fonts_that_draw_something_or_carry_their_own_widths_are_left_alone(tmp_path):

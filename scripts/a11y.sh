@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Accessibility checks of the web app (#369): axe-core in a headless browser over the main pages, as a person, a
-# group admin and a super admin, in light and dark, against WCAG 2.2 A and AA. The pages show invented people and
-# documents (tests/a11y/serve.py) on the portal test suite's database.
+# group admin, a service admin and a super admin, in light and dark, against WCAG 2.2 A and AA. The pages show
+# invented people and documents (tests/a11y/serve.py) on the portal test suite's database.
 #
 #   scripts/a11y.sh                    every page
 #   A11Y_ONLY=admin scripts/a11y.sh    the pages whose name contains "admin"
+#
+# Then, with every page checked (no A11Y_ONLY), that a new build loads on the next click (web/a11y/newBuild.mjs, #575).
 #
 # Needs Python with the engine's and portal's requirements (the .venv), Node with web/'s packages (npm ci), and a
 # browser for Playwright (npx --prefix web playwright install chromium; or A11Y_CHANNEL=chrome to use Chrome).
@@ -71,3 +73,9 @@ wait_for "http://localhost:$WEB_PORT/" web "$web_pid"
 
 log "checking the pages"
 (cd web && A11Y_SEED="$WORK/seed.json" A11Y_BASE="http://localhost:$WEB_PORT" node a11y/axe.mjs)
+
+# Not accessibility, but the same app and data: after a deploy, the next click loads the new build (#575)
+if [ -z "${A11Y_ONLY:-}" ]; then
+  log "checking the new-build reload"
+  (cd web && A11Y_SEED="$WORK/seed.json" A11Y_BASE="http://localhost:$WEB_PORT" node a11y/newBuild.mjs)
+fi

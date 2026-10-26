@@ -3,11 +3,11 @@ the default. A file's metadata is its producer's to write: a title of thousands 
 not a language tag, was copied into the output as it was."""
 from app.pipeline.models import DocumentAnalysis
 from app.pipeline.orchestrator import JobOptions, _pick_title
+from tests.engine.layout import block, document, page
 
 
 def _analysis(title=None, language=None) -> DocumentAnalysis:
-    return DocumentAnalysis(page_count=0, pages=[], title=title, language=language, has_struct_tree=False,
-                            is_marked=False)
+    return document(title=title, language=language)
 
 
 def test_a_title_from_the_file_is_bounded():
@@ -29,7 +29,6 @@ def test_a_language_from_the_file_must_be_a_language_tag():
 def test_an_application_and_file_name_is_no_title():
     """Word and PowerPoint write "Microsoft Word - syllabus.docx" when the author gave no title; a reader announced
     it as the document's name. The first top-level heading is the title then."""
-    from app.pipeline.models import PageAnalysis, TextBlock
     from app.pipeline.orchestrator import usable_title
 
     for poor in ("Microsoft Word - syllabus_accessible.docx", "Microsoft PowerPoint - Lecture 3.pptx",
@@ -41,9 +40,7 @@ def test_an_application_and_file_name_is_no_title():
                  "Excel - The Basics", "Node.js in Practice", "Report v2.1"):
         assert usable_title(good), good
 
-    page = PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792), blocks=[
-        TextBlock(id="b0", page=0, text="Introduction to Physics", bbox=(72, 72, 300, 90), font_size=18, role="H1")])
-    a = DocumentAnalysis(page_count=1, pages=[page], title="Microsoft Word - syllabus_accessible.docx",
-                         language=None, has_struct_tree=False, is_marked=False)
+    a = document(page(block("b0", (72, 72, 300, 90), "Introduction to Physics", "H1", size=18)),
+                 title="Microsoft Word - syllabus_accessible.docx")
     assert _pick_title(JobOptions(stem="syllabus"), a) == "Introduction to Physics"
     assert _pick_title(JobOptions(stem="syllabus_v2"), _analysis(title="Microsoft Word - x.docx")) == "syllabus v2"

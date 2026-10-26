@@ -9,6 +9,7 @@ const KIND: Record<LedgerEntry["kind"], string> = {
   commit: "Used",
   release: "Returned",
   correct: "Correction",
+  cap: "Subgroup limit",
 };
 
 export function LedgerTable({ entries, emails }: { entries: LedgerEntry[]; emails?: Record<string, string> }) {

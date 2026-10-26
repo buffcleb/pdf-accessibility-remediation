@@ -2,16 +2,20 @@
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { get, getBytes, type TagMap } from "../api";
-import type { Received } from "../components/loadWords";
+import type { Loading } from "../components/loadWords";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 export type PDFDoc = pdfjs.PDFDocumentProxy;
 export type PaneData = { pdf: PDFDoc; tagmap: TagMap; destroy: () => void };
-// How far a version's loading has got (#424): its two downloads, then reading them (the tags, and the PDF by pdf.js)
-export type LoadState = { pdf: Received; tags: Received; reading: boolean; pages: number | null };
+// How far a version's loading has got (#424): its two downloads, then reading them (pdf.js opening the PDF). The
+// tag map comes on its own (#579): `pages` is set once it has, whether or not the PDF has.
+export type LoadState = Loading;
 
-const cache = new Map<string, Promise<PaneData>>();
+type Opened = { pdf: PDFDoc; destroy: () => void };
+const tagmaps = new Map<string, Promise<TagMap>>();
+const pdfs = new Map<string, Promise<Opened>>();
+const versions = new Map<string, Promise<PaneData>>();
 const states = new Map<string, LoadState>();
 const watchers = new Map<string, Set<(s: LoadState) => void>>();
 
@@ -19,6 +23,12 @@ function report(key: string, change: Partial<LoadState>) {
   const s = { ...states.get(key)!, ...change };
   states.set(key, s);
   watchers.get(key)?.forEach((fn) => fn(s));
+}
+
+function begin(key: string) {
+  if (states.has(key)) return;
+  const none = { received: 0, total: null };
+  states.set(key, { pdf: none, tags: none, reading: false, pages: null });
 }
 
 /** Follow a version's loading: called now with where it stands, then on each change. Returns the unfollow. */
@@ -31,20 +41,33 @@ export function watchVersion(jobId: string, number: number, fn: (s: LoadState) =
   return () => void watchers.get(key)?.delete(fn);
 }
 
-export function loadVersion(jobId: string, number: number): Promise<PaneData> {
+/** A version's tag map alone: all the tag tree and the reader need, without waiting for the PDF (#579). */
+export function loadTagmap(jobId: string, number: number): Promise<TagMap> {
   const key = `${jobId}:${number}`;
-  let p = cache.get(key);
+  let p = tagmaps.get(key);
   if (!p) {
-    const none = { received: 0, total: null };
-    states.set(key, { pdf: none, tags: none, reading: false, pages: null });
+    begin(key);
+    p = get<TagMap>(`/jobs/${jobId}/versions/${number}/tagmap`,
+      (received, total) => report(key, { tags: { received, total } }))
+      .then((tagmap) => {
+        report(key, { pages: tagmap.pages.length });
+        return tagmap;
+      });
+    p.catch(() => tagmaps.delete(key));
+    tagmaps.set(key, p);
+  }
+  return p;
+}
+
+function loadPdf(jobId: string, number: number): Promise<Opened> {
+  const key = `${jobId}:${number}`;
+  let p = pdfs.get(key);
+  if (!p) {
+    begin(key);
     p = (async () => {
-      const [bytes, tagmap] = await Promise.all([
-        getBytes(`/jobs/${jobId}/versions/${number}/pdf`,
-          (received, total) => report(key, { pdf: { received, total } })),
-        get<TagMap>(`/jobs/${jobId}/versions/${number}/tagmap`,
-          (received, total) => report(key, { tags: { received, total } })),
-      ]);
-      report(key, { reading: true, pages: tagmap.pages.length });
+      const bytes = await getBytes(`/jobs/${jobId}/versions/${number}/pdf`,
+        (received, total) => report(key, { pdf: { received, total } }));
+      report(key, { reading: true });
       const task = pdfjs.getDocument({
         data: new Uint8Array(bytes),
         cMapUrl: "/pdfjs/cmaps/",
@@ -54,17 +77,36 @@ export function loadVersion(jobId: string, number: number): Promise<PaneData> {
         iccUrl: "/pdfjs/iccs/",
         enableXfa: false,
       });
-      const pdf = await task.promise;
-      return { pdf, tagmap, destroy: () => void task.destroy() };
+      try {
+        return { pdf: await task.promise, destroy: () => void task.destroy() };
+      } catch (e) {
+        void task.destroy();
+        throw e;
+      }
     })();
-    p.catch(() => cache.delete(key));
-    cache.set(key, p);
+    p.catch(() => pdfs.delete(key));
+    pdfs.set(key, p);
+  }
+  return p;
+}
+
+/** The PDF and its tag map together, for the page view: both downloads start at once. */
+export function loadVersion(jobId: string, number: number): Promise<PaneData> {
+  const key = `${jobId}:${number}`;
+  let p = versions.get(key);
+  if (!p) {
+    p = Promise.all([loadPdf(jobId, number), loadTagmap(jobId, number)])
+      .then(([opened, tagmap]) => ({ ...opened, tagmap }));
+    p.catch(() => versions.delete(key));
+    versions.set(key, p);
   }
   return p;
 }
 
 export function clearVersionCache() {
-  for (const p of cache.values()) p.then((d) => d.destroy()).catch(() => {});
-  cache.clear();
+  for (const p of pdfs.values()) p.then((d) => d.destroy()).catch(() => {});
+  pdfs.clear();
+  tagmaps.clear();
+  versions.clear();
   states.clear();
 }

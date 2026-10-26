@@ -18,6 +18,7 @@ import math
 import re
 from collections import Counter
 
+from app.pipeline.markers import DRAWING_CAPTION
 from app.pipeline.models import BBox, ImageRegion, bbox_area, bbox_intersection, bbox_union
 
 Segment = tuple[float, float, float, float]
@@ -34,7 +35,6 @@ _ARROW_GAP = 40.0    # an arrow or a plus sign this near a structure, in its row
 _MARK_GAP = 10.0     # the same for a mark right above or below it
 _NAME_BELOW = 14.0   # a compound's name sits this far under its structure
 _JOINERS = ("+", "→", "⟶", "⇒", "⟹", "⇌", "↔", "or")
-_CAPTION = re.compile(r"^\s*(?:fig(?:ure)?\.?|scheme|table|chart|eq(?:uation)?\.?)\s*\d", re.IGNORECASE)
 # What is written on a structure: element symbols and the usual groups, with counts and charges
 _ATOM = re.compile(
     r"^[\(\[]?(?:[A-Z][a-z]?\d*|R\d?'*|X|Y|Z|Nu|E|Ar|Ph|Me|Et|Bu|Pr|Bn|Ac|Ts|Ms|Tf|Boc|Cbz|TMS|TBS|TBDPS|PMB|THP|"
@@ -83,7 +83,7 @@ def is_atom_label(text: str) -> bool:
 def _is_label(text: str) -> bool:
     """Short text that belongs to a drawing (a reagent on an arrow, a compound's name), not a sentence or caption."""
     t = (text or "").strip()
-    if not t or _CAPTION.match(t):
+    if not t or DRAWING_CAPTION.match(t):
         return False
     return len(t.split()) <= 4 and len(t) <= 40
 

@@ -26,6 +26,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name
 
 from app.tagging.existing_tags import resolve_role
+from app.tagging.tree import kids as _kids
 
 GROUPING = {"Document", "Part", "Art", "Sect", "Div"}
 INLINE = {"Span", "Quote", "Note", "Reference", "BibEntry", "Code", "Link", "Annot", "Ruby", "Warichu"}
@@ -34,11 +35,6 @@ ILLUSTRATION = {"Figure", "Formula", "Form"}
 
 def _is_elem(o) -> bool:
     return isinstance(o, Dictionary) and "/S" in o and o.get("/Type", Name.StructElem) == Name.StructElem
-
-
-def _kids(e) -> list:
-    k = e.get("/K")
-    return list(k) if isinstance(k, Array) else [] if k is None else [k]
 
 
 def _set_kids(e, kids: list) -> None:

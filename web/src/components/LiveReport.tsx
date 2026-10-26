@@ -2,9 +2,11 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { download, get, type Group } from "../api";
 import { useAuth } from "../auth";
+import { can } from "../permissions";
 import { useFullWidth } from "./fullwidth";
 import { ReportChart, type ChartData } from "./ReportChart";
 import { ScheduleView } from "./ScheduleView";
+import { Dropdown } from "./Dropdown";
 import { ErrorNotice, Loading, fmtNum, useLoad } from "./ui";
 import { ListBar, ListPager } from "./lists";
 import { apiQuery } from "./listQuery";
@@ -51,7 +53,7 @@ function describeDetails(raw: string): string {
   try { d = JSON.parse(raw); } catch { return raw; }
   const bits: string[] = [];
   for (const [k, v] of Object.entries(d ?? {})) {
-    if (v === null || v === undefined || v === "" || k === "by_super_admin") continue;
+    if (v === null || v === undefined || v === "" || k === "by_super_admin" || k === "by_service_admin") continue;
     const val = Array.isArray(v) && v.length === 2 ? `${JSON.stringify(v[0])} → ${JSON.stringify(v[1])}` : JSON.stringify(v);
     bits.push(`${k}: ${val}`);
   }
@@ -63,7 +65,7 @@ function breakable(text: string) {
   return text.split(/(?<=[.@])/).map((part, i) => <Fragment key={i}>{i > 0 && <wbr />}{part}</Fragment>);
 }
 
-function cell(col: Column, row: Record<string, unknown>, labels: Record<string, Record<string, string>>, isSuper: boolean,
+function cell(col: Column, row: Record<string, unknown>, labels: Record<string, Record<string, string>>, people: boolean,
   period: string, back: string) {
   const v = row[col.key];
   if (v === null || v === undefined || v === "") return col.kind === "num" && col.key === "limit" ? <span className="muted">No limit</span> : <span className="muted">–</span>;
@@ -94,7 +96,7 @@ function cell(col: Column, row: Record<string, unknown>, labels: Record<string, 
     : col.link === "help" && row._help_id ? `/admin/help/${row._help_id}`
       : col.link === "group" && row._group_id ? `/admin/groups/${row._group_id}`
         : col.link === "person" && row._group_id ? `/admin/groups/${row._group_id}/people`
-          : col.link === "person" && isSuper ? "/admin/people" : null;
+          : col.link === "person" && people ? "/admin/people" : null;
   if (col.key === "details") return <span className="report-details">{describeDetails(text)}</span>;
   const isEmail = /^[^\s@]+@[^\s@]+$/.test(text);
   const shownText = col.key === "event" ? breakable(text) : isEmail ? text.split(/(?<=@)/).map((p, i) => (
@@ -106,7 +108,8 @@ function cell(col: Column, row: Record<string, unknown>, labels: Record<string, 
 /** The live reports, as tabs. `groupId`: fixed to one group. */
 export function LiveReports({ groupId }: { groupId?: string }) {
   const { me } = useAuth();
-  const isSuper = !!me?.is_super_admin;
+  // Every report and column, for every group: super admins and service admins (#564)
+  const isSuper = can(me, "reports.all");
   const [params, setParams] = useSearchParams();
   const location = useLocation();
   const name = params.get("report") ?? "documents";
@@ -279,8 +282,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
           <div className="report-toolbar" id="rp-top">
             {/* The count is the pager's, below (#545): here only that it's updating */}
             <span role="status" aria-live="polite" className="small muted">{report.loading ? "Updating…" : ""}</span>
-            <details className="report-columns" key={name}>{/* a new chooser, closed, for each report */}
-              <summary>Columns</summary>
+            <Dropdown className="report-columns" label="Columns" key={name}>{/* a new chooser, closed, for each report */}
               <fieldset className="choices">
                 <legend className="visually-hidden">Columns to show</legend>
                 {data.columns.map((c) => (
@@ -289,7 +291,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
                   </label>
                 ))}
               </fieldset>
-            </details>
+            </Dropdown>
             {(tooWide || full) && (
               <button className="btn secondary small" aria-pressed={full} onClick={() => setFull(!full)}
                 title={full ? "Back to the normal page width" : "Use the full width of the window"}>
@@ -332,7 +334,7 @@ export function LiveReports({ groupId }: { groupId?: string }) {
                       {shown.map((c) => (
                         <td key={c.key} className={c.kind === "num" || c.kind === "money" || c.kind === "hours" ? "num"
                           : c.kind === "bool" || c.link === "group" ? "nowrap" : c.kind === "date" ? "date-cell" : undefined}>
-                          {cell(c, row, labels, isSuper, periodKind, location.pathname + location.search)}
+                          {cell(c, row, labels, can(me, "people"), periodKind, location.pathname + location.search)}
                         </td>
                       ))}
                     </tr>

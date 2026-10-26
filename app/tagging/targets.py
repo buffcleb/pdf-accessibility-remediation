@@ -13,7 +13,6 @@ from app.pipeline.models import (
 )
 
 ARTIFACT_LAYOUT = ("artifact:Layout", "Artifact")
-ARTIFACT_PAGINATION = ("artifact:Pagination", "Artifact")
 # A decorative picture (a shape behind a label, a shadow): unlike a plain Layout answer, which can also mean
 # "nothing matched", this one says what the content is, so orphaned tagged content may be made an artifact on it
 ARTIFACT_BACKGROUND = ("artifact:Background", "Artifact")

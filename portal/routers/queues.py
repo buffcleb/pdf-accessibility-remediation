@@ -1,4 +1,5 @@
-"""Super-admin routes: see the queues, pause and resume them, and retry or cancel single items."""
+"""The queues: see them, pause and resume them (super admins), and retry or cancel single items (super admins and, #564,
+service admins)."""
 from __future__ import annotations
 
 import uuid
@@ -10,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from portal import queues
 from portal.db import get_db
-from portal.deps import Principal, require_super_admin
+from portal.deps import Principal, require
+from portal.permissions import PAUSE_QUEUES, QUEUE_ITEMS, QUEUES
 
 router = APIRouter(prefix="/admin/queues", tags=["super admin"])
 
@@ -100,13 +102,13 @@ class PauseIn(BaseModel):
 
 
 @router.get("", response_model=list[QueueOut])
-def list_queues(p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+def list_queues(p: Principal = Depends(require(QUEUES)), db: Session = Depends(get_db)):
     return queues.overview(db)
 
 
 @router.get("/live", response_model=LiveOut)
 def live(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None, queue: str | None = Query(None, max_length=80),
-         state: str | None = Query(None, max_length=16), p: Principal = Depends(require_super_admin),
+         state: str | None = Query(None, max_length=16), p: Principal = Depends(require(QUEUES)),
          db: Session = Depends(get_db)):
     """Every queue's items at once: in progress, waiting, and just ended; narrowed by search, group, queue or state."""
     return queues.live(db, q=q, group_id=group_id, queue=queue, state=state)
@@ -114,14 +116,14 @@ def live(q: str = Query("", max_length=200), group_id: uuid.UUID | None = None, 
 
 @router.get("/{key}/items", response_model=ItemsOut)
 def list_items(key: str, state: str = "waiting", q: str = Query("", max_length=200), page: int = Query(1, ge=1, le=100_000),
-               page_size: int = Query(25, ge=1, le=200), p: Principal = Depends(require_super_admin),
+               page_size: int = Query(25, ge=1, le=200), p: Principal = Depends(require(QUEUES)),
                db: Session = Depends(get_db)):
     """One queue's items in one state, a page at a time, searched by document or person (#514)."""
     return queues.items(db, key, state, q=q, page=page, page_size=page_size)
 
 
 @router.post("/{key}/pause", response_model=list[QueueOut])
-def pause(key: str, request: Request, body: PauseIn | None = None, p: Principal = Depends(require_super_admin),
+def pause(key: str, request: Request, body: PauseIn | None = None, p: Principal = Depends(require(PAUSE_QUEUES)),
           db: Session = Depends(get_db)):
     """Start nothing new from this queue until it's resumed; work already started finishes."""
     queues.pause(db, request, key, p.user, body.note if body else None)
@@ -130,28 +132,28 @@ def pause(key: str, request: Request, body: PauseIn | None = None, p: Principal 
 
 
 @router.post("/{key}/resume", response_model=list[QueueOut])
-def resume(key: str, request: Request, p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
+def resume(key: str, request: Request, p: Principal = Depends(require(PAUSE_QUEUES)), db: Session = Depends(get_db)):
     queues.resume(db, request, key, p.user)
     db.commit()
     return queues.overview(db)
 
 
 @router.post("/{key}/items/{item_id}/retry", status_code=204)
-def retry(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+def retry(key: str, item_id: str, request: Request, p: Principal = Depends(require(QUEUE_ITEMS)),
           db: Session = Depends(get_db)):
     queues.retry(db, request, key, item_id, p.user)
     db.commit()
 
 
 @router.post("/{key}/items/{item_id}/cancel", status_code=204)
-def cancel(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+def cancel(key: str, item_id: str, request: Request, p: Principal = Depends(require(QUEUE_ITEMS)),
            db: Session = Depends(get_db)):
     queues.cancel(db, request, key, item_id, p.user)
     db.commit()
 
 
 @router.post("/{key}/items/{item_id}/stop", status_code=204)
-def stop(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+def stop(key: str, item_id: str, request: Request, p: Principal = Depends(require(QUEUE_ITEMS)),
          db: Session = Depends(get_db)):
     """Stop an item that's in progress (the engine is told to stop it too)."""
     queues.stop(db, request, key, item_id, p.user)
@@ -159,7 +161,7 @@ def stop(key: str, item_id: str, request: Request, p: Principal = Depends(requir
 
 
 @router.post("/{key}/items/{item_id}/restart", status_code=204)
-def restart(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+def restart(key: str, item_id: str, request: Request, p: Principal = Depends(require(QUEUE_ITEMS)),
             db: Session = Depends(get_db)):
     """Start an item that's in progress over (it goes back to the queue; nothing is charged again)."""
     queues.restart(db, request, key, item_id, p.user)
@@ -167,7 +169,7 @@ def restart(key: str, item_id: str, request: Request, p: Principal = Depends(req
 
 
 @router.post("/{key}/items/{item_id}/remove", status_code=204)
-def remove(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+def remove(key: str, item_id: str, request: Request, p: Principal = Depends(require(QUEUE_ITEMS)),
            db: Session = Depends(get_db)):
     """Take a failed item off the queue's list (the item itself is unchanged)."""
     queues.remove(db, request, key, item_id, p.user)
@@ -175,7 +177,7 @@ def remove(key: str, item_id: str, request: Request, p: Principal = Depends(requ
 
 
 @router.post("/{key}/items/{item_id}/process-now", status_code=204)
-def process_now(key: str, item_id: str, request: Request, p: Principal = Depends(require_super_admin),
+def process_now(key: str, item_id: str, request: Request, p: Principal = Depends(require(QUEUE_ITEMS)),
                 db: Session = Depends(get_db)):
     """A waiting large document goes next, ahead of the large-document rules."""
     queues.process_now(db, request, key, item_id, p.user)

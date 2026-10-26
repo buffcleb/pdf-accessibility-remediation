@@ -188,13 +188,115 @@ def _encoding_map(font: Dictionary) -> dict[int, str]:
     return out
 
 
+_HEX_SPACED = re.compile(r"<([0-9A-Fa-f\s]+)>")  # a destination may be written in groups: <00e0 f0e0>
+
+
+def _entries(text: str) -> list[tuple[str, str]]:
+    """Every mapping in a ToUnicode CMap of any code width, as (source code as written in hex, text)."""
+    out: list[tuple[str, str]] = []
+    for block in re.findall(r"beginbfchar(.*?)endbfchar", text, re.S):
+        hexes = [re.sub(r"\s", "", h) for h in _HEX_SPACED.findall(block)]
+        out += [(src, _utf16(dst)) for src, dst in zip(hexes[0::2], hexes[1::2])]
+    for block in re.findall(r"beginbfrange(.*?)endbfrange", text, re.S):
+        for line in block.strip().splitlines():
+            arr = re.search(r"\[(.*)\]", line)
+            hexes = _HEX.findall(line.split("[")[0])
+            if len(hexes) < 2:
+                continue
+            width, lo, hi = len(hexes[0]), int(hexes[0], 16), int(hexes[1], 16)
+            if arr:
+                out += [(f"{lo + k:0{width}X}", _utf16(dst)) for k, dst in enumerate(_HEX.findall(arr.group(1)))]
+            elif len(hexes) >= 3 and (base := _utf16(hexes[2])):
+                out += [(f"{lo + k:0{width}X}", base[:-1] + chr(ord(base[-1]) + k)) for k in range(hi - lo + 1)]
+    return out
+
+
+def _embedded_symbol_codes(font: Dictionary) -> dict[str, str]:
+    """For a Symbol or Wingdings Type0 font with its TrueType program embedded: each CID's text, from the program's own
+    symbol table (cmap 3,0, which gives each glyph its code as U+F000 plus the code), as (CID in hex, text). Used for
+    the codes the document's map leaves out, which readers otherwise take from that table as private use."""
+    from io import BytesIO
+
+    from fontTools.ttLib import TTFont
+
+    from app.pipeline.symbol_chars import unicode_for
+    try:
+        cid = font.DescendantFonts[0]
+        program = cid.FontDescriptor.FontFile2.read_bytes()
+        tt = TTFont(BytesIO(program), lazy=True)
+        table = tt["cmap"].getcmap(3, 0)
+    except Exception:  # noqa: BLE001 - a font program fontTools can't read gives no codes, nothing else
+        return {}
+    if table is None:
+        return {}
+    gid_cid = {}
+    to_gid = cid.get("/CIDToGIDMap")
+    if isinstance(to_gid, pikepdf.Stream):
+        data = to_gid.read_bytes()
+        gid_cid = {int.from_bytes(data[i:i + 2], "big"): i // 2 for i in range(0, len(data) - 1, 2)}
+    name = str(font.get("/BaseFont", ""))
+    out = {}
+    for code, glyph in table.cmap.items():
+        u = unicode_for(name, chr(code if code >= 0xF000 else 0xF000 + code))
+        if u == chr(code) or "\ue000" <= u <= "\uf8ff":
+            continue
+        try:
+            gid = tt.getGlyphID(glyph)
+        except (KeyError, ValueError):
+            continue
+        out[f"{gid_cid.get(gid, gid):04X}"] = u
+    return out
+
+
+def symbol_tounicode(pdf: pikepdf.Pdf, font: Dictionary) -> int:
+    """A font's own ToUnicode map, where it gives Symbol or Wingdings characters (or Adobe's pieces of tall brackets)
+    as private use code points, rewritten to say what they are (app.pipeline.symbol_chars, #605). The map is rebuilt
+    with every other entry as it was. Returns how many entries changed."""
+    from app.pipeline.symbol_chars import family, unicode_for
+    try:
+        data = font.ToUnicode.read_bytes()
+    except (pikepdf.PdfError, AttributeError):
+        return 0
+    name = str(font.get("/BaseFont", ""))
+    if family(name) is None and not re.search(rb"<F8[EF][0-9A-F]>", data, re.I):
+        return 0
+    text = data.decode("latin-1")
+    entries = _entries(text)
+    n_own = len(entries)
+    if font.get("/Subtype") == Name.Type0 and family(name):
+        have = {src.upper() for src, _ in entries}
+        entries += [(cid, u) for cid, u in _embedded_symbol_codes(font).items() if cid not in have]
+    def said(dst: str) -> str:
+        # Word writes the letter typed and the symbol it stands for ("à" then U+F0E0): the symbol alone, where it maps
+        mapped = [unicode_for(name, ch) for ch in dst]
+        symbols = [m for ch, m in zip(dst, mapped) if m != ch]
+        return "".join(symbols) if symbols else dst
+    new = [(src, said(dst)) for src, dst in entries]
+    changed = sum(1 for (_, a), (_, b) in zip(entries, new) if a != b) + len(entries) - n_own
+    if not changed:
+        return 0
+    head = re.split(r"\d+\s+beginbf(?:char|range)", text, maxsplit=1)[0]
+    tail = text[max(text.rfind("endbfchar") + 9, text.rfind("endbfrange") + 10):]
+    body = []
+    for i in range(0, len(new), 100):
+        chunk = new[i:i + 100]
+        body.append(f"{len(chunk)} beginbfchar")
+        body += [f"<{src}> <{dst.encode('utf-16-be').hex().upper()}>" for src, dst in chunk]
+        body.append("endbfchar")
+    font.ToUnicode = pdf.make_stream((head + "\n".join(body) + "\n" + tail).encode("latin-1"))
+    return changed
+
+
 def add_missing_tounicode(src: Path, dst: Path) -> list[str]:
-    """Write dst with ToUnicode maps added where they can be derived. Returns the fonts fixed."""
+    """Write dst with ToUnicode maps added where they can be derived, and Symbol and Wingdings characters a map gives
+    as private use code points said as what they are (#605). Returns the fonts fixed."""
     fixed: list[str] = []
     with pikepdf.open(src) as pdf:
         for obj in pdf.objects:
             if not isinstance(obj, Dictionary) or obj.get("/Type") != Name.Font:
                 continue
+            if "/ToUnicode" in obj and (n := symbol_tounicode(pdf, obj)):
+                fixed.append(f"{str(obj.get('/BaseFont', '/?'))[1:]} ({n} symbol characters said as Unicode)")
             if "/ToUnicode" not in obj and (mapping := _encoding_map(obj)):
                 obj.ToUnicode = pdf.make_stream(_cmap(mapping))
                 fixed.append(f"{str(obj.get('/BaseFont', '/?'))[1:]} (its {str(obj.Encoding)[1:]}, "

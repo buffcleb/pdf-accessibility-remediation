@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { TagEdit, TagMap } from "../api";
 import { LiveRegion, errorMessage } from "../components/ui";
-import { loadVersion } from "./pdf";
+import { loadTagmap } from "./pdf";
 import { chunks, speechScript, startFor, type Utterance } from "./speech";
 
 type Side = "left" | "right";
@@ -69,8 +69,8 @@ export function Reader({ jobId, versions, ops, selected, onShow, onClose, from =
     if (!version) return;
     let live = true;
     setError(null);
-    loadVersion(jobId, version.number).then(
-      (d) => { if (live) { setMap(d.tagmap); setScript(speechScript(d.tagmap, sideOps)); } },
+    loadTagmap(jobId, version.number).then(
+      (tagmap) => { if (live) { setMap(tagmap); setScript(speechScript(tagmap, sideOps)); } },
       (e) => { if (live) setError(e); },
     );
     return () => { live = false; };

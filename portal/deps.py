@@ -15,7 +15,7 @@ import jwt
 from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
-from portal import api_tokens, rls
+from portal import api_tokens, permissions, rls
 from portal.db import get_db
 from portal.errors import ApiError, forbidden, not_found, unauthorized
 from portal.models import ApiToken, AuthSession, Group, User
@@ -33,8 +33,12 @@ class Principal:
         # A token never acts as an admin, whoever owns it: it reaches its owner's own documents
         return self.token is None and self.user.is_super_admin
 
+    def can(self, permission: str) -> bool:
+        """What the person's roles let them do (portal/permissions.py); never with a token."""
+        return self.token is None and permissions.has(self.user, permission)
+
     def can_admin_group(self, group_id: uuid.UUID) -> bool:
-        return self.token is None and (self.is_super_admin or group_id in self.user.admin_group_ids())
+        return self.token is None and (self.can(permissions.ALL_GROUPS) or group_id in self.user.admin_group_ids())
 
 
 def _bearer(request: Request) -> str:
@@ -87,7 +91,7 @@ def _session_principal(request: Request, db: Session, bearer: str) -> Principal:
     user = session.user
     if user.status != "active":
         raise unauthorized("Your account has been disabled.")
-    if not user.is_super_admin:
+    if not user.across_groups:
         group = db.get(Group, user.group_id) if user.group_id else None
         if group is None or group.status != "active":
             raise unauthorized("Your group has been disabled.")
@@ -102,6 +106,18 @@ def require_super_admin(p: Principal = Depends(current_principal)) -> Principal:
     return p
 
 
+@lru_cache
+def require(permission: str):
+    """For a route only those with this permission may use (portal/permissions.py): super admins, and service admins
+    for theirs."""
+    def dependency(p: Principal = Depends(current_principal)) -> Principal:
+        if not p.can(permission):
+            raise forbidden()
+        return p
+    dependency.permission = permission  # for the route-by-role test
+    return dependency
+
+
 def group_for_admin(group_id: uuid.UUID, p: Principal, db: Session) -> Group:
     """The group, if the caller administers it. Others get 404 so group IDs can't be probed."""
     group = db.get(Group, group_id)
@@ -111,9 +127,11 @@ def group_for_admin(group_id: uuid.UUID, p: Principal, db: Session) -> Group:
 
 
 def require_any_admin(p: Principal = Depends(current_principal)) -> Principal:
-    if not (p.is_super_admin or p.user.admin_group_ids()):
+    """Any admin: one who may see every group's reports (super admins, service admins), or of a group."""
+    if not (p.can(permissions.REPORTS) or p.user.admin_group_ids()):
         raise forbidden()
     return p
 
 
-__all__ = ["Principal", "current_principal", "document_principal", "require_super_admin", "require_any_admin", "group_for_admin", "ApiError"]
+__all__ = ["Principal", "current_principal", "document_principal", "require_super_admin", "require", "require_any_admin",
+           "group_for_admin", "ApiError"]

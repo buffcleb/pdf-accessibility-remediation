@@ -16,6 +16,7 @@ service's send time) or **Off**.
 | **Your documents** | A document is done, couldn't be processed, or was canceled by support |
 | **Help requests** | Replies and changes on your help requests, and reminders when one is waiting for your reply. For support staff, new requests and replies |
 | **Admin notices** (admins) | Someone in your group is waiting for approval |
+| **Service alerts** (service admins) | Something is wrong with the service, such as work that's stuck or email that isn't going out, and when it clears. New 23 October 2026 (#564); super admins always get these at once |
 
 - Sign-in codes and news about your own account (approved or declined) always come at once.
 - Everything is still in the portal, whatever you choose.
@@ -37,7 +38,7 @@ A summary in your inbox, so you don't need to sign in to keep track. Each is **M
   nothing waiting means no email.
 - **Group summary** (group admins): pages used and left against the pool, the most active people, how many
   documents pass, open help requests and people waiting for approval.
-- **Service summary** (super admins): pages by group and option, AI cost and Adobe pages, days a daily limit was
+- **Service summary** (super admins and service admins): pages by group and option, AI cost and Adobe pages, days a daily limit was
   reached, quality and the most common remaining failures, and the help queue.
 
 Monthly reports cover the month before and arrive on its first working day; weekly ones cover Monday to Sunday;

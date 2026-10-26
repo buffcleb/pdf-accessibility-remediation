@@ -19,3 +19,8 @@ def test_a_higher_setting_keeps_more(monkeypatch):
     monkeypatch.setattr(get_portal_settings(), "review_findings_max", 1000)
     assert len(worker.summarize(_resp(450))["review"]["findings"]) == 450
     assert len(worker.version_summary(_resp(1200), "primary")["findings"]) == 1000
+
+
+def test_the_engine_version_is_kept_for_run_details():
+    resp = {**_resp(1), "metrics": {"route": "standard", "engine_version": "7278730a36"}}
+    assert worker.summarize(resp)["metrics"]["engine_version"] == "7278730a36"

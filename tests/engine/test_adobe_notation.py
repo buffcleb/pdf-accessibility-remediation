@@ -2,21 +2,19 @@
 the improved copy as ActualText on Adobe's text tags. Adobe's own file stays as it was (see test_adobe.py for the
 whole route)."""
 from app.pipeline.adobe_job import notation_edits
-from app.pipeline.models import DocumentAnalysis, PageAnalysis, TableCell, TableRegion, TextBlock
+from app.pipeline.models import TableCell, TableRegion
+from tests.engine.layout import block, document, page
 
 LINE = "The second batch held more H2O2 once it was warmed."
 SAID = "The second batch held more H 2 O 2 once it was warmed."
 
 
 def _analysis(blocks, tables=()):
-    return DocumentAnalysis(page_count=1, title=None, language=None, has_struct_tree=False, is_marked=False, pages=[
-        PageAnalysis(number=0, width=612, height=792, rotation=0, pdf_to_page=(1, 0, 0, -1, 0, 792), blocks=blocks,
-                     tables=list(tables))])
+    return document(page(*blocks, *tables))
 
 
 def _read(bbox=(72, 88, 538, 104), text=LINE, said=SAID, role="P"):
-    return TextBlock(id="b", page=0, bbox=bbox, text=text, font_size=11, role=role, actual_text=said,
-                     notation_reading=True)
+    return block("b", bbox, text, role, actual_text=said, notation_reading=True)
 
 
 def _el(i, role, bbox=(72, 91, 520, 101), page=1, text=LINE, **kw):

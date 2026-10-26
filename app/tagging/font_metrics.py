@@ -14,7 +14,7 @@ from pathlib import Path
 import pikepdf
 from pikepdf import Array, ContentStreamInstruction, Dictionary, Name, Operator
 
-from app.tagging.content_marker import MAX_CID, inherited_resources
+from app.tagging.content_marker import MAX_CID, inherited_resources, write_ops
 
 log = logging.getLogger(__name__)
 
@@ -163,11 +163,7 @@ def fix_width_mismatches(src: Path, dst: Path, mismatches: Mismatches) -> int:
                     out.append(ContentStreamInstruction([], Operator("T*")))
                 out.append(ContentStreamInstruction([new_arr], Operator("TJ")))
             if changed:
-                data = pikepdf.unparse_content_stream(out)
-                if isinstance(owner, pikepdf.Stream):
-                    owner.write(data)
-                else:
-                    owner.Contents = pdf.make_stream(data)
+                write_ops(pdf, owner, out)
 
         for page in pdf.pages:
             process(page.obj, inherited_resources(page.obj))

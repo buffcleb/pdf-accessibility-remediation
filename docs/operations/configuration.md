@@ -7,6 +7,12 @@ Everything is configured with environment variables, so the same images run anyw
 `deploy/k8s/engine.env` and `deploy/k8s/portal.env`. `.env.example` lists the engine settings an operator is likely
 to change, with comments.
 
+The complete list, every setting with its default and what it does, is the [settings reference](settings-reference.md),
+generated from the code. This page is the overview: where settings live, the ones most often changed, and how they
+fit together.
+
+> **New 23 October 2026:** the settings reference (#588).
+
 ## The engine
 
 > **Changed 22 October 2026:** `PORTAL_MALWARE_SCAN` moved to [the portal's table](#the-portal), where it's read.

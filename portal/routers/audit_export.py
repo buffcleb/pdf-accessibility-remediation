@@ -17,8 +17,9 @@ from sqlalchemy.orm import Session
 from portal import siem
 from portal.config import get_portal_settings
 from portal.db import get_db, system_session
-from portal.deps import Principal, require_super_admin
+from portal.deps import Principal, require
 from portal.errors import ApiError
+from portal.permissions import SYSTEM
 from portal.security.tokens import constant_time_equal
 
 router = APIRouter(tags=["audit"])
@@ -41,6 +42,7 @@ def export(request: Request, after: int = Query(0, ge=0), limit: int = Query(500
 
 
 @router.get("/admin/audit/siem")
-def siem_status(p: Principal = Depends(require_super_admin), db: Session = Depends(get_db)):
-    """Where the audit log goes, how far it's got, and the last error (a super admin sees every group's events)."""
+def siem_status(p: Principal = Depends(require(SYSTEM)), db: Session = Depends(get_db)):
+    """Where the audit log goes, how far it's got, and the last error (super admins and service admins see every
+    group's events)."""
     return siem.status(db)

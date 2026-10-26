@@ -43,7 +43,7 @@ One sub-tab per topic, each with its own **Save**; moving to another with unsave
 | **Uploads and queues** | Each upload, each person's queue, large documents |
 | **Downloads and scripts** | Downloading as a zip, API tokens for scripts |
 | **AI** | AI in the tag manager, Let AI decide the kind of document |
-| **Checks** | PDF/UA validation (veraPDF) |
+| **Checks** | PDF/UA-2, PDF/UA validation (veraPDF) |
 | **Help** | Help requests |
 | **Alerts** | Alerts, security alerts |
 
@@ -100,9 +100,14 @@ One sub-tab per topic, each with its own **Save**; moving to another with unsave
   **Attention** for a day and recorded in the audit log. **Security alerts on** turns them all off or on. The
   numbers: wrong codes for one address (5), addresses tried from one IP (10) and refused requests from one IP (10),
   each within **Sign-in patterns counted over** (15 minutes); codes asked for unknown addresses (20 an hour); other
-  people's files downloaded by one person (25 an hour). A new super admin, a group allowed to send documents outside,
-  shortened retention and a reused session cookie are told every time. The list, with what to do about each, is in
+  people's files downloaded by one person (25 an hour). A new super admin or service admin, a group allowed to send
+  documents outside, shortened retention and a reused session cookie are told every time. The list, with what to do about each, is in
   [monitoring](../../operations/monitoring.md#security-alerts).
+- **PDF/UA-2** (**New 24 October 2026**, #445): **Let groups offer PDF/UA-2** (off by default). On, each group's
+  admins can let their people choose, per document, PDF/UA-1, PDF/UA-2 (the file delivered as PDF 2.0) or Both (a
+  PDF/UA-2 copy beside the PDF/UA-1 file), and set what's preselected. Off, everyone gets PDF/UA-1, and documents
+  already run keep their files. Re-running a document keeps its standard; the re-run dialog can change it when the
+  document was PDF/UA-2 or Both.
 - **PDF/UA validation (veraPDF)**: how the checks run. The results are the same either way.
   - **As a service kept running** (the default): faster. If the service doesn't answer, the engine runs that check
     from the command line instead.

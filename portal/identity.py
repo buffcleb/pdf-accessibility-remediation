@@ -68,7 +68,8 @@ class Eligibility:
 
 def eligibility(db: Session, email: str) -> Eligibility:
     """An existing account; else the group that lists this address; else the group of its domain; else nothing
-    (or a bootstrap super admin)."""
+    (or a bootstrap super admin). Addresses and domains are each listed on one group only and matched exactly, so
+    a subgroup's (#431: an address, or its own domain such as nursing.example.edu) wins over its parent's domain."""
     user = db.scalar(select(User).where(User.email == email))
     if user is not None:
         return Eligibility(user, user.group, False)

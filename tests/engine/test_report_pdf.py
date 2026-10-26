@@ -88,3 +88,34 @@ def test_tables_across_a_page_break_still_make_a_pdf():
         result = {**RESULT, "reports": {**RESULT["reports"],
                                         "remediation_summary": "\n".join(f"Step {i} done." for i in range(n))}}
         weasyprint.HTML(string=build_html(META, result, BRAND)).write_pdf(pdf_variant="pdf/ua-1")
+
+
+
+def test_private_use_characters_from_the_document_are_shown_as_white_squares(tmp_path):
+    """#600: a Wingdings arrow (U+F0E0), a Symbol bullet (U+F0B7) or a music font's note (U+E021) quoted from the
+    document has no glyph in the report's fonts, and a .notdef glyph fails PDF/UA-1 (7.21.8)."""
+    from app.reports.pdf import drawable
+    assert drawable("Ag+ \uf0e0 Ag, \uf0b7 item, \ue021 and β → ✓") == "Ag+ □ Ag, □ item, □ and β → ✓"
+    pytest.importorskip("weasyprint")
+    import pymupdf
+    result = {**RESULT, "warnings": ["Read Ag+ \uf0e0 Ag and \uf0b7 a bullet."]}
+    out = tmp_path / "report.pdf"
+    write_report_pdf(out, META, result, BRAND)
+    with pymupdf.open(out) as doc:
+        text = "".join(p.get_text() for p in doc)
+    assert "Ag+ □ Ag" in text and not any(0xE000 <= ord(c) <= 0xF8FF for c in text)
+
+
+def test_a_file_converted_to_pdf_2_is_said_to_be_so():
+    """#445: a PDF/UA-2 run says the file was converted to PDF 2.0; Both says a PDF/UA-2 copy was made and its
+    verdict. Both note that older readers may not support PDF 2.0."""
+    from app.reports.markdown import render_job_markdown
+    comp = RESULT["reports"]["comparison"]
+    two = {**RESULT, "reports": {**RESULT["reports"], "comparison": {**comp, "pdfua2_changes": ["saved as PDF 2.0"]}}}
+    both = {**RESULT, "reports": {**RESULT["reports"], "comparison": {
+        **comp, "pdfua2_changes": ["saved as PDF 2.0"], "after_pdfua2": {"compliant": True, "pdfua_part": 2}}}}
+    assert "converted to PDF 2.0" in build_html(META, two, BRAND)
+    assert "converted to PDF 2.0" in render_job_markdown("j", META, "completed", two)
+    assert "it passes the PDF/UA-2 check" in build_html(META, both, BRAND)
+    assert "older PDF readers" in build_html(META, both, BRAND)
+    assert "PDF 2.0" not in build_html(META, RESULT, BRAND)

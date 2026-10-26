@@ -9,9 +9,11 @@ left side can show another version instead (your original, say) to compare the t
 Open it with **Open in tag manager** on the document's page, or **Show** on an item in the review list, which
 highlights the area the item is about ([more](finding-your-way.md#an-item-from-the-review-list)).
 
-While a document opens, each side shows how far it has got: the document and its tags downloading (with how many
-megabytes have come), then reading the tags, then drawing the first page. A large document (over 100 pages or
-20 MB) can take a minute or two; refreshing the page starts it again from the beginning, so it's best to wait.
+**Changed 23 October 2026:** While a document opens, each side shows how far it has got: the document and its tags
+downloading (with how many megabytes have come), then reading the tags, then drawing the first page. The tag tree
+needs only the tags, so it shows as soon as they've come, while the pages may still be on their way. A large
+document (over 100 pages or 20 MB) can take a minute or two; refreshing the page starts it again from the
+beginning, so it's best to wait.
 
 ![The tag manager for a two-page parking guide. On the left, the original document, marked "111 failed checks".
 In the middle, the remediated version, marked "passes", with each tag outlined and labeled on the page: P, H1, H2,

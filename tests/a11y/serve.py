@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 from portal import prometheus, workloads  # noqa: E402
 from portal.config import get_portal_settings  # noqa: E402
 from portal.engine import set_engine_client  # noqa: E402
-from portal.models import Job, User  # noqa: E402
+from portal.models import Group, Job, User  # noqa: E402
 from portal.security.ratelimit import RateLimiter, get_rate_limiter  # noqa: E402
 from tests.portal.test_ai_tiers import _tier  # noqa: E402
 from tests.portal.test_adobe import _improved_with_findings, _send  # noqa: E402
@@ -40,7 +40,7 @@ from tests.portal.test_jobs import API, FakeEngine, pdf_bytes, run_worker, topup
 get_portal_settings.cache_clear()
 
 PEOPLE = {"jordan.lee@northfield.example": "Jordan Lee", "priya.shah@northfield.example": "Priya Shah",
-          "alex.morgan@northfield.example": "Alex Morgan"}
+          "alex.morgan@northfield.example": "Alex Morgan", "sam.rivera@northfield.example": "Sam Rivera"}
 
 
 class CannedPrometheus:
@@ -49,6 +49,7 @@ class CannedPrometheus:
 
     NS = "pdf-remediation"
     DIGEST = "sha256:" + "4e61d15fd359" * 5 + "4e61"  # invented: one digest for every image
+    OTHER = "sha256:" + "9b49eed8f628" * 5 + "9b49"  # what the database runs instead: System > Versions in bold (#570)
     PODS = {"engine-worker-5d9f7-abcde": "engine-worker", "engine-worker-5d9f7-fghij": "engine-worker",
             "portal-api-7c4b8-klmno": "portal-api", "postgres-0": "postgres"}
 
@@ -73,7 +74,7 @@ class CannedPrometheus:
             "kube_pod_info": [v(1, pod=pod, node="node-1", namespace=ns, created_by_kind="ReplicaSet")
                               for pod in self.PODS],
             "kube_pod_container_info": [v(1, pod=pod, container=app, image_spec=f"example/{app}:1.0@{self.DIGEST}",
-                                          image_id=f"example/{app}@{self.DIGEST}")
+                                          image_id=f"example/{app}@{self.OTHER if app == 'postgres' else self.DIGEST}")
                                         for pod, app in self.PODS.items()],
             "kube_pod_start_time": [v(self.now - 7200, pod=pod) for pod in self.PODS],
             "kube_pod_status_phase == 1": [v(1, pod=pod, phase="Running") for pod in self.PODS],
@@ -165,6 +166,7 @@ def main() -> None:
         cf.make_user(db, "alex.morgan@northfield.example", g, role="super_admin")
         cf.make_user(db, "priya.shah@northfield.example", g, admin_of=g)
         cf.make_user(db, "jordan.lee@northfield.example", g)
+        cf.make_user(db, "sam.rivera@northfield.example", g, role="service_admin")  # #564
         for u in db.query(User).all():
             u.name = PEOPLE.get(u.email)
         db.commit()
@@ -209,6 +211,14 @@ def main() -> None:
         run_worker(db)
         _improved_with_findings(engine, db.get(Job, uuid.UUID(jobs["adobe"])).engine_job_id)
         run_worker(db)
+        # A subgroup (#431): a person of its own, a limit on Northfield's Standard pages, one setting of its own
+        r = admin.post(f"{API}/groups/{g.id}/subgroups", json={"name": "School of Nursing"})
+        sub_id = r.json()["id"]
+        nurse = cf.make_user(db, "casey.nguyen@northfield.example", db.get(Group, uuid.UUID(sub_id)))
+        nurse.name = "Casey Nguyen"
+        db.commit()
+        assert admin.patch(f"{API}/groups/{sub_id}/services/standard", json={"cap_pages": 120}).status_code == 200
+        assert admin.patch(f"{API}/groups/{sub_id}", json={"show_external": True}).status_code == 200
         for c in clients.values():
             c.__exit__(None, None, None)
 
@@ -219,7 +229,7 @@ def main() -> None:
     # What the checks open: the documents, and the group
     Path(os.environ.get("A11Y_SEED_OUT", "a11y-seed.json")).write_text(json.dumps(
         {"done": jobs["Campus_Parking_Guide_2026.pdf"], "processing": jobs["processing"], "adobe": jobs["adobe"],
-         "group": str(g.id)}))
+         "group": str(g.id), "subgroup": sub_id}))
     print("ready", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
 

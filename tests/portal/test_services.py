@@ -224,7 +224,8 @@ def test_completion_and_failure_settle_the_right_service(setup):
     assert extra["used_pages"] == 3 and extra["reserved_pages"] == 0
     g = s["c"]["admin_a"].get(f"{API}/groups/{s['a'].id}").json()
     gs = next(x for x in g["services"] if x["key"] == EXTRA)["balance"]
-    assert gs == {"pool_pages": 20, "used_pages": 3, "reserved_pages": 0, "remaining_pages": 17}
+    assert gs == {"pool_pages": 20, "used_pages": 3, "reserved_pages": 0, "remaining_pages": 17,
+                  "cap_pages": None, "shared": False}
     assert g["balance"]["used_pages"] == 0  # standard untouched
     kinds = [(e.service_key, e.kind) for e in db.scalars(select(QuotaLedger).order_by(QuotaLedger.id))]
     assert (EXTRA, "commit") in kinds and (EXTRA, "release") in kinds and ("standard", "commit") not in kinds

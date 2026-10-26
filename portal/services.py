@@ -3,7 +3,7 @@
 A service is usable by a user when all of these hold:
   * it's switched on globally (super admin),
   * the group has it switched on (group admin), and the group isn't local-only when the service sends
-    documents to an external provider,
+    documents to an external provider; a subgroup's parent has it switched on too (#431),
   * the user is granted it: individually, or because the group grants it to all its members.
 Quota (pages) is checked separately, when pages are reserved (portal.quota).
 """
@@ -87,7 +87,8 @@ def access(db: Session, user: User, key: str) -> Access:
         return Access(False, "local_only", f"Your group keeps documents on this service's own servers, so {service.label} "
                                            "can't be used.")
     gs = group.service(key)
-    if gs is None or not gs.enabled:
+    pool = group.pool.service(key)
+    if gs is None or not gs.enabled or pool is None or not pool.enabled:
         return Access(False, "group_not_enabled", f"{service.label} isn't enabled for your group.")
     if not granted(user, key):
         return Access(False, "not_granted", f"You haven't been given access to {service.label}. "
@@ -108,15 +109,32 @@ def full_review_allowed(db: Session, tier: str | None) -> bool:
     return s is None or s.allow_full_review
 
 
+def subgroup_left(gs: GroupService) -> int | None:
+    """What a subgroup may still use of its parent's pool under its own cap (#431). None: no cap."""
+    return None if gs.cap_pages is None else gs.cap_pages - gs.used_pages - gs.reserved_pages
+
+
+def pool_left(group: Group, key: str) -> tuple[int, int] | None:
+    """(size, left) of a service's pages a group's documents may still use: its pool's, or for a subgroup its
+    parent's within the subgroup's limit (the size is then the limit, if it has one). None: no row for it."""
+    gs, pool = group.service(key), group.pool.service(key)
+    if gs is None or pool is None:
+        return None
+    size, left = pool.pool_pages, pool.pool_pages - pool.used_pages - pool.reserved_pages
+    if pool is not gs and gs.cap_pages is not None:
+        size, left = gs.cap_pages, min(left, subgroup_left(gs))
+    return size, left
+
+
 def remaining(user: User, key: str, service: Service) -> int | None:
-    """Pages the user can still submit to a service: the smallest of their cap, the group pool and the
-    global pool. None = unlimited (an unmetered service)."""
+    """Pages the user can still submit to a service: the smallest of their cap, the group pool (a subgroup's
+    parent's, and the subgroup's cap on it) and the global pool. None = unlimited (an unmetered service)."""
     if not service.metered:
         return None
-    gs = user.group.service(key) if user.group else None
-    if gs is None:
+    pl = pool_left(user.group, key) if user.group else None
+    if pl is None:
         return 0
-    left = gs.pool_pages - gs.used_pages - gs.reserved_pages
+    left = pl[1]
     if service.pool_pages is not None:
         left = min(left, service.pool_pages - service.used_pages - service.reserved_pages)
     cap = effective_cap(user, key)

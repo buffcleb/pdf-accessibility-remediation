@@ -4,7 +4,9 @@ import { useBlocker } from "react-router-dom";
 /* "You have unsaved changes": forms say when they hold edits with useUnsavedChanges(dirty). One provider owns the
  * router's blocker (a router supports only one) and the browser's reload/close warning, and asks before leaving. */
 
-type Registry = { add: (id: string) => void; remove: (id: string) => void; confirmLeave: () => Promise<boolean> };
+type Registry = {
+  add: (id: string) => void; remove: (id: string) => void; confirmLeave: () => Promise<boolean>; any: () => boolean;
+};
 
 const Ctx = createContext<Registry | null>(null);
 
@@ -50,6 +52,7 @@ export function UnsavedChangesProvider({ children }: { children: ReactNode }) {
     add: (id) => dirty.current.add(id),
     remove: (id) => dirty.current.delete(id),
     confirmLeave,
+    any: () => dirty.current.size > 0,
   }), [confirmLeave]);
 
   return (
@@ -81,6 +84,12 @@ export function useUnsavedChanges(dirty: boolean) {
 export function useConfirmLeave() {
   const registry = useContext(Ctx);
   return registry?.confirmLeave ?? (() => Promise.resolve(true));
+}
+
+/** Whether any form on the page holds unsaved edits right now (for reloading onto a new build, newBuild.tsx). */
+export function useHasUnsaved() {
+  const registry = useContext(Ctx);
+  return registry?.any ?? (() => false);
 }
 
 function LeaveDialog({ onLeave, onStay }: { onLeave: () => void; onStay: () => void }) {

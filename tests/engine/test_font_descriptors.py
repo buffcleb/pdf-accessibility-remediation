@@ -9,6 +9,7 @@ import pytest
 from app.pipeline.fonts import _CANDIDATES, fix_inserted_cid_fonts
 from app.tagging.font_descriptors import remove_incomplete_glyph_lists
 from app.validation.verapdf import RuleFailure
+from tests.engine.pdfs import same_render
 
 FONT = next((f for f in _CANDIDATES if Path(f).is_file()), None)
 needs_font = pytest.mark.skipif(FONT is None, reason="no TrueType font to embed")
@@ -45,10 +46,6 @@ def _has_cidset(path: Path) -> bool:
                    and o.get("/Subtype") == pikepdf.Name.CIDFontType2)
 
 
-def _same_render(a: Path, b: Path) -> bool:
-    return fitz.open(a)[0].get_pixmap(dpi=72).samples == fitz.open(b)[0].get_pixmap(dpi=72).samples
-
-
 @needs_font
 def test_reported_cidset_is_removed_and_nothing_else_changes(tmp_path):
     src = _cid_doc(tmp_path / "cid.pdf")
@@ -56,7 +53,7 @@ def test_reported_cidset_is_removed_and_nothing_else_changes(tmp_path):
     dst = tmp_path / "fixed.pdf"
     fixed = remove_incomplete_glyph_lists(src, dst, [failure])
     assert len(fixed) == 1 and "CIDSet" in fixed[0]
-    assert not _has_cidset(dst) and _same_render(src, dst)
+    assert not _has_cidset(dst) and same_render(src, dst)
 
 
 @needs_font
@@ -73,7 +70,8 @@ def test_other_fonts_and_other_rules_are_left_alone(tmp_path):
 def test_verapdf_passes_the_rule_after_the_fix(tmp_path, verapdf_available):
     if not verapdf_available:
         pytest.skip("veraPDF not installed")
-    from app.pipeline.orchestrator import _fix_glyph_lists, _primary, _validate
+    from app.pipeline.orchestrator import _fix_glyph_lists, _primary
+    from app.pipeline.outputs import validate as _validate
 
     pdf = _cid_doc(tmp_path / "cid.pdf")
     before = pdf.with_name("before.pdf")
@@ -82,7 +80,7 @@ def test_verapdf_passes_the_rule_after_the_fix(tmp_path, verapdf_available):
     assert "7.21.4.2" in _primary(vera).failed_clauses
     vera, fixed = _fix_glyph_lists(pdf, vera, tmp_path, "t", "cid")
     assert fixed and "7.21.4.2" not in _primary(vera).failed_clauses
-    assert _same_render(before, pdf)
+    assert same_render(before, pdf)
 
 
 @needs_font

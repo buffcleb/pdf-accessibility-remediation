@@ -5,6 +5,7 @@ import {
   type Notifications as NotificationsData, type NotifyChoice, type ReportView,
 } from "../api";
 import { useAuth } from "../auth";
+import { isAdmin } from "../permissions";
 import { VIEW_FREQUENCIES } from "../components/ScheduleView";
 import { ErrorNotice, Loading, Notice, useLoad, useTitle } from "../components/ui";
 import { useConfirmLeave } from "../components/unsaved";
@@ -19,7 +20,7 @@ const REPORT_FREQUENCIES: [EmailReportChoice["frequency"], string][] = [
 export function MySettings() {
   useTitle("Settings");
   const { me } = useAuth();
-  const isAdmin = !!me && (me.is_super_admin || me.admin_of.length > 0);
+  const admin = isAdmin(me);
   return (
     <div className="settings-page">
       <header className="settings-intro">
@@ -28,13 +29,13 @@ export function MySettings() {
         <nav className="settings-nav" aria-label="On this page">
           <a href="#notifications">Email notifications</a>
           <a href="#reports">Email reports</a>
-          {isAdmin && <a href="#views">Scheduled report views</a>}
+          {admin && <a href="#views">Scheduled report views</a>}
           <a href="#devices">Signed-in devices</a>
         </nav>
       </header>
       <Notifications />
       <EmailReportsCard />
-      <ReportViews isAdmin={isAdmin} />
+      <ReportViews isAdmin={admin} />
       <ApiTokens wrap={(children) => (
         <Card id="tokens" title="API tokens"
           intro="For scripts that send documents, and if you choose, check on them and fetch the results. Each token sends to one processing option and AI level. Documents it sends appear in My documents.">

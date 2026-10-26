@@ -12,7 +12,7 @@ import { splitPreview } from "./figure";
 import { contentMoves, newTags, splitKeeps } from "./areaPreview";
 import { loadVersion, watchVersion, type LoadState, type PaneData } from "./pdf";
 import { LoadProgress } from "../components/LoadProgress";
-import { LARGE_NOTE, READING_TAGS, downloading, drawingPage, fraction, isLarge } from "../components/loadWords";
+import { LARGE_NOTE, drawingPage, isLarge, pageLoading } from "../components/loadWords";
 import { PageView, type OverlayItem } from "./PageView";
 import type { Spot } from "./spot";
 
@@ -83,20 +83,6 @@ export function VersionPicker({ side, versions, value, onNumber, onTree, treeDis
       </select>
     </>
   );
-}
-
-/** A version's loading in words, and how far its downloads have got (null once they're done, or not yet known). */
-// pdfSize: the file's size as the version records it, for when the download doesn't say
-export function loadingWords(load: LoadState | null,
-  pdfSize?: number | null): { lines: string[]; fraction: number | null } {
-  if (load?.reading) return { lines: [READING_TAGS], fraction: null };
-  const none = { received: 0, total: null };
-  const pdf = load?.pdf ?? none;
-  const doc = { ...pdf, total: pdf.total ?? (pdfSize || null) };
-  return {
-    lines: [downloading("the document", doc), downloading("the tags", load?.tags ?? none)],
-    fraction: load ? fraction([doc, load.tags]) : null,
-  };
 }
 
 export function versionStatus(v: DocVersion): string {
@@ -292,7 +278,7 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
   const drawing = !!data && !drawn && pages.length > 0;
   const progress = data && !drawing ? null : (
     <LoadProgress className={data ? "pv-loading pv-loading-over" : "pv-loading"}
-      {...(data ? { lines: [drawingPage(shownPage ?? 1)], fraction: null } : loadingWords(load, version?.pdf_size))}
+      {...(data ? { lines: [drawingPage(shownPage ?? 1)], fraction: null } : pageLoading(load, version?.pdf_size))}
       note={isLarge({ pages: data?.tagmap.pages.length ?? load?.pages, bytes: version?.pdf_size ?? load?.pdf.total })
         ? LARGE_NOTE : null} />
   );

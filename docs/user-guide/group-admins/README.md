@@ -2,7 +2,7 @@
 
 For people who look after a group: a department, team or organization using the service. You approve new
 people, share out the group's pages, choose how the group uses AI, and follow its documents, help requests and
-reports. A super admin made you a group admin; a group can have several.
+reports. A super admin or a service admin made you a group admin; a group can have several.
 
 You're also an ordinary user, so the [guide for people submitting documents](../people/README.md) applies to
 you too.
@@ -15,6 +15,7 @@ you too.
 4. [Group settings](group-settings.md): approval, AI for uploads, local-only, marking external options
 5. [Documents and help requests](documents-and-help.md): your group's documents and requests
 6. [Reports](reports.md): live reports, CSV, scheduled report views and email summaries
+7. [Subgroups](subgroups.md): groups inside yours, their pages, settings and people (**new 26 October 2026**)
 
 ## Common tasks
 
@@ -30,4 +31,6 @@ you too.
 | Make everyone use one AI level | **Group settings → AI for uploads → One level for everything** ([more](group-settings.md#ai-for-uploads)) |
 | Keep the group's documents on the service's own servers | **Group settings → Local only** ([more](group-settings.md#local-only)) |
 | See how many pages the group used last month | **Reports → Usage** ([more](reports.md)) |
+| Add a subgroup, or limit its pages | **Add a subgroup** beside the group's name; the subgroup's **Services and pages → Set limit** ([more](subgroups.md)) |
+| Move someone into a subgroup | **People → Manage → Group** ([more](subgroups.md#who-joins-it)) |
 | Get a monthly summary by email | **Settings → Email reports → Group summary** ([more](reports.md#email-summaries)) |

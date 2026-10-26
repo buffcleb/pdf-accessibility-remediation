@@ -1,0 +1,164 @@
+# With EGRESS_DENY=on (#594): nothing in this namespace opens a connection anywhere unless a policy lets it, as
+# default-deny-ingress does for what comes in (80-network-policies.yaml). Every pod may ask the cluster's DNS; each
+# policy below lets one workload reach what it uses and nothing else. Replies to a connection a pod was let in on
+# are let out whatever these say (Calico, in Canal, tracks connections).
+#
+# Already limited elsewhere, and not changed here: the pods that open uploaded PDFs (engine-egress and music-egress,
+# 80-network-policies.yaml), the egress proxy (26-egress-proxy.yaml), and the portal, the AI gateway, the Adobe
+# worker and ClamAV, which reach out as EGRESS_PROXY says (82-egress-enforce.yaml with enforce; 84-egress-direct.yaml
+# otherwise). Postgres, both Redises, SeaweedFS and veraPDF only answer, so they get DNS and nothing more.
+#
+# The Kubernetes API: pods call the kubernetes service's cluster address, which the node rewrites to an API server's
+# own (its endpoints, on 6443 with RKE2) before the policy is checked, so the policy names those: KUBE_API_CIDRS and
+# KUBE_API_PORT in deploy.env (the server nodes' addresses by default; deploy.sh checks them against the service's
+# endpoints). The kubelets Prometheus reads are on every node's address (NODE_CIDRS), port 10250.
+#
+# The job folder and the backup share are NFS mounts made by the node, not the pod, so they aren't affected.
+# Each carries the label pdfrem/egress-deny, so they can be removed together (EGRESS_DENY=off, or by hand in a hurry).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+# Every pod: the cluster's DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dns-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } },
+             podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+---
+# The web app's nginx: the portal API it passes /api/ to, and Grafana for super admins (when monitoring is on)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: { matchLabels: { app: web } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: portal-api } } }]
+      ports: [{ port: 8080 }]
+    - to: [{ podSelector: { matchLabels: { app: grafana } } }]
+      ports: [{ port: 3000 }]
+---
+# The tunnel: Cloudflare's edge (7844, QUIC or HTTP/2, and 443 for Cloudflare's API), and the one service its public
+# hostname points at (the web app, or the portal API with the Worker front end)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloudflared-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: { matchLabels: { app: cloudflared } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: ${CLUSTER_CIDRS} } }]
+      ports: [{ port: 7844, protocol: TCP }, { port: 7844, protocol: UDP }, { port: 443, protocol: TCP }]
+    - to: [{ podSelector: { matchLabels: { app: ${TUNNEL_ORIGIN} } } }]
+      ports: [{ port: 8080 }]
+---
+# Prometheus: the pods it reads, on their metrics ports (each lets it in on its own: 80-network-policies.yaml,
+# 95-monitoring.yaml), and the nodes' kubelets
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: { matchLabels: { app: prometheus } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: {} }]
+      ports: [{ port: 8000 }, { port: 8080 }, { port: 9121 }, { port: 9187 }, { port: 9464 }]
+    - to: ${NODE_TO}
+      ports: [{ port: 10250 }]
+---
+# The Kubernetes API: Prometheus (to find the pods and nodes it reads), kube-state-metrics, and the hourly veraPDF
+# restart
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-api-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [prometheus, kube-state-metrics, verapdf-restart] }
+  policyTypes: [Egress]
+  egress:
+    - to: ${KUBE_API_TO}
+      ports: [{ port: ${KUBE_API_PORT} }]
+---
+# Postgres: its exporter, the migrations and the nightly backup's database dumps
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [postgres-exporter, portal-migrate, backup] }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: postgres } } }]
+      ports: [{ port: 5432 }]
+---
+# The nightly backup's copy of the stored files
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backup-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: { matchLabels: { app: backup } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: seaweedfs } } }]
+      ports: [{ port: 8333 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-exporter-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: { matchLabels: { app: redis-exporter } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: redis } } }]
+      ports: [{ port: 6379 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana-egress
+  namespace: ${NAMESPACE}
+  labels: { pdfrem/egress-deny: "on" }
+spec:
+  podSelector: { matchLabels: { app: grafana } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: prometheus } } }]
+      ports: [{ port: 9090 }]

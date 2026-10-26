@@ -5,7 +5,8 @@ from pathlib import Path
 import pymupdf as fitz
 
 from app.pipeline.models import PageAnalysis, TextBlock
-from app.pipeline.structure import _by_rows, heuristic_reading_order, right_to_left
+from app.pipeline.structure import heuristic_reading_order, right_to_left
+from app.pipeline.structure.reading_order import _by_rows
 from app.verification.verify import _rtl_findings
 
 HEBREW = "שלום עולם זהו טקסט בעברית לבדיקה של כיוון הקריאה בעמוד"

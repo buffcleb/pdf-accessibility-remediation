@@ -1,6 +1,8 @@
 import { Fragment, useState } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { get, post, type Paged } from "../../api";
+import { useAuth } from "../../auth";
+import { can } from "../../permissions";
 import { ErrorNotice, Loading, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { QueuesLive } from "./QueuesLive";
 import { ListBar, ListPager } from "../../components/lists";
@@ -34,6 +36,8 @@ const ago = (since: string) => { const a = age(since); return a === "just now" ?
 /** Super admins: every queue, how much is in it, and pause or resume it; then the items of one queue. */
 export function QueuesPage() {
   useTitle("Queues");
+  const { me } = useAuth();
+  const pauses = can(me, "queues.pause");  // super admins; service admins see the queues and act on items (#564)
   const [params, setParams] = useSearchParams();
   const queues = useLoad(() => get<Queue[]>("/admin/queues"), [], always, 10000);
   const [error, setError] = useState<unknown>(null);
@@ -107,7 +111,7 @@ export function QueuesPage() {
                     ? <><span className="pill warn">Paused</span>
                       <div className="muted small">by {q.paused.by}, {ago(q.paused.at)}{q.paused.note ? `: ${q.paused.note}` : ""}</div></>
                     : <span className="pill good">Running</span>}</td>
-                  <td>{q.paused
+                  <td>{!pauses ? null : q.paused
                     ? <button className="btn small" disabled={busy}
                       onClick={() => void act(() => post<Queue[]>(`${path(q.key)}/resume`))}>
                       Resume<span className="visually-hidden"> {q.label}</span></button>
@@ -115,7 +119,7 @@ export function QueuesPage() {
                       onClick={() => { setPausing(pausing === q.key ? null : q.key); setNote(""); }}>
                       Pause<span className="visually-hidden"> {q.label}</span></button>}</td>
                 </tr>
-                {pausing === q.key && (
+                {pauses && pausing === q.key && (
                   <tr className="row-panel"><td colSpan={7}>
                     <form className="form-row" onSubmit={(e) => { e.preventDefault(); void act(() => post<Queue[]>(`${path(q.key)}/pause`, { note: note || null })); }}>
                       <div className="field" style={{ flex: "1 1 280px" }}>

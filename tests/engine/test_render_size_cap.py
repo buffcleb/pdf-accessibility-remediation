@@ -6,7 +6,7 @@ import pymupdf as fitz
 import pytest
 from pikepdf import Array, Dictionary, Name
 
-from app.pipeline.orchestrator import _visual_fidelity
+from app.pipeline.outputs import visual_fidelity
 
 HUGE = 100_000  # points a side
 MAX_RENDER_PX = 10_000  # the long side any whole-page render may reach, in pixels
@@ -50,7 +50,7 @@ def test_the_cap_lowers_the_dpi_of_a_huge_page_only(tmp_path):
 
 def test_the_pixel_comparison_renders_a_huge_page_within_the_cap(tmp_path, dpi_requests):
     _huge_page(tmp_path / "huge.pdf")
-    result = _visual_fidelity(tmp_path / "huge.pdf", tmp_path / "huge.pdf")
+    result = visual_fidelity(tmp_path / "huge.pdf", tmp_path / "huge.pdf")
     assert result["identical"] and dpi_requests
     assert all(HUGE * d / 72 <= MAX_RENDER_PX for d in dpi_requests), dpi_requests
 

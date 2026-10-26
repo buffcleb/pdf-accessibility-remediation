@@ -14,11 +14,13 @@ from sqlalchemy.orm import Session, object_session
 
 from portal import api_tokens, approval, audit, export, finding_marks, malware, quota, removal, services, settings_store
 from portal.db import get_db
-from portal.deps import Principal, current_principal, document_principal, require_super_admin
+from portal.deps import Principal, current_principal, document_principal, require
 from portal.errors import ApiError, not_found
+from portal import pdfua
 from portal.export import STAFF_ONLY_FILES
 from portal.models import ACTIVE_JOB_STATUSES, ApiTokenDownload, HelpRequest, Job, JobFile, User
 from portal.pdfcheck import receive_pdf
+from portal.permissions import COSTS, RERUN_REMOVE, STAFF_FILES
 from portal.security.ratelimit import per_person
 from portal.storage import get_storage, job_prefix, safe_name
 
@@ -37,6 +39,8 @@ FILE_LABELS = {
     "adobe_report": "Adobe accessibility report (Excel)",
     "enhanced": "Improved copy of Adobe's file (PDF)",
     "verapdf_after_enhanced": "veraPDF report: improved copy",
+    "pdfua2": "PDF/UA-2 (PDF 2.0)",
+    "verapdf_after_pdfua2": "veraPDF report: PDF/UA-2 copy",
     "music_score": "Music: the whole piece (MusicXML)",
     "music_files": "Music: every line, and the whole piece (MusicXML files, zip)",
     "math_list": "Math: every formula, to read with a screen reader (web page)",
@@ -77,6 +81,7 @@ class JobOut(BaseModel):
     needs_confirmation: bool
     full_review: bool
     ignore_existing: bool  # its own tags ignored, tagged afresh (#396)
+    pdfua: str = "1"  # the PDF/UA part it was run for: "1", "2" or "both" (#445)
     no_ai: bool  # made without AI (an audit, when its AI level is set that way)
     ai_refunded: bool  # the AI tier's pages were given back: every AI call failed, or (ai_unused) none was needed
     ai_unused: bool
@@ -113,6 +118,8 @@ def _file_label(job: Job, kind: str) -> str:
         return "Adobe tagged PDF"
     if kind == "enhanced" and summary.get("improved_label"):
         return f"{summary['improved_label']} (PDF)"
+    if kind == "primary" and job.pdfua == "both" and summary.get("converted_pdf2"):
+        return "PDF/UA-1 (PDF 1.7)"  # beside the PDF/UA-2 copy (#445)
     return FILE_LABELS.get(kind, kind)
 
 
@@ -130,9 +137,9 @@ def _ai_label(job: Job) -> str | None:
 
 
 def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool = False,
-            show_cost: bool = False) -> JobOut:
-    """show_cost: the viewer is a super admin. The AI's cost and the engine's own reports (STAFF_ONLY_FILES) are theirs
-    only."""
+            show_cost: bool = False, staff: bool = False) -> JobOut:
+    """show_cost: the viewer may see the AI's cost in dollars. staff: a super admin or a service admin (#564), who see
+    the engine's own reports (STAFF_ONLY_FILES) and the Run details."""
     hold = runtime.early_removal_hold_hours
     removal_at = removal.remove_at(job, hold)
     expires = None if job.files_deleted_at else job.created_at + timedelta(days=runtime.file_retention_days)
@@ -144,12 +151,12 @@ def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool =
         ai_label=_ai_label(job),
         charged_services=list(job.charged_services or []),
         external_services=list(job.external_services or []), needs_confirmation=job.status == "held",
-        full_review=job.full_review, ignore_existing=bool(job.ignore_existing), no_ai=bool(job.no_ai),
+        full_review=job.full_review, ignore_existing=bool(job.ignore_existing), pdfua=job.pdfua or "1", no_ai=bool(job.no_ai),
         ai_refunded=bool((job.cost or {}).get("ai_refunded")),
         ai_unused=bool((job.cost or {}).get("ai_unused")),
         cost=job.cost if show_cost else None,
         staff={"engine_job_id": job.engine_job_id, "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None}
-        if show_cost else None,
+        if staff else None,
         rerun_of=job.rerun_of, sent_by_script=job.api_token.name if job.api_token_id and job.api_token else None,
         status=job.status, progress=job.progress,
         result=finding_marks.summary_with_keys(job.result_summary, "review", "findings"), error_code=job.error_code,
@@ -162,7 +169,7 @@ def job_out(job: Job, runtime: settings_store.RuntimeSettings, with_user: bool =
             JobFileOut(id=f.id, kind=f.kind, label=_file_label(job, f.kind), name=f.name,
                        size_bytes=f.size_bytes) for f in job.files
             if not f.kind.startswith(("tagmap_", "reviewed_", "corrected_"))
-            and (show_cost or f.kind != "report_json")])  # (the Markdown report stays listed: the Report tab is shown
+            and (staff or f.kind != "report_json")])  # (the Markdown report stays listed: the Report tab is shown
             # when there is one, and reads it through /jobs/{id}/report)
 
 
@@ -174,13 +181,13 @@ class UploadResult(BaseModel):
 
 
 def _visible_job(db: Session, job_id: uuid.UUID, p: Principal) -> Job:
-    """Owner, an admin of the job's group, or a super admin. Others get 404."""
+    """Owner, an admin of the job's group, or a super admin or service admin. Others get 404."""
     job = db.get(Job, job_id)
     if job is None:
         raise not_found("Job")
-    if p.is_super_admin:
+    # A deleted document is gone for everyone but super admins and service admins (its record stays for reports)
+    if p.can(STAFF_FILES):
         return job
-    # A deleted document is gone for everyone but super admins (its record stays for reports)
     if job.deleted_at is None and (job.user_id == p.user.id or (job.group_id and p.can_admin_group(job.group_id))):
         return job
     raise not_found("Job")
@@ -208,7 +215,9 @@ class ServiceChoice(BaseModel):
     ai_use: str | None            # processing services: "full" (AI helps throughout) or "alt_text"
                                   # (optional AI alt text for figures, in a separate copy)
     kinds: list[KindChoice] = []  # AI levels: kinds of document, General first (never model names)
-    audit_ai: str | None = None   # AI levels: an audit with this level is free, counts its pages, or uses no AI
+    audit_ai: str | None = None   # AI levels: an audit with this level is free, counts its pages, uses no AI, or
+    #                               isn't offered ("disabled", #586)
+    engine_route: str | None = None  # processing services: "standard" or "adobe" (PDF/UA-2 is the standard route's, #445)
 
 
 @router.get("/services", response_model=list[ServiceChoice])
@@ -228,7 +237,8 @@ def my_services(p: Principal = Depends(current_principal), db: Session = Depends
             is_default=bool(gs and gs.is_default), allow_full_review=s.allow_full_review,
             ai_use=services.ai_use(s) if s.kind == "processing" else None,
             kinds=_kind_choices(db, s.key, classifier) if s.kind == "ai_tier" else [],
-            audit_ai=s.audit_ai if s.kind == "ai_tier" else None))
+            audit_ai=s.audit_ai if s.kind == "ai_tier" else None,
+            engine_route=s.engine_route if s.kind == "processing" else None))
     return out
 
 
@@ -251,18 +261,23 @@ class UploadOptions(BaseModel):
     ai_kind: str | None       # fixed: the kind (None: General)
     show_external: bool       # mark the options that send documents to an outside provider
     malware_scan: bool = False  # uploads are scanned for malware before they're accepted (#455), so say so (#560)
+    # The PDF/UA parts people may choose (#445): ["1"], or ["1", "2", "both"] where the service and group allow it,
+    # and the one preselected
+    pdfua_choices: list[str] = ["1"]
+    pdfua_default: str = "1"
 
 
 @router.get("/upload-options", response_model=UploadOptions)
-def upload_options(p: Principal = Depends(current_principal)):
+def upload_options(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     g = p.user.group
+    parts = {"pdfua_choices": pdfua.choices(db, g), "pdfua_default": pdfua.default(db, g)}
     if g is None:
         return UploadOptions(ai_mode="choose", ai_level=None, ai_kind=None, show_external=False,
-                             malware_scan=malware.enabled())
+                             malware_scan=malware.enabled(), **parts)
     fixed = g.ai_mode == "fixed" and bool(g.ai_level)
     return UploadOptions(ai_mode="fixed" if fixed else "choose", ai_level=g.ai_level if fixed else None,
                          ai_kind=g.ai_kind if fixed else None, show_external=g.show_external,
-                         malware_scan=malware.enabled())
+                         malware_scan=malware.enabled(), **parts)
 
 
 def _pick_tier(db: Session, user, requested: str | None) -> str | None:
@@ -341,7 +356,11 @@ def _plan(db: Session, user, chosen, processing: str, report_only: bool, ai_alt_
     no_ai = False
     charge_keys = [processing] + ([tier] if tier else [])
     if report_only:
-        audit_ai = services.get_service(db, tier).audit_ai if tier else "free"
+        level = services.get_service(db, tier) if tier else None
+        audit_ai = level.audit_ai if level else "free"
+        if audit_ai == "disabled":  # #586: the level's super admins turned checks off
+            raise ApiError(422, "check_not_offered",
+                           f"Check only isn't offered with {level.label}. Choose another AI level, or remediate.")
         if audit_ai == "off":
             tier, kind, no_ai = None, None, True
         charge_keys = [tier] if audit_ai == "charge" else []
@@ -384,6 +403,7 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
            ai_kind: str | None = Form(None, max_length=40),
            confirm: bool = Form(False), full_review: bool = Form(False), ai_alt_text: bool = Form(True),
            ignore_existing: bool = Form(False),
+           pdfua_part: str | None = Form(None, max_length=4, alias="pdfua"),
            per_file: str | None = Form(None, max_length=20_000),
            p: Principal = Depends(document_principal("submit")), db: Session = Depends(get_db)):
     """Submit one or more PDFs. Each file is accepted or refused on its own.
@@ -414,6 +434,13 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
     if report_only and chosen.engine_route != services.STANDARD:
         # A report needs nothing from another provider: it's always made here, and costs no pages.
         processing, chosen = services.STANDARD, services.get_service(db, services.STANDARD)
+    # The PDF/UA part (#445): what was asked, or the group's default. PDF/UA-2 is made by the engine's own route only
+    if chosen.engine_route != services.STANDARD:
+        if pdfua_part in ("2", "both"):
+            raise ApiError(422, "pdfua_route", f"PDF/UA-2 isn't available with {chosen.label}.")
+        part = "1"
+    else:
+        part = pdfua.resolve(db, p.user.group, pdfua_part)
     overrides = _per_file(per_file, len(files))
     plans: dict[tuple, _Plan] = {}
 
@@ -470,6 +497,7 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                       charged_services=pl.charge_keys if charged else [], external_services=pl.external,
                       status="held" if held else "queued", full_review=pl.full_review, no_ai=pl.no_ai,
                       ignore_existing=ignore_existing and not report_only,  # a check only changes no tags
+                      pdfua="1" if report_only else part,
                       ai_kind_auto=pl.auto, progress={"held": held} if held else None,
                       api_token_id=p.token.id if p.token else None)
             db.add(job)
@@ -483,7 +511,7 @@ def upload(request: Request, files: list[UploadFile] = File(...), report_only: b
                                                          "charged": charged, "report_only": report_only,
                                                          "processing": processing, "ai_tier": pl.tier,
                                                          "ai_kind": services.AUTO if pl.auto else pl.kind,
-                                                         "no_ai": pl.no_ai,
+                                                         "no_ai": pl.no_ai, **({"pdfua": part} if part != "1" else {}),
                                                          "external": pl.external, "held": bool(held),
                                                          **({"signed": True} if checked.signed else {}),
                                                          **({"api_token": p.token.name} if p.token else {})})
@@ -600,7 +628,8 @@ def documents_query(scope: list, *, q: str, status: str | None, result: str | No
 
 def documents_page(db: Session, scope: list, *, q: str, status: str | None, result: str | None, service: str | None,
                    audit: bool | None, since: datetime | None, until: datetime | None, sort: str, page: int,
-                   page_size: int, people: bool = False, show_cost: bool = False, via: str | None = None) -> DocumentsPage:
+                   page_size: int, people: bool = False, show_cost: bool = False, staff: bool = False,
+                   via: str | None = None) -> DocumentsPage:
     """One page of the documents in `scope` (see documents_query). With `people`, each says whose it is."""
     where, order = documents_query(scope, q=q, status=status, result=result, service=service, audit=audit, since=since,
                                    until=until, sort=sort, people=people, via=via)
@@ -609,7 +638,8 @@ def documents_page(db: Session, scope: list, *, q: str, status: str | None, resu
     jobs = db.scalars(select(Job).where(*where).order_by(*order).limit(size).offset((page - 1) * size)).all()
     active = db.scalar(select(func.count()).select_from(Job).where(
         *scope, Job.status.in_(("queued", "submitted", "processing")))) or 0
-    return DocumentsPage(items=_with_help(db, jobs, settings_store.load(db), with_user=people, show_cost=show_cost),
+    return DocumentsPage(items=_with_help(db, jobs, settings_store.load(db), with_user=people, show_cost=show_cost,
+                                          staff=staff),
                          total=total, page=page, page_size=size, active=active)
 
 
@@ -658,7 +688,7 @@ def my_document_neighbours(job_id: uuid.UUID, q: str = Query("", max_length=200)
 
 
 def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSettings, with_user: bool = False,
-               show_cost: bool = False) -> list[JobOut]:
+               show_cost: bool = False, staff: bool = False) -> list[JobOut]:
     """The documents, each with its current help request (the active one, else the latest). "Unread" is the
     owner's own: an admin looking at someone else's documents hasn't a reply waiting for them there."""
     helps: dict = {}
@@ -668,7 +698,7 @@ def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSett
             helps[r.job_id] = {"id": str(r.id), "status": r.status, "unread": r.unread_for_person and not with_user}
     out = []
     for j in jobs:
-        o = job_out(j, runtime, with_user=with_user, show_cost=show_cost)
+        o = job_out(j, runtime, with_user=with_user, show_cost=show_cost, staff=staff)
         o.help = helps.get(j.id)
         out.append(o)
     return out
@@ -677,8 +707,9 @@ def _with_help(db: Session, jobs: list[Job], runtime: settings_store.RuntimeSett
 @router.get("/jobs/{job_id}", response_model=JobOut)
 def job_detail(job_id: uuid.UUID, p: Principal = Depends(document_principal("status")), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
-    # Cost is for super admins only: what groups are charged isn't the per-page cost
-    out = job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id, show_cost=p.is_super_admin)
+    # Cost is for super admins and service admins only: what groups are charged isn't the per-page cost
+    out = job_out(job, settings_store.load(db), with_user=job.user_id != p.user.id, show_cost=p.can(COSTS),
+                  staff=p.can(STAFF_FILES))
     out.reruns = list(db.scalars(select(Job.id).where(Job.rerun_of == job.id, Job.deleted_at.is_(None))
                                  .order_by(Job.created_at)))
     return out
@@ -788,10 +819,11 @@ class Rerun(BaseModel):
     charge: bool = False  # hold the owner's pages again, as a new upload would
     reason: str | None = Field(None, max_length=500)
     ignore_existing: bool | None = None  # tag it afresh from the page (#396); left out: as the original was run
+    pdfua: str | None = Field(None, max_length=4)  # the PDF/UA part (#445); left out: as the original was run
 
 
 @router.post("/jobs/{job_id}/rerun", response_model=JobOut, status_code=201)
-def rerun(job_id: uuid.UUID, body: Rerun, request: Request, p: Principal = Depends(require_super_admin),
+def rerun(job_id: uuid.UUID, body: Rerun, request: Request, p: Principal = Depends(require(RERUN_REMOVE)),
           db: Session = Depends(get_db)):
     """Send a document through again, whatever became of it (#323): a new document for the same owner, with the
     same options and the original file; the old one, its versions and edits stay as they are. Its pages are
@@ -817,7 +849,8 @@ def rerun(job_id: uuid.UUID, body: Rerun, request: Request, p: Principal = Depen
               charged_services=keys, external_services=list(old.external_services or []), status="queued",
               full_review=old.full_review, no_ai=old.no_ai, ai_kind_auto=old.ai_kind_auto, rerun_of=old.id,
               ignore_existing=(old.ignore_existing if body.ignore_existing is None else body.ignore_existing)
-              and not old.report_only)
+              and not old.report_only,
+              pdfua="1" if old.report_only else old.pdfua if body.pdfua is None else pdfua.resolve(db, old.user.group, body.pdfua))
     db.add(job)
     db.flush()
     storage = get_storage()
@@ -830,7 +863,8 @@ def rerun(job_id: uuid.UUID, body: Rerun, request: Request, p: Principal = Depen
                    content_type="application/pdf"))
     audit.record(db, request, "job.rerun", actor=p.user, target_type="job", target_id=job.id, group_id=job.group_id,
                  details={"rerun_of": str(old.id), "previous_status": old.status, "charged": job.pages_charged,
-                          "reason": body.reason or None, "ignore_existing": job.ignore_existing})
+                          "reason": body.reason or None, "ignore_existing": job.ignore_existing,
+                          **({"pdfua": job.pdfua} if job.pdfua != "1" else {})})
     db.commit()
     db.refresh(job)
     return job_out(job, settings_store.load(db))
@@ -896,7 +930,7 @@ def keep(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_pri
          db: Session = Depends(get_db)):
     """Undo "I'm done with it" while the hold lasts: the files are kept for the normal period."""
     job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
-    if job is None or job.deleted_at is not None or not (job.user_id == p.user.id or p.is_super_admin):
+    if job is None or job.deleted_at is not None or not (job.user_id == p.user.id or p.can(RERUN_REMOVE)):
         raise not_found("Job")
     removal.cancel_removal(db, request, job, p.user)
     db.commit()
@@ -904,9 +938,9 @@ def keep(job_id: uuid.UUID, request: Request, p: Principal = Depends(current_pri
 
 
 @router.post("/admin/jobs/remove", response_model=RemovalResult)
-def admin_remove(body: AdminRemoval, request: Request, p: Principal = Depends(require_super_admin),
+def admin_remove(body: AdminRemoval, request: Request, p: Principal = Depends(require(RERUN_REMOVE)),
                  db: Session = Depends(get_db)):
-    """Super admins: remove documents' files now, or delete the documents. Documents still waiting or in progress
+    """Super admins and service admins: remove documents' files now, or delete the documents. Documents still waiting or in progress
     are skipped."""
     ids = removal.parse_ids(body.ids)
     jobs = list(db.scalars(select(Job).where(Job.id.in_(ids)).with_for_update()))
@@ -948,7 +982,7 @@ def download(job_id: uuid.UUID, file_id: uuid.UUID, request: Request, reason: st
              p: Principal = Depends(document_principal("download")), db: Session = Depends(get_db)):
     job = _visible_job(db, job_id, p)
     f = _file(db, job, file_id)
-    if f.kind in STAFF_ONLY_FILES and not p.is_super_admin:
+    if f.kind in STAFF_ONLY_FILES and not p.can(STAFF_FILES):
         raise not_found("File")
     if p.token is not None and not api_tokens.may_download(p.token, f.kind):
         raise ApiError(403, "token_scope", "This API token can't download this file. Make one that can in Settings.")
@@ -1032,7 +1066,7 @@ def export_plan(db: Session, p: Principal, scope: list, body: ExportRequest, *, 
     runtime = settings_store.load(db)
     limit = runtime.max_export_documents
     jobs, matched = _export_jobs(db, scope, body, people=people, limit=limit)
-    plan = export.plan(db, jobs[:limit], is_super_admin=p.is_super_admin, time_zone=runtime.report_time_zone,
+    plan = export.plan(db, jobs[:limit], staff=p.can(STAFF_FILES), time_zone=runtime.report_time_zone,
                        retention_days=runtime.file_retention_days)
     return plan, matched, limit
 

@@ -399,6 +399,14 @@ function LimitsChecks() {
   return (
     <LimitTab label="Checks">
       {(s, set) => <>
+          <Section title="PDF/UA-2" intro={"PDF/UA-2 is the newer accessibility standard for PDF 2.0 files. Offered here, each group's admins " +
+            "can let their people choose it for a document: the file is delivered as PDF 2.0 (PDF/UA-2), or as two files, a PDF/UA-1 " +
+            "one and a PDF/UA-2 copy (Both). PDF/UA-1 stays the default. Some older PDF readers and checkers don't support PDF 2.0 yet."}>
+            <label className="check">
+              <input type="checkbox" checked={!!s.pdfua2_enabled} onChange={(e) => set({ pdfua2_enabled: e.target.checked })} />
+              <span>Let groups offer PDF/UA-2</span>
+            </label>
+          </Section>
           <Section title="PDF/UA validation (veraPDF)" intro={"veraPDF checks every document before and after remediation, " +
             "and every saved version. The results are the same either way; only the speed and memory differ."}>
             <fieldset className="choices">

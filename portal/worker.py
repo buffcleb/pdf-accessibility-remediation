@@ -6,6 +6,7 @@ SELECT ... FOR UPDATE SKIP LOCKED.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from portal import (
     alerts, api_tokens, audit, email_reports, helpdesk, metrics, notifications, outbox, pool_alerts, prometheus, queues, quota,
-    removal, report_views, security_alerts, services, settings_store, siem,
+    removal, report_views, security_alerts, services, settings_store, siem, tagmarks,
 )
 from portal.config import get_portal_settings
 from portal.db import system_session
@@ -128,6 +129,10 @@ def summarize(resp: dict) -> dict:
         "failed_rules_after": after.get("failed_rules"),
         "visual_file_compliant": (comp.get("after_visual_fallback") or {}).get("compliant"),
         "two_files": bool(files.get("remediated_visual_fallback")),
+        # Both (#445): the PDF/UA-2 copy's own verdict; and, for PDF/UA-2 or Both, that the file was converted to
+        # PDF 2.0 (the page and the report say so)
+        "pdfua2_compliant": (comp.get("after_pdfua2") or {}).get("compliant") if comp.get("after_pdfua2") else None,
+        "converted_pdf2": bool(comp.get("pdfua2_changes")),
         "destructive_pages": comp.get("destructive_pages") or [],
         "fonts_embedded": comp.get("fonts_embedded") or [],
         "visual_fidelity": visual if isinstance(visual, dict) else {},
@@ -152,7 +157,7 @@ def summarize(resp: dict) -> dict:
                                                  "notation_ai_rejected_by_reason", "notation_by_rule", "ai_failures",
                                                  "tables_analyzed", "reading_order_pages_ai", "music_examples",
                                                  "music_read", "scan_figures", "ocr_ai_words_corrected",
-                                                 "ocr_ai_lines_transcribed", "ocr_ai_rejected")}
+                                                 "ocr_ai_lines_transcribed", "ocr_ai_rejected", "engine_version")}
         | {"limits_hit": _limits_hit(metrics, len(findings))},
         "adobe": {k: (metrics.get("adobe") or {}).get(k) for k in ("parts", "pages_sent", "seconds")}
         if metrics.get("adobe") else None,
@@ -211,6 +216,8 @@ def _engine_files(resp: dict) -> list[tuple[str, str]]:
     ]
     maps = reports.get("tag_maps") or {}
     pairs += [("enhanced", files.get("enhanced")), ("verapdf_after_enhanced", after.get("enhanced"))]
+    # Both (#445): the main file as PDF 2.0, PDF/UA-2, and its check
+    pairs += [("pdfua2", files.get("remediated_pdfua2")), ("verapdf_after_pdfua2", after.get("pdfua2"))]
     pairs += [(f"tagmap_{label}", maps.get(label)) for label in ("original", "primary", "visual_fallback", "enhanced")]
     pairs += [("adobe_report", p) for p in reports.get("adobe_reports") or []]
     pairs.append(("report_pdf", reports.get("report_pdf")))
@@ -481,7 +488,7 @@ def submit_queued(db: Session) -> int:
                                                   full_review=job.full_review, route=_route(db, job),
                                                   branding=_branding(db, job), no_ai=job.no_ai,
                                                   validator=validator_flags(rs),
-                                                  ignore_existing=job.ignore_existing)
+                                                  ignore_existing=job.ignore_existing, pdfua=job.pdfua or "1")
         except EngineUnavailable as e:
             job.submit_attempts += 1
             log.warning("engine unavailable, job %s stays queued: %s", job.id, e)
@@ -706,6 +713,12 @@ def _collect(db: Session, job: Job, resp: dict) -> None:
     db.flush()
     _create_output_versions(db, job, resp, stored)
     job.result_summary = summarize(resp)
+    if job.result_summary.get("tags_kept"):
+        # Which tags were the upload's own, written into each tag map now rather than on every opening (#580)
+        original = _read_tagmap(stored.get("tagmap_original"))
+        for kind, f in stored.items():
+            if kind.startswith("tagmap_"):
+                _store_marked(f, None if kind == "tagmap_original" else original)
     m = resp.get("metrics") or {}
     job.cost = {"ai_usd": round(float(m.get("ai_cost_usd") or 0) + float(m.get("verification_ai_cost_usd") or 0), 6),
                 "ai_calls": m.get("ai_calls") or 0, "ai_tier": job.ai_tier, **_ai_use(db, job, m),
@@ -730,6 +743,42 @@ def _collect(db: Session, job: Job, resp: dict) -> None:
     audit.record(db, None, "job.completed", actor_email="system", target_type="job", target_id=job.id,
                  group_id=job.group_id, details={"pages": job.pages_charged,
                                                  "compliant_after": job.result_summary.get("compliant_after")})
+
+
+def _read_tagmap(f: JobFile | None) -> dict | None:
+    if f is None:
+        return None
+    try:
+        return json.loads(b"".join(get_storage().get_stream(f.s3_key)))
+    except ValueError:
+        return None
+
+
+def _store_marked(f: JobFile | None, original: dict | None) -> None:
+    """Store a tag map of a document whose tags were kept with the tags that were its own marked (tagmarks): against
+    the original's tag map, or all of them (original None) for the original's own. A map that can't be read is left
+    as it is, and the viewer's request marks it as it would a map stored before this (#580)."""
+    tagmap = _read_tagmap(f)
+    if f is None or not isinstance(tagmap, dict):
+        return
+    try:
+        tagmarks.mark_all(tagmap) if original is None else tagmarks.mark_original(tagmap, original)
+    except (KeyError, TypeError):
+        return
+    f.size_bytes = get_storage().put_bytes(f.s3_key, tagmarks.dump_marked(tagmap), f.content_type)
+
+
+def _mark_version_tagmap(db: Session, job: Job, f: JobFile | None) -> None:
+    """A saved version's tag map, marked against the original's when the document's tags were kept (#580)."""
+    if f is None or not (job.result_summary or {}).get("tags_kept"):
+        return
+    first = db.scalar(select(DocumentVersion).where(DocumentVersion.job_id == job.id,
+                                                    DocumentVersion.kind == "original"))
+    if first is None or first.tagmap_file_id is None:
+        return
+    original = _read_tagmap(db.get(JobFile, first.tagmap_file_id))
+    if original is not None:
+        _store_marked(f, original)
 
 
 def _store_engine_file(db: Session, job: Job, kind: str, path: str, name: str, prefix: str) -> JobFile:
@@ -995,6 +1044,7 @@ def _open_early(db: Session, v: DocumentVersion, partial: dict) -> None:
     stored = [_store_engine_file(db, job, kind, path, name, prefix)
               for kind, path, name in (("reviewed_pdf", pdf, pdf_name), ("reviewed_tagmap", tagmap, map_name))]
     db.flush()
+    _mark_version_tagmap(db, job, stored[1])
     v.pdf_file_id, v.tagmap_file_id = stored[0].id, stored[1].id
     v.status, v.checking = "ready", True
     audit.record(db, None, "version.open_early", actor_email="system", target_type="job", target_id=job.id,
@@ -1028,6 +1078,7 @@ def _collect_version(db: Session, v: DocumentVersion, resp: dict) -> None:
         if isinstance(path, str) and path.startswith("/api/v1/jobs/") and name:
             files[kind] = _store_engine_file(db, job, kind, path, name, prefix)
     db.flush()
+    _mark_version_tagmap(db, job, files.get("reviewed_tagmap"))
     v.pdf_file_id = have.get("reviewed_pdf") or (files["reviewed_pdf"].id if "reviewed_pdf" in files else None)
     v.tagmap_file_id = have.get("reviewed_tagmap") or (
         files["reviewed_tagmap"].id if "reviewed_tagmap" in files else None)

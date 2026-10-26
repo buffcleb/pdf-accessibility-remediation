@@ -142,6 +142,12 @@ itself is then the only pod reaching the internet over HTTPS, and the portal rea
 directly. The cluster's outbound traffic still leaves from the node addresses, so the campus firewall can add its
 own rules.
 
+> **New 24 October 2026:** with `EGRESS_DENY=on` (#594) every other pod is closed as well: nothing in the namespace
+> reaches out unless a policy lets it. Of the rest, only **cloudflared** (the optional tunnel) leaves the cluster:
+> Cloudflare's edge on 7844 (TCP and UDP) and 443. Prometheus reads each node's kubelet (10250) and the API servers
+> (6443) at the node addresses, so `NODE_CIDRS` in `deploy.env` lists them
+> ([default deny](../../../deploy/k8s/README.md#outbound-traffic-default-deny)).
+
 ## Mail
 
 The portal sends sign-in codes and notices through `<smtp-relay>`. Allow the three node addresses to relay, for the

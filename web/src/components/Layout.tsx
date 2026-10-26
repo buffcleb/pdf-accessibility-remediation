@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth";
+import { isAdmin } from "../permissions";
 import { FullWidth } from "./fullwidth";
 import { useConfirmLeave } from "./unsaved";
 
@@ -41,7 +42,7 @@ export function Layout() {
   }, [me !== null]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!me) return null;
-  const isAdmin = me.is_super_admin || me.admin_of.length > 0;
+  const admin = isAdmin(me);
 
   return (
     <>
@@ -61,7 +62,7 @@ export function Layout() {
               My documents
               {me.help_unread > 0 && <> <span className="badge">{me.help_unread}<span className="visually-hidden"> new {me.help_unread === 1 ? "reply" : "replies"} on your help requests</span></span></>}
             </NavLink>
-            {isAdmin && (
+            {admin && (
               <NavLink to="/admin">Administration
                 {me.pending_approvals > 0 && <> <span className="badge">{me.pending_approvals}<span className="visually-hidden"> waiting for approval</span></span></>}
               </NavLink>

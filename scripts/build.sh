@@ -108,6 +108,8 @@ for n in "${ONLY[@]}"; do
   args=(buildx build --platform "$PLATFORM" -f "$(dockerfile "$n")" -t "$image:$TAG" -t "$image:latest"
         --label "org.opencontainers.image.revision=$(git rev-parse HEAD)"
         --label "org.opencontainers.image.source=https://github.com/buffcleb/pdf-accessibility-remediation")
+  [ "$n" = web ] && args+=(--build-arg "WEB_BUILD_ID=$TAG") # the id pages compare to load a new build
+  [ "$n" = engine ] && args+=(--build-arg "ENGINE_VERSION=$TAG") # recorded with every result (Run details)
   if [ "$PUSH" = 1 ]; then args+=(--push); else args+=(--output type=cacheonly); fi
   if ! docker "${args[@]}" .; then
     [ "$PUSH" = 1 ] && log "if the push was refused: gh auth refresh -s write:packages,read:packages"

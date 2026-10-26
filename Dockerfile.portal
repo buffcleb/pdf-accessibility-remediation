@@ -1,7 +1,7 @@
 # Portal API image. Runs as a non-root user with no build tools in the final image.
 # Base images are pinned to a digest (the tag says which, the digest makes it that build and no other); the
 # digests are those of 2026-10-13, and moving to a newer build is a deliberate change of this line.
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 

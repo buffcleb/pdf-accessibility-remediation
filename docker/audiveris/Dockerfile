@@ -5,7 +5,7 @@
 # Audiveris ships for x86-64 only: build with --platform linux/amd64.
 # Base images are pinned to a digest (the tag says which, the digest makes it that build and no other); the
 # digests are those of 2026-10-13, and moving to a newer build is a deliberate change of this line.
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 
 ARG AUDIVERIS_VERSION=5.11.0
 ARG TESSDATA_VERSION=4.1.0

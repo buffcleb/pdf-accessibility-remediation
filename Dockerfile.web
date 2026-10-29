@@ -2,7 +2,7 @@
 # /api/ to the portal API (same origin, so no CORS and the refresh cookie stays first-party).
 # Base images are pinned to a digest (the tag says which, the digest makes it that build and no other); the
 # digests are those of 2026-10-13, and moving to a newer build is a deliberate change of this line.
-FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS build
+FROM node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS build
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -12,7 +12,7 @@ COPY web/ ./
 ARG WEB_BUILD_ID=""
 RUN WEB_BUILD_ID="$WEB_BUILD_ID" npm run build
 
-FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:378d0c32f6562f7fd9629170797f57d2b953aa09be983b3daaf4809bb039ca00
+FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
 # Packages of the base image with a fixed vulnerability newer than its digest (scripts/build.sh's Trivy scan): libexpat
 # (CVE-2026-77214, fixed in 2.9.0); brotli-libs (CVE-2026-111497, critical, fixed in 1.2.1-r0); curl and libcurl
 # (CVE-2026-92392, fixed in 8.23.0-r0); libx11 (CVE-2026-88806, fixed in 1.8.14-r0). Drop a package from the list

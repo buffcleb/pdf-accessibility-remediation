@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TagEdit } from "../src/api";
-import { SPLIT_ROLES, changePending, dropPending, justMade, makesTag, pendingRoles } from "../src/viewer/pending";
+import { SPLIT_ROLES, changePending, justMade, makesTag, pendingRoles } from "../src/viewer/pending";
 
 const AREA: TagEdit = { op: "tag_artifacts", element: 3, expect_role: "P", position: "after", page: 1, sections: [0, 1],
   role: "P" };
@@ -36,10 +36,21 @@ test("a split's new part gets a type of its own, or drops it when it's its tag's
   assert.equal(changePending([SPLIT], 0, "Figure", "x"), null);
 });
 
-test("taking a new tag back drops its edit; a new tag just made is found", () => {
-  assert.deepEqual(dropPending([MOVE, AREA, SPLIT], 1), [MOVE, SPLIT]);
+test("a new tag just made is found", () => {
   assert.equal(justMade([MOVE], [MOVE, AREA]), 1);
   assert.equal(justMade([MOVE], [MOVE, MOVE]), null);
   assert.equal(justMade([MOVE, AREA], [MOVE]), null);
   assert.equal(justMade([MOVE], [{ ...MOVE }, AREA]), null); // an earlier edit changed too: not just a new one
+});
+
+test("an area's new tags are chosen one by one: each changed in the one edit making them", () => {
+  const REGROUP: TagEdit = { op: "regroup", element: 3, expect_role: "P", position: "before", page: 1, groups: [
+    { role: "P", pieces: [1] }, { role: "Figure", box: [0, 0, 50, 50], alt: "A board" }] };
+  assert.ok(makesTag(REGROUP));
+  assert.deepEqual(pendingRoles(REGROUP, 1), ["Figure", "Formula"]); // a part of a picture stays a figure or formula
+  const ops = [MOVE, REGROUP];
+  const h = changePending(ops, 1, "H2", "", undefined, 0)!;
+  assert.deepEqual((h[1] as typeof REGROUP).groups[0], { role: "H2", pieces: [1] });
+  assert.equal(changePending(ops, 1, "P", "", undefined, 1), null);
+  assert.equal(changePending(ops, 1, "Figure", " ", undefined, 1), null);
 });

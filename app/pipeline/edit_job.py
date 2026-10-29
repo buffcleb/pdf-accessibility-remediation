@@ -28,6 +28,29 @@ def _elements_with_alt(path, alts: set[str]) -> set[int]:
     return {e.index for e in index.elements if str(e.obj.get("/Alt", "") or "").strip() in alts}
 
 
+def _figure_boxes(path) -> int:
+    """Figures and formulas the edits made, with their bounding box (PAC fails a figure without one): from the tag
+    map of the edited file, only when some figure or formula on one page lacks it."""
+    import pymupdf
+
+    from app.tagging import structure_rules
+    from app.tagging.tree import walk
+    from app.verification.tagmap import build_tagmap
+    with pikepdf.open(path) as pdf:
+        root = pdf.Root.get("/StructTreeRoot")
+        if root is None or not any(str(e.get("/S", "")) in ("/Figure", "/Formula") and not structure_rules._has(e, "/BBox")
+                                   for e in walk(root)):
+            return 0
+    tagmap = build_tagmap(path)
+    with pymupdf.open(path) as doc:
+        matrices = [tuple(p.transformation_matrix) for p in doc]
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        given = structure_rules.bboxes_from_tagmap(pdf, tagmap, matrices)
+        if given:
+            pdf.save(path)
+    return given
+
+
 def reading_choices(ops: list[dict]) -> list[dict]:
     """The choices people made between a formula's two readings (#403), from the edits that carry one: which formula,
     which reading ("ai", "rule", "picture": the formula reader's, or "own": their own words), and the text the tag
@@ -59,6 +82,7 @@ async def run_edit(store: JobStore, progress: Callable[[str, int], None]) -> dic
     dst = out / f"{stem}_reviewed.pdf"
     if ops:
         log = await asyncio.to_thread(apply_edits, store.input_pdf, dst, ops)
+        await asyncio.to_thread(_figure_boxes, dst)
     else:  # review only: the file as it is
         await asyncio.to_thread(shutil.copyfile, store.input_pdf, dst)
         log = []

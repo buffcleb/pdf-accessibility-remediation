@@ -108,6 +108,8 @@ class Settings(BaseSettings):
     """Retries for an AI call that failed for a temporary reason (throttling, a timeout, a server error)."""
     ai_max_output_tokens: int = 800
     """The most an AI answer may be, in tokens: it caps runaway generations (small models can loop on JSON lists)."""
+    ai_area_tags_max_output_tokens: int = 8000
+    """The most the AI's tags for an area may be, in tokens (Suggest tags with AI in the tag manager): a busy page's tags and figure descriptions run to about 5,000."""
     allow_mock_provider: bool = False
     """`true` only for tests and the harness: the mock provider writes placeholder alt text."""
     ai_notation_enabled: bool = True

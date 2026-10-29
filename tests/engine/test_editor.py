@@ -10,6 +10,7 @@ from app.tagging.editor import EditError, apply_edits, validate_ops
 from app.tagging.tagger import tag_document
 from app.verification.integrity import check_integrity
 from app.verification.tagmap import build_tagmap
+from app.tagging.tree import walk as _walk
 from tests.engine.pdfs import integrity_errors
 
 
@@ -176,6 +177,49 @@ def test_edits_refuse_stale_or_unsafe_requests(report, tmp_path):
         validate_ops([{"op": "set_lang", "element": 1, "lang": "not a lang!"}])
     with pytest.raises(EditError, match="scope"):
         validate_ops([{"op": "set_cell", "element": 1, "role": "TH"}])
+
+
+def test_a_move_is_checked_against_the_tree_earlier_moves_left(report, tmp_path):
+    # A Sect taken out of its parent Sect, then the parent moved before it: once the first move is done, the parent
+    # no longer holds it, so the second isn't a move inside itself
+    tm = build_tagmap(report)
+    inner = next(e for e in tm["elements"] if e["role"] == "Sect" and tm["elements"][e["parent"]]["role"] == "Sect"
+                 and tm["elements"][e["parent"]]["parent"] is not None)
+    outer = tm["elements"][inner["parent"]]
+    dst, log = _edit(report, tmp_path, [
+        {"op": "move", "element": inner["i"], "expect_role": "Sect", "target": outer["i"], "position": "before"},
+        {"op": "move", "element": outer["i"], "expect_role": "Sect", "target": inner["i"], "position": "before"}])
+    assert len(log) == 2
+    with pytest.raises(EditError, match="inside itself"):
+        apply_edits(report, tmp_path / "x.pdf", [
+            {"op": "move", "element": outer["i"], "expect_role": "Sect", "target": inner["i"], "position": "before"}])
+
+
+def test_a_move_in_a_tag_makes_it_the_last_child(report, tmp_path):
+    tm = build_tagmap(report)
+    els = tm["elements"]
+    p = next(e for e in els if e["role"] == "P" and e["own"] and e.get("text") and els[e["parent"]]["role"] == "Sect")
+    into = next(e for e in els if e["role"] == "Sect" and not _under(tm, p["i"], e["i"]))  # a Sect it isn't in
+    dst, log = _edit(report, tmp_path, [
+        {"op": "move", "element": p["i"], "expect_role": "P", "target": into["i"], "position": "in"}])
+    assert "moved into" in log[0]
+    after = build_tagmap(dst)["elements"]
+    moved = next(e for e in after if e["role"] == "P" and e.get("text") == p["text"])
+    holder = after[moved["parent"]]
+    assert holder["role"] == "Sect" and holder["kids"][-1] == moved["i"]
+    # Not into a tag of its own
+    outer = els[p["parent"]]
+    with pytest.raises(EditError, match="inside itself"):
+        apply_edits(report, tmp_path / "x.pdf", [
+            {"op": "move", "element": outer["i"], "expect_role": "Sect", "target": p["i"], "position": "in"}])
+
+
+def _under(tm, i, ancestor):
+    while i is not None:
+        if i == ancestor:
+            return True
+        i = tm["elements"][i]["parent"]
+    return False
 
 
 def test_merge_joins_content_into_one_tag(report, tmp_path):
@@ -680,6 +724,19 @@ def test_taking_pieces_refuses_what_cant_work(tmp_path):
             validate_ops(op(**bad))
 
 
+
+def test_a_figure_deleted_earlier_in_the_save_says_so_when_pieces_are_taken_from_it(tmp_path):
+    """Production: a figure was deleted with its content, then pieces of it were made a figure of their own in the
+    same save. The tag manager no longer offers that; the engine says why it can't, not that the pieces aren't the
+    figure's."""
+    src, f, pieces = _figure_of_four(tmp_path)
+    take = [{"page": pieces[0]["page"], "mcid": pieces[0]["mcid"]}]
+    with pytest.raises(EditError, match="earlier change in this save deleted the tag"):
+        apply_edits(src, tmp_path / "x.pdf", [
+            {"op": "delete", "element": f["i"], "expect_role": "Figure", "children": "delete"},
+            {"op": "take_pieces", "element": f["i"], "expect_role": "Figure", "pieces": take, "role": "Figure", "alt": "x"},
+        ])
+
 def _coarse_scheme(tmp_path):
     """A tagged page whose figure is one marked section holding a whole scheme (two ring structures, an arrow, two
     labels), as some producers tag one: a single piece for all of it."""
@@ -881,6 +938,267 @@ def test_tag_artifacts_refuses_bad_requests(report, table, tmp_path):
         apply_edits(table, tmp_path / "x.pdf", [{"op": "tag_artifacts", "element": td["i"], "position": "after",
                                                  "page": 1, "sections": [0], "role": "P"}])
 
+
+
+def test_an_areas_content_regrouped_into_new_tags(report, tmp_path):
+    """The AI's proposal for an area, as the tag manager sends it: a figure with its caption as one Figure, the list's
+    three items as one paragraph, and the banner (untagged) as a paragraph. The tags they leave empty go, the
+    list and the figure's section with them; the new tags are read where the first piece's was."""
+    tm = build_tagmap(report)
+    on1 = {p["mcid"]: p for p in tm["pieces"] if p["page"] == 1}
+    banner = next(a for a in tm["artifacts"] if a["page"] == 1 and a.get("text") == "ACME Annual Report")
+    fig = next(m for m, p in on1.items() if p["kind"] == "image")
+    caption = next(m for m, p in on1.items() if (p.get("text") or "").startswith("Figure 1"))
+    items = [m for m, p in on1.items() if tm["elements"][p["el"]]["role"] == "LBody"]
+    anchor = tm["elements"][on1[items[0]]["el"]]
+    dst, log = _edit(report, tmp_path, [{"op": "regroup", "element": anchor["i"], "expect_role": "LBody",
+                                         "position": "before", "page": 1, "groups": [
+        {"role": "P", "pieces": items, "sections": []},
+        {"role": "Figure", "pieces": [fig, caption], "alt": "Bar chart of progress by quarter, with its caption"},
+        {"role": "P", "sections": [banner["seq"]]}]}])
+    after = build_tagmap(dst)
+    holder = {p["text"][:12] if p.get("text") else p["kind"]: after["elements"][p["el"]] for p in after["pieces"]
+              if p["page"] == 1}
+    assert holder["• Headings a"]["role"] == "P" and holder["• Headings a"]["i"] == holder["• Lists and "]["i"]
+    assert holder["image"]["role"] == "Figure" and holder["image"]["i"] == holder["Figure 1: Re"]["i"]
+    assert holder["ACME Annual "]["role"] == "P"
+    roles = Counter(e["role"] for e in after["elements"] if e["page"] == 1)
+    assert roles["L"] == 0 and roles["LI"] == 0 and roles["Caption"] == 0, "emptied tags should go"
+    # Read in order, where the list was: after the section's first paragraph, before the second
+    order = [e["text"][:12] for e in after["elements"] if e["own"] and e["page"] == 1 and e.get("text")]
+    assert order.index("Accessible d") < order.index("• Headings a") < order.index("ACME Annual ")
+    assert "3 new tag(s)" in log[0] and "left empty were removed" in log[0]
+
+
+
+def test_content_of_tags_deleted_earlier_in_the_save_can_be_regrouped(report, tmp_path):
+    """Production (the Assembly Poster): tags deleted, then the AI's tags for an area added, in one save. The deleted
+    tags' content became artifacts; the new tags take it back, by the MCIDs the tag map gave."""
+    tm = build_tagmap(report)
+    on1 = {p["mcid"]: p for p in tm["pieces"] if p["page"] == 1}
+    heading = next(m for m, p in on1.items() if (p.get("text") or "").startswith("Section 1"))
+    para = next(m for m, p in on1.items() if (p.get("text") or "").startswith("Accessible"))
+    sect = tm["elements"][tm["elements"][on1[heading]["el"]]["parent"]]  # section 1, all of it
+    later = next(e for e in tm["elements"] if e["parent"] == sect["parent"] and e["i"] > sect["i"])  # section 2
+    delete = {"op": "delete", "element": sect["i"], "expect_role": sect["role"], "children": "delete"}
+    dst, log = _edit(report, tmp_path, [delete, {
+        "op": "regroup", "element": later["i"], "expect_role": later["role"], "position": "before", "page": 1,
+        "groups": [{"role": "H2", "pieces": [heading]}, {"role": "P", "pieces": [para]}]}])
+    after = build_tagmap(dst)
+    held = {p["mcid"]: after["elements"][p["el"]]["role"] for p in after["pieces"] if p["page"] == 1}
+    assert held[heading] == "H2" and held[para] == "P"
+    with pikepdf.open(dst) as pdf:  # nothing left saying what each artifact was
+        assert b"RemediationWasMCID" not in pikepdf.unparse_content_stream(pikepdf.parse_content_stream(pdf.pages[0]))
+    # Every tag of the document deleted: they go in its top tag
+    top = next(e for e in tm["elements"] if e["parent"] is None)
+    dst, _ = _edit(report, tmp_path, [
+        *({"op": "delete", "element": k, "expect_role": tm["elements"][k]["role"], "children": "delete"} for k in top["kids"]),
+        {"op": "regroup", "element": top["i"], "expect_role": top["role"], "position": "in", "page": 1,
+         "groups": [{"role": "H1", "pieces": [heading]}]}])
+    after = build_tagmap(dst)
+    h1 = next(e for e in after["elements"] if e["role"] == "H1")  # (links are kept, moved up: see the delete tests)
+    assert h1["parent"] == 0 and after["elements"][0]["kids"][-1] == h1["i"]
+    # ...and a tag deleted in the same save is no place to put them
+    with pytest.raises(EditError, match="removed by an earlier change"):
+        apply_edits(report, tmp_path / "x.pdf", [delete, {
+            "op": "regroup", "element": on1[heading]["el"], "expect_role": "H2", "position": "before", "page": 1,
+            "groups": [{"role": "H2", "pieces": [heading]}]}])
+
+
+
+def _poster(tmp_path, see_through: bool):
+    """A page drawn as one picture with its labels as text over it, as a poster exported from a layout program is:
+    two coloured boards on the picture, and a heading and labels on top (tagged; the picture is an artifact)."""
+    import numpy as np
+    from PIL import Image
+    px = np.full((400, 300, 4), 255, dtype=np.uint8)
+    px[40:160, 30:140, :3] = (200, 30, 30)       # a red board
+    px[220:360, 160:280, :3] = (30, 60, 200)     # a blue board
+    if see_through:
+        px[:, :, 3] = 255
+        px[0:400, 0:20, 3] = 0                   # a transparent edge
+        px[160:220, :, 3] = 128                  # a half-transparent shadow
+    img = tmp_path / "art.png"
+    Image.fromarray(px if see_through else px[:, :, :3]).save(img)
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=400)
+    page.insert_image(page.rect, filename=str(img))
+    page.insert_text((40, 30), "Assembly", fontsize=14, fontname="helv")
+    page.insert_text((40, 175), "Driver board", fontsize=9, fontname="helv")
+    src = tmp_path / "poster.pdf"
+    doc.save(src)
+    out = tmp_path / "poster_tagged.pdf"
+    tag_document(src, out, prepare_analysis(src), title="Poster", language="en-US")
+    return out
+
+
+@pytest.mark.parametrize("see_through", [False, True])
+def test_a_part_of_a_picture_becomes_a_figure_and_the_page_looks_the_same(tmp_path, see_through):
+    """The AI's (or a person's) box over part of a picture the page draws: that part is drawn again as the figure's
+    content, right after the picture and before the text over it; a see-through picture's copy is drawn unseen."""
+    src = _poster(tmp_path, see_through)
+    tm = build_tagmap(src)
+    label = next(p for p in tm["pieces"] if (p.get("text") or "").startswith("Driver"))
+    anchor = tm["elements"][label["el"]]
+    dst, log = _edit(src, tmp_path, [{"op": "regroup", "element": anchor["i"], "expect_role": anchor["role"],
+                                      "position": "before", "page": 1, "groups": [
+        {"role": "Figure", "box": [30, 40, 140, 160], "pieces": [label["mcid"]], "alt": "The red driver board"},
+        {"role": "Figure", "box": [160, 220, 280, 360], "alt": "The blue board"}]}])
+    after = build_tagmap(dst)
+    figs = {e["alt"]: e for e in after["elements"] if e["role"] == "Figure" and e.get("alt", "").startswith("The ")}
+    assert figs["The blue board"]["boxes"] == [{"page": 1, "bbox": [160.0, 220.0, 280.0, 360.0]}]
+    red = [p for p in after["pieces"] if p["el"] == figs["The red driver board"]["i"]]
+    assert sorted(p["kind"] for p in red) == ["image", "text"], "the label goes in with the part of the picture"
+    with pikepdf.open(dst) as pdf:
+        assert ("/ExtGState" in pdf.pages[0].Resources) == see_through
+
+
+
+
+def test_a_part_of_a_picture_next_to_an_earlier_one_is_cut_from_the_picture_not_the_copy(tmp_path):
+    """Production (the Assembly Poster, saved several times): a figure's box overlapping one made earlier came out a
+    sliver, cut from the earlier figure's copy (the last picture drawn) instead of the picture itself."""
+    src = _poster(tmp_path, see_through=True)
+    tm = build_tagmap(src)
+    anchor = tm["elements"][next(p for p in tm["pieces"] if (p.get("text") or "").startswith("Driver"))["el"]]
+    first = tmp_path / "first.pdf"
+    apply_edits(src, first, [{"op": "regroup", "element": anchor["i"], "expect_role": anchor["role"], "position": "before",
+                              "page": 1, "groups": [{"role": "Figure", "box": [20, 40, 150, 200], "alt": "Left"}]}])
+    tm = build_tagmap(first)
+    anchor = tm["elements"][next(p for p in tm["pieces"] if (p.get("text") or "").startswith("Driver"))["el"]]
+    dst, _ = _edit(first, tmp_path, [{"op": "regroup", "element": anchor["i"], "expect_role": anchor["role"],
+                                      "position": "before", "page": 1, "groups": [
+        {"role": "Figure", "box": [140, 190, 290, 380], "alt": "Right"}]}])
+    after = build_tagmap(dst)
+    right = next(e for e in after["elements"] if e.get("alt") == "Right")
+    assert right["boxes"] == [{"page": 1, "bbox": [140.0, 190.0, 290.0, 380.0]}]
+
+
+def test_a_part_of_a_picture_on_a_page_drawn_inside_one_save_and_restore(tmp_path):
+    """Production (the Assembly Poster): the page's content was one q..Q from its start to its end (as scanned pages'
+    figure copies leave it), so the picture's copy waited for that to close, after all the text drawn over it, and
+    the save was refused. It goes right after the picture's own marked section now."""
+    src = _poster(tmp_path, see_through=False)
+    wrapped = tmp_path / "wrapped.pdf"
+    with pikepdf.open(src) as pdf:
+        page = pdf.pages[0]
+        page.contents_add(pdf.make_stream(b"q\n"), prepend=True)
+        page.contents_add(pdf.make_stream(b"Q\n"))
+        pdf.save(wrapped)
+    tm = build_tagmap(wrapped)
+    anchor = tm["elements"][next(p for p in tm["pieces"] if (p.get("text") or "").startswith("Driver"))["el"]]
+    dst, _ = _edit(wrapped, tmp_path, [{"op": "regroup", "element": anchor["i"], "expect_role": anchor["role"],
+                                        "position": "before", "page": 1, "groups": [
+        {"role": "Figure", "box": [30, 40, 140, 160], "alt": "The red board"}]}])
+    fig = next(e for e in build_tagmap(dst)["elements"] if e.get("alt") == "The red board")
+    assert fig["boxes"] == [{"page": 1, "bbox": [30.0, 40.0, 140.0, 160.0]}]
+
+def test_figures_an_edit_makes_get_their_bounding_box(tmp_path):
+    """The editor makes figures without knowing where content is drawn (a part of a picture, a tag's type changed to
+    Figure): the edit job gives each on one page its /BBox from the tag map, as PAC asks, where the box is."""
+    from app.pipeline.edit_job import _figure_boxes
+    src = _poster(tmp_path, see_through=True)
+    tm = build_tagmap(src)
+    label = next(p for p in tm["pieces"] if (p.get("text") or "").startswith("Driver"))
+    heading = tm["elements"][next(p for p in tm["pieces"] if (p.get("text") or "").startswith("Assembly"))["el"]]
+    dst, _ = _edit(src, tmp_path, [
+        {"op": "regroup", "element": label["el"], "expect_role": tm["elements"][label["el"]]["role"], "position": "before",
+         "page": 1, "groups": [{"role": "Figure", "box": [160, 220, 280, 360], "alt": "The blue board"}]},
+        {"op": "set_role", "element": heading["i"], "expect_role": heading["role"], "role": "Figure"},
+        {"op": "set_alt", "element": heading["i"], "expect_role": heading["role"], "alt": "The word Assembly"}])
+    assert _figure_boxes(dst) == 2
+    assert _figure_boxes(dst) == 0, "only figures that lack one"
+    with pikepdf.open(dst) as pdf:
+        boxes = {str(e.Alt): [round(float(v)) for v in e.A.BBox] for e in _walk(pdf.Root.StructTreeRoot)
+                 if e.get("/Alt") is not None and isinstance(e.get("/A"), pikepdf.Dictionary) and "/BBox" in e.A}
+    assert boxes["The blue board"] == [160, 40, 280, 180]  # the page's user space: y up from the bottom of 400
+    assert _pixels(dst) == _pixels(src)
+
+
+def test_a_cells_words_are_cut_across_cells_and_a_column_comes_out_as_a_paragraph(table, tmp_path):
+    """The table editor (production: the Assembly Poster's switch table, read off a picture): a header cell holding
+    several headers' words is cut into cells, one cut after another in its one piece of text; and a column that is
+    a paragraph set beside the table comes out of it, as one paragraph right after it."""
+    tm = build_tagmap(table)
+    t = _first(tm, "Table")
+    head, *body = [tm["elements"][r]["kids"] for r in t["kids"]]
+    quarter, docs, rate = head
+    th = lambda f: {"from": f, "role": "TH", "scope": "Column"}  # noqa: E731
+    td = lambda f: {"from": f, "role": "TD"}  # noqa: E731
+    rows = [[th([quarter]), th([[rate, 0]]), th([[rate, 1]])]] + [[td([r[0]]), td([r[2]]), td([])] for r in body]
+    out = [{"role": "P", "from": [docs] + [r[1] for r in body]}]
+    op = {"op": "rebuild_table", "element": t["i"], "expect_role": "Table", "rows": rows,
+          "cuts": {str(rate): [{"at": 0, "char": 5}]}, "out": out}
+    dst, log = _edit(table, tmp_path, [op])
+    after = build_tagmap(dst)
+    t2 = _first(after, "Table")
+    cells = [[after["elements"][c].get("text") for c in after["elements"][r]["kids"]] for r in t2["kids"]]
+    assert cells[0] == ["Quarter", "Pass", "rate"] and cells[1][:2] == ["Q1", "64%"]
+    para = after["elements"][after["elements"][t2["parent"]]["kids"][after["elements"][t2["parent"]]["kids"].index(t2["i"]) + 1]]
+    assert para["role"] == "P" and para["text"] == "Documents 120 180 240"
+    assert "1 cut(s)" in log[0] and "1 paragraph(s) taken out" in log[0]
+    # A cut cell goes in by every one of its parts, and only by them
+    for bad in ({**op, "rows": [[th([quarter]), th([rate])]] + rows[1:]},
+                {**op, "rows": [[th([quarter]), th([[rate, 0]]), th([])]] + rows[1:]},
+                {**op, "cuts": {}}):
+        with pytest.raises(EditError):
+            validate_ops([bad])
+
+
+def test_a_cell_is_read_as_the_words_set_in_the_table_editor(table, tmp_path):
+    """A value misread off a picture ("_ 1/16 Step") is corrected in the table editor: the cell is read as the words
+    set there (ActualText), a cut cell's part too; set to nothing, it's read as its drawn text again."""
+    tm = build_tagmap(table)
+    t = _first(tm, "Table")
+    head, *body = [tm["elements"][r]["kids"] for r in t["kids"]]
+    th = lambda f, **k: {"from": f, "role": "TH", "scope": "Column", **k}  # noqa: E731
+    td = lambda f, **k: {"from": f, "role": "TD", **k}  # noqa: E731
+    rows = [[th([head[0]]), th([head[1]]), th([[head[2], 0]], text="Pass"), th([[head[2], 1]])]]
+    rows += [[td([r[0]]), td([r[1]], text="one hundred twenty" if n == 0 else None), td([r[2]]), td([])]
+             for n, r in enumerate(body)]
+    for row in rows:
+        for c in row:
+            if c.get("text") is None:
+                c.pop("text", None)
+    op = {"op": "rebuild_table", "element": t["i"], "expect_role": "Table", "rows": rows,
+          "cuts": {str(head[2]): [{"at": 0, "char": 5}]}}
+    dst, _ = _edit(table, tmp_path, [op])
+    after = build_tagmap(dst)
+    t2 = _first(after, "Table")
+    cells = [[after["elements"][c] for c in after["elements"][r]["kids"]] for r in t2["kids"]]
+    assert cells[0][2]["actual_text"] == "Pass" and cells[1][1]["actual_text"] == "one hundred twenty"
+    assert not cells[1][0].get("actual_text")
+    # ...and back to its drawn text: the saved table as it is, that cell set to nothing
+    same = [[{"from": [c["i"]], "role": c["role"], **({"scope": "Column"} if c["role"] == "TH" else {}),
+              **({"text": ""} if c["i"] == cells[1][1]["i"] else {})} for c in row] for row in cells]
+    again = tmp_path / "again.pdf"
+    apply_edits(dst, again, [{"op": "rebuild_table", "element": t2["i"], "expect_role": "Table", "rows": same}])
+    redone = build_tagmap(again)
+    assert not redone["elements"][cells[1][1]["i"]].get("actual_text")
+    assert redone["elements"][cells[0][2]["i"]]["actual_text"] == "Pass"  # the others left as they were
+
+def test_a_box_with_no_picture_under_it_is_refused(report, tmp_path):
+    tm = build_tagmap(report)
+    h1 = _first(tm, "H1")
+    with pytest.raises(EditError, match="no picture under that box"):
+        apply_edits(report, tmp_path / "x.pdf", [{"op": "regroup", "element": h1["i"], "expect_role": "H1",
+                                                  "position": "before", "page": 1, "groups": [
+            {"role": "Figure", "box": [5, 5, 30, 30], "alt": "Nothing there"}]}])
+    with pytest.raises(EditError, match="from a box"):
+        validate_ops([{"op": "regroup", "element": h1["i"], "position": "before", "page": 1,
+                       "groups": [{"role": "P", "box": [5, 5, 30, 30]}]}])
+
+def test_regrouping_refuses_what_cant_work(report, tmp_path):
+    tm = build_tagmap(report)
+    h1 = _first(tm, "H1")
+    base = {"op": "regroup", "element": h1["i"], "expect_role": "H1", "position": "before", "page": 1}
+    for groups, why in [([], "need the page"), ([{"role": "P"}], "content it holds"),
+                        ([{"role": "Figure", "pieces": [0]}], "alt text"), ([{"role": "TD", "pieces": [0]}], "can be"),
+                        ([{"role": "P", "pieces": [0]}, {"role": "H1", "pieces": [0]}], "only one new tag")]:
+        with pytest.raises(EditError, match=why):
+            validate_ops([{**base, "groups": groups}])
+    with pytest.raises(EditError, match="isn't tagged any more"):
+        apply_edits(report, tmp_path / "x.pdf", [{**base, "groups": [{"role": "P", "pieces": [999]}]}])
 
 def test_two_area_edits_on_one_page_use_the_tag_maps_numbers(table, tmp_path):
     tm = build_tagmap(table)

@@ -14,9 +14,11 @@ RUN WEB_BUILD_ID="$WEB_BUILD_ID" npm run build
 
 FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:378d0c32f6562f7fd9629170797f57d2b953aa09be983b3daaf4809bb039ca00
 # Packages of the base image with a fixed vulnerability newer than its digest (scripts/build.sh's Trivy scan): libexpat
-# (CVE-2026-77214, fixed in 2.9.0). Drop a package from the list once the pinned base image has the fix.
+# (CVE-2026-77214, fixed in 2.9.0); brotli-libs (CVE-2026-111497, critical, fixed in 1.2.1-r0); curl and libcurl
+# (CVE-2026-92392, fixed in 8.23.0-r0); libx11 (CVE-2026-88806, fixed in 1.8.14-r0). Drop a package from the list
+# once the pinned base image has the fix.
 USER root
-RUN apk upgrade --no-cache libexpat
+RUN apk upgrade --no-cache libexpat brotli-libs curl libcurl libx11
 USER 101
 COPY docker/web/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --chmod=755 docker/web/15-trusted-proxies.sh /docker-entrypoint.d/15-trusted-proxies.sh

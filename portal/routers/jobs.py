@@ -16,7 +16,7 @@ from portal import api_tokens, approval, audit, export, finding_marks, malware, 
 from portal.db import get_db
 from portal.deps import Principal, current_principal, document_principal, require
 from portal.errors import ApiError, not_found
-from portal import pdfua
+from portal import no_ai, pdfua
 from portal.export import STAFF_ONLY_FILES
 from portal.models import ACTIVE_JOB_STATUSES, ApiTokenDownload, HelpRequest, Job, JobFile, User
 from portal.pdfcheck import receive_pdf
@@ -82,7 +82,7 @@ class JobOut(BaseModel):
     full_review: bool
     ignore_existing: bool  # its own tags ignored, tagged afresh (#396)
     pdfua: str = "1"  # the PDF/UA part it was run for: "1", "2" or "both" (#445)
-    no_ai: bool  # made without AI (an audit, when its AI level is set that way)
+    no_ai: bool  # made without AI (#659: chosen, or no AI level; or an audit, when its AI level is set that way)
     ai_refunded: bool  # the AI tier's pages were given back: every AI call failed, or (ai_unused) none was needed
     ai_unused: bool
     cost: dict | None  # AI spend etc.; admins only
@@ -257,7 +257,7 @@ def _kind_choices(db: Session, level: str, classifier) -> list[KindChoice]:
 class UploadOptions(BaseModel):
     """What the upload form offers, as the person's group sets it."""
     ai_mode: str              # "choose": people pick the AI level and kind; "fixed": the group's are used
-    ai_level: str | None      # fixed: the level
+    ai_level: str | None      # fixed: the level ("none": No AI, #659)
     ai_kind: str | None       # fixed: the kind (None: General)
     show_external: bool       # mark the options that send documents to an outside provider
     malware_scan: bool = False  # uploads are scanned for malware before they're accepted (#455), so say so (#560)
@@ -265,6 +265,8 @@ class UploadOptions(BaseModel):
     # and the one preselected
     pdfua_choices: list[str] = ["1"]
     pdfua_default: str = "1"
+    # No AI (#659): "off", "on" (offered beside the AI levels) or "default" (offered and preselected)
+    no_ai: str = "off"
 
 
 @router.get("/upload-options", response_model=UploadOptions)
@@ -277,12 +279,17 @@ def upload_options(p: Principal = Depends(current_principal), db: Session = Depe
     fixed = g.ai_mode == "fixed" and bool(g.ai_level)
     return UploadOptions(ai_mode="fixed" if fixed else "choose", ai_level=g.ai_level if fixed else None,
                          ai_kind=g.ai_kind if fixed else None, show_external=g.show_external,
-                         malware_scan=malware.enabled(), **parts)
+                         malware_scan=malware.enabled(),
+                         no_ai=("default" if no_ai.preselected(db, g) else "on") if no_ai.offered(db, g) else "off",
+                         **parts)
 
 
 def _pick_tier(db: Session, user, requested: str | None) -> str | None:
     """The AI tier for an upload: the one asked for, else the group's default tier if the user can use it,
-    else none (the engine's default AI)."""
+    else none: No AI (#659), which is also what no_ai.NO_AI asks for, where it's offered."""
+    if requested == no_ai.NO_AI:
+        no_ai.require(db, user.group)
+        return None
     if requested:
         s = services.get_service(db, requested)
         if s is None or s.kind != "ai_tier":
@@ -291,6 +298,8 @@ def _pick_tier(db: Session, user, requested: str | None) -> str | None:
         if not a.ok:
             raise ApiError(403, a.code, a.message)
         return requested
+    if no_ai.preselected(db, user.group):
+        return None
     for gs in user.group.services if user.group else []:
         if gs.is_default and gs.service.kind == "ai_tier" and services.access(db, user, gs.service_key).ok:
             return gs.service_key
@@ -353,7 +362,7 @@ def _plan(db: Session, user, chosen, processing: str, report_only: bool, ai_alt_
     wants_ai = services.ai_use(chosen) == "full" or ai_alt_text
     tier = _pick_tier(db, user, ai_tier) if wants_ai else None
     kind = _pick_kind(db, tier, ai_kind, group)
-    no_ai = False
+    without_ai = tier is None  # No AI (#659): chosen, or no level; never the engine's fallback AI
     charge_keys = [processing] + ([tier] if tier else [])
     if report_only:
         level = services.get_service(db, tier) if tier else None
@@ -362,16 +371,16 @@ def _plan(db: Session, user, chosen, processing: str, report_only: bool, ai_alt_
             raise ApiError(422, "check_not_offered",
                            f"Check only isn't offered with {level.label}. Choose another AI level, or remediate.")
         if audit_ai == "off":
-            tier, kind, no_ai = None, None, True
+            tier, kind, without_ai = None, None, True
         charge_keys = [tier] if audit_ai == "charge" else []
-    full_review = full_review and wants_ai and not no_ai
+    full_review = full_review and wants_ai and not without_ai
     if full_review and not services.full_review_allowed(db, tier):
         raise ApiError(422, "full_review_not_allowed", "Reviewing every figure isn't available with this AI level.")
     keys = [processing] + ([tier] if tier else [])
     hold = any(services.get_service(db, k).confirm_before_send for k in keys) and not confirm and not report_only
     external = [k for k in keys if services.get_service(db, k).external]
     auto = kind == services.AUTO
-    return _Plan(tier, None if auto else kind, full_review, keys, charge_keys, hold, external, no_ai, auto)
+    return _Plan(tier, None if auto else kind, full_review, keys, charge_keys, hold, external, without_ai, auto)
 
 
 _WAITING_WORDS = {"held": "waiting for you to confirm it", "queued": "waiting its turn",

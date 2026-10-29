@@ -81,6 +81,8 @@ class GroupOut(BaseModel):
     ai_mode: str  # choose | fixed
     ai_level: str | None  # fixed: the AI level everyone's documents use
     ai_kind: str | None  # fixed: its kind of document (None: General)
+    no_ai: str = "off"  # No AI for its people (#659): "off", "on" or "default" (preselected)
+    no_ai_offered: bool = False  # super admins offer No AI, so the group's setting takes effect
     show_external: bool  # show people which options send documents to an external provider
     ai_describe: bool | None = None  # "Describe with AI" for its people; None follows the service default
     api_tokens_enabled: bool = False  # its people may make API tokens for scripts (#518)
@@ -202,6 +204,17 @@ def group_services_out(g: Group, services: list[Service]) -> list[GroupServiceOu
     return out
 
 
+def _no_ai_offered(g: Group) -> bool:
+    """Super admins offer No AI (#659); read once per request, not once per group of a list."""
+    from portal import settings_store
+    db = object_session(g)
+    if db is None:
+        return False
+    if "no_ai_enabled" not in db.info:
+        db.info["no_ai_enabled"] = settings_store.load(db).no_ai_enabled
+    return db.info["no_ai_enabled"]
+
+
 def group_out(g: Group, services: list[Service] | None = None) -> GroupOut:
     std = g.service(svc.STANDARD)
     services = services if services is not None else _services_of(g)
@@ -209,6 +222,7 @@ def group_out(g: Group, services: list[Service] | None = None) -> GroupOut:
                     emails=_emails_of(g),
                     local_only=g.local_only, require_approval=g.require_approval, ai_mode=g.ai_mode, ai_level=g.ai_level,
                     ai_kind=g.ai_kind, show_external=g.show_external, ai_describe=g.ai_describe,
+                    no_ai=g.no_ai or "off", no_ai_offered=_no_ai_offered(g),
                     api_tokens_enabled=g.api_tokens_enabled, pdfua_choice=g.pdfua_choice,
                     pdfua_default=g.pdfua_default or "1", **_family_of(g),
                     pending_members=_pending_in(g), help_active=_help_active_in(g), default_user_cap=std.default_user_cap if std else None,

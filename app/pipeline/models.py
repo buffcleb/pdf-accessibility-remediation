@@ -85,6 +85,7 @@ class TextBlock:
     # own: math typeset piece by piece, superscripts ("10 to the power of 4"), subscripts.
     actual_text: str | None = None
     has_scripts: bool = False  # contains superscripts or subscripts
+    fraction: bool = False  # contains a stacked fraction (numerator over a bar over denominator)
     # Baseline of the first line: where a row of text sits, even when something in it (a stacked fraction,
     # an exponent) reaches higher than the rest of the line
     baseline: float | None = None
@@ -112,6 +113,12 @@ class TextBlock:
     # a block of its own that continues it (the note's block id), tagged as part of the same Note
     note_kind: str = "footnote"
     continues: str | None = None
+    # A value typed onto a scanned form (the page's own text, on a page the engine OCR'd): its size is the typist's,
+    # not a heading's
+    typed_on_scan: bool = False
+    # The title of a page that opens a section and says nothing else ("SECTION I" over "FINANCIAL"): a heading at the
+    # top level, whatever its print
+    divider: bool = False
 
 
 def append_block(dst: "TextBlock", src: "TextBlock") -> None:
@@ -122,6 +129,8 @@ def append_block(dst: "TextBlock", src: "TextBlock") -> None:
         dst.actual_text = spoken
     dst.bbox = bbox_union([dst.bbox, src.bbox])
     dst.has_scripts = dst.has_scripts or src.has_scripts
+    dst.fraction = dst.fraction or src.fraction
+    dst.typed_on_scan = dst.typed_on_scan or src.typed_on_scan
     dst.marks = dst.marks + src.marks
     dst.mark_after = dst.mark_after + src.mark_after
     dst.mark_boxes = dst.mark_boxes + src.mark_boxes
@@ -153,7 +162,9 @@ class ImageRegion:
     # its box is part of it, however small
     holds_pieces: bool = False
     labels: str | None = None  # the text inside it (axis values, names), for whoever describes it
-    # What kind of line drawing the analysis found it to be ("scheme": chemical structures, a reaction), when it
+    # What kind of line drawing the analysis found it to be ("scheme": chemical structures, a reaction; "equation": a
+    # displayed equation's pieces, found by the number beside its line; "layers": pictures drawn one over another,
+    # analyzer._join_stacked_pictures), when it
     # knows: whoever describes it is told, since a crop of strokes and letters doesn't say so by itself
     drawing: str | None = None
 
@@ -241,6 +252,9 @@ class PageAnalysis:
     images: list[ImageRegion] = field(default_factory=list)
     tables: list[TableRegion] = field(default_factory=list)
     is_scanned: bool = False
+    # No text, its print placed as pictures a line or a word each (not a scan): read by OCR, the pictures it read
+    # becoming background (analyzer._text_as_pictures, orchestrator._ocr)
+    text_pictures: bool = False
     columns: int = 1
     reading_order: list[str] = field(default_factory=list)  # ids of blocks/images/tables
     reading_order_source: str = "heuristic"

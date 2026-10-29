@@ -3,7 +3,7 @@
  *
  * Everything here is an edit the engine knows (web/src/api.ts, TagEdit). */
 import type { TagEdit, TagElement, TagMap } from "../api";
-import { ROLE_NAMES, absorbedBy, addEdit, listMembers, listPlan, overrides, pageOrder, withoutEdits } from "./draft";
+import { ROLE_NAMES, absorbedBy, addEdit, draftTree, listMembers, listPlan, overrides, pageOrder, tagsOnPage, withoutEdits } from "./draft";
 import { actionNote, checkElementRole, checkMove } from "./roles";
 import { outlineLines } from "./outline";
 
@@ -12,7 +12,7 @@ export type MenuAct = "split-text" | "delete" | "read" | "report" | "show" | "ty
 export type MenuItem = {
   id: string;
   label: string;
-  group: "type" | "shape" | "list" | "order" | "note" | "toc" | "artifact" | "area" | "more";
+  group: "type" | "shape" | "list" | "order" | "nest" | "note" | "toc" | "artifact" | "area" | "more";
   note?: string;       // what else choosing it does ("the text is wrapped in a list with one item")
   disabled?: string;   // why it can't be chosen now
   ops?: TagEdit[];     // the unsaved changes as they would be after choosing it
@@ -202,11 +202,12 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
       if (map.elements[p]?.role === "Table") { table = p; break; }
     }
     if (table !== null) {
-      const t = table;
+      const t = map.elements[table]?.of ?? table;  // a table being rebuilt is edited again as the table it is
       const busy = ops.some((o) => o.op !== "rebuild_table" && "element" in o && (o.element === t || isInside(map, o.element, t)));
       items.push({ id: "table", group: "list", label: "Edit table…", act: "table",
         note: "Header rows and columns, the caption, cells merged or split, rows and columns added or removed.",
-        disabled: readOnly ?? (busy ? "The table has other unsaved changes. Save or undo those first." : undefined) });
+        disabled: readOnly ?? (map.elements[t]?.made ? "This table is made by an unsaved change: edit it again after saving, or undo that change and make it again."
+          : busy ? "The table has other unsaved changes. Save or undo those first." : undefined) });
     }
   }
   {
@@ -297,6 +298,49 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
     };
     move(list[idx - 1], "before", "earlier", "Read it earlier");
     move(list[idx + 1], "after", "later", "Read it later");
+    // Into any tag on its page that can hold it, as its last part (a section, a list item's body, a table cell, a
+    // figure...), or out of the tag it's in. Worked out on the tree with the unsaved changes in it
+    if (one.parent !== null) {
+      const tree = draftTree(map, ops);
+      const over = overrides(ops, map);
+      const role = (i: number | null | undefined) => (i === null || i === undefined ? null : over.get(i)?.role ?? map.elements[i]?.role ?? null);
+      const up = tree.parent.get(one.i) ?? one.parent;
+      const within = (i: number) => { for (let p: number | null | undefined = i; p != null; p = tree.parent.get(p)) if (p === one.i) return true; return false; };
+      // On its page: a tag with content there, and the tags holding it
+      const onPage = new Set<number>();
+      const held = new Set<number>(); // tags with content on any page, in them or under them
+      const up2 = (i: number, into: Set<number>) => { for (let p: number | null | undefined = i; p != null && !into.has(p); p = tree.parent.get(p)) into.add(p); };
+      for (const i of page ? tagsOnPage(map, page) : []) up2(i, onPage);
+      for (const e of map.elements) if (e.boxes.length && !tree.deleted.has(e.i)) up2(e.i, held);
+      // ...and an empty one (a section with nothing in it yet) in a tag on the page
+      const here = (i: number) => onPage.has(i) || (!held.has(i) && onPage.has(tree.parent.get(i) ?? -1));
+      const holders: TagElement[] = [];
+      const walk = (i: number) => {
+        if (tree.deleted.has(i) || i === one.i) return;
+        if (here(i) && i !== up && !within(i) && checkMove(role(one.i)!, role(up), role(i), false).ok) holders.push(map.elements[i]);
+        for (const k of tree.kids.get(i) ?? []) walk(k);
+      };
+      for (const r of tree.kids.get(-1) ?? []) walk(r);
+      const sibs = (tree.kids.get(up ?? -1) ?? []).filter((k) => !tree.deleted.has(k));
+      const before = sibs[sibs.indexOf(one.i) - 1];
+      const label = (e: TagElement) => `${ROLE_NAMES[role(e.i)!] ?? role(e.i)}${e.text ? ` “${e.text.slice(0, 30)}${e.text.length > 30 ? "…" : ""}”` : ""}`;
+      for (const h of holders.slice(0, 20)) {
+        items.push({ id: `into:${h.i}`, group: "nest", label: label(h),
+          note: `At its end.${h.i === before ? " It's the tag just before this one (Alt+→ in the tag tree)." : ""}`, disabled: readOnly,
+          ops: [...ops, { op: "move", element: one.i, expect_role: one.role, target: h.i, expect_target_role: h.role, position: "in" }] });
+      }
+      if (!holders.length) {
+        items.push({ id: "into", group: "nest", label: "Move into another tag", disabled: readOnly ?? "No other tag on this page can hold it." });
+      }
+      const outer = up === null ? undefined : map.elements[up];
+      const top = outer ? (tree.parent.get(outer.i) ?? outer.parent) : null;
+      const vOut = outer && top !== null ? checkMove(role(one.i)!, role(up), role(top), false) : null;
+      items.push({ id: "out", group: "order", label: outer ? `Move out of its ${ROLE_NAMES[role(outer.i)!] ?? role(outer.i)}` : "Move out of its tag",
+        note: outer ? `Just after ${short(outer)}. In the tag tree: Alt+←.` : undefined,
+        disabled: readOnly ?? (!outer || top === null ? "It's already at the top level." : vOut && !vOut.ok ? vOut.reason : undefined),
+        ops: outer && top !== null && vOut?.ok ? [...ops, { op: "move", element: one.i, expect_role: one.role, target: outer.i,
+          expect_target_role: outer.role, position: "after" }] : undefined });
+    }
     // A footnote the rules didn't link: the mark (or the text it's in) points at its note
     const over = overrides(ops, map);
     const roleOf2 = (e: TagElement) => over.get(e.i)?.role ?? e.role;
@@ -332,6 +376,12 @@ export function tagMenu(map: TagMap, ops: TagEdit[], ids: number[], at: MenuPoin
       note: "What it says, its findings, alt text, read-aloud text and language." });
     items.push({ id: "delete", group: "more", label: "Remove or delete this tag…", disabled: readOnly ?? (one.parent === null
       ? "The document's top tag stays." : undefined), act: "delete" });
+  }
+
+  // Several at once: one question for all of them, which says which can't go and why
+  if (many) {
+    items.push({ id: "delete", group: "more", label: `Remove or delete these ${els.length} tags…`, act: "delete",
+      disabled: readOnly ?? (els.every((e) => e.parent === null) ? "The document's top tag stays." : undefined) });
   }
 
   // --- the rest ---
@@ -376,8 +426,8 @@ export function menuAndTypes(items: MenuItem[]): { menu: MenuItem[]; types: Menu
  * kind with a single choice ("Change type…") and the everyday actions under "More" are on the top level itself. */
 export type MenuEntry = { kind: "item"; item: MenuItem } | { kind: "group"; group: MenuItem["group"]; label: string; items: MenuItem[]; none: boolean };
 
-export const GROUP_NAMES: Record<MenuItem["group"], string> = { type: "Type", shape: "Merge and split", list: "Lists and tables", order: "Reading order", note: "Footnote", toc: "Goes to", artifact: "Mark as artifact", area: "Areas", more: "More" };
-const GROUP_ORDER: MenuItem["group"][] = ["type", "shape", "list", "order", "note", "toc", "artifact", "area", "more"];
+export const GROUP_NAMES: Record<MenuItem["group"], string> = { type: "Type", shape: "Merge and split", list: "Lists and tables", order: "Reading order", nest: "Move into", note: "Footnote", toc: "Goes to", artifact: "Mark as artifact", area: "Areas", more: "More" };
+const GROUP_ORDER: MenuItem["group"][] = ["type", "shape", "list", "order", "nest", "note", "toc", "artifact", "area", "more"];
 const FLAT: MenuItem["group"][] = ["area", "more"];
 
 export function menuEntries(items: MenuItem[]): MenuEntry[][] {
@@ -389,7 +439,7 @@ export function menuEntries(items: MenuItem[]): MenuEntry[][] {
     if (FLAT.includes(group)) {
       if (submenus.length) { sections.push(submenus); submenus = []; }
       sections.push(mine.map((item) => ({ kind: "item", item })));
-    } else if (mine.length === 1) {
+    } else if (mine.length === 1 && group !== "nest") {  // a place to move into is named only under "Move into"
       submenus.push({ kind: "item", item: mine[0] });
     } else {
       // "none": nothing in it can be chosen now; it still opens, to say why

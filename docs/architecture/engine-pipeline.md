@@ -32,7 +32,8 @@ What happens to one document inside the engine, step by step, and the rules each
    upload; sent to the engine's API directly, it's run with a note in the report that it can't be made accessible
    (#360).
 2. **Fix font Unicode maps.** Fonts whose glyphs have no Unicode value (common in LaTeX output) get their map
-   completed from glyph names. Rendering is unchanged.
+   completed from glyph names, and composite fonts whose own map is wrong get it corrected (**changed 29 October
+   2026**, see [Fonts](#fonts-and-the-two-file-case)). Rendering is unchanged.
 3. **Analyze layout** (PyMuPDF), in visual page space, character by character:
    - **text:** superscripts and subscripts attach to their line, including ones set at the line's own size and
      moved up or down by a text rise, when they touch its characters (**changed 24 October 2026**, #596; labels
@@ -62,8 +63,20 @@ What happens to one document inside the engine, step by step, and the rules each
    - **headings:** leveled by style, consistently. The same style gets the same level, section numbers set depth,
      and no level is skipped. A line led by a list's label isn't a heading however large its print: "(a)", "b)" or
      "iv.", or a number before more than 12 words, a question or a lead-in ending in ":" (**changed 24 October
-     2026**, #596: a worksheet's numbered questions, larger than its body text, had become headings).
-   - **running headers and footers,** including "Page N of M" lines, become artifacts.
+     2026**, #596: a worksheet's numbered questions, larger than its body text, had become headings). **Changed 29
+     October 2026:** a bold line in capitals up to 15% smaller than the text is a heading too (an audit report's
+     "NOTE 1: ..." and "REPORTING ENTITY" in 9.7-point bold over 10.6-point text), and in a style partly led by a
+     section's label and number ("NOTE 1:", "Part A:"; not a caption's "Table 1.") the labelled headings rank half a
+     level above the others. A heading smaller than the text has to stand alone on its row and be followed by plain
+     text starting where it does (bold capitals in a chart are labels). A page of a long document holding only a few
+     short lines of plain print close together ("SECTION I" over "FINANCIAL") is a section's title page: its lines
+     become one heading at the top level (not a page saying it's blank, or "END OF QUESTION").
+   - **running headers and footers,** including "Page N of M" lines, become artifacts. A page number can be in small
+     roman numerals or between dashes ("iv", "- 12 -"), or start a little above the bottom 8% of the page, when it
+     comes in a series: body-size print in the bottom 10% with nothing under it, in the same place on three pages or
+     more (a lone "7" or "i" by a flowchart stays). A running head can reach down to 14% of the page when nothing
+     above it is lower; there it has to repeat word for word, in print no larger than the text's (**changed 29
+     October 2026**).
    - **list items:** several items on one line are split into separate items.
    - **columns and reading order:** top to bottom in bands, columns left to right inside a band. Columns can sit
      under a title or a row of buttons narrower than the page, and a column can hold columns. What lines up row
@@ -447,6 +460,9 @@ sentences around them). `app/pipeline/music.py` handles it before the AI step:
 > **Changed 22 October 2026:** WinAnsi and MacRoman fonts without a Unicode map get one from their encoding (#528).
 >
 > **Changed 23 October 2026:** each substitute font file is embedded once and shared (#577).
+>
+> **Changed 29 October 2026:** wrong Unicode maps of composite fonts are corrected, and a font veraPDF finds without
+> Unicode flattens every page it's used on, with OCR text in place of its own.
 
 **Least destructive first.** Glyphs whose declared width disagrees with the embedded font program (PDF/UA 7.21.5) are
 corrected, with the spacing compensated in the content stream so the page stays pixel-identical; this happens in the
@@ -471,10 +487,31 @@ standard's table, and PAC reports them as characters it can't map. Such a font g
 printable code, from the encoding itself (cp1252, Mac Roman), in `app/tagging/font_unicode.py`; the page is
 unchanged.
 
+**Composite fonts with a wrong map** (`app/tagging/wrong_maps.py`). A printer driver can write a map that gives each
+glyph's number in the original font instead of its character, and U+0000 for glyphs it couldn't place: Foxit
+PhantomPDF Printer did for every font of a 72-page audit report, which read "/,%(57" for LIBERTY on 41 pages. The
+embedded subsets have no cmap and no glyph names, so the map is all there is. For a composite TrueType font with
+Identity-H codes whose map looks wrong (entries with no text or control codes, no lowercase, or mostly punctuation):
+
+- a glyph that draws nothing, mapped to U+0000, becomes a space (one such glyph made nine good pages fail);
+- the map is read as glyph numbers in the Macintosh standard order (where the common Windows and Mac TrueType fonts
+  keep their first 258 glyphs, so the text is shifted by 29) when that reading makes the font's text read as words
+  and the map as written doesn't;
+- glyphs still without text are read by OCR, on up to 8 pages chosen to show each of them: each recognized word laid
+  over the glyphs it covers, where both have as many letters, votes for those glyphs, and a word whose other glyphs
+  already have text counts only when they agree. A font with too few words to judge is read as glyph numbers when
+  OCR agrees with that reading, and a reading OCR mostly disagrees with is put back.
+
+The page renders the same; only the maps change. Where some glyphs stay without text, the flattening route below
+still applies.
+
 **Dual output.** If the visually exact file still fails, the engine checks whether the remaining failures are ones
 only a visible change can fix: unembedded or Type3 fonts, missing Unicode mappings, or content that can't be tagged in
-place. veraPDF attributes those failures to pages, and only those pages are flattened: each becomes a background image
-(an artifact) with an invisible text layer in an embedded font, placed glyph by glyph, and its original images and
+place. veraPDF attributes those failures to pages, and only those pages are flattened, plus every page that uses a
+font veraPDF finds a problem with (it reports a font's problem on its first page, and lists 200 glyph checks at most;
+a font whose map gives glyphs U+0000 is read from the glyph checks). Each becomes a background image
+(an artifact) with an invisible text layer in an embedded font, placed glyph by glyph (text in a font whose map veraPDF
+found giving glyphs no text is read by OCR instead: it would copy the wrong text over), and its original images and
 vector figures are redrawn so they keep their Figure tags. Flattening is skipped if it would drop meaningful structure.
 A picture the second analysis finds on a page that wasn't flattened, and the first didn't, isn't made a figure: no
 description was written for it.

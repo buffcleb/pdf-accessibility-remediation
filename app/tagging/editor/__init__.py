@@ -31,6 +31,7 @@ Operations:
         (the whole document's: its title, announced when it opens, and its language. No element.)
     {"op": "set_cell", "element": 77, "expect_role": "TD", "role": "TH", "scope": "Column"}
     {"op": "move", "element": 15, "expect_role": "P", "target": 9, "position": "before"}
+        (or "after"; "in" makes it the target's last child: into a Sect, say)
     {"op": "merge", "element": 20, "expect_role": "P", "absorb": [21, 22]}   (21 and 22 join 20, in that order)
     {"op": "split", "element": 30, "expect_role": "P", "at": 2}   (the /K items from position 2 become a new tag)
     {"op": "split", "element": 30, "expect_role": "P", "at": 0, "char": 14}
@@ -104,6 +105,12 @@ Operations:
         removes it (#631))
     take_pieces and cut_area look at what the tag is when its turn comes, so they can follow a make_list in the same
     save; expect_role is still what the tag was in the file.
+
+An edit that makes tags (tag_artifacts, regroup, split, take_pieces, cut_area, make_list, build_list, build_table,
+rebuild_table) can carry an "id"; a later edit of the
+save names a tag it made as {"made": "<id>", "group": k} wherever it would put a number (refs.py, #692):
+    {"op": "tag_artifacts", "id": "a1", "element": 12, ...}
+    {"op": "move", "element": 15, "expect_role": "P", "target": {"made": "a1", "group": 0}, "position": "in"}
 """
 from __future__ import annotations
 
@@ -112,8 +119,8 @@ from pathlib import Path
 import pikepdf
 from pikepdf import Dictionary
 
-from app.tagging.editor import areas, lists, roles, structure, tables, text
-from app.tagging.editor._ctx import MAX_TEXT, OPERATIONS, EditError, Operation, _Ctx, _elem
+from app.tagging.editor import areas, lists, refs, roles, structure, tables, text
+from app.tagging.editor._ctx import MAX_TEXT, OPERATIONS, WAS_MCID, EditError, Operation, _Ctx, _elem
 from app.tagging.table_headers import write_id_tree
 from app.tagging.tree import walk
 from app.verification.integrity import IntegrityChecker
@@ -134,17 +141,33 @@ def validate_ops(ops) -> list[dict]:
         raise EditError("No edits to apply.")
     if len(ops) > MAX_OPS:
         raise EditError(f"Too many edits at once (at most {MAX_OPS}).")
-    clean = []
     for n, op in enumerate(ops, 1):
         if not isinstance(op, dict) or op.get("op") not in OPS:
             raise EditError(f"Edit {n}: unknown operation.")
+    # The checks see a tag an earlier edit makes as a number of its own (refs.py)
+    for n, op in enumerate(refs.check(ops), 1):
         o = OPERATIONS[op["op"]]
         if o.element and (not isinstance(op.get("element"), int) or op["element"] < 0):
             raise EditError(f"Edit {n}: missing element.")
         if o.validate is not None:
             o.validate(op, n)
-        clean.append(op)
-    return clean
+    return list(ops)
+
+
+def _forget_was_mcid(ctx: _Ctx) -> None:
+    """The note on each artifact section of which MCID it was, kept for a later edit of the save to tag it again,
+    goes before the file is saved."""
+    from pikepdf import ContentStreamInstruction
+
+    from app.tagging.content_marker import write_ops
+    for owner in ctx.artifacted.values():
+        ops = list(pikepdf.parse_content_stream(owner))
+        for i, ins in enumerate(ops):
+            if (isinstance(ins, ContentStreamInstruction) and str(ins.operator) == "BDC" and len(ins.operands) == 2
+                    and isinstance(ins.operands[1], Dictionary) and WAS_MCID in ins.operands[1]):
+                props = Dictionary({k: v for k, v in ins.operands[1].items() if k != str(WAS_MCID)})
+                ops[i] = ContentStreamInstruction([ins.operands[0], props], ins.operator)
+        write_ops(ctx.pdf, owner, ops)
 
 
 def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
@@ -157,9 +180,14 @@ def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
         checker = IntegrityChecker(pdf)
         checker.run()
         ctx = _Ctx(pdf, root, checker, checker.index.elements, Path(src))
+        # From the first edit naming a tag the save makes, edits find their tags as they are when their turn comes
+        # (refs.py); those they name by number are noted first
+        late = next((i for i, op in enumerate(ops) if refs.names_made(op)), len(ops))
+        for n, op in enumerate(ops[late:], late + 1):
+            refs.pin(ctx, op, n)
         # Resolve every reference first; later moves change pre-order indices but not objects.
         resolved = []
-        for n, op in enumerate(ops, 1):
+        for n, op in enumerate(ops[:late], 1):
             o = OPERATIONS[op["op"]]
             if not o.element:
                 resolved.append((op, None, None))
@@ -168,8 +196,23 @@ def apply_edits(src: Path, dst: Path, ops: list[dict]) -> list[str]:
             t = o.resolve(ctx, op, n) if o.resolve is not None else None
             resolved.append((op, e, t))
         log = []
-        for n, (op, e, t) in enumerate(resolved, 1):
-            log.append(OPERATIONS[op["op"]].apply(ctx, op, e, t, n))
+        for n, op in enumerate(ops, 1):
+            o = OPERATIONS[op["op"]]
+            if n <= late:
+                op, e, t = resolved[n - 1]
+            elif not o.element:
+                e = t = None
+            else:
+                if refs.names_made(op):
+                    refs.reindex(ctx)
+                op = refs.map_refs(op, lambda v, n=n: refs.now(ctx, v, n))
+                e = ctx.elems[op["element"]]
+                t = o.resolve(ctx, op, n) if o.resolve is not None else None
+            ctx.made, ctx.new_tags = None, []
+            log.append(o.apply(ctx, op, e, t, n))
+            if op.get("id"):
+                ctx.named[op["id"]] = list(ctx.new_tags)
+        _forget_was_mcid(ctx)
         if ctx.ids_changed:
             write_id_tree(pdf, root, walk(root))
         # The edited tree keeps tags at the right level (#438): a figure made a block, inline tags in a paragraph

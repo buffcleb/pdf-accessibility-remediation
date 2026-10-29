@@ -14,8 +14,10 @@ decoder.onnx bd695497bf1b22279b7626f5916c79226e1e244c84355f8da7edfd2d921d0072 \
 image_resizer.onnx e0b075c39700f64d50400f39c8fc186bbb3b5d84d31864008313f376603aca9d \
 tokenizer.json 1dc27b18d6a518d0d5ff3f4bb7bd98521fe80ad39e5b2a246d4109f1bb9d5019"
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-# OpenCV's libraries
+# OpenCV's libraries; and OpenSSL from the base image upgraded for CVE-2026-84782 (fixed in 3.0.22-1~deb12u2): drop
+# that once the pinned base image has the fix
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 curl \
+ && apt-get install -y --no-install-recommends --only-upgrade openssl libssl3 \
  && rm -rf /var/lib/apt/lists/*
 COPY docker/formula/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \

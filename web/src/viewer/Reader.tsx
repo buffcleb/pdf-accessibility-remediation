@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { TagEdit, TagMap } from "../api";
 import { LiveRegion, errorMessage } from "../components/ui";
+import { expand } from "./made";
 import { loadTagmap } from "./pdf";
 import { chunks, speechScript, startFor, type Utterance } from "./speech";
 
@@ -70,7 +71,8 @@ export function Reader({ jobId, versions, ops, selected, onShow, onClose, from =
     let live = true;
     setError(null);
     loadTagmap(jobId, version.number).then(
-      (tagmap) => { if (live) { setMap(tagmap); setScript(speechScript(tagmap, sideOps)); } },
+      // The tags the changes make are read as tags (made.ts, #692)
+      (tagmap) => { if (!live) return; const d = expand(tagmap, sideOps); setMap(d.map); setScript(speechScript(d.map, d.ops)); },
       (e) => { if (live) setError(e); },
     );
     return () => { live = false; };
@@ -241,7 +243,7 @@ export function Reader({ jobId, versions, ops, selected, onShow, onClose, from =
             A preview of the reading order and
             alt text, not a screen reader: NVDA, JAWS and VoiceOver word things differently and offer more ways to move
             around, so check with one before you finish. Voices depend on your browser and system.
-            {side === "right" && ops.some((o) => o.op === "assign" || o.op === "tag_artifacts") && " Area changes are heard once saved."}
+            {side === "right" && ops.some((o) => o.op === "assign" || o.op === "tag_artifacts" || o.op === "regroup") && " Area changes are heard once saved."}
             {missingVoices.length > 0 && ` No voice for ${missingVoices.join(", ")} here: it's read with the default voice.`}
           </details>
         </>

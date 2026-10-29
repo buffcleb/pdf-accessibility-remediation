@@ -7,6 +7,9 @@ tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-m
 
 > **Changed 22 October 2026:** pending edits show as the tags they'll make, and those can be chosen before saving
 > (#427); a saved version opens before its checks finish (#428); a review item with a page shows its area (#426).
+>
+> **Changed 29 October 2026:** the tags unsaved edits make are tags before the save, and later edits name them (#692):
+> see "Tags an edit makes, before the save" below.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../images/diagrams/tag-editor-save-dark.svg">
@@ -26,6 +29,16 @@ tags in the browser. How to use it: [The tag manager](../user-guide/people/tag-m
     marked-content operator changes (`/Artifact` becomes the tag with a new MCID), so the page draws the same. It's
     placed next to the tag read just before the area, moved up the tree until that type is allowed there. A section
     nested in another, or that extends outside the box, isn't offered.
+- **Tags an edit makes, before the save.** (**New 29 October 2026**, #692) An edit that makes tags (`tag_artifacts`,
+  `regroup`, `split`, `take_pieces`, `cut_area`, `make_list`, `build_list`, `build_table`, `rebuild_table`) carries an
+  `id`; a later edit of the save names one of its tags as `{"made": id, "group": k}` wherever it would give a tag's
+  number (`app/tagging/editor/refs.py`). A list's or table's tags are numbered in the order the viewer's previews draw
+  them (`builtPreview`, `tablePreview`). From the first edit naming a made tag, the engine finds tags by object as the
+  tree is when each edit's turn comes: it rebuilds the tag index (`IntegrityChecker.rewalk`, 0.9 s on 50,000 tags)
+  before an edit that names one. In the browser, `web/src/viewer/made.ts` puts the new tags in the tag map, numbered
+  after the saved ones (`expand`), and turns edits made on those numbers back into names (`store`); taking back an edit
+  that makes a tag takes the edits naming it with it (`prune`, `takeBack`). Content of a tag deleted earlier in the
+  save can be given to a tag (`assign`) or a new one (`regroup`) before the save.
 - **Lists from several tags.** `make_list` turns the named tags into the items of one list where the first was: a
   text tag becomes the `LI` itself (`LI > LBody` holding its content), so later edits that name it find the item; a
   list among them gives its items. `indent` moves an item to the end of the list nested in the body of the item

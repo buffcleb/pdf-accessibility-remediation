@@ -105,7 +105,8 @@ def render_job_markdown(job_id: str, meta: dict, status: str, result: dict | Non
     name = meta.get("filename") or "document.pdf"
     out = [f"# Accessibility remediation report: {_esc(name)}", ""]
     out += [f"- **Job:** `{job_id}`", f"- **Status:** {status}",
-            f"- **AI provider:** {meta.get('ai_provider')}" + (f" (`{meta['ai_model']}`)" if meta.get("ai_model") else "")]
+            "- **AI provider:** none: made without AI" if (meta.get("ai_provider") or "none") == "none"
+            else f"- **AI provider:** {meta.get('ai_provider')}" + (f" (`{meta['ai_model']}`)" if meta.get("ai_model") else "")]
     flags = {k: v for k, v in (meta.get("flags") or {}).items() if v}
     if flags:
         out.append("- **Flags:** " + ", ".join(f"`{k}={v}`" for k, v in flags.items()))

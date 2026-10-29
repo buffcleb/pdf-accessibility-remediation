@@ -7,6 +7,8 @@
 > **Changed 23 October 2026:** the service admin role (#564). [What changed](changes-2026-10-23.md).
 >
 > **Changed 26 October 2026:** subgroups (#431). [What changed](changes-2026-10-26.md).
+>
+> **Changed 29 October 2026:** new tags before the save (#692). [What changed](changes-2026-10-29.md).
 
 ## Using the service
 

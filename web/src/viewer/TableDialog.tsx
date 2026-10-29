@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { TagEdit, TagMap } from "../api";
 import {
-  addColumn, addRow, buildEdit, canMerge, fromLayout, fromOp, fromTable, headerCols, headerRows, merge, problems,
-  rebuildEdit, removeColumn, removeRow, setHeaders, slots, split, toggleHeader, type Grid, type GridCell,
+  addColumn, addRow, buildEdit, canMerge, cellSays, cellWords, cutCell, fromLayout, fromOp, fromTable, headerCols,
+  headerRows, merge, problems, rebuildEdit, removeColumn, removeRow, setHeaders, setSay, slots, split, takeOutColumn,
+  toggleHeader, type Grid, type GridCell,
 } from "./tablegrid";
 
 const short = (t: string) => (t.length > 30 ? `${t.slice(0, 30)}…` : t);
@@ -25,6 +26,7 @@ export function TableDialog({ map, ops, table, tags, onApply, onClose }: {
     return pending ? fromOp(map, pending) : fromTable(map, table!);
   });
   const [chosen, setChosen] = useState<number | null>(grid.cells[0]?.key ?? null);
+  const [cutting, setCutting] = useState<number[] | null>(null); // the words a cell's text is being cut before
   const [said, setSaid] = useState("");
   useEffect(() => {
     const d = ref.current;
@@ -35,6 +37,8 @@ export function TableDialog({ map, ops, table, tags, onApply, onClose }: {
   }, []);
 
   const cell = grid.cells.find((x) => x.key === chosen) ?? null;
+  const words = cell && !building ? cellWords(map, cell) : [];
+  useEffect(() => setCutting(null), [chosen]);
   const change = (next: Grid, what: string, keep?: number | null) => {
     setGrid(next);
     if (keep !== undefined) setChosen(keep);
@@ -87,8 +91,8 @@ export function TableDialog({ map, ops, table, tags, onApply, onClose }: {
                   return (
                     <td key={c} rowSpan={x.rows} colSpan={x.cols} className={`${x.role === "TH" ? "th" : ""}${x.key === chosen ? " on" : ""}`}>
                       <button type="button" aria-pressed={x.key === chosen} onClick={() => setChosen(x.key)}
-                        aria-label={`${x.role === "TH" ? "Header" : "Cell"}, ${where(x)}${x.rows > 1 || x.cols > 1 ? `, spanning ${x.rows} by ${x.cols}` : ""}: ${x.text || "empty"}`}>
-                        {x.text ? short(x.text) : <em className="muted">empty</em>}
+                        aria-label={`${x.role === "TH" ? "Header" : "Cell"}, ${where(x)}${x.rows > 1 || x.cols > 1 ? `, spanning ${x.rows} by ${x.cols}` : ""}: ${cellSays(x) || "empty"}${x.say?.trim() ? " (read aloud as set here)" : ""}`}>
+                        {cellSays(x) ? short(cellSays(x)) : <em className="muted">empty</em>}
                       </button>
                     </td>
                   );
@@ -116,6 +120,55 @@ export function TableDialog({ map, ops, table, tags, onApply, onClose }: {
             onClick={() => change(removeRow(grid, cell.r), `Row ${cell.r + 1} removed; its content joined the row ${cell.r === 0 ? "below" : "above"}.`)}>Remove row</button>
           <button type="button" className="btn secondary small" disabled={grid.width < 2}
             onClick={() => change(removeColumn(grid, cell.c), `Column ${cell.c + 1} removed; its content joined the column ${cell.c === 0 ? "to its right" : "to its left"}.`)}>Remove column</button>
+          {!building && (
+            <>
+              <button type="button" className="btn secondary small" disabled={words.length < 2} aria-expanded={cutting !== null}
+                onClick={() => setCutting(cutting === null ? [] : null)}>Split its words into cells…</button>
+              <button type="button" className="btn secondary small" disabled={grid.width < 2}
+                onClick={() => change(takeOutColumn(grid, cell.c), `Column ${cell.c + 1} taken out of the table: its text is one paragraph after it.`)}>
+                Take the column out as a paragraph</button>
+            </>
+          )}
+        </div>
+      )}
+      {cell && !building && (
+        <div className="field pv-tgrid-say">
+          <label htmlFor="pv-tgrid-say" className="small">Read aloud as <span className="hint">(optional; leave empty to read the drawn text)</span></label>
+          <input id="pv-tgrid-say" value={cell.say ?? ""} maxLength={4000}
+            placeholder={cell.text || undefined}
+            onChange={(e) => setGrid(setSay(grid, cell.key, e.target.value))} />
+          <span className="hint">For a cell whose drawn text reads wrongly: a misread value, a stray mark, a symbol.</span>
+          {!cell.say && cell.text && (
+            <button type="button" className="linkbtn small" onClick={() => setGrid(setSay(grid, cell.key, cell.text))}>Start from the drawn text</button>
+          )}
+        </div>
+      )}
+      {cell && cutting !== null && (
+        <fieldset className="pv-tgrid-cut">
+          <legend className="small">Where its words go into cells: choose the words that start a new cell</legend>
+          <div className="pv-tgrid-words">
+            {words.map((w, n) => (
+              <button key={n} type="button" className="btn secondary small" disabled={n === 0}
+                aria-pressed={n === 0 ? undefined : cutting.includes(n)}
+                onClick={() => setCutting(cutting.includes(n) ? cutting.filter((i) => i !== n) : [...cutting, n])}>{w.text}</button>
+            ))}
+          </div>
+          <p className="small muted">The first part stays in this cell; each next part goes in the next cell to its right
+            (an empty one takes it), with a column added if the row runs out.</p>
+          <div className="actions">
+            <button type="button" className="btn small" disabled={!cutting.length}
+              onClick={() => { change(cutCell(map, grid, cell.key, cutting), `The cell's words are in ${cutting.length + 1} cells now.`, cell.key); setCutting(null); }}>
+              Split into {cutting.length + 1} cells</button>
+            <button type="button" className="btn secondary small" onClick={() => setCutting(null)}>Cancel</button>
+          </div>
+        </fieldset>
+      )}
+      {!!grid.out?.length && (
+        <div className="small">
+          <h3 className="small">After the table</h3>
+          <ul className="pv-tgrid-out">
+            {grid.out.map((p, n) => <li key={n}>Paragraph: {p.text ? `“${p.text.slice(0, 120)}${p.text.length > 120 ? "…" : ""}”` : "empty"}</li>)}
+          </ul>
         </div>
       )}
       <p className="small muted">{grid.height} row{grid.height === 1 ? "" : "s"} by {grid.width} column{grid.width === 1 ? "" : "s"}

@@ -6,12 +6,13 @@ import {
 } from "./split";
 import { reportLabel, reportLink } from "./report";
 import type { BackState } from "../pages/JobDetail";
-import { get, post, put, type DocVersion, type Job, type ServiceChoice, type TagDraft, type TagDraftInfo, type TagDrafts, type TagEdit, type TagElement, type Versions } from "../api";
+import { get, post, put, type AreaTags, type DocVersion, type Job, type ServiceChoice, type TagDraft, type TagDraftInfo, type TagDrafts, type TagEdit, type TagElement, type Versions } from "../api";
 import { useAuth } from "../auth";
 import { ErrorNotice, LiveRegion, Loading, Notice, fmtDate, useLoad, useTitle } from "../components/ui";
 import { useConfirmLeave, useUnsavedChanges } from "../components/unsaved";
-import type { Area } from "./draft";
-import { DeleteTag, EditPanel, ReviewStatus, SaveChanges } from "./EditPanel";
+import { MarksContext, useFindingMarks } from "../components/reviewMarks";
+import type { Area, AreaBoxes } from "./draft";
+import { DeleteTag, DeleteTags, EditPanel, ReviewStatus, SaveChanges } from "./EditPanel";
 import { Reader } from "./Reader";
 import { LONG_DOCUMENT_PAGES, ROLE_NAMES, addEdit, describe, draftTree, jumpQuestion, undoMoves } from "./draft";
 import { fresh, historyKey, push, redo, undo, type History } from "./history";
@@ -33,8 +34,8 @@ import { DocumentPanel } from "./DocumentPanel";
 import { TableDialog } from "./TableDialog";
 import { clearVersionCache, type PaneData } from "./pdf";
 import { findItem, spotExtent, spotFor, spotWords, type Spot } from "./spot";
-import { newTags } from "./areaPreview";
-import { changePending, dropPending, justMade, makesTag } from "./pending";
+import { expand, store, takeBack, withIds } from "./made";
+import { changePending, justMade, makesTag } from "./pending";
 import { PendingTag } from "./PendingTag";
 
 // 1 = fit the page to the pane's width; larger values scroll sideways
@@ -76,6 +77,14 @@ export function TagViewer() {
   const [zoom, setZoomState] = useState<number>(() => {
     try { return Number(localStorage.getItem("pv-zoom")) || 1; } catch { return 1; }
   });
+  // Tags' cards on hover and focus: turned off, they stay off for the rest of this editing session (this tab)
+  const [cards, setCardsState] = useState<boolean>(() => {
+    try { return sessionStorage.getItem("pv-cards") !== "off"; } catch { return true; }
+  });
+  const setCards = (on: boolean) => {
+    setCardsState(on);
+    try { sessionStorage.setItem("pv-cards", on ? "on" : "off"); } catch { /* this tab's preference only */ }
+  };
   const [selected, setSelected] = useState<{ side: "left" | "right"; i: number } | null>(null);
   // Other tags selected along with `selected` (Ctrl or Cmd-click, Shift-click). They belong to that tag: once
   // another tag is selected on its own they no longer count
@@ -83,15 +92,31 @@ export function TagViewer() {
   const [menu, setMenu] = useState<{ x: number; y: number; ids: number[]; at: MenuPoint | null; page?: number } | null>(null);
   const navigate = useNavigate();
   // The unsaved changes, with their history for undo and redo (#365). Loading a draft or saving starts afresh.
+  // They're kept with the new tags they make named (made.ts, #692): `stored` is what's saved, `ops` what the tag manager
+  // works on, every tag a number of `rightMap` (the right-hand version's tags with the new ones in it)
   const [history, setHistory] = useState<History<TagEdit[]>>(() => fresh([]));
-  const ops = history.present;
-  const setOps = useCallback((next: TagEdit[]) => setHistory((h) => push(h, next)), []);
-  const resetOps = useCallback((next: TagEdit[]) => setHistory(fresh(next)), []);
+  const stored = history.present;
   const [rightData, setRightData] = useState<PaneData | null>(null);
+  const draft = useMemo(() => (rightData ? expand(rightData.tagmap, stored) : null), [rightData, stored]);
+  const ops = draft?.ops ?? stored;
+  const rightMap = draft?.map ?? null;
+  // Taking out an edit that makes a tag takes the changes made to that tag with it (Undo brings them all back)
+  const tookToo = (n: number) => setAnnounce(`…and ${n} change${n === 1 ? "" : "s"} made to it. Undo brings them back.`);
+  const setOps = useCallback((next: TagEdit[]) => {
+    const kept = draft ? store(draft, next) : { ops: withIds(next), dropped: 0 };
+    setHistory((h) => push(h, kept.ops));
+    if (kept.dropped) tookToo(kept.dropped);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+  const setStored = useCallback((next: TagEdit[]) => setHistory((h) => push(h, next)), []);
+  const resetOps = useCallback((next: TagEdit[]) => setHistory(fresh(withIds(next))), []);
   const [rightPage, setRightPage] = useState(1);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<unknown>(null);
   const [waitingFor, setWaitingFor] = useState<number | null>(null);
+  // The changes a save sent, still shown while it's checked: the tree and the page stay as they were edited, not
+  // back to the version they were made on, until the new version opens (or the save fails)
+  const [sent, setSent] = useState<TagEdit[] | null>(null);
   const [announce, setAnnounce] = useState("");
   const [failedSave, setFailedSave] = useState<DocVersion | null>(null);
   // Either pane can show the tag tree of the other pane's version instead of a document
@@ -120,6 +145,7 @@ export function TagViewer() {
   const [reviewBusy, setReviewBusy] = useState(false);
   // An area chosen on the right-hand page, for changing which content tags cover
   const [area, setArea] = useState<Area | null>(null);
+  const [areaBoxes, setAreaBoxes] = useState<AreaBoxes | null>(null); // the AI's figures for the area, on the page
   const [areaMode, setAreaMode] = useState(false);
   useEffect(() => {
     if (!areaMode) return;
@@ -166,9 +192,32 @@ export function TagViewer() {
   // null: not looked up yet. After that, edits are sent a moment after each change, so closing the tab loses nothing
   const [draftReady, setDraftReady] = useState(false);
   const [restored, setRestored] = useState<{ at: string; count: number; from?: string } | null>(null);
+  // A save the engine refused: its changes can be put back as unsaved changes, on the version they were made on, to
+  // save again once what refused them is fixed (or after taking out the change that was refused)
+  const [retried, setRetried] = useState<{ label: string; count: number } | null>(null);
+  const [notAgain, setNotAgain] = useState<number | null>(null);  // the failed save whose notice was dealt with
+  const newest = list.reduce<DocVersion | null>((m, v) => (!m || v.number > m.number ? v : m), null);
+  const failedNow = failedSave ?? (newest?.status === "failed" && newest.kind === "reviewed" ? newest : null);
+  const failed = failedNow && failedNow.number !== notAgain ? failedNow : null;
+  async function tryAgain(v: DocVersion) {
+    try {
+      const got = await get<{ based_on: number | null; edits: TagEdit[] }>(`/jobs/${id}/versions/${v.number}/edits`);
+      if (got.based_on === null || !usable.some((x) => x.number === got.based_on && x.kind !== "original")) {
+        throw new Error("The version its changes were made on has changed since, so they can't be put back on it.");
+      }
+      setRight(got.based_on);
+      resetOps(got.edits);
+      setSelected(null);
+      setFailedSave(null);
+      setNotAgain(v.number);
+      setRetried({ label: v.label, count: got.edits.length });
+      setAnnounce(`The changes of ${v.label} are back as unsaved changes.`);
+    } catch (e) { setSaveError(e); }
+  }
   const [lostDraft, setLostDraft] = useState<TagDraft | null>(null);   // its version is gone: can't be applied
   const [otherDraft, setOtherDraft] = useState<TagDraftInfo | null>(null);
   const [readOnlyFor, setReadOnlyFor] = useState<TagDraftInfo | null>(null);
+  const [notesOpen, setNotesOpen] = useState(false);  // the notes under the heading, folded at first
   const [kept, setKept] = useState<{ at: Date | null; dirty: boolean; error: boolean }>({ at: null, dirty: false, error: false });
   const hasDraft = useRef(false);
   const lastKept = useRef("");
@@ -194,19 +243,19 @@ export function TagViewer() {
   }, [draftReady, id, versions.data, right, canEditDoc, usable]);
   useEffect(() => {
     if (!draftReady || !canEditDoc || !id || right === null || readOnlyFor || lostDraft) return;
-    if (!ops.length && !hasDraft.current) return;
-    const body = JSON.stringify([right, ops]);
+    if (!stored.length && !hasDraft.current) return;
+    const body = JSON.stringify([right, stored]);
     if (body === lastKept.current) return;
     setKept((k) => ({ ...k, dirty: true }));
     const timer = window.setTimeout(() => {
-      put<TagDraft | null>(`/jobs/${id}/tag-draft`, { based_on: right, edits: ops }).then(() => {
+      put<TagDraft | null>(`/jobs/${id}/tag-draft`, { based_on: right, edits: stored }).then(() => {
         lastKept.current = body;
-        hasDraft.current = ops.length > 0;
-        setKept({ at: ops.length ? new Date() : null, dirty: false, error: false });
+        hasDraft.current = stored.length > 0;
+        setKept({ at: stored.length ? new Date() : null, dirty: false, error: false });
       }).catch(() => setKept((k) => ({ ...k, dirty: true, error: true })));
     }, 1500);
     return () => window.clearTimeout(timer);
-  }, [ops, right, draftReady, canEditDoc, id, readOnlyFor, lostDraft]);
+  }, [stored, right, draftReady, canEditDoc, id, readOnlyFor, lostDraft]);
   async function startFrom(other: TagDraftInfo) {
     setOtherDraft(null);
     try {
@@ -232,10 +281,12 @@ export function TagViewer() {
       setRight(v.number);
       setSelected(null);
       setWaitingFor(null);
+      setSent(null);
     } else if (v.status === "failed") {
       setAnnounce(`Saving ${v.label} failed.`);
       setFailedSave(v);
       setWaitingFor(null);
+      setSent(null);
     }
   }, [list, waitingFor]);
 
@@ -359,6 +410,9 @@ export function TagViewer() {
     });
   }, [onPageShown]);
 
+  // Review items' statuses (#663): signed off here, where they're fixed, as on Needs review
+  const marks = useFindingMarks(id);
+
   // A review item's area, highlighted on its page (#426): from Show on the review list, or the page's own list
   const [spot, setSpot] = useState<Spot | null>(null);
   const showSpot = useCallback((s: Spot) => {
@@ -380,28 +434,28 @@ export function TagViewer() {
   useEffect(() => {
     const el = params.get("el");
     const page = params.get("page");
-    if (jumped.current || (el === null && page === null) || !rightData) return;
+    if (jumped.current || (el === null && page === null) || !rightMap) return;
     jumped.current = true;
-    const e = el === null ? undefined : rightData.tagmap.elements[Number(el)];
+    const e = el === null ? undefined : rightMap.elements[Number(el)];
     if (e) setSelected({ side: "right", i: e.i });
     const findings = list.find((v) => v.number === right)?.summary?.findings ?? [];
     const item = findItem(findings, params.get("f"), page === null ? null : Number(page),
       e ? e.i : null);
     const n = page === null ? null : Number(page);
-    const s = item ? spotFor(item, rightData.tagmap)
-      : n !== null && rightData.tagmap.pages[n - 1] ? { page: n, boxes: [], issue: `Page ${n}` } : null;
+    const s = item ? spotFor(item, rightMap)
+      : n !== null && rightMap.pages[n - 1] ? { page: n, boxes: [], issue: `Page ${n}` } : null;
     if (s && (item || !e)) showSpot(s);
     else if (e?.boxes.length) {
       const b = e.boxes[0];
       window.setTimeout(() => scrollTo("right", b.page, b.bbox[1], b.bbox[3]), 100);
     }
-  }, [params, rightData, list, right, scrollTo, showSpot]);
+  }, [params, rightMap, list, right, scrollTo, showSpot]);
 
   const selectFrom = (side: "left" | "right") => (i: number | null) => {
     setSelected(i === null ? null : { side, i });
     setAlso(ALONE); // or coming back to a tag later would bring back the tags once selected with it
-    if (i !== null && side === "right" && rightData) {
-      const e = rightData.tagmap.elements[i];
+    if (i !== null && side === "right" && rightMap) {
+      const e = rightMap.elements[i];
       if (e?.boxes.length) setRightPage(e.boxes[0].page);
     }
   };
@@ -442,6 +496,7 @@ export function TagViewer() {
   const [areaOpen, setAreaOpen] = useState(false); // the chosen area's contents, in a dialog
   const [headingDialog, setHeadingDialog] = useState<"changes" | "review" | "document" | null>(null); // opened from the heading's buttons
   const [deleteFor, setDeleteFor] = useState<number | null>(null);
+  const [deleteMany, setDeleteMany] = useState<number[] | null>(null); // several tags chosen together
   const [figureFor, setFigureFor] = useState<{ i: number; keys?: string[] } | null>(null); // the figure being split, and pieces chosen already // the tag the "remove or delete" question is about
   // The editing panel: hidden unless asked for, since the menu and its dialogs do its work (remembered per browser)
   const [panel, setPanelState] = useState(() => { try { return localStorage.getItem("pv-panel") === "1"; } catch { return false; } });
@@ -456,17 +511,17 @@ export function TagViewer() {
     if (item.act === "figure-split" && menu?.ids.length) setFigureFor({ i: menu.ids[0] });
     if (item.act === "build" && menu) setBuildFrom(menu.ids);
     if (item.act === "make-table" && menu) setTableFor({ tags: menu.ids });
-    if (item.act === "table" && menu?.ids.length && rightData) {
+    if (item.act === "table" && menu?.ids.length && rightMap) {
       let t: number | null = menu.ids[0];
-      while (t !== null && rightData.tagmap.elements[t]?.role !== "Table") t = rightData.tagmap.elements[t]?.parent ?? null;
-      if (t !== null) setTableFor({ table: t });
+      while (t !== null && rightMap.elements[t]?.role !== "Table") t = rightMap.elements[t]?.parent ?? null;
+      if (t !== null) setTableFor({ table: rightMap.elements[t]?.of ?? t });  // a table being rebuilt: the one in the file
     }
     if (item.act === "isolate" && menu?.ids.length) { setIsolated(menu.ids[0]); setAnnounce("Tag isolated: the rest is veiled. Show everything again from the menu or the button at the top."); return setMenu(null); }
     if (item.act === "unisolate") { setIsolated(null); setAnnounce("Showing everything."); return setMenu(null); }
     setMenu(null);
     if (item.act?.startsWith("area-")) {
       const page = menu?.page ?? rightPage;
-      const size = rightData?.tagmap.pages[page - 1];
+      const size = rightMap?.pages[page - 1];
       setRightPage(page);
       // What's in the area opens in a dialog: at once for a whole page, once it's drawn for an area
       if (item.act === "area-clear") setArea(null);
@@ -477,10 +532,10 @@ export function TagViewer() {
     }
     if (item.id === "merge") setAlso(ALONE); // the others are part of the first now
     if (item.ops) { setOps(item.ops); setAnnounce(`${item.label}: done. Not in the file until you save.`); return; }
-    if (first === undefined || !rightData) return;
-    const el = rightData.tagmap.elements[first];
+    if (first === undefined || !rightMap) return;
+    const el = rightMap.elements[first];
     if (item.act === "split-text") setSplitFor(first);
-    else if (item.act === "delete") setDeleteFor(first);
+    else if (item.act === "delete") { if (menu && menu.ids.length > 1) setDeleteMany(menu.ids); else setDeleteFor(first); }
     else if (item.act === "read") { selectFrom("right")(first); setReading(true); setReadFrom((r) => ({ i: first, n: (r?.n ?? 0) + 1 })); }
     else if (item.act === "report" && el && rightVersion) navigate(reportLink(id, rightVersion.number, el, el.boxes[0]?.page ?? rightPage));
   };
@@ -546,38 +601,56 @@ export function TagViewer() {
   const tierChoice = job.data?.ai_tier ? choices.data?.find((c) => c.key === job.data!.ai_tier) : undefined;
   const allowFullReview = !job.data?.ai_tier || (tierChoice?.allow_full_review ?? true);
   const leftVersion = list.find((v) => v.number === left);
-  const editable = !!versions.data?.can_edit && !!rightVersion && rightVersion.kind !== "original" && !readOnlyFor && !lostDraft;
-  // A tag pending edits make, chosen before it's saved (#427), by the place of the edit making it. A tag just made
-  // from an area or a split is chosen at once, so its type or alt text can be set straight away
-  const [pendingSel, setPendingSel] = useState<number | null>(null);
-  const madeTags = useMemo(() => (rightData && editable ? newTags(rightData.tagmap, ops) : []),
-    [rightData, editable, ops]);
-  const lastOps = useRef(ops);
+  const editable = !!versions.data?.can_edit && !!rightVersion && rightVersion.kind !== "original" && !readOnlyFor && !lostDraft
+    && !(sent && waitingFor !== null);  // a save being checked: its changes are shown, and can't be changed now
+  // What the panes draw: the unsaved changes, or while a save is checked, the ones it sent
+  const shownOps = sent && waitingFor !== null ? sent : stored;
+  // "Describe with AI" on a part of the page (a figure's piece, a drawn area): one call at the document's AI level
+  // A document made without AI is never sent to one afterwards either (#659)
+  const withAi = !!job.data?.ai_tier && !job.data?.no_ai;
+  const describeArea = me?.can_describe && withAi && editable && rightVersion ? async (page: number, bbox: [number, number, number, number]) => {
+    const r = await post<{ alt: string }>(`/jobs/${id}/versions/${rightVersion.number}/describe`, { page, bbox, long: true });
+    return r.alt;
+  } : undefined;
+  // "Suggest tags with AI" for a drawn area: allowed and costed as Describe with AI is
+  const suggestArea = describeArea && rightVersion ? (page: number, bbox: [number, number, number, number],
+    items: { kind: string; text: string; bbox: [number, number, number, number] }[]) =>
+    post<AreaTags>(`/jobs/${id}/versions/${rightVersion.number}/area-tags`, { page, bbox, items }) : undefined;
+  // A tag just made (from an area, the AI's tags for one, a split) is chosen at once, like any tag (#692). While a new
+  // tag is chosen, a bar above the pages changes its type and alt text in the edit that makes it, or takes it back
+  const [barClosed, setBarClosed] = useState<number | null>(null);
+  const lastStored = useRef(stored);
   useEffect(() => {
-    const made = justMade(lastOps.current, ops);
-    const same = lastOps.current.length === ops.length; // edits taken out or undone: the places have moved
-    lastOps.current = ops;
-    if (made !== null) {
-      setPendingSel(made);
-      setSelected(null); // the new tag is the one chosen now, not the tag it came from
-      setAnnounce("New tag chosen. Not in the file until you save; its type and alt text can be changed.");
-    } else setPendingSel((cur) => (cur !== null && same && makesTag(ops[cur]) ? cur : null));
-  }, [ops]);
-  const choosePending = (op: number) => {
-    setPendingSel(op);
-    setSelected(null);
-    const t = madeTags.find((x) => x.op === op);
-    if (t?.boxes.length) scrollTo("right", t.boxes[0].page, t.boxes[0].bbox[1], t.boxes[0].bbox[3]);
+    const at = justMade(lastStored.current, stored);
+    lastStored.current = stored;
+    const m = at === null ? undefined : draft?.made.find((x) => x.op === at);
+    if (!m) return;
+    setSelected({ side: "right", i: m.i });
+    setAlso(ALONE);
+    setAnnounce("New tag chosen. Not in the file until you save; it can be changed like any tag.");
+  }, [stored, draft]);
+  const madeTags = useMemo(() => (draft && editable ? draft.made.filter((m) => makesTag(stored[m.op])).map((m) => {
+    const el = draft.map.elements[m.i];
+    return { ...m, role: el.role, alt: el.alt ?? "", text: el.text ?? "" };
+  }) : []), [draft, editable, stored]);
+  const choosePending = (i: number) => {
+    setSelected({ side: "right", i });
+    setAlso(ALONE);
+    setBarClosed(null);
+    const b = rightMap?.elements[i]?.boxes[0];
+    if (b) scrollTo("right", b.page, b.bbox[1], b.bbox[3]);
   };
-  useEffect(() => { if (selected) setPendingSel(null); }, [selected]);
-  const pendingTag = pendingSel === null ? undefined : madeTags.find((t) => t.op === pendingSel);
+  const pendingTag = selected?.side === "right" && barClosed !== selected.i ? madeTags.find((t) => t.i === selected.i) : undefined;
   // Undo and redo, saying what was undone or redone: the edit one list has and the other doesn't
   const stepHistory = useCallback((way: "undo" | "redo") => {
     const next = way === "undo" ? undo(history) : redo(history);
     if (next === history) return;
     const [more, fewer] = next.present.length >= history.present.length ? [next.present, history.present] : [history.present, next.present];
     const op = more.find((o) => !fewer.includes(o)) ?? next.present.find((o, n) => o !== history.present[n]);
-    const what = op && rightData ? `: ${describe(op, rightData.tagmap)}` : "";
+    // Described with the new tags it names as they are in the list it's in
+    const list = more.includes(op!) ? more : next.present;
+    const shown = op && rightData ? expand(rightData.tagmap, list) : null;
+    const what = op && shown ? `: ${describe(shown.ops[list.indexOf(op)], shown.map)}` : "";
     setHistory(next);
     setAnnounce(`${way === "undo" ? "Undone" : "Redone"}${what}. ${next.present.length} unsaved change${next.present.length === 1 ? "" : "s"}.`);
   }, [history, rightData]);
@@ -592,7 +665,7 @@ export function TagViewer() {
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
   }, [editable, stepHistory]);
-  const selectedEl = selected?.side === "right" && rightData ? rightData.tagmap.elements[selected.i] ?? null : null;
+  const selectedEl = selected?.side === "right" && rightMap ? rightMap.elements[selected.i] ?? null : null;
   const selectedFindings = useMemo(
     () => (rightVersion?.summary?.findings ?? []).filter((f) => selectedEl && f.element === selectedEl.i),
     [rightVersion, selectedEl],
@@ -629,8 +702,9 @@ export function TagViewer() {
     setSaveError(null);
     try {
       const v = await post<DocVersion>(`/jobs/${id}/versions`, {
-        based_on: rightVersion.number, edits: ops, note: note || null, review: aiReview, replace,
+        based_on: rightVersion.number, edits: stored, note: note || null, review: aiReview, replace,
       });
+      setSent(stored);
       resetOps([]);
       // The draft became this version (the server removed it)
       hasDraft.current = false;
@@ -638,6 +712,7 @@ export function TagViewer() {
       setRestored(null);
       setKept({ at: null, dirty: false, error: false });
       setFailedSave(null);
+      setRetried(null);
       setWaitingFor(v.number);
       setAnnounce(`Saving ${v.label}. The tags are being checked.`);
       await versions.reload();
@@ -651,6 +726,16 @@ export function TagViewer() {
   if (job.loading || versions.loading) return <Loading />;
   if (job.error || versions.error) return <ErrorNotice error={job.error ?? versions.error} />;
   const waiting = waitingFor !== null ? list.find((v) => v.number === waitingFor) : undefined;
+  // The titles of the notes folded under the heading, shown while folded: one for each notice below it
+  const notes = ([
+    failed && !waiting && { title: `${failed.label} wasn't saved`, warn: true },
+    retried && ops.length > 0 && { title: `The changes of ${retried.label} are back` },
+    restored && ops.length > 0 && { title: restored.from ? `Started from ${restored.from}'s unsaved changes` : "Your unsaved changes are back" },
+    lostDraft && { title: "Your earlier unsaved changes can't be applied", warn: true },
+    readOnlyFor && { title: "Read-only" },
+    canEditDoc && (kept.at || kept.error) && ops.length > 0 && (kept.error ? { title: "Changes not kept on the server", warn: true }
+      : { title: `Unsaved changes kept ${kept.at!.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` }),
+  ] as const).filter((n): n is { title: string; warn?: boolean } => !!n);
 
   // The viewing controls sit in the panes' own header rows, beside the version pickers: what's shown on the left,
   // how it's shown on the right
@@ -689,6 +774,8 @@ export function TagViewer() {
   // On the picker's own line, at its right-hand end: nothing here is worth a line of its own
   const rightTools = (
     <div className="pv-tools">
+      <label className="check small" title="A tag's details on hover and focus. Off for the rest of this session until you turn them back on.">
+        <input type="checkbox" checked={cards} onChange={(e) => setCards(e.target.checked)} /> Tag cards</label>
       <label htmlFor="pv-zoom" className="visually-hidden">Zoom</label>
       <select id="pv-zoom" value={zoom} onChange={(e) => setZoom(Number(e.target.value))}>
         {ZOOMS.map((z) => <option key={z} value={z}>{z === 1 ? "Fit width" : `${Math.round(z * 100)}%`}</option>)}
@@ -698,7 +785,7 @@ export function TagViewer() {
   );
 
   return (
-    <>
+    <MarksContext.Provider value={marks}>
       {askAll && (
         <Ask title={`Show all ${pages.toLocaleString()} pages at once?`} onCancel={() => setAskAll(false)}
           actions={[{ label: "Show all pages", run: () => { setAskAll(false); setView("all", true); } }]}
@@ -735,10 +822,10 @@ export function TagViewer() {
         <p className="small pv-top-back"><Link to={backTo}>← Back to the document</Link></p>
         <div className="pv-top-title">
           <h1>Tag manager: {job.data?.filename}</h1>
-          <p className="sub small">Hover over or focus an outlined tag for details.</p>
+          <p className="sub small">{cards ? "Hover over or focus an outlined tag for details." : "Tag cards are off. Right-click a tag for its details."}</p>
         </div>
         <div className="actions pv-top-actions">
-          {selected?.side === "right" && rightData && (
+          {selected?.side === "right" && rightMap && (
             // The menu for the selected tags, for the keyboard and for anyone who doesn't right-click
             <button className="btn secondary small" aria-haspopup="menu" onClick={(e) => {
               const box = e.currentTarget.getBoundingClientRect();
@@ -756,7 +843,7 @@ export function TagViewer() {
           {editable && ops.length > 0 && rightVersion && (
             <button className="btn small" aria-haspopup="dialog" onClick={() => setHeadingDialog("changes")}>Unsaved changes ({ops.length})…</button>
           )}
-          {rightData && rightVersion && (
+          {rightMap && rightVersion && (
             <button className="btn secondary small" aria-haspopup="dialog" onClick={() => setHeadingDialog("document")}
               title="The document's title and language">Document…</button>
           )}
@@ -784,7 +871,7 @@ export function TagViewer() {
         </div>
         {/* In the heading, which stays in view: the reader and the tag being read are seen together */}
         {reading && usable.length > 0 && (
-          <Reader jobId={id} ops={ops} selected={selected} onShow={showRead} onClose={() => { setReading(false); setReadFrom(null); }}
+          <Reader jobId={id} ops={shownOps} selected={selected} onShow={showRead} onClose={() => { setReading(false); setReadFrom(null); }}
             from={readFrom}
             versions={{
               left: leftVersion && left !== null ? { number: left, label: leftVersion.label } : null,
@@ -793,59 +880,94 @@ export function TagViewer() {
         )}
       </div>
       <LiveRegion message={announce} />
+      <LiveRegion message={marks.said} />
       {usable.length === 0 ? (
         <Notice kind="info">The tag manager isn't available for this document. Documents processed before it was added need to be submitted again.</Notice>
       ) : (
         <>
           {areaMode && editable && <Notice kind="info">Drag on the right-hand page to draw an area. What's inside it opens in a window. Escape stops.</Notice>}
-          {waiting && <Notice kind="info" title={`Saving ${waiting.label}`}>The tags are being checked and validated. This view switches to it when it's ready.</Notice>}
-          {failedSave && !waiting && (
-            <Notice kind="warn" title={`${failedSave.label} wasn't saved`}>{failedSave.error_message}</Notice>
-          )}
+          {waiting && <Notice kind="info" title={`Saving ${waiting.label}`}>The tags are being checked and validated. Meanwhile the tree and the pages show the changes it's making, and
+            can't be changed; this view switches to it when it's ready.</Notice>}
           <ErrorNotice error={saveError} />
-          {restored && ops.length > 0 && (
-            <Notice kind="info" title={restored.from ? `Started from ${restored.from}'s unsaved changes` : "Your unsaved changes are back"}>
-              {restored.count.toLocaleString()} change{restored.count === 1 ? "" : "s"}, last kept {fmtDate(restored.at)}
-              {restored.from ? ". Theirs are untouched; these are now yours." : ". They're listed under Unsaved changes, where you can undo any of them or discard them all."}
-            </Notice>
+          <ErrorNotice error={marks.error} />
+          {/* Notes about the document and the unsaved changes, folded under the heading so the pages keep the room;
+              their titles show while folded */}
+          {notes.length > 0 && (
+            <details className="pv-notes" open={notesOpen} onToggle={(e) => setNotesOpen(e.currentTarget.open)}>
+              <summary>
+                <span className="pv-notes-count">{notes.length === 1 ? "1 note" : `${notes.length} notes`}</span>
+                {notes.map((n, k) => <span key={k} className={n.warn ? "pv-note-warn" : undefined}>{n.title}</span>)}
+              </summary>
+            {failed && !waiting && (
+              <Notice kind="warn" title={`${failed.label} wasn't saved`}>
+                {failed.error_message}
+                {canEditDoc && (
+                  <>{" "}
+                    {ops.length ? (
+                      <span className="muted">To try its changes again, save your unsaved changes or{" "}
+                        <button className="linkbtn" onClick={() => {
+                          setOps([]);
+                          setAnnounce("Your unsaved changes were discarded. Undo brings them back.");
+                        }}>discard them</button> (Undo brings them back).</span>
+                    ) : <button className="linkbtn" onClick={() => void tryAgain(failed)}>Try its changes again</button>}{" "}
+                    <button className="linkbtn" onClick={() => { setNotAgain(failed.number); setFailedSave(null); }}>Dismiss</button>
+                  </>
+                )}
+              </Notice>
+            )}
+            {retried && ops.length > 0 && (
+              <Notice kind="info" title={`The changes of ${retried.label} are back`}>
+                {retried.count.toLocaleString()} change{retried.count === 1 ? "" : "s"}, as unsaved changes on the version they were
+                made on. Save them again; if one is refused again, take it out under Unsaved changes first.
+              </Notice>
+            )}
+            {restored && ops.length > 0 && (
+              <Notice kind="info" title={restored.from ? `Started from ${restored.from}'s unsaved changes` : "Your unsaved changes are back"}>
+                {restored.count.toLocaleString()} change{restored.count === 1 ? "" : "s"}, last kept {fmtDate(restored.at)}
+                {restored.from ? ". Theirs are untouched; these are now yours." : ". They're listed under Unsaved changes, where you can undo any of them or discard them all."}
+              </Notice>
+            )}
+            {lostDraft && (
+              <Notice kind="warn" title="Your earlier unsaved changes can't be applied">
+                They were made on a version of this document that is no longer available ({lostDraft.edits.length.toLocaleString()} changes,
+                last kept {fmtDate(lostDraft.updated_at)}).{" "}
+                <button className="linkbtn" onClick={() => { void put(`/jobs/${id}/tag-draft`, { based_on: lostDraft.based_on, edits: [] }).then(() => { hasDraft.current = false; setLostDraft(null); }).catch(setSaveError); }}>
+                  Discard them and start again</button>
+              </Notice>
+            )}
+            {readOnlyFor && (
+              <Notice kind="info" title="Read-only">
+                {readOnlyFor.user_email} has unsaved changes on this document, last kept {fmtDate(readOnlyFor.updated_at)}.{" "}
+                <button className="linkbtn" onClick={() => setReadOnlyFor(null)}>Start my own changes</button>
+              </Notice>
+            )}
+            {canEditDoc && (kept.at || kept.error) && ops.length > 0 && (
+              <p className="muted small" role="status">
+                {kept.error ? "Your changes couldn't be kept on the server just now; they're still here in this tab. Trying again with your next change."
+                  : `Unsaved changes kept ${kept.at!.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. You can close this page and carry on later; nothing is in the file until you save.`}
+              </p>
+            )}
+            </details>
           )}
-          {lostDraft && (
-            <Notice kind="warn" title="Your earlier unsaved changes can't be applied">
-              They were made on a version of this document that is no longer available ({lostDraft.edits.length.toLocaleString()} changes,
-              last kept {fmtDate(lostDraft.updated_at)}).{" "}
-              <button className="linkbtn" onClick={() => { void put(`/jobs/${id}/tag-draft`, { based_on: lostDraft.based_on, edits: [] }).then(() => { hasDraft.current = false; setLostDraft(null); }).catch(setSaveError); }}>
-                Discard them and start again</button>
-            </Notice>
-          )}
-          {readOnlyFor && (
-            <Notice kind="info" title="Read-only">
-              {readOnlyFor.user_email} has unsaved changes on this document, last kept {fmtDate(readOnlyFor.updated_at)}.{" "}
-              <button className="linkbtn" onClick={() => setReadOnlyFor(null)}>Start my own changes</button>
-            </Notice>
-          )}
-          {canEditDoc && (kept.at || kept.error) && ops.length > 0 && (
-            <p className="muted small" role="status">
-              {kept.error ? "Your changes couldn't be kept on the server just now; they're still here in this tab. Trying again with your next change."
-                : `Unsaved changes kept ${kept.at!.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. You can close this page and carry on later; nothing is in the file until you save.`}
-            </p>
-          )}
-          {pendingTag && ops[pendingTag.op] && (
-            <PendingTag tag={pendingTag} op={ops[pendingTag.op]} all={madeTags} onChoose={choosePending}
+          {pendingTag && stored[pendingTag.op] && (
+            <PendingTag tag={pendingTag} op={stored[pendingTag.op]} all={madeTags} onChoose={choosePending}
               onClose={() => {
-                setPendingSel(null);
-                setAnnounce("New tag no longer chosen.");
+                setBarClosed(pendingTag.i);
+                setAnnounce("New tag bar closed. The tag stays chosen.");
                 scrollEls.current.right?.focus({ preventScroll: true }); // the bar had focus: back to the pages
               }}
               onChange={(role, alt) => {
-                const next = changePending(ops, pendingTag.op, role, alt);
+                const next = changePending(stored, pendingTag.op, role, alt, undefined, pendingTag.group);
                 if (!next) return false;
-                setOps(next);
+                setStored(next);
                 setAnnounce(`The new tag is now ${ROLE_NAMES[role] ?? role}. Not in the file until you save.`);
                 return true;
               }}
               onRemove={() => {
-                setOps(dropPending(ops, pendingTag.op));
-                setAnnounce("The new tag was taken back.");
+                const back = takeBack(stored, pendingTag.op, pendingTag.group);
+                setStored(back.ops);
+                setSelected(null);
+                setAnnounce(`The new tag was taken back${back.dropped ? `, with ${back.dropped} change${back.dropped === 1 ? "" : "s"} made to it. Undo brings them back` : ""}.`);
                 scrollEls.current.right?.focus({ preventScroll: true });
               }} />
           )}
@@ -855,18 +977,17 @@ export function TagViewer() {
               <TreePane side="left" tools={leftTools} jobId={id} number={right} sourceLabel={rightVersion.label}
                 picker={<VersionPicker side="left" versions={list} value={TREE} treeDisabled={false}
                   onTree={() => {}} onNumber={(n) => { setLeft(n); setTree(null); setHover(null); }} />}
-                findings={rightVersion.summary?.findings ?? []} ops={ops} follow={follow} page={only}
+                findings={rightVersion.summary?.findings ?? []} ops={shownOps} follow={follow} page={only}
                 onUndoMove={editable ? (el) => { setOps(undoMoves(ops, el.i)); } : undefined}
                 onMove={editable ? (el, target, position) => setOps([...ops, { op: "move", element: el.i, expect_role: el.role,
                   target: target.i, expect_target_role: target.role, position }]) : undefined}
                 selected={selected?.side === "right" ? selected.i : null} onSelect={showFromTree("right")}
                 picked={picked} onPick={(el, how, visible) => pickRight(el.i, how, visible)} isolated={isolated}
-                pendingSel={pendingSel} onPendingSelect={editable ? choosePending : undefined}
                 onMenu={(el, x, y) => openMenu(el.i, x, y)}
                 onReadAll={(el) => { selectFrom("right")(el.i); setEditFor(el.i); }}
                 onHover={(i) => setHover(i === null ? null : { side: "right", i })} />
             ) : (
-              <Pane side="left" tools={leftTools} jobId={id} versions={list} number={left} onNumber={setLeft} mode={mode} zoom={zoom}
+              <Pane side="left" tools={leftTools} jobId={id} versions={list} number={left} onNumber={setLeft} mode={mode} zoom={zoom} cards={cards}
                 selected={selected?.side === "left" ? selected.i : null} onSelect={selectFrom("left")} ops={[]}
                 scrollRef={(el) => { scrollEls.current.left = el; }} onScroll={onScroll("left")}
                 onLayout={noteLayout("left")} onlyPage={only}
@@ -886,28 +1007,27 @@ export function TagViewer() {
                 selected={selected?.side === "left" ? selected.i : null} onSelect={showFromTree("left")}
                 onHover={(i) => setHover(i === null ? null : { side: "left", i })} />
             ) : (
-              <Pane side="right" tools={rightTools} jobId={id} versions={list} number={right} onNumber={changeRight} mode={mode} zoom={zoom}
-                selected={selected?.side === "right" ? selected.i : null} onSelect={selectFrom("right")} ops={ops}
+              <Pane side="right" tools={rightTools} jobId={id} versions={list} number={right} onNumber={changeRight} mode={mode} zoom={zoom} cards={cards}
+                selected={selected?.side === "right" ? selected.i : null} onSelect={selectFrom("right")} ops={shownOps}
                 scrollRef={(el) => { scrollEls.current.right = el; }} onScroll={onScroll("right")} onPage={setRightPage}
                 onLayout={noteLayout("right")} onData={setRightData} onlyPage={only}
-                pendingSel={pendingSel} onPendingSelect={editable ? choosePending : undefined}
-                areaMode={areaMode && editable} area={editable ? area : null}
+                areaMode={areaMode && editable} area={editable ? area : null} areaBoxes={area ? areaBoxes : null}
                 onArea={(p, bbox) => { setArea({ page: p, bbox }); setRightPage(p); setAreaMode(false); setAreaOpen(true); }}
                 highlight={hover?.side === "right" ? hover.i : null}
                 picked={picked} onPick={(i) => pickRight(i, "toggle")} onMenu={openMenu}
                 onPageMenu={(page, x, y) => setMenu({ x, y, ids: [], at: null, page })} isolated={isolated}
                 spot={spot} onSpotClose={closeSpot}
-                onSpot={(f) => { const s = spotFor(f, rightData?.tagmap ?? null); if (s) showSpot(s); }}
+                onSpot={(f) => { const s = spotFor(f, rightMap); if (s) showSpot(s); }}
                 onTree={() => openTree("right")} treeDisabled={tree === "left"} />
             ))}
-            {rightData && rightVersion && tree !== "right" && panel && (
+            {rightMap && rightVersion && tree !== "right" && panel && (
               <Divider className="pv-split-side" label="Divider before the editing panel" value={sideWidth} min={SIDE_MIN} max={SIDE_MAX}
                 text={`Editing panel ${sideWidth} pixels wide`}
                 at={(x) => sideAt(x, gridRef.current!.getBoundingClientRect().right)}
                 keyTo={sideKey} reset={SIDE_DEFAULT} onChange={setSideWidth} onDone={(v) => saveSide(localStore(), v)} />
             )}
-            {rightData && rightVersion && tree !== "right" && panel && (
-              <EditPanel map={rightData.tagmap} element={selectedEl} findings={selectedFindings} page={rightPage}
+            {rightMap && rightVersion && tree !== "right" && panel && (
+              <EditPanel map={rightMap} element={selectedEl} findings={selectedFindings} page={rightPage}
                 ops={ops} setOps={setOps} onSelect={(i) => selectFrom("right")(i)} canEdit={editable}
                 readOnlyReason={!versions.data?.can_edit
                   ? "You can view this document's tags. Only its owner and their group admins can edit them."
@@ -915,7 +1035,7 @@ export function TagViewer() {
                   : lostDraft ? "Your earlier unsaved changes can't be applied (see the note above)."
                   : "The original can't be edited. Choose a remediated or reviewed version on the right to edit it."}
                 baseLabel={rightVersion.label} saving={saving} onSave={(n, r, into) => void save(n, r, into)}
-                version={rightVersion} onReview={(full) => void review(full)} reviewBusy={reviewBusy} jump={jump}
+                version={rightVersion} onReview={withAi ? (full) => void review(full) : undefined} reviewBusy={reviewBusy} jump={jump} describe={describeArea} suggest={suggestArea} onBoxes={setAreaBoxes}
                 allowFullReview={allowFullReview} area={area} setArea={setArea} areaMode={areaMode} setAreaMode={setAreaMode}
                 count={chosen.length} onActions={selectedEl ? (from) => {
                   const box = from.getBoundingClientRect();
@@ -923,56 +1043,65 @@ export function TagViewer() {
                 } : undefined} />
             )}
           </div>
-          {menu && rightData && (
+          {menu && rightMap && (
             <TagMenu x={menu.x} y={menu.y} title={menu.page ? `Page ${menu.page}` : menu.ids.length > 1 ? `${menu.ids.length} tags selected` : "This tag"}
               items={menu.page ? [...pageMenu(menu.page, area !== null, areaMode, editable), ...(isolated !== null ? [isolateItem(isolated, null)] : [])]
-                : [...menuAndTypes(tagMenu(rightData.tagmap, ops, menu.ids, menu.at, editable)).menu.filter((it) => it.act !== "report" || canReport),
+                : [...menuAndTypes(tagMenu(rightMap, ops, menu.ids, menu.at, editable)).menu.filter((it) => it.act !== "report" || canReport),
                   isolateItem(isolated, menu.ids[0] ?? null)]}
               onChoose={choose} onClose={() => setMenu(null)} />
           )}
-          {tableFor && rightData && (
-            <TableDialog map={rightData.tagmap} ops={ops} table={tableFor.table} tags={tableFor.tags} onClose={() => setTableFor(null)}
+          {tableFor && rightMap && (
+            <TableDialog map={rightMap} ops={ops} table={tableFor.table} tags={tableFor.tags} onClose={() => setTableFor(null)}
               onApply={(op) => { setOps(addEdit(ops, op)); setTableFor(null); setAlso(ALONE); setAnnounce(`${tableFor.table !== undefined ? "Table edited" : "Table made"}. Not in the file until you save.`); }} />
           )}
-          {buildFrom && rightData && (
-            <ListBuilder els={inReadingOrder(rightData.tagmap, buildFrom)} onClose={() => setBuildFrom(null)}
+          {buildFrom && rightMap && (
+            <ListBuilder els={inReadingOrder(rightMap, buildFrom)} onClose={() => setBuildFrom(null)}
               onApply={(op) => { setOps([...ops, op]); setAlso(ALONE); setAnnounce("List built. Not in the file until you save."); }} />
           )}
-          {editFor !== null && rightData?.tagmap.elements[editFor] && rightVersion && (
-            <TagDialog map={rightData.tagmap} element={rightData.tagmap.elements[editFor]} ops={ops} setOps={setOps} canEdit={editable}
+          {editFor !== null && rightMap?.elements[editFor] && rightVersion && (
+            <TagDialog map={rightMap} element={rightMap.elements[editFor]} ops={ops} setOps={setOps} canEdit={editable}
               findings={(rightVersion.summary?.findings ?? []).filter((f) => f.element === editFor)}
               onSelect={(i) => selectFrom("right")(i)} onClose={() => setEditFor(null)} />
           )}
-          {figureFor && rightData?.tagmap.elements[figureFor.i] && (
-            <FigureSplit map={rightData.tagmap} element={rightData.tagmap.elements[figureFor.i]} pdf={rightData.pdf} preselect={figureFor.keys}
-              describe={me?.can_describe && editable && rightVersion ? async (page, bbox) => {
-                const r = await post<{ alt: string }>(`/jobs/${id}/versions/${rightVersion.number}/describe`, { page, bbox, long: true });
-                return r.alt;
-              } : undefined}
+          {figureFor && rightData && rightMap?.elements[figureFor.i] && (
+            <FigureSplit map={rightMap} element={rightMap.elements[figureFor.i]} pdf={rightData.pdf} preselect={figureFor.keys}
+              describe={describeArea}
               onClose={() => setFigureFor(null)}
               onApply={(edits) => { setOps([...ops, ...edits]); setAnnounce("Figure split. Not in the file until you save."); }} />
           )}
-          {deleteFor !== null && rightData?.tagmap.elements[deleteFor] && (
-            <DeleteTag map={rightData.tagmap} element={rightData.tagmap.elements[deleteFor]} ops={ops} onCancel={() => setDeleteFor(null)}
+          {deleteFor !== null && rightMap?.elements[deleteFor] && (
+            <DeleteTag map={rightMap} element={rightMap.elements[deleteFor]} ops={ops} onCancel={() => setDeleteFor(null)}
               onDelete={(children) => {
-                const el = rightData.tagmap.elements[deleteFor];
+                const el = rightMap.elements[deleteFor];
                 setDeleteFor(null);
                 setOps(addEdit(ops, { op: "delete", element: el.i, expect_role: el.role, children }));
-                const up = draftTree(rightData.tagmap, ops).parent.get(el.i);
+                const up = draftTree(rightMap, ops).parent.get(el.i);
                 if (up !== null && up !== undefined) selectFrom("right")(up);
                 setAnnounce(`${children === "lift" ? "Tag removed" : "Tag deleted"}. Not in the file until you save.`);
               }} />
           )}
-          {headingDialog === "changes" && editable && ops.length > 0 && rightData && rightVersion && (
+          {deleteMany && rightMap && (
+            <DeleteTags map={rightMap} ids={inReadingOrder(rightMap, deleteMany).map((e) => e.i)} ops={ops}
+              onCancel={() => setDeleteMany(null)}
+              onDelete={(next, done, children) => {
+                setDeleteMany(null);
+                setAlso(ALONE);
+                setOps(next);
+                const up = draftTree(rightMap, ops).parent.get(done[0]);
+                if (up !== null && up !== undefined) selectFrom("right")(up);
+                setAnnounce(`${done.length} tags ${children === "lift" ? "removed" : "deleted"}. Not in the file until you save.`);
+              }} />
+          )}
+          {headingDialog === "changes" && editable && ops.length > 0 && rightMap && rightVersion && (
             <HeadingDialog title="Unsaved changes" className="pv-savedlg" onClose={() => setHeadingDialog(null)}>
-              <SaveChanges map={rightData.tagmap} ops={ops} setOps={setOps} version={rightVersion} baseLabel={rightVersion.label} saving={saving}
-                allowFullReview={allowFullReview} prefix="savedlg"
+              <SaveChanges map={rightMap} ops={ops} setOps={setOps} version={rightVersion} baseLabel={rightVersion.label} saving={saving}
+                allowFullReview={allowFullReview} prefix="savedlg" aiReview={withAi}
                 onSave={(n, r, into) => { setHeadingDialog(null); void save(n, r, into); }} />
             </HeadingDialog>
           )}
-          {headingDialog === "document" && rightData && (
+          {headingDialog === "document" && rightMap && (
             <HeadingDialog title="Document" className="pv-docdlg" onClose={() => setHeadingDialog(null)}>
-              <DocumentPanel map={rightData.tagmap} ops={ops} setOps={setOps} canEdit={editable}
+              <DocumentPanel map={rightMap} ops={ops} setOps={setOps} canEdit={editable}
                 onDone={() => { setHeadingDialog(null); setAnnounce("Added to the unsaved changes."); }} />
             </HeadingDialog>
           )}
@@ -980,32 +1109,32 @@ export function TagViewer() {
             <HeadingDialog title="AI review" className="pv-reviewdlg" onClose={() => setHeadingDialog(null)}>
               <h2>AI review of {rightVersion.label}</h2>
               <ReviewStatus version={rightVersion} canEdit={editable} busy={reviewBusy} allowFull={allowFullReview}
-                onReview={(full) => { setHeadingDialog(null); void review(full); }} />
+                onReview={withAi ? (full) => { setHeadingDialog(null); void review(full); } : undefined} />
             </HeadingDialog>
           )}
-          {areaOpen && area && !areaMode && rightData && editable && (
-            <AreaDialog map={rightData.tagmap} page={area.page} element={selectedEl} ops={ops} setOps={setOps} area={area} setArea={setArea}
+          {areaOpen && area && !areaMode && rightMap && editable && (
+            <AreaDialog map={rightMap} page={area.page} element={selectedEl} ops={ops} setOps={setOps} area={area} setArea={setArea}
               areaMode={areaMode} setAreaMode={(on) => { setAreaMode(on); if (on) setAreaOpen(false); }}
-              onSelect={(i) => selectFrom("right")(i)} onClose={() => { setAreaOpen(false); setArea(null); }}
+              onSelect={(i) => selectFrom("right")(i)} onClose={() => { setAreaOpen(false); setArea(null); }} describe={describeArea} suggest={suggestArea} onBoxes={setAreaBoxes}
               onFigure={(el, keys) => { setAreaOpen(false); setArea(null); setFigureFor({ i: el, keys }); }} />
           )}
-          {splitFor !== null && rightData?.tagmap.elements[splitFor] && (
-            <SplitDialog element={rightData.tagmap.elements[splitFor]} onClose={() => setSplitFor(null)}
+          {splitFor !== null && rightMap?.elements[splitFor] && (
+            <SplitDialog element={rightMap.elements[splitFor]} onClose={() => setSplitFor(null)}
               onSplit={(at, char) => {
-                const el = rightData.tagmap.elements[splitFor];
+                const el = rightMap.elements[splitFor];
                 setOps([...ops, { op: "split", element: el.i, expect_role: el.role, at, char }]);
                 setAnnounce("Split: done. Not in the file until you save.");
               }} />
           )}
-          {typesFor && rightData && (
+          {typesFor && rightMap && (
             <TypeDialog title={typesFor.length > 1 ? `${typesFor.length} tags selected` : "The selected tag"}
-              types={menuAndTypes(tagMenu(rightData.tagmap, ops, typesFor, null, editable)).types}
+              types={menuAndTypes(tagMenu(rightMap, ops, typesFor, null, editable)).types}
               onChoose={(item) => { if (item.ops) { setOps(item.ops); setAnnounce(`Changed to ${item.label}. Not in the file until you save.`); } }}
               onClose={() => setTypesFor(null)} />
           )}
         </>
       )}
-    </>
+    </MarksContext.Provider>
   );
 }
 

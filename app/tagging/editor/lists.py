@@ -60,6 +60,7 @@ def _make_list(ctx: _Ctx, e: Elem, others: list[Elem], n: int) -> str:
             raise EditError(f"Edit {n}: the tag wasn't found under its parent.")
         siblings[pos] = lst
         parent.K = Array(siblings)
+        ctx.new_tags = [lst]
         _as_item(ctx, e, n)
         e.obj.P = lst
         items = [e.obj]
@@ -147,6 +148,8 @@ def _build_list(ctx: _Ctx, e: Elem, others: list[Elem], rows: list[dict], n: int
     open_lists: list[tuple[Dictionary, list]] = []   # the list being filled at each level, and its items
     last_body: Dictionary | None = None  # the body of the item made last, where a deeper list goes
     made_tags = made_items = 0
+    # The tags it makes, in the order the tag manager shows them (refs.py): each row's tag, and a list where one opens
+    ctx.new_tags = []
     for i, (row, start) in enumerate(zip(rows, starts)):
         chunk = content[start:starts[i + 1] if i + 1 < len(rows) else len(content)]
         owner = chunk[0][0]
@@ -154,6 +157,7 @@ def _build_list(ctx: _Ctx, e: Elem, others: list[Elem], rows: list[dict], n: int
             tag = holder(row["as"], owner, parent, reuse=i == 0)
             tag.K = take(chunk, tag)
             out.append(tag)
+            ctx.new_tags.append(tag)
             open_lists, last_body = [], None
             made_tags += 1
             continue
@@ -172,8 +176,10 @@ def _build_list(ctx: _Ctx, e: Elem, others: list[Elem], rows: list[dict], n: int
             else:
                 out.append(lst)
             open_lists.append((lst, []))
+            ctx.new_tags.append(lst)
         lst, items = open_lists[-1]
         li = holder("LI", owner, lst, reuse=i == 0)
+        ctx.new_tags.append(li)
         body = ctx.pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name.LBody, P=li))
         if "/Pg" in owner.obj:
             body.Pg = owner.obj.Pg

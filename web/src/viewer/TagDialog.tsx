@@ -1,10 +1,12 @@
 import { useEffect, useRef } from "react";
 import type { Finding, TagEdit, TagElement, TagMap } from "../api";
 import { TagForm } from "./EditPanel";
+import { useMovable } from "./movable";
 
 /** The selected tag in a dialog, opened from the tag menu's "Edit tag…": what it is and says, its findings, and its
  * type, alt text, read-aloud text and language to change, as in the panel, without the panel's room. Adding a change
- * closes it; Escape or Close closes it without one. */
+ * closes it; Escape or Close closes it without one. It moves out of the way of the page: drag its title, or "Move to
+ * the side". */
 export function TagDialog({ map, element, findings, ops, setOps, canEdit, onSelect, onClose }: {
   map: TagMap; element: TagElement; findings: (Finding & { extra?: { suggested_alt?: string } })[]; ops: TagEdit[];
   setOps: (o: TagEdit[]) => void; canEdit: boolean; onSelect: (i: number) => void; onClose: () => void;
@@ -12,6 +14,7 @@ export function TagDialog({ map, element, findings, ops, setOps, canEdit, onSele
   const ref = useRef<HTMLDialogElement>(null);
   // Where the focus was before the dialog: noted once, since an effect that runs twice would find it inside
   const opener = useRef(document.activeElement as HTMLElement | null);
+  const move = useMovable(ref, "#dlg-h");
   useEffect(() => {
     const d = ref.current;
     const back = opener.current;
@@ -22,6 +25,7 @@ export function TagDialog({ map, element, findings, ops, setOps, canEdit, onSele
   }, []);
   return (
     <dialog ref={ref} className="confirm-dialog pv-tagdlg" aria-labelledby="dlg-h" onCancel={(e) => { e.preventDefault(); onClose(); }}>
+      <button type="button" className="btn secondary small dlg-move" onClick={move.next}>{move.label}</button>
       <TagForm map={map} element={element} findings={findings} ops={ops} setOps={setOps} canEdit={canEdit} prefix="dlg"
         onSelect={(i) => { onSelect(i); onClose(); }} onDone={onClose} />
       <div className="actions">

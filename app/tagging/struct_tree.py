@@ -9,8 +9,9 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, String
 
 from app.pipeline.language import passage_language
-from app.pipeline.lists import LabelKey, _core, fix_row_order, label_kind, label_order, nest
-from app.pipeline.models import DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, TextBlock, bbox_intersection
+from app.pipeline.lists import LabelKey, _core, fix_row_order, label_kind, label_order, nest, ordinal
+from app.pipeline.models import (DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, TextBlock, bbox_area,
+                                 bbox_intersection)
 from app.pipeline.structure import caption_pairs, footnote_words, row_top
 from app.tagging.content_marker import StreamMarks, apply, mcid_of
 from app.tagging.existing_tags import _is_struct_elem, _role_map, resolve_role
@@ -20,6 +21,12 @@ from app.tagging.tree import new_elem, new_mcr
 
 ObjGen = tuple[int, int]
 log = logging.getLogger(__name__)
+
+# Markup drawn over the page (a box, a highlight) without a note of its own is described by the text it marks: what
+# the subtype alone gave ("Square annotation") says nothing a listener can use
+_MARKUP = {"/Square": "Box drawn around", "/Circle": "Circled", "/Highlight": "Highlighted", "/Underline": "Underlined",
+           "/Squiggly": "Underlined with a wavy line", "/StrikeOut": "Struck out"}
+MARKED_TEXT_MAX = 300
 
 
 @dataclass
@@ -39,6 +46,7 @@ class BuildStats:
     tables_linked: int = 0  # complex tables whose cells name their headers (Headers and ID)
     footnotes: int = 0  # footnotes tagged as Note, linked from the text that points at them
     footnote_references: int = 0  # footnote marks tagged as a Reference of their own, in the text they are in
+    toc_entries: int = 0  # entries of a table of contents found by its layout, tagged TOCI (#665)
     notes_given_ids: int = 0  # Notes kept from the document that had no ID (PDF/UA requires one)
     links: int = 0
     annotations: int = 0
@@ -75,6 +83,12 @@ def _numbering(key: LabelKey) -> str:
     return "None" if key.style in ("-", "–", "*") else "Disc"
 
 
+def _goes_on(level, key: LabelKey, last: int | None) -> bool:
+    """Whether a list level's first item carries on numbering of this kind from `last` ("9." after "8.")."""
+    first = ordinal(level.items[0][0].list_label, level.key) if level.items else None
+    return level.key == key and last is not None and first == last + 1
+
+
 def _list_numbering(label: str | None) -> str:
     """ListNumbering from a list's first label alone (a kept list's, in the PDF/UA-2 step), by the same rule."""
     return _numbering(label_kind(label)[0])
@@ -93,6 +107,15 @@ class StructTreeBuilder:
         # The last list built: its kind of label and its last label, for the next one's first label to be read in
         # (a list split in two by a figure: "(v)" after "(iv)" is roman, "(c)" after "(b)" a letter, #619)
         self._last_list: tuple[LabelKey, str] | None = None
+        # The last top-level list built, its kind of label and its last number: a list that ends a page and goes on at
+        # the top of the next ("8." then "9.") is one list
+        self._tail_list: tuple[pikepdf.Object, LabelKey, int | None] | None = None
+        # The last table of contents built, with its open levels (each entry's left edge, the TOC its entries go in):
+        # contents that go on over the next page are one TOC (#665)
+        self._tail_toc: tuple[pikepdf.Object, list[tuple[float, pikepdf.Object]]] | None = None
+        # Figures placed inside a list item, by the item's block id: a figure between two items of one list ("6. The
+        # graph below ..." then the graph, then "7.") is part of the item before it, and the list goes on
+        self._in_item: dict[str, list[pikepdf.Object]] = defaultdict(list)
         self.refs: dict[str, list[Ref]] = defaultdict(list)
         self.key_elems: dict[str, pikepdf.Object] = {}  # leaf key -> element (for annotation placement)
         self.key_page: dict[str, int] = {}
@@ -372,20 +395,145 @@ class StructTreeBuilder:
             before = {self._last_list[0]: self._last_list[1]} if self._last_list else None
             levels = nest(items, lambda b: b.list_label, lambda b: b.bbox[0], lambda b: b.font_size, before)
             label_order(levels, lambda b: b.list_label)
-            for level in levels:
-                lst = self._list(level, doc, page.number)
-                if lst is not None:
+            for n, level in enumerate(levels):
+                # The page's first element, going on from the list that ended the page before
+                tail = self._tail_list
+                kids = doc.get("/K")
+                last = kids[len(kids) - 1] if isinstance(kids, Array) and len(kids) else None
+                join = (tail[0] if n == 0 and not out and tail is not None and last is not None
+                        and last.objgen == tail[0].objgen and _goes_on(level, tail[1], tail[2]) else None)
+                lst = self._list(level, doc, page.number, into=join)
+                if lst is not None and join is None:
                     out.append(lst)
             run.clear()
+
+        toc_run: list[TextBlock] = []  # consecutive contents entries, built into a TOC when the run ends
+
+        def flush_toc() -> None:
+            if not toc_run:
+                return
+            kids = doc.get("/K")
+            last = kids[len(kids) - 1] if isinstance(kids, Array) and len(kids) else None
+            tail = self._tail_toc
+            joined = not out and tail is not None and last is not None and last.objgen == tail[0].objgen
+            if joined:
+                root, levels = tail[0], list(tail[1])
+            else:
+                root = self._elem("TOC", doc, page.number)
+                levels = [(toc_run[0].bbox[0], root)]
+            for b in toc_run:
+                x = b.bbox[0]
+                while len(levels) > 1 and x < levels[-1][0] - 4:
+                    levels.pop()
+                toc = levels[-1][1]
+                if x > levels[-1][0] + 4 and len(toc.K):
+                    # Further in than the entry above: a nested contents inside that entry (placed once it has one)
+                    above = toc.K[len(toc.K) - 1]
+                    toc = self._elem("TOC", above, page.number)
+                    levels.append((x, toc))
+                item = self._elem("TOCI", toc, page.number)
+                body = self._text_elem(b, "P", item, page.number)
+                if body is None:
+                    continue  # (an entry with no content of its own: no empty TOCI)
+                item.K.append(body)
+                if not len(toc.K) and toc is not root:
+                    toc.P.K.append(toc)
+                toc.K.append(item)
+                self.stats.toc_entries += 1
+            if len(root.K):
+                if not joined:
+                    out.append(root)
+                self._tail_toc = (root, levels)
+            toc_run.clear()
+
+        def holder(i: int) -> TextBlock | None:
+            """The item the element at reading_order[i] belongs in, when the list goes on after it (goes_on_after):
+            the run's last item; or, for one drawn beside that item rather than under it (a question's picture to the
+            right of its choices), the item whose numbering the next one carries on."""
+            if not goes_on_after(i, starts=True):
+                return None
+            el, last = page.element(page.reading_order[i]), run[-1]
+            beside = el.bbox[0] >= last.bbox[2] or el.bbox[2] <= last.bbox[0]
+            return continued if continued is not None and continued is not last and beside else last
+
+        continued: TextBlock | None = None  # set by goes_on_after: the item the next one carries on from
+
+        def beside(el) -> TextBlock | None:
+            """For a picture drawn beside the list's last item, level with it (a question's diagram to the right of
+            its choices) when no item comes after it: the last item of the list's outer level."""
+            last = run[-1]
+            if el.bbox[1] >= last.bbox[3] or el.bbox[3] <= last.bbox[1] or (
+                    el.bbox[0] < last.bbox[2] and el.bbox[2] > last.bbox[0]):
+                return None
+            outer = label_kind(run[0].list_label)[0]
+            return next((b for b in reversed(run) if label_kind(b.list_label)[0] == outer), last)
+
+        def goes_on_after(i: int, starts: bool = False) -> bool:
+            """Whether the list item after the element at reading_order[i] carries on the run's numbering, with only
+            figures, their captions, artifacts and other in-item text between. starts: or begins a list nested in the
+            run's last item ("a." after "6.", an equation between the question and its choices)."""
+            nonlocal continued
+            continued = None
+            # Text set in between is close: each piece within a few lines of what's above it, and so is the next item
+            size = max(run[-1].font_size, 1.0)
+            bottom, crossed = run[-1].bbox[3], False
+            for k, eid in enumerate(page.reading_order[order[run[-1].id] + 1:], order[run[-1].id] + 1):
+                nxt = page.element(eid)
+                if k <= i and not (starts and in_item(nxt)):
+                    continue  # (between the item and here: figures and what was already placed in the item)
+                if isinstance(nxt, ImageRegion) or (isinstance(nxt, TextBlock) and (nxt.role == "Artifact"
+                                                                                  or nxt.id in pairs)):
+                    continue
+                if starts and in_item(nxt):
+                    if not run[-1].bbox[1] <= nxt.bbox[1] <= bottom + 4 * size:
+                        return False
+                    bottom, crossed = max(bottom, nxt.bbox[3]), True
+                    continue
+                if not (isinstance(nxt, TextBlock) and nxt.role == "LI"):
+                    return False
+                if crossed and nxt.bbox[1] > bottom + 4 * size:
+                    return False
+                key, _ = label_kind(nxt.list_label)
+                prev = next((b for b in reversed(run) if label_kind(b.list_label)[0] == key), None)
+                n, m = ordinal(nxt.list_label, key), ordinal(prev.list_label, key) if prev else None
+                if n is not None and m is not None and n == m + 1:
+                    continued = prev
+                    return True
+                return starts and n == 1 and key.kind != "bullet" and label_kind(run[-1].list_label)[0] != key
+            return False
+
+        def in_item(el) -> bool:
+            """A paragraph or formula that may sit inside the list item above it: not a heading or a note, and set in
+            from the list's labels (a paragraph flush with them stands between two parts of the list)."""
+            if not isinstance(el, TextBlock) or el.role not in ("P", "Formula") or el.continues:
+                return False
+            return el.bbox[0] >= min(b.bbox[0] for b in run) + 0.8 * max(run[-1].font_size, 1.0)
 
         pairs = caption_pairs(page)  # caption id -> figure or table id; each caption is placed with its partner
         caption_of = {partner: cap for cap, partner in pairs.items()}
         order = {eid: n for n, eid in enumerate(page.reading_order)}
 
-        for eid in page.reading_order:
+        for i, eid in enumerate(page.reading_order):
             el = page.element(eid)
+            if isinstance(el, TextBlock) and el.role == "TOCI":
+                flush_run()
+                toc_run.append(el)
+                continue
+            if toc_run and not (isinstance(el, TextBlock) and el.role == "Artifact"):
+                flush_toc()
             if isinstance(el, TextBlock) and el.role == "LI":
                 run.append(el)
+                continue
+            if (isinstance(el, ImageRegion) and run and not el.decorative
+                    and (home := holder(i) or beside(el)) is not None):
+                self._in_item[home.id] += self._captioned(self._figure(el, doc), el, page, caption_of, order, doc)
+                continue
+            if isinstance(el, TextBlock) and run and (el.role == "Artifact" or el.id in pairs):
+                continue  # (a caption placed with its figure, page furniture: the list goes on)
+            if run and in_item(el) and (home := holder(i)) is not None:
+                # Part of the item above: the list goes on after it
+                if (e := self._block_elem(el, doc, page.number)) is not None:
+                    self._in_item[home.id].append(e)
                 continue
             flush_run()
 
@@ -394,21 +542,9 @@ class StructTreeBuilder:
                     continue
                 if el.continues and self._continue_note(el, page.number):
                     continue
-                role = "P" if el.role == "Caption" else el.role
-                e = self._elem(role, doc, page.number)
-                if role == "Formula":
-                    # Math written as text: the spoken form ("10 to the power of 4 = 10 000") is its alt text
-                    e.Alt = String(el.actual_text or el.text)
-                    self.boxes[e.objgen] = (page.number, el.bbox)
-                elif el.actual_text:
-                    e.ActualText = String(el.actual_text)
-                if role != "Formula":
-                    self._own_language(e, el.text)
-                if self._attach_text(e, el, page.number):
+                e = self._block_elem(el, doc, page.number)
+                if e is not None:
                     out.append(e)
-                    if role == "Note":  # PDF/UA: a note has an ID, for what points at it
-                        e.ID = self._new_id(f"note-{el.id}")
-                        self.stats.footnotes += 1
             elif isinstance(el, ImageRegion):
                 if el.decorative:
                     continue
@@ -416,6 +552,7 @@ class StructTreeBuilder:
             elif isinstance(el, TableRegion):
                 out.extend(self._captioned(self._table(el, doc), el, page, caption_of, order, doc))
         flush_run()
+        flush_toc()
 
         unmatched = f"p{page.number}:unmatched"
         if unmatched in self.refs:
@@ -424,6 +561,25 @@ class StructTreeBuilder:
                 out.append(e)
                 self.stats.unmatched_paragraphs += 1
         return out
+
+    def _block_elem(self, el: TextBlock, doc, page_no: int) -> pikepdf.Object | None:
+        """A text block's own element (P, H1, Formula, Note ...), or None when it marks nothing."""
+        role = "P" if el.role == "Caption" else el.role
+        e = self._elem(role, doc, page_no)
+        if role == "Formula":
+            # Math written as text: the spoken form ("10 to the power of 4 = 10 000") is its alt text
+            e.Alt = String(el.actual_text or el.text)
+            self.boxes[e.objgen] = (page_no, el.bbox)
+        elif el.actual_text:
+            e.ActualText = String(el.actual_text)
+        if role != "Formula":
+            self._own_language(e, el.text)
+        if not self._attach_text(e, el, page_no):
+            return None
+        if role == "Note":  # PDF/UA: a note has an ID, for what points at it
+            e.ID = self._new_id(f"note-{el.id}")
+            self.stats.footnotes += 1
+        return e
 
     def _text_elem(self, block: TextBlock, role: str, parent, page_no: int) -> pikepdf.Object | None:
         e = self._elem(role, parent, page_no)
@@ -469,13 +625,15 @@ class StructTreeBuilder:
         group.K = Array([cap, main] if first else [main, cap])
         return [group]
 
-    def _list(self, level, parent, page_no: int, top: bool = True) -> pikepdf.Object | None:
-        """One list level: L > LI > LBody, with each item's nested lists inside its LBody after its text. top: a list
-        of its own, not one nested in an item (whose labels were read with its parent's when nesting)."""
+    def _list(self, level, parent, page_no: int, top: bool = True, into=None) -> pikepdf.Object | None:
+        """One list level: L > LI > LBody, each item's LBody holding its text, then the figures, formulas and paragraphs
+        that belong to it, then its nested lists. top: a list of its own, not one nested in an item (whose
+        labels were read with its parent's when nesting). into: the list this one goes on from, its items added to it
+        (and None returned: it is placed already)."""
         if top and level.items:
             self._last_list = (level.key, _core(level.items[-1][0].list_label or ""))
-        lst = self._elem("L", parent, page_no,
-                         A=Dictionary(O=Name.List, ListNumbering=Name("/" + _numbering(level.key))))
+        lst = into if into is not None else self._elem(
+            "L", parent, page_no, A=Dictionary(O=Name.List, ListNumbering=Name("/" + _numbering(level.key))))
         for el, children in level.items:
             li = self._elem("LI", lst, page_no)
             body = self._elem("LBody", li, page_no)
@@ -490,6 +648,9 @@ class StructTreeBuilder:
                 if el.actual_text:
                     body.ActualText = String(el.actual_text)
                 has_text = self._attach_text(body, el, page_no)  # its footnote marks become References
+            for fig in self._in_item.pop(el.id, []):  # (read before any nested list: placed while it was the last item)
+                fig.P = body
+                body.K.append(fig)
             for child in children:
                 sub = self._list(child, body, page_no, top=False)
                 if sub is not None:
@@ -497,6 +658,10 @@ class StructTreeBuilder:
             if has_text or len(body.K):
                 li.K.append(body)
                 lst.K.append(li)
+        if top and len(lst.K):
+            self._tail_list = (lst, level.key, ordinal(level.items[-1][0].list_label, level.key))
+        if into is not None:
+            return None
         return lst if len(lst.K) else None
 
     def _figure(self, img: ImageRegion, doc) -> list[pikepdf.Object]:
@@ -645,12 +810,17 @@ class StructTreeBuilder:
                     stack.append(it.K)
         return found
 
-    def _annot_parent(self, pa: PageAnalysis, annot, doc):
+    @staticmethod
+    def _annot_box(pa: PageAnalysis, annot) -> tuple:
+        """Where an annotation sits, in the page's visual space (as the analysis's blocks)."""
         rect = [float(v) for v in annot.get("/Rect", [0, 0, 0, 0])]
         m = pa.pdf_to_page
         x0, y0 = apply(m, rect[0], rect[1])
         x1, y1 = apply(m, rect[2], rect[3])
-        bbox = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+    def _annot_parent(self, pa: PageAnalysis, annot, doc):
+        bbox = self._annot_box(pa, annot)
         if str(annot.get("/Subtype")) != "/Link":
             return doc, None
         best, best_ov = None, 0.0
@@ -670,17 +840,31 @@ class StructTreeBuilder:
                 target.TU = String(name)
                 self.stats.contents_added += 1
             return
-        if "/Contents" in annot and str(annot.Contents).strip():
+        subtype = str(annot.get("/Subtype", "/Annotation"))
+        given = str(annot.get("/Contents", "")).strip()
+        # A file this engine tagged before carries its stand-in ("Square annotation"): described again from its text
+        if given and not (subtype in _MARKUP and given == f"{subtype[1:]} annotation"):
             return
-        text = None
         if role == "Link":
             action = annot.get("/A")
             uri = action.get("/URI") if isinstance(action, Dictionary) else None
             text = f"Link to {uri}" if uri is not None else "Link to another location in this document"
         else:
-            text = f"{str(annot.get('/Subtype', '/Annotation'))[1:]} annotation"
+            marked = self._marked_text(pa, annot) if subtype in _MARKUP else ""
+            text = f"{_MARKUP[subtype]}: {marked}" if marked else f"{subtype[1:]} annotation"
+        if text == given:
+            return
         annot.Contents = String(text)
         self.stats.contents_added += 1
+
+    def _marked_text(self, pa: PageAnalysis, annot) -> str:
+        """The text inside a markup annotation's box: the blocks mostly within it, top to bottom."""
+        x0, y0, x1, y1 = self._annot_box(pa, annot)
+        box = (x0 - 2, y0 - 2, x1 + 2, y1 + 2)
+        inside = [b for b in pa.blocks if b.role != "Artifact" and b.text.strip()
+                  and bbox_intersection(box, b.bbox) >= 0.5 * max(1e-6, bbox_area(b.bbox))]
+        text = " ".join(" ".join(b.text.split()) for b in sorted(inside, key=lambda b: (b.bbox[1], b.bbox[0])))
+        return text if len(text) <= MARKED_TEXT_MAX else text[:MARKED_TEXT_MAX - 1].rstrip() + "…"
 
     # ------------------------------------------------------------------ parent tree
     def _parent_tree(self, root) -> None:

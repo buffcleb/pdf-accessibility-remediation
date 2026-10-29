@@ -116,7 +116,13 @@ def test_edit_requests_are_checked(setup):
     assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": no_tag}).status_code == 422
     doc = [{"op": "set_doc_title", "title": "Annual report"}, {"op": "set_doc_lang", "lang": "fr-CA"}]
     assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": doc}).status_code == 201
-    for _ in range(2):
+    # A tag an earlier edit makes is named by that edit's id (#692); the engine checks the name
+    made = [{"op": "split", "id": "s1", "element": 1, "at": 1},
+            {"op": "set_role", "element": {"made": "s1", "group": 0}, "role": "H2"}]
+    assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": made}).status_code == 201
+    odd = [{"op": "set_role", "element": {"made": "s1"}, "role": "H2"}]
+    assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": odd}).status_code == 422
+    for _ in range(1):
         assert u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS}).status_code == 201
     r = u.post(f"{API}/jobs/{job_id}/versions", json={"based_on": 1, "edits": EDITS})
     assert r.status_code == 429
@@ -139,6 +145,7 @@ def _save(s, job_id, **extra):
 def test_save_with_ai_review_runs_it_with_the_edits(setup):
     s = setup
     job_id = _completed_job(s)
+    _with_ai_level(s, job_id)  # an AI review needs the document's AI level (#659)
     v = _save(s, job_id, review="sampled")
     assert v["review"] == "sampled" and v["review_status"] == "queued"
     db = s["db"]
@@ -161,6 +168,7 @@ def test_save_with_ai_review_runs_it_with_the_edits(setup):
 def test_review_a_saved_version_later_replaces_its_findings_only(setup):
     s = setup
     job_id = _completed_job(s)
+    _with_ai_level(s, job_id)  # an AI review needs the document's AI level (#659)
     v = _save(s, job_id)
     db = s["db"]
     worker.submit_versions(db)
@@ -193,6 +201,7 @@ def test_review_a_saved_version_later_replaces_its_findings_only(setup):
 def test_failed_review_keeps_earlier_findings(setup):
     s = setup
     job_id = _completed_job(s)
+    _with_ai_level(s, job_id)  # an AI review needs the document's AI level (#659)
     v = _save(s, job_id)
     db = s["db"]
     worker.submit_versions(db)
@@ -212,6 +221,7 @@ def test_failed_review_keeps_earlier_findings(setup):
 def test_only_editors_can_request_a_review(setup):
     s = setup
     job_id = _completed_job(s)
+    _with_ai_level(s, job_id)  # an AI review needs the document's AI level (#659)
     v = _save(s, job_id)
     db = s["db"]
     worker.submit_versions(db)
@@ -406,6 +416,46 @@ def test_a_failed_save_into_leaves_the_version_as_it_was(setup):
     assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{first['number']}/pdf").status_code == 200
 
 
+
+def test_a_failed_saves_changes_can_be_put_back_to_try_again(setup):
+    """A save the engine refused keeps its changes: whoever can edit the document gets them back, with the version
+    they were made on, to save again once what refused them is fixed."""
+    s = setup
+    job_id = _completed_job(s)
+    first = _save(s, job_id)
+    _finish(s, first["number"])
+    new = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                              json={"based_on": first["number"], "edits": EDITS, "replace": True}).json()
+    url = f"{API}/jobs/{job_id}/versions/{new['number']}/edits"
+    assert s["c"]["user"].get(url).status_code == 409  # still being saved: nothing to try again
+    _finish(s, new["number"], ok=False)
+    r = s["c"]["user"].get(url)
+    assert r.status_code == 200 and r.json() == {"based_on": first["number"], "edits": EDITS}
+    assert s["c"]["admin_a"].get(url).status_code == 200                       # the group admin can edit it too
+    assert s["c"]["user2"].get(url).status_code in (403, 404)                  # someone else in the group can't
+    assert s["c"]["user"].get(f"{API}/jobs/{job_id}/versions/{first['number']}/edits").status_code == 409
+
+
+def test_a_failed_save_can_be_removed_from_the_list(setup):
+    """A save that wasn't made can be removed, by whoever can edit the document; a saved version can't be."""
+    s = setup
+    job_id = _completed_job(s)
+    first = _save(s, job_id)
+    _finish(s, first["number"])
+    new = s["c"]["user"].post(f"{API}/jobs/{job_id}/versions",
+                              json={"based_on": first["number"], "edits": EDITS, "replace": True}).json()
+    url = f"{API}/jobs/{job_id}/versions/{new['number']}"
+    assert s["c"]["user"].delete(url).status_code == 409                       # still being saved
+    _finish(s, new["number"], ok=False)
+    assert s["c"]["user2"].delete(url).status_code in (403, 404)               # someone else in the group can't
+    assert s["c"]["user"].delete(f"{API}/jobs/{job_id}/versions/{first['number']}").status_code == 409
+    assert s["c"]["user"].delete(url).status_code == 204
+    vs = {v["number"]: v for v in _listed(s, job_id)}
+    assert new["number"] not in vs and vs[first["number"]]["status"] == "ready"
+    assert s["c"]["user"].delete(url).status_code == 404
+    from portal.models import AuditEvent
+    assert s["db"].scalar(select(AuditEvent).where(AuditEvent.action == "version.discarded")) is not None
+
 # --- "Describe with AI": alt text for an area, allowed by service default, group and person ---------------------
 
 def _me(client):
@@ -417,7 +467,7 @@ def _with_ai_level(s, job_id):
     from tests.portal.test_ai_tiers import _tier
     key = _tier(s, "Vision AI", "local-vision")
     job = s["db"].get(Job, uuid.UUID(job_id))
-    job.ai_tier = key
+    job.ai_tier, job.no_ai = key, False  # uploaded with no level, so made without AI (#659) until now
     s["db"].commit()
 
 
@@ -483,6 +533,32 @@ def test_describe_an_area_writes_alt_text_and_records_its_cost(setup):
     assert s["c"]["user"].post(url, json={"page": 1, "bbox": [10, 10, 10, 50]}).status_code == 422
 
 
+
+def test_the_ai_suggests_tags_for_an_area_as_describe_with_ai_is_allowed_and_costed(setup):
+    s = setup
+    job_id = _completed_job(s)
+    _with_ai_level(s, job_id)
+    body = {"page": 1, "bbox": [100, 100, 300, 260], "items": [
+        {"kind": "image", "text": "", "bbox": [110, 110, 290, 230]}, {"kind": "text", "text": "Sales", "bbox": [110, 235, 150, 245]}]}
+    url = f"{API}/jobs/{job_id}/versions/1/area-tags"
+    r = s["c"]["user"].post(url, json=body)
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "ai_describe_off"
+    uid = _me(s["c"]["user"])["id"]
+    s["c"]["admin_a"].patch(f"{API}/groups/{s['a'].id}/users/{uid}", json={"ai_describe": True})
+    r = s["c"]["user"].post(url, json=body)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"tags": [{"role": "Figure", "items": [0, 1], "alt": "A chart"}], "decorative": []}
+    page, bbox, items, model, size = s["engine"].area_asked[-1]
+    assert (page, bbox, model) == (1, [100, 100, 300, 260], "local-vision") and size > 0
+    assert items[1] == {"kind": "text", "text": "Sales", "bbox": [110, 235, 150, 245]}
+    s["db"].expire_all()
+    cost = s["db"].get(Job, uuid.UUID(job_id)).cost
+    assert cost["describe_calls"] == 1 and cost["describe_log"][-1]["for"] == "tags"
+    from portal.models import AuditEvent
+    assert any(e.action == "version.ai_area_tags" for e in s["db"].scalars(select(AuditEvent)))
+    assert s["c"]["user"].post(url, json={**body, "items": []}).status_code == 200  # an area that is only a picture
+    assert s["c"]["user"].post(url, json={**body, "items": body["items"] * 151}).status_code == 422
+
 def test_describe_needs_an_ai_level_and_says_when_the_ai_is_down(setup):
     from portal.engine import EngineUnavailable
     s = setup
@@ -493,7 +569,7 @@ def test_describe_needs_an_ai_level_and_says_when_the_ai_is_down(setup):
     s["db"].get(Job, uuid.UUID(job_id)).ai_tier = None
     s["db"].commit()
     r = s["c"]["user"].post(url, json=body)
-    assert r.status_code == 409 and r.json()["detail"]["error"] == "no_ai_level"
+    assert r.status_code == 409 and r.json()["detail"]["error"] == "no_ai_document"  # made without AI (#659)
     _with_ai_level(s, job_id)
     s["engine"].describe_answer = EngineUnavailable("gateway down")
     r = s["c"]["user"].post(url, json=body)

@@ -17,6 +17,7 @@ a second script fetch them.
   - **Name:** what it's for, such as "lab scanner".
   - **Processing**, **AI level** and **Kind of document:** every document the token sends uses these, whatever the
     script asks for.
+    **New 29 October 2026:** the AI level can be **No AI**, where your group offers it.
   - **It may:** every token can submit. Tick **Check their status** if the script needs to know when documents are
     done.
   - **Download results:** **No** (the default; download them in the web app), **Everything** (each document's zip)

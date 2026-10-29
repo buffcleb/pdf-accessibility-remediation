@@ -174,3 +174,16 @@ def test_marks_explained_by_a_legend_get_its_label_and_sit_before_their_item(tmp
     els = [e for e in build_tagmap(out)["elements"] if e.get("own")]
     seq = [e.get("alt") if e["role"] == "Figure" else (e.get("text") or "")[:5] for e in els]
     assert seq == ["Quart", "Beta", "First", "Select", "Secon", "Third"], seq
+
+
+def test_an_untagged_blank_line_is_an_artifact_not_an_empty_paragraph(tmp_path):
+    """Word marks its blank lines as paragraphs too; where no tag points at them they were each given an empty P,
+    at the end of every page (#665)."""
+    pieces = _slide_pieces(792) + [(_text(60, 400, " "), None), (_text(60, 380, "A sentence left untagged."), None)]
+    src = _tagged(tmp_path, "blank", (612, 792), pieces, order=[0, 1, 2, 3])
+    out = tmp_path / "o.pdf"
+    res = tag_document(src, out, prepare_analysis(src), title="T", language="en-US")
+    assert res.orphans_artifacted == 1
+    elements = build_tagmap(out)["elements"]
+    assert not [e for e in elements if e["role"] == "P" and not (e.get("text") or "").strip()]
+    assert any((e.get("text") or "").startswith("A sentence left") for e in elements)

@@ -16,9 +16,9 @@ from sqlalchemy.orm import Session
 from portal.errors import ApiError
 from portal.models import Group
 
-# A setting, and the group columns it covers (the AI one is three, set together)
+# A setting, and the group columns it covers (the AI one is four, set together: No AI with the levels, #659)
 SETTINGS: dict[str, tuple[str, ...]] = {
-    "ai": ("ai_mode", "ai_level", "ai_kind"),
+    "ai": ("ai_mode", "ai_level", "ai_kind", "no_ai"),
     "local_only": ("local_only",),
     "require_approval": ("require_approval",),
     "ai_describe": ("ai_describe",),

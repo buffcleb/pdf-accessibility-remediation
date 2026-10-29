@@ -138,7 +138,9 @@ jobs:
           fi
           /opt/verapdf/verapdf --version | grep -F "$version"
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q tests/engine
+      # One worker per CPU (pytest-xdist): about four times as quick. The portal suite stays in one process, as
+      # its tests share one database
+      - run: python -m pytest -q -n auto tests/engine
 
   portal:
     name: Portal tests

@@ -35,7 +35,7 @@ def test_a_group_sets_one_ai_level_for_everything(setup):
     _kind(s, premium, "Math and science", "local-vision")
     assert s["c"]["user"].get(f"{API}/upload-options").json() == {
         "ai_mode": "choose", "ai_level": None, "ai_kind": None, "show_external": False, "malware_scan": False,
-        "pdfua_choices": ["1"], "pdfua_default": "1"}
+        "pdfua_choices": ["1"], "pdfua_default": "1", "no_ai": "off"}
     # The level has to be one the group uses, and the kind one the level offers
     assert _group(s, ai_mode="fixed").json()["detail"]["error"] == "level_required"
     assert _group(s, ai_mode="fixed", ai_level=premium, ai_kind="forms").json()["detail"]["error"] == "unknown_kind"
@@ -44,7 +44,7 @@ def test_a_group_sets_one_ai_level_for_everything(setup):
     assert r.json()["ai_mode"] == "fixed" and r.json()["show_external"] is True
     assert s["c"]["user"].get(f"{API}/upload-options").json() == {
         "ai_mode": "fixed", "ai_level": premium, "ai_kind": "math-and-science", "show_external": True,
-        "malware_scan": False, "pdfua_choices": ["1"], "pdfua_default": "1"}
+        "malware_scan": False, "pdfua_choices": ["1"], "pdfua_default": "1", "no_ai": "off"}
     # What people ask for is set aside
     job = _jobs(s, ai_tier=basic, ai_kind="general")[0]
     assert job["ai_tier"] == premium and job["ai_kind"] == "math-and-science"

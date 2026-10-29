@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import false, func, or_, select
 from sqlalchemy.orm import Session, aliased
 
-from portal import approval, audit, inherit, paging, quota, services
+from portal import approval, audit, inherit, no_ai, paging, quota, services
 from portal.db import get_db
 from portal.deps import Principal, current_principal, group_for_admin
 from portal.errors import ApiError, not_found
@@ -203,6 +203,9 @@ class GroupSettings(BaseModel):
     ai_mode: str | None = Field(None, pattern="^(choose|fixed)$")  # how documents get their AI
     ai_level: str | None = Field(None, max_length=64)  # fixed: the level ("" clears)
     ai_kind: str | None = Field(None, max_length=40)  # fixed: the kind ("" or "general": General)
+    # No AI (#659), once super admins offer it: "off", "on" (offered beside the levels) or "default" (preselected).
+    # ai_level "none" with ai_mode "fixed" makes it the only choice
+    no_ai: str | None = Field(None, pattern="^(off|on|default)$")
     show_external: bool | None = None  # show people which options send documents to an external provider
     ai_describe: bool | None = None  # "Describe with AI" for its people; null follows the service default
     # Its people may make API tokens for scripts (#518), when super admins allow them; off stops existing tokens
@@ -213,6 +216,14 @@ class GroupSettings(BaseModel):
     # A subgroup's settings to take from its parent again (#431: ai, local_only, require_approval, ai_describe,
     # show_external, over_quota_message); one it sets above it overrides from then on
     inherit: list[str] | None = Field(None, max_length=10)
+
+
+def _fix_no_ai(db: Session, group: Group, sent: dict) -> None:
+    """No AI as the group's only choice (#659): offered by super admins, with no kind, and turned on with it."""
+    no_ai.require_service(db)
+    sent["ai_level"], sent["ai_kind"] = no_ai.NO_AI, None
+    if "no_ai" not in sent and group.no_ai == "off":
+        sent["no_ai"] = "on"
 
 
 @router.patch("/{group_id}", response_model=GroupOut)
@@ -233,7 +244,14 @@ def update_group_settings(group_id: uuid.UUID, body: GroupSettings, request: Req
     mode = sent.get("ai_mode", group.ai_mode)
     level = sent.get("ai_level", group.ai_level)
     kind = sent.get("ai_kind", group.ai_kind if "ai_level" not in sent else None)
-    if mode == "fixed":
+    if mode == "fixed" and level == no_ai.NO_AI:
+        if sent.get("no_ai") == "off":
+            raise ApiError(422, "no_ai_fixed", "Everyone's documents are made with No AI. Choose an AI level for "
+                                               "everything, or let people choose, first.")
+        if {"ai_mode", "ai_level", "ai_kind", "no_ai"} & set(sent):  # not when another setting changes
+            _fix_no_ai(db, group, sent)
+    elif mode == "fixed":
+
         gs = group.service(level) if level else None
         if gs is None or not gs.enabled or gs.service.kind != "ai_tier":
             raise ApiError(422, "level_required", "Choose an AI level the group has, for everyone's documents.")
@@ -246,7 +264,7 @@ def update_group_settings(group_id: uuid.UUID, body: GroupSettings, request: Req
     changed = set()
     for field, value in list(sent.items()):
         if value is None and field in ("local_only", "require_approval", "ai_mode", "show_external", "api_tokens_enabled",
-                                       "pdfua_choice", "pdfua_default"):
+                                       "pdfua_choice", "pdfua_default", "no_ai"):
             del sent[field]
             continue
         if field == "local_only":  # a subgroup can't loosen its parent's (#431)

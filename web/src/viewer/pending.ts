@@ -1,19 +1,22 @@
-// A tag pending edits make, chosen before it's saved (#427): its type and alt text changed, or the edit taken back.
-// It has no number until the engine saves it, so the edit that makes it stands for it: changing it changes that edit.
+// A tag pending edits make, chosen before it's saved (#427): its type and alt text changed in the edit that makes it.
+// Taking it back, and everything else done to it, is in made.ts (#692).
 import type { TagEdit } from "../api";
 import { NEW_AREA_ROLES } from "./roles";
 
 /** Types the new part of a split text tag can have (the engine's SPLIT_ROLES). */
 export const SPLIT_ROLES = NEW_AREA_ROLES.filter((r) => r !== "Figure" && r !== "Formula");
 
-/** Whether the edit at this place makes a tag that can be chosen before saving. */
-export function makesTag(op: TagEdit | undefined): op is Extract<TagEdit, { op: "tag_artifacts" | "split" }> {
-  return op?.op === "tag_artifacts" || op?.op === "split";
+/** Whether the edit at this place makes a tag the New tag bar changes: its type and alt text are the edit's own (a
+ * tag from an area, the new part of a split, a figure's part). A built list's or table's are changed as tags. */
+export function makesTag(op: TagEdit | undefined): op is Extract<TagEdit, { op: "tag_artifacts" | "split" | "regroup" | "take_pieces" | "cut_area" }> {
+  return op?.op === "tag_artifacts" || op?.op === "split" || op?.op === "regroup" || op?.op === "take_pieces" || op?.op === "cut_area";
 }
 
-/** The types the tag an edit makes can be given. */
-export function pendingRoles(op: TagEdit): string[] {
-  return op.op === "tag_artifacts" ? NEW_AREA_ROLES : op.op === "split" ? SPLIT_ROLES : [];
+/** The types the tag an edit makes can be given (a part of a picture is a figure or formula). */
+export function pendingRoles(op: TagEdit, group = 0): string[] {
+  if (op.op === "regroup") return op.groups[group]?.box ? ["Figure", "Formula"] : NEW_AREA_ROLES;
+  return op.op === "tag_artifacts" || op.op === "take_pieces" || op.op === "cut_area" ? NEW_AREA_ROLES
+    : op.op === "split" ? SPLIT_ROLES : [];
 }
 
 export const needsAlt = (role: string) => role === "Figure" || role === "Formula";
@@ -22,11 +25,18 @@ export const needsAlt = (role: string) => role === "Figure" || role === "Formula
  * Null when that can't be: the edit makes no tag, the type isn't one it can have, or a figure has no alt text. A split
  * part given its tag's own type drops the role, as the engine would then do nothing with it. */
 export function changePending(ops: TagEdit[], at: number, role: string, alt: string,
-  ownRole?: string): TagEdit[] | null {
+  ownRole?: string, group = 0): TagEdit[] | null {
   const op = ops[at];
-  if (!makesTag(op) || !pendingRoles(op).includes(role)) return null;
+  if (!makesTag(op) || !pendingRoles(op, group).includes(role)) return null;
   let next: TagEdit;
-  if (op.op === "tag_artifacts") {
+  if (op.op === "regroup") {
+    if (needsAlt(role) && !alt.trim()) return null;
+    next = { ...op, groups: op.groups.map((g, n) => {
+      if (n !== group) return g;
+      const { alt: _old, ...rest } = g;
+      return { ...rest, role, ...(needsAlt(role) ? { alt: alt.trim() } : {}) };
+    }) };
+  } else if (op.op === "tag_artifacts" || op.op === "take_pieces" || op.op === "cut_area") {
     if (needsAlt(role) && !alt.trim()) return null;
     const { alt: _old, ...rest } = op;
     next = { ...rest, role, ...(needsAlt(role) ? { alt: alt.trim() } : {}) };
@@ -35,11 +45,6 @@ export function changePending(ops: TagEdit[], at: number, role: string, alt: str
     next = role === (ownRole ?? op.expect_role) ? rest : { ...rest, role };
   }
   return ops.map((o, n) => (n === at ? next : o));
-}
-
-/** The edits without the one at `at` (the tag it would make isn't made). */
-export function dropPending(ops: TagEdit[], at: number): TagEdit[] {
-  return ops.filter((_, n) => n !== at);
 }
 
 /** The place of the edit that makes a tag, when `next` is `prev` with one such edit added at its end. */

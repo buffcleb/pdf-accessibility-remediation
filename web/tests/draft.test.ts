@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TagEdit, TagElement, TagMap } from "../src/api";
-import { addEdit, describe, documentDraft, draftTree, editMarks, jumpQuestion, overrides, pageOrder, tagPages, tagsOnPage, undoMoves, withoutEdits } from "../src/viewer/draft";
+import { addEdit, describe, documentDraft, draftTree, editMarks, jumpQuestion, overrides, pageOrder, pendingArea, tagPages, tagsOnPage, undoMoves, withoutEdits } from "../src/viewer/draft";
 
 type Spec = Partial<TagElement> & { i: number; role: string; parent: number | null };
 
@@ -33,13 +33,27 @@ const sample = () => doc([
   { i: 8, role: "TD", parent: 7, own: true, text: "Cell", page: 2 },
 ]);
 
-const move = (element: number, target: number, position: "before" | "after"): TagEdit =>
+const move = (element: number, target: number, position: "before" | "after" | "in"): TagEdit =>
   ({ op: "move", element, expect_role: "P", target, expect_target_role: "P", position });
 
 test("one page's tags: its content, the groups around it, and tags with no place of their own", () => {
   const map = sample();
   assert.deepEqual([...tagsOnPage(map, 1)].sort((a, b) => a - b), [0, 1, 2, 3, 4]);
   assert.deepEqual([...tagsOnPage(map, 2)].sort((a, b) => a - b), [0, 2, 5, 6, 7, 8]);
+});
+
+test("a tag moved in another goes at its end; taken out first, a section can then be moved before it", () => {
+  const map = sample();
+  const ops = [move(1, 2, "in")];                       // the title into the section, after its paragraphs
+  const tree = draftTree(map, ops);
+  assert.equal(tree.parent.get(1), 2);
+  assert.deepEqual(tree.kids.get(2), [3, 5, 1]);
+  assert.deepEqual(tree.kids.get(-1), [0]);
+  assert.deepEqual(tree.kids.get(0), [2, 6]);
+  // The paragraph taken out of the section, then the section moved before it (what the engine once refused)
+  const two = draftTree(map, [move(3, 2, "before"), move(2, 3, "before")]);
+  assert.deepEqual(two.kids.get(0), [1, 2, 3, 6]);
+  assert.deepEqual(two.kids.get(2), [5]);
 });
 
 test("undoing a tag's move leaves every other pending change", () => {
@@ -138,4 +152,15 @@ test("the document's title and language are one pending change each, kept when a
   assert.equal(editMarks(map, ops).size, 1);  // nothing marked on a tag for the document's own changes
   // A tag map from before the Document panel says neither
   assert.deepEqual(documentDraft([], sample()), { title: "", lang: "" });
+});
+
+test("an area's new tags from the AI: said in the list of changes, and their content not offered again", () => {
+  const map = sample();
+  const op: TagEdit = { op: "regroup", element: 3, expect_role: "P", position: "before", page: 1, groups: [
+    { role: "H2", pieces: [4] }, { role: "Figure", pieces: [5, 6], sections: [2], alt: "A map of the lots" }, { role: "P", sections: [3] }] };
+  assert.equal(describe(op, map), "3 new tags for an area of page 1: Heading 2, Figure, Paragraph");
+  const used = pendingArea([op]);
+  assert.deepEqual([...used.pieces.entries()], [["1:4", -1], ["1:5", -1], ["1:6", -1]]);
+  assert.deepEqual([...used.sections], ["1:2", "1:3"]);
+  assert.deepEqual(editMarks(map, [op]).get(3), ["area given new tags"]);
 });

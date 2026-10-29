@@ -149,3 +149,45 @@ def test_the_tag_viewer_outlines_only_the_figure(tmp_path):
     tm = build_tagmap(tmp_path / "tagged.pdf")
     box = next(e for e in tm["elements"] if e["role"] == "Figure")["boxes"][0]["bbox"]
     assert all(abs(a - b) < 1 for a, b in zip(box, CHART)), box
+
+
+def _poster(tmp_path):
+    """A page printed as one picture, an assembly poster: two solid drawings (a motor, a board) a dashed wire runs
+    between, and a schematic drawn in thin lines below them."""
+    src = fitz.open()
+    p = src.new_page(width=W, height=H)
+    p.draw_rect(fitz.Rect(60, 120, 200, 300), color=None, fill=(0.3, 0.3, 0.3))            # the motor
+    p.draw_rect(fitz.Rect(300, 100, 540, 420), color=None, fill=(0.15, 0.35, 0.7))         # the board
+    p.draw_line((200, 210), (300, 210), color=(0.4, 0.4, 0.4), width=1, dashes="[3 3] 0")   # the wire
+    p.draw_line((540, 300), (560, 700), color=(0.4, 0.4, 0.4), width=1, dashes="[3 3] 0")   # another, down the page
+    for k in range(4):                                                                      # a switch schematic
+        x = 80 + 60 * k
+        p.draw_line((x, 520), (x + 40, 500), color=(0, 0, 0), width=1)
+        p.draw_line((x - 10, 520), (x + 50, 520), color=(0, 0, 0), width=1)
+        p.draw_rect(fitz.Rect(x + 12, 560, x + 22, 570), color=None, fill=(0, 0, 0))
+        p.draw_line((x + 17, 520), (x + 17, 560), color=(0, 0, 0), width=1)
+    p.draw_line((60, 600), (320, 600), color=(0, 0, 0), width=1)
+    doc = fitz.open()
+    page = doc.new_page(width=W, height=H)
+    page.insert_image(page.rect, stream=src[0].get_pixmap(dpi=150).tobytes("png"))
+    path = tmp_path / "poster.pdf"
+    doc.save(path)
+    return path
+
+
+def test_drawings_a_thin_line_joins_are_separate_figures(tmp_path):
+    """Production (the Assembly Poster): dashed wiring joined every drawing into one region over the whole page, one
+    figure. A region over most of the page is split: its solid drawings with thin lines taken out, and what's left
+    in clusters (a schematic in thin lines). A region that size that doesn't come apart is kept whole."""
+    page = fitz.open(_poster(tmp_path))[0]
+    regions = sf.find_regions(page, [])
+    near = lambda r, box: all(abs(a - b) < 10 for a, b in zip(r, box))  # noqa: E731
+    assert any(near(r, (60, 120, 200, 300)) for r in regions), regions
+    assert any(near(r, (300, 100, 540, 420)) for r in regions), regions
+    assert any(r[1] > 450 and r[3] < 640 and r[0] < 100 for r in regions), regions  # the schematic
+    assert not any(sf.bbox_area(r) > 0.4 * W * H for r in regions)
+    # One picture over most of the page, nothing joined by lines: one region still
+    def photo(p):
+        p.draw_rect(fitz.Rect(60, 300, 535, 760), color=None, fill=(0.4, 0.5, 0.3))  # 44% of the page: over the share split
+    whole = fitz.open(_scan(tmp_path, chart=False, extras=[photo]))[0]
+    assert [r for r in sf.find_regions(whole, TEXT) if r[1] > 250] == [(57.0, 297.0, 537.0, 762.0)]

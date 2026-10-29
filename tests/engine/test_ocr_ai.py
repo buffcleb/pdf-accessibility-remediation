@@ -19,7 +19,7 @@ def _line(*words, size=10.0, extent=200.0):
 
 
 def test_only_uncertain_words_change_and_must_look_alike():
-    ok, _, changes, text = check_correction(_line(("Accessible", 95), ("Unmiversity.", 40)), "Accessible University")
+    ok, _, changes, text, _ = check_correction(_line(("Accessible", 95), ("Unmiversity.", 40)), "Accessible University")
     assert ok and text == "Accessible University." and changes == [("Unmiversity.", "University.")]  # punctuation kept
     ok, why, *_ = check_correction(_line(("the", 95), ("cat", 95)), "the dog")
     assert not ok and "sure of" in why
@@ -30,11 +30,11 @@ def test_only_uncertain_words_change_and_must_look_alike():
 
 
 def test_spacing_fixes_and_specks():
-    ok, _, changes, text = check_correction(_line(("Toprovide", 90), ("students", 95)), "To provide students")
+    ok, _, changes, text, _ = check_correction(_line(("Toprovide", 90), ("students", 95)), "To provide students")
     assert ok and text == "To provide students"  # re-spacing a confident word is fine
-    ok, _, _, text = check_correction(_line(("the", 95), ("|", 30), ("end", 95)), "the end")
+    ok, _, _, text, _ = check_correction(_line(("the", 95), ("|", 30), ("end", 95)), "the end")
     assert ok and text == "the end"  # a speck read as punctuation may go
-    ok, why, *_ = check_correction(_line(("the", 95), ("big", 30), ("end", 95)), "the end")
+    ok, why, *_ = check_correction(_line(("the", 95), ("big", 60), ("end", 95)), "the end")
     assert not ok and "dropped" in why  # a real word may not
 
 
@@ -325,3 +325,22 @@ def test_existing_figures_that_are_rules_or_fail_never_fail_the_job(tmp_path):
     out = asyncio.run(_describe_regions(AI(), pdf, [(0, (72.0, 290.3, 540.0, 290.5)), (0, (100, 100, 300, 250))], stats))
     assert out == [(0, (72.0, 290.3, 540.0, 290.5), None, True)]  # the rule: an artifact, without asking the AI
     assert AI.calls == 1 and any("failed" in f for f in stats.findings)  # the real figure: left for review
+
+
+def test_a_picture_read_as_letters_is_left_out_when_the_ai_says_so():
+    from app.pipeline.ocr_ai import PICTURE, _leave_out
+    # Five rating stars read as one word, then the text beside them
+    words = [OcrWord("kxkxkXe", 5, (100, 100, 160, 114)), OcrWord("Rate", 97, (166, 103, 190, 110)),
+             OcrWord("this", 97, (193, 103, 212, 110))]
+    line = OcrLine(0, "kxkxkXe Rate this", (100, 100, 212, 114), (100, 112), 9.0, (1, 0), 112, words)
+    ok, _, changes, text, dropped = check_correction(line, f"{PICTURE} Rate this")
+    assert ok and text == "Rate this" and changes == [("kxkxkXe", "")] and dropped == {0}
+    _leave_out(line, dropped)
+    assert line.origin == (166, 112) and line.extent == 46 and line.bbox == (166, 103, 212, 110)
+    assert [w.text for w in line.words] == ["Rate", "this"]
+    # A model that leaves the stars out instead of answering [picture]: Tesseract hardly read them, so that's fine too
+    ok, _, changes, text, dropped = check_correction(_line(("kxkxkXe", 5), ("Rate", 97), ("this", 97)), "Rate this")
+    assert ok and text == "Rate this" and changes == [("kxkxkXe", "")] and dropped == {0}
+    # Only a word Tesseract was unsure of can be called a picture
+    ok, why, *_ = check_correction(_line(("Rate", 97), ("this", 97)), f"{PICTURE} this")
+    assert not ok and "sure of" in why

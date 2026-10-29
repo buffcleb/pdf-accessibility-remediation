@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import bisect
 
+from app.pipeline.markers import BULLET
 from app.pipeline.models import BBox, PageAnalysis, TextBlock
 
 
@@ -169,6 +170,18 @@ def _columns_below(items: list[tuple[str, BBox]], width: float) -> tuple[list, l
     return items, [], [], []
 
 
+def _above_rows_across(items: list[tuple[str, BBox]], gutter: float) -> tuple[list, list]:
+    """(What lies wholly above the first row with something either side of the gap, the rest)."""
+    left = [b for _, b in items if (b[0] + b[2]) / 2 < gutter]
+    right = [b for _, b in items if (b[0] + b[2]) / 2 >= gutter]
+    tops = [a[1] for a in left for b in right if abs(a[1] - b[1]) <= max(3.0, 0.5 * min(a[3] - a[1], b[3] - b[1]))]
+    if not tops:
+        return [], items
+    top = min(tops)
+    head = [it for it in items if it[1][3] <= top + 2]
+    return head, [it for it in items if it not in head]
+
+
 def _reads_across(boxes: list[BBox], gutter: float) -> bool:
     """Whether what's either side of a gap lines up row by row (labels beside values, a grid of exercise items,
     a table without rules), so it reads across, not down one side and then the other. Most items on BOTH sides
@@ -201,17 +214,29 @@ def right_to_left(text: str) -> bool:
     return rtl > len(letters) / 2
 
 
-def _by_rows(items: list[tuple[str, BBox]], rtl: bool = False) -> list[tuple[str, BBox]]:
+def _level(a: BBox, b: BBox) -> bool:
+    """Two lines side by side in different print (a scanned form's label and the larger value typed beside it): one
+    mostly overlaps the other's height, and neither is more than twice as tall, so neither is a paragraph beside a
+    line."""
+    ha, hb = a[3] - a[1], b[3] - b[1]
+    short, tall = min(ha, hb), max(ha, hb)
+    return 0 < short and tall <= 2 * short and min(a[3], b[3]) - max(a[1], b[1]) >= 0.5 * short
+
+
+def _by_rows(items: list[tuple[str, BBox]], rtl: bool = False, typed: frozenset = frozenset()
+             ) -> list[tuple[str, BBox]]:
     """Top to bottom, and left to right within a row (right to left on a right-to-left page). Items whose tops are
     within a few points of the row's first item share the row: sorting on the exact top would let a point's
-    difference put the right-hand item of a row first."""
+    difference put the right-hand item of a row first. On a scanned form, a value typed in larger print and the
+    label level with it share the row too (see _level; typed: the ids of the values typed onto a scan)."""
     rest = sorted(items, key=lambda it: (it[1][1], it[1][0]))
     out: list[tuple[str, BBox]] = []
     while rest:
         first = rest[0]
         h = max(1.0, first[1][3] - first[1][1])
         tol = min(3.0, 0.35 * h)
-        row = [it for it in rest if it[1][1] - first[1][1] <= tol]
+        row = [it for it in rest if it[1][1] - first[1][1] <= tol
+               or (first[0] in typed or it[0] in typed) and _level(first[1], it[1])]
         out += sorted(row, key=lambda it: -it[1][2]) if rtl else sorted(row, key=lambda it: it[1][0])
         rest = [it for it in rest if it not in row]
     return out
@@ -224,26 +249,41 @@ def heuristic_reading_order(page: PageAnalysis) -> list[str]:
     if not items:
         return []
     rtl = right_to_left(" ".join(b.text for b in page.blocks))
+    typed = frozenset(b.id for b in page.blocks if b.typed_on_scan)
     full = page.width * 0.6
     order: list[str] = []
     band: list[tuple[str, BBox]] = []
+
+    labelled = {b.id for b in page.blocks if b.role == "LI" or BULLET.match(b.text)}
+
+    def mostly_items(items: list[tuple[str, BBox]]) -> bool:
+        return sum(1 for i, _ in items if i in labelled) * 2 > len(items)
 
     def ordered(items: list[tuple[str, BBox]], depth: int = 0) -> list[str]:
         """Columns left to right, each read on its own (it may hold columns too: a logo beside a page that then
         splits in two); otherwise what's above any columns by rows, then those columns."""
         if depth > 3 or len(items) < 2:
-            return [i for i, _ in _by_rows(items, rtl)]
+            return [i for i, _ in _by_rows(items, rtl, typed)]
         gutters = _gutters([b for _, b in items], page.width)
         if gutters and depth and _reads_across([b for _, b in items], gutters[0]):
-            return [i for i, _ in _by_rows(items, rtl)]  # inside a column: labels beside their values, not more columns
+            # inside a column: labels beside their values, not more columns
+            return [i for i, _ in _by_rows(items, rtl, typed)]
         below: list[tuple[str, BBox]] = []
         if gutters:
             head, cols = [], items
         else:
             head, cols, gutters, below = _columns_below(items, page.width)
             if not cols:
-                return [i for i, _ in _by_rows(items, rtl)]
-        out = [i for i, _ in _by_rows(head, rtl)]
+                return [i for i, _ in _by_rows(items, rtl, typed)]
+        out = [i for i, _ in _by_rows(head, rtl, typed)]
+        if mostly_items(cols):
+            # A question's choices set out in two columns ("a. b. c." beside "d. e."), with an equation or a small
+            # table above them: what's above the choices first, then the choices by rows. Read as columns, the
+            # equation went with the right-hand choices, between "c." and "d."
+            above, rest = _above_rows_across(cols, gutters[0])
+            if above and _reads_across([b for _, b in rest], gutters[0]):
+                return (out + [i for i, _ in _by_rows(above, rtl, typed) + _by_rows(rest, rtl, typed)]
+                        + ordered(below, depth + 1))
         edges = [float("-inf"), *gutters, float("inf")]
         columns = [[it for it in cols if lo <= (it[1][0] + it[1][2]) / 2 < hi] for lo, hi in zip(edges, edges[1:])]
         # A heading that starts below where every other column has ended, near the end of its own, opens what comes
@@ -268,7 +308,7 @@ def heuristic_reading_order(page: PageAnalysis) -> list[str]:
                 break
         for col in (reversed(columns) if rtl else columns):
             out += ordered(col, depth + 1)
-        return out + [i for i, _ in _by_rows(tail, rtl)] + ordered(below, depth + 1)
+        return out + [i for i, _ in _by_rows(tail, rtl, typed)] + ordered(below, depth + 1)
 
     def flush() -> None:
         order.extend(ordered(band))

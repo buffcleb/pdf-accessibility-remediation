@@ -1,12 +1,11 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import type { Finding, TagEdit, TagElement, TagMap } from "../api";
+import type { Finding, MovePosition, TagEdit, TagElement, TagMap } from "../api";
 import { errorMessage } from "../components/ui";
 import { subtree } from "./isolate";
 import { ROLE_NAMES, absorbedBy, draftTree, editMarks, overrides, pageOrder, roleClass, tagsOnPage } from "./draft";
-import { builtPreview, builtSummary, type BuiltRow } from "./outline";
-import { tablePreview, tableReplaced } from "./tablegrid";
-import { splitPreview, type SplitPart } from "./figure";
-import { contentMoves, newTags, splitKeptText } from "./areaPreview";
+import { tableReplaced } from "./tablegrid";
+import { contentMoves, splitKeptText } from "./areaPreview";
+import { expand } from "./made";
 import { centered, keptInView } from "./scroll";
 import { loadTagmap, watchVersion, type LoadState } from "./pdf";
 import { tagsLoading } from "../components/loadWords";
@@ -28,7 +27,7 @@ type Props = {
   onHover: (i: number | null) => void;
   follow: { page: number; y: number } | null; // where the document beside the tree is scrolled to
   // Editable versions: drag a tag (or Alt+arrow keys) to move it; only moves that keep the tags valid are allowed
-  onMove?: (el: TagElement, target: TagElement, position: "before" | "after") => void;
+  onMove?: (el: TagElement, target: TagElement, position: MovePosition) => void;
   onUndoMove?: (el: TagElement) => void; // take back a tag's unsaved moves
   page?: number | null; // one-page view: only this page's tags (and the groups around them)
   tools?: ReactNode; // viewing controls shown at the end of the header row
@@ -38,26 +37,25 @@ type Props = {
   onPick?: (el: TagElement, how: "toggle" | "range", visible: number[]) => void;
   onMenu?: (el: TagElement, x: number, y: number) => void; // a right-click, Shift+F10 or the Menu key on a row
   onReadAll?: (el: TagElement) => void; // "Read all" by a row's cut-off words: the tag's details, where it's in full
-  pendingSel?: number | null; // a tag pending edits make, chosen (#427): the place of the edit making it
-  onPendingSelect?: (op: number) => void;
 };
 
 // role/text: how a row will look once pending changes are saved (a list taken apart into one tag per item)
 // head: in the reading-order list, the first tag of a page (the page's heading is drawn above it)
 // `ghost`: a row of an unsaved change's preview that stands for part of `el` (a list built from it): drawn, and
 // clicking it selects `el`, but it isn't a tag of its own yet, so the keys pass over it
-// `made`: a tag a pending edit makes (#427), named by that edit's place: clicking it chooses that new tag
-type Row = { el: TagElement; depth: number; hasKids: boolean; role?: string; text?: string; head?: number; page?: number; ghost?: number;
-  made?: number };
+type Row = { el: TagElement; depth: number; hasKids: boolean; role?: string; text?: string; head?: number; page?: number; ghost?: number };
 
 /** The tag structure tree of a version, for finding your way around it; clicking a tag shows it on its page. */
-export function TreePane({ side, jobId, number, sourceLabel, picker, findings, ops, selected, onSelect, onHover, follow, onMove,
-  onUndoMove, page = null, tools, picked, onPick, onMenu, onReadAll, isolated = null, pendingSel = null,
-  onPendingSelect }: Props) {
+export function TreePane({ side, jobId, number, sourceLabel, picker, findings, ops: given, selected, onSelect, onHover, follow, onMove,
+  onUndoMove, page = null, tools, picked, onPick, onMenu, onReadAll, isolated = null }: Props) {
   // The tags as a tree, or as the list a screen reader goes through (the same pending changes either way)
   const [show, setShow] = useState<"tree" | "order">("tree");
   const [helpOpen, setHelpOpen] = useState(() => { try { return localStorage.getItem("pv-tree-help") === "1"; } catch { return false; } });
-  const [map, setMap] = useState<TagMap | null>(null);
+  const [loaded, setMap] = useState<TagMap | null>(null);
+  // With the unsaved changes, the tags they make are tags of the tree (made.ts, #692)
+  const draft = useMemo(() => (loaded ? expand(loaded, given) : null), [loaded, given]);
+  const map = draft?.map ?? null;
+  const ops = draft?.ops ?? given;
   const [error, setError] = useState<unknown>(null);
   const [open, setOpen] = useState<Set<number>>(new Set());
   const [focus, setFocus] = useState<number | null>(null);
@@ -89,7 +87,6 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
   const tree = useMemo(() => (map ? draftTree(map, ops) : null), [map, ops]);
   // Tags no longer in the tree: merged into another, or deleted
   // Tags made by pending edits (an area of untagged content, a split), and tags whose content all moves away (#427)
-  const made = useMemo(() => (map ? newTags(map, ops) : []), [map, ops]);
   const kept = useMemo(() => (map ? splitKeptText(map, ops) : new Map<number, string>()), [map, ops]);
   const emptied = useMemo(() => (map ? contentMoves(map, ops).emptied : new Set<number>()), [map, ops]);
   const gone = useMemo(() => new Set([...absorbedBy(ops).keys(), ...(tree?.deleted ?? []), ...emptied,
@@ -98,7 +95,7 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
   const isolatedTags = useMemo(() => (isolated !== null && map ? subtree(map, isolated) : null), [isolated, map]);
   const edited = useMemo(() => (map ? editMarks(map, ops) : new Map<number, string[]>()), [map, ops]);
   const [drag, setDrag] = useState<number | null>(null);
-  const [drop, setDrop] = useState<{ i: number; position: "before" | "after"; ok: boolean } | null>(null);
+  const [drop, setDrop] = useState<{ i: number; position: MovePosition; ok: boolean } | null>(null);
   const [moveNote, setMoveNote] = useState("");
 
   const sevOf = useMemo(() => {
@@ -120,19 +117,6 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
   const anyOrig = useMemo(() => !!map?.elements.some((e) => e.orig), [map]);
   const onThisPage = useMemo(() => (map && page ? tagsOnPage(map, page) : null), [map, page]);
 
-  const built = useMemo(() => {
-    const out = new Map<number, BuiltRow[]>();
-    if (map) for (const op of ops) {
-      if (op.op === "build_list") out.set(op.element, builtPreview(map, op));
-      // A table made or edited (#370): drawn as it will be saved, in place of the tag the edit names
-      if (op.op === "build_table" || op.op === "rebuild_table") out.set(op.element, tablePreview(map, op));
-    }
-    return out;
-  }, [map, ops]);
-
-  // Tags a pending figure split will make, drawn after the figure they come out of until it's saved
-  const splits = useMemo(() => (map ? splitPreview(map, ops) : new Map<number, SplitPart[]>()), [map, ops]);
-
   const rows = useMemo(() => {
     const out: Row[] = [];
     if (!map) return out;
@@ -147,12 +131,6 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
     const kidsOf = (e: TagElement) => (tree?.kids.get(e.i) ?? e.kids).filter(
       (k) => map.elements[k] && !gone.has(k) && (!onThisPage || onThisPage.has(k)));
     const walk = (e: TagElement, depth: number) => {
-      const plan = built.get(e.i);
-      if (plan) {
-        // Preview of the save: the heading, lists and items it builds, all standing for this tag until then
-        plan.forEach((b, n) => out.push({ el: e, depth: depth + b.depth, hasKids: false, role: b.role, text: b.text, ...(n ? { ghost: n } : {}) }));
-        return;
-      }
       const next = over.get(e.i)?.role;
       if (e.role === "L" && next && checkElementRole(map, e, next).action === "collapse_list") {
         // Preview of the save: each item becomes a tag of the new type, nested lists follow it
@@ -170,25 +148,15 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
         return;
       }
       const kids = kidsOf(e);
-      // A tag a pending edit makes beside this one (#427): shown where it will be read, until it's saved
-      const beside = (where: "before" | "after", from: number) => made.forEach((t, n) => {
-        if (t.anchor === e.i && t.position === where) {
-          out.push({ el: e, depth, hasKids: false, role: t.role, text: t.alt || t.text || "(new tag)",
-            ghost: from + n, made: t.op });
-        }
-      });
-      beside("before", 200);
       out.push({ el: e, depth, hasKids: kids.length > 0, ...(kept.has(e.i) ? { text: kept.get(e.i) } : {}) });
       // One page's tags are few enough to show open
       if (open.has(e.i) || onThisPage) for (const k of kids) walk(map.elements[k], depth + 1);
-      (splits.get(e.i) ?? []).forEach((part, n) => out.push({ el: e, depth, hasKids: false, role: part.role, text: part.alt || "(no alt text)", ghost: 100 + n }));
-      beside("after", 300);
     };
     for (const i of tree?.kids.get(-1) ?? map.elements.filter((e) => e.parent === null).map((e) => e.i)) {
       if (!gone.has(i)) walk(map.elements[i], 0);
     }
     return out;
-  }, [map, open, gone, over, tree, show, page, ops, onThisPage, built, splits, made, kept]);
+  }, [map, open, gone, over, tree, show, page, ops, onThisPage, kept]);
 
   // --- moving tags (editable versions) -----------------------------------------------------------
   const roleOf = (i: number | null | undefined) => (i === null || i === undefined || !map ? null : over.get(i)?.role ?? map.elements[i].role);
@@ -197,18 +165,18 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
     for (let p: number | null = i; p !== null; p = parentOf(p)) if (p === ancestor) return true;
     return false;
   };
-  /** Whether `el` can go before/after `target`, and if not, why. */
-  const verdict = (el: number, target: number) => {
+  /** Whether `el` can go before/after `target`, or in it (its last child), and if not, why. */
+  const verdict = (el: number, target: number, position: MovePosition = "before") => {
     if (el === target || inside(target, el)) return { ok: false, reason: "A tag can't move inside itself." };
-    const from = parentOf(el), to = parentOf(target);
+    const from = parentOf(el), to = position === "in" ? target : parentOf(target);
     return checkMove(roleOf(el)!, roleOf(from), roleOf(to), from === to);
   };
-  const tryMove = (el: number, target: number, position: "before" | "after") => {
+  const tryMove = (el: number, target: number, position: MovePosition) => {
     if (!map || !onMove) return;
-    const v = verdict(el, target);
+    const v = verdict(el, target, position);
     if (!v.ok) { setMoveNote(`Can't move it there. ${v.reason}`); return; }
     onMove(map.elements[el], map.elements[target], position);
-    setMoveNote(`Moved ${roleOf(el)} ${position} ${roleOf(target)}. Not saved yet.`);
+    setMoveNote(`Moved ${roleOf(el)} ${position === "in" ? "into" : position} ${roleOf(target)}. Not saved yet.`);
   };
   const siblings = (i: number) => (tree?.kids.get(parentOf(i) ?? -1) ?? []).filter((k) => !gone.has(k));
 
@@ -288,6 +256,19 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
       e.preventDefault();
       return;
     }
+    if (onMove && show === "tree" && e.altKey && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
+      // Into the tag before it (at its end), or out of its own tag (just after it)
+      const sib = siblings(r.el.i), k = sib.indexOf(r.el.i), up = parentOf(r.el.i);
+      if (e.key === "ArrowRight") {
+        if (k > 0) {
+          tryMove(r.el.i, sib[k - 1], "in");
+          setOpen((o) => new Set([...o, sib[k - 1]]));
+        } else setMoveNote("There's no tag before it, in its group, to move it into.");
+      } else if (up !== null && parentOf(up) !== null) tryMove(r.el.i, up, "after");
+      else setMoveNote("It's already at the top level.");
+      e.preventDefault();
+      return;
+    }
     if (onUndoMove && e.altKey && (e.key === "Backspace" || e.key === "Delete")) {
       if (edited.get(r.el.i)?.includes("moved")) undoMove(r.el);
       e.preventDefault();
@@ -358,7 +339,7 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
           <summary>About<span className="visually-hidden"> this {show === "tree" ? "tag tree" : "list"}</span></summary>
           {show === "tree" ? "Tree" : "Reading order"} of {sourceLabel}{page ? `, page ${page}` : ""}
           {ops.length ? ", with your unsaved changes" : ""}
-          {onMove ? " · drag a tag, or Alt+↑/↓, to move it" : ""}{onUndoMove ? "; Alt+Delete undoes its move" : ""}
+          {onMove ? " · drag a tag, or Alt+↑/↓, to move it; drop it on the middle of a tag, or Alt+→, to put it inside (into a section, say), Alt+← to take it out" : ""}{onUndoMove ? "; Alt+Delete undoes its move" : ""}
         </details>
         {show === "tree" && !page && (
           <span className="pv-tree-btns">
@@ -410,7 +391,7 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
                 <li role={show === "tree" ? "treeitem" : "option"} aria-level={show === "tree" ? r.depth + 1 : undefined}
                   aria-selected={selected === r.el.i || !!picked?.includes(r.el.i)}
                   aria-expanded={r.hasKids && !onThisPage ? open.has(r.el.i) : undefined}
-                  className={`pv-tree-row${isolatedTags && !isolatedTags.has(r.el.i) ? " veiled" : ""}${r.ghost ? " ghost" : ""}${(r.made === undefined ? selected === r.el.i || picked?.includes(r.el.i) : r.made === pendingSel) ? " selected" : ""}${o.decorative ? " decorative" : ""}${marks ? " edited" : ""}${r.el.orig ? " orig" : ""}`}
+                  className={`pv-tree-row${isolatedTags && !isolatedTags.has(r.el.i) ? " veiled" : ""}${r.ghost ? " ghost" : ""}${selected === r.el.i || picked?.includes(r.el.i) ? " selected" : ""}${o.decorative ? " decorative" : ""}${marks ? " edited" : ""}${r.el.orig ? " orig" : ""}`}
                   style={{ paddingLeft: 4 + r.depth * 14 }}
                   data-i={r.ghost ? undefined : r.el.i} tabIndex={!r.ghost && roving === r.el.i ? 0 : -1} title={tip}
                   aria-hidden={r.ghost ? true : undefined}
@@ -418,7 +399,6 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
                   onFocus={() => { setFocus(r.el.i); onHover(r.el.i); }}
                   onMouseEnter={() => onHover(r.el.i)}
                   onClick={(e) => {
-                    if (r.made !== undefined && onPendingSelect) { onPendingSelect(r.made); return; } // a tag not yet saved
                     setFocus(r.el.i);
                     const ids = rows.map((x) => x.el.i);
                     if (onPick && (e.ctrlKey || e.metaKey)) onPick(r.el, "toggle", ids);
@@ -432,8 +412,11 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
                   onDragOver={(e) => {
                     if (drag === null) return;
                     const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                    const position = e.clientY < box.top + box.height / 2 ? "before" : "after";
-                    const v = verdict(drag, r.el.i);
+                    // The middle of a tag that can hold it puts it inside; above and below it, beside
+                    const y = (e.clientY - box.top) / box.height;
+                    const position: MovePosition = y > 0.25 && y < 0.75 && verdict(drag, r.el.i, "in").ok ? "in"
+                      : y < 0.5 ? "before" : "after";
+                    const v = verdict(drag, r.el.i, position);
                     if (!drop || drop.i !== r.el.i || drop.position !== position || drop.ok !== v.ok) {
                       setDrop({ i: r.el.i, position, ok: v.ok });
                       setMoveNote(v.ok ? "" : `Can't drop here. ${v.reason}`);
@@ -466,7 +449,6 @@ export function TreePane({ side, jobId, number, sourceLabel, picker, findings, o
                       title="Read all of it in the tag's details"
                       onClick={(e) => { e.stopPropagation(); setFocus(r.el.i); onReadAll(r.el); }}>Read all</button>
                   )}
-                  {!r.ghost && built.has(r.el.i) && <span className="visually-hidden">, {builtSummary(built.get(r.el.i)!)}</span>}
                   {marks && <span className="pv-tree-edit small">{marks.length > 1 ? `${marks.length} changes` : marks[0]}
                     <span className="visually-hidden">{marks.length > 1 ? `: ${marks.join(", ")}` : ""}, not saved</span></span>}
                   {onUndoMove && marks?.includes("moved") && (

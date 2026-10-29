@@ -137,6 +137,30 @@ def test_semantic_flags_body_text_heading_and_filename_alt(good, tmp_path):
     assert "alt text is a file name or generic word" in issues
 
 
+def test_a_figure_without_alt_text_is_listed_for_a_person(good, tmp_path):
+    """#659: a document made without AI has its figures left without alt text; each is a review item, not only a
+    veraPDF failure, so a person is asked to describe it."""
+    assert not any(f.issue == "figure has no alt text" for f in _semantic(good))
+
+    def mutate(pdf):
+        for el in _elements_with_mcid(pdf):
+            if str(el.S) == "/Figure":
+                del el["/Alt"]
+    found = [f for f in _semantic(_mutate(good, tmp_path, mutate)) if f.issue == "figure has no alt text"]
+    assert found and all(f.severity == "high" and f.role == "Figure" and "Edit tag" in f.action for f in found)
+
+
+def test_every_figure_without_alt_text_keeps_its_own_row():
+    """Other findings fold into "(and N more like this)" past 25; a figure to describe is each one's own to-do."""
+    from app.verification.model import Finding
+    from app.verification.semantic import SemanticChecker
+    many = [Finding("semantic", "high", "figure has no alt text", element=i) for i in range(40)]
+    many += [Finding("semantic", "suggest", "alt text is very short", element=i) for i in range(40)]
+    out = SemanticChecker._cap(many)
+    assert sum(f.issue == "figure has no alt text" for f in out) == 40
+    assert sum(f.issue == "alt text is very short" for f in out) == 25
+
+
 def test_identical_images_sharing_alt_are_not_flagged(good):
     # simple_report draws the same picture on both pages with the same alt: that is fine.
     assert not any(f.issue == "same alt text on different images" for f in _semantic(good))

@@ -5,7 +5,7 @@ import pikepdf
 import pymupdf as fitz
 
 from app.pipeline.models import PageAnalysis, TextBlock
-from app.pipeline.orchestrator import _covers_page
+from app.pipeline.analyzer import covers_page
 from app.pipeline.structure import detect_columns, heuristic_reading_order
 from app.pipeline.structure.headings import is_heading_candidate
 from app.verification.integrity import check_integrity
@@ -84,10 +84,10 @@ def test_a_row_of_controls_is_not_a_heading():
 
 
 def test_a_scan_is_the_page_however_it_is_placed():
-    assert _covers_page((0, 0, 612, 792), 612, 792)
-    assert _covers_page((28, 28, 1100, 736), 612, 792)      # inside margins, and wider than the page
-    assert not _covers_page((223, 142, 337, 255), 612, 792)  # a photo on the page
-    assert not _covers_page((700, 0, 1300, 792), 612, 792)   # entirely off the page
+    assert covers_page((0, 0, 612, 792), 612, 792)
+    assert covers_page((28, 28, 1100, 736), 612, 792)      # inside margins, and wider than the page
+    assert not covers_page((223, 142, 337, 255), 612, 792)  # a photo on the page
+    assert not covers_page((700, 0, 1300, 792), 612, 792)   # entirely off the page
 
 
 def _picture_page(tmp_path, rect):

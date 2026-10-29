@@ -17,7 +17,7 @@ ARTIFACT_LAYOUT = ("artifact:Layout", "Artifact")
 # "nothing matched", this one says what the content is, so orphaned tagged content may be made an artifact on it
 ARTIFACT_BACKGROUND = ("artifact:Background", "Artifact")
 
-_MC_TAG = {"LI": "LBody", "Caption": "P"}
+_MC_TAG = {"LI": "LBody", "Caption": "P", "TOCI": "P"}
 
 
 @dataclass
@@ -41,6 +41,7 @@ class PageResolver:
         self.page = page
         self.unmatched_key = f"p{page.number}:unmatched"
         self.text: list[_T] = []
+        self.sizes = {b.id: b.font_size for b in page.blocks}
         for b in page.blocks:
             if b.role == "Artifact":
                 self.text.append(_T("artifact:" + (b.artifact_type or "Pagination"), "Artifact", b.bbox))
@@ -107,7 +108,7 @@ class PageResolver:
         # The estimated advance can overshoot; also try the start of the run.
         sx = bbox[0] + min(4.0, (bbox[2] - bbox[0]) / 2)
         for x in (cx, sx):
-            hit = self._smallest_containing(self.cells + self.text, x, cy, tol=2.0)
+            hit = self._line_containing(bbox, x, cy, tol=2.0)
             if hit:
                 return hit.key, hit.tag
         for tb, cells in self.tables:
@@ -200,6 +201,35 @@ class PageResolver:
             if ov > best_ov:
                 best, best_ov = t, ov
         return (best.key, best.tag) if best else ARTIFACT_LAYOUT
+
+    def _line_containing(self, glyph: BBox, x: float, y: float, tol: float) -> _T | None:
+        """The smallest box the point lies in; but a subscript in small print at the foot of a line ("N2H4" in a
+        choice) that reaches into the box of the line below, set a little closer than its print, belongs to the line
+        above it when that line's box holds it and the smaller one doesn't. Table cells keep the smallest: a cell's box
+        is its own, not a line's."""
+        best = self._smallest_containing(self.cells + self.text, x, y, tol)
+        if best is None or any(best is c for c in self.cells):
+            return best
+        h = glyph[3] - glyph[1]
+        if h <= 0:
+            return best
+
+        def held(t: _T) -> float:
+            return max(0.0, min(t.bbox[3], glyph[3]) - max(t.bbox[1], glyph[1])) / h
+
+        def stacked(t: _T) -> bool:  # one over the other, overlapping a little
+            a, b = t.bbox, best.bbox
+            across = min(a[2], b[2]) - max(a[0], b[0])
+            down = min(a[3], b[3]) - max(a[1], b[1])
+            return across > 0.5 * min(a[2] - a[0], b[2] - b[0]) and 0 < down < 0.5 * min(a[3] - a[1], b[3] - b[1])
+
+        if held(best) >= 0.33:
+            return best  # (a power at the top of its own line reaches into the one above by more than a third)
+        # (small print for the line above: a run of a line's own text, or a tall sign, stays where it was)
+        better = [t for t in self.text if t is not best and t.tag != "Artifact" and stacked(t) and held(t) >= 0.9
+                  and t.bbox[1] < best.bbox[1] and h <= 0.8 * self.sizes.get(t.key, 0.0)
+                  and bbox_contains_point(t.bbox, x, y, tol)]
+        return min(better, key=lambda t: bbox_area(t.bbox)) if better else best
 
     @staticmethod
     def _smallest_containing(targets: list[_T], x: float, y: float, tol: float) -> _T | None:

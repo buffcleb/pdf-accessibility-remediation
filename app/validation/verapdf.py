@@ -36,6 +36,11 @@ _PAGE_CTX = re.compile(r"pages\[(\d+)\]")
 _GLYPH_CTX = re.compile(r"usedGlyphs\[\d+\]\((\S+) \S+ (\d+) ")
 _WIDTH_MSG = re.compile(r"Glyph width (-?[\d.]+) .*?\(value (-?[\d.]+)\)")
 _FONT_CTX = re.compile(r"/font\[\d+\]\(([^)]+)\)")
+# A check on one glyph names its font first: usedGlyphs[0](FPRVML+FEFEF3A587B FPRVML+FEFEF3A587B 1 0 192194474 7 true).
+# Read for the rule that a map's Unicode values can't be 0 (7.21.7, test 2) only: such a value means the font's map is
+# wrong wherever it's used, and veraPDF lists 200 checks at most, so the pages it names can be a few of those that use
+# the font. A code missing from a map (test 1) is one glyph, and only the pages that show it are named
+_GLYPH_FONT_CTX = re.compile(r"usedGlyphs\[\d+\]\(([^\s)]+)")
 
 
 @dataclass
@@ -289,7 +294,10 @@ def parse_report(xml: bytes, flavour: str) -> VeraResult:
                 m = _PAGE_CTX.search(ctx.text or "")
                 if m:
                     pages.add(int(m.group(1)))
-                fonts.update(f.split("+", 1)[-1] for f in _FONT_CTX.findall(ctx.text or ""))
+                named = _FONT_CTX.findall(ctx.text or "")
+                if rule.get("clause", "") == "7.21.7" and rule.get("testNumber") == "2":
+                    named += _GLYPH_FONT_CTX.findall(ctx.text or "")
+                fonts.update(f.split("+", 1)[-1] for f in named)
             res.failures.append(
                 RuleFailure(
                     clause=rule.get("clause", ""),

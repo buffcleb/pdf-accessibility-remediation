@@ -40,10 +40,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Java for veraPDF, Tesseract for OCR of scanned pages, DejaVu as the embeddable text-layer font,
 # Liberation as metric-compatible substitutes for unembedded Times/Arial/Helvetica/Courier, and Pango for
-# WeasyPrint (the PDF report).
+# WeasyPrint (the PDF report). Then packages of the base image with a fixed vulnerability newer than its digest
+# (scripts/build.sh's Trivy scan): OpenSSL (CVE-2026-84782, fixed in 3.0.22-1~deb12u2). Drop a package from the
+# upgrade once the pinned base image has the fix.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless tesseract-ocr tesseract-ocr-eng fonts-dejavu-core fonts-liberation2 curl unzip gnupg \
         libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+    && apt-get install -y --no-install-recommends --only-upgrade openssl libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY docker/verapdf-auto-install.xml /tmp/verapdf-auto-install.xml

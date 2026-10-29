@@ -90,6 +90,7 @@ Read by the engine's API and workers (`app/config.py`): locally from `.env`, on 
 | `AI_TIMEOUT_S` | `180` | How long one AI call may take, in seconds | [more](limits.md#what-the-ai-is-asked) |
 | `AI_MAX_RETRIES` | `3` | Retries for an AI call that failed for a temporary reason (throttling, a timeout, a server error) | [more](limits.md#what-the-ai-is-asked) |
 | `AI_MAX_OUTPUT_TOKENS` | `800` | The most an AI answer may be, in tokens: it caps runaway generations (small models can loop on JSON lists) | [more](limits.md#what-the-ai-is-asked) |
+| `AI_AREA_TAGS_MAX_OUTPUT_TOKENS` | `8000` | The most the AI's tags for an area may be, in tokens (Suggest tags with AI in the tag manager): a busy page's tags and figure descriptions run to about 5,000 | [more](limits.md#what-the-ai-is-asked) |
 | `ALLOW_MOCK_PROVIDER` | `false` | `true` only for tests and the harness: the mock provider writes placeholder alt text | [more](limits.md#what-the-ai-is-asked) |
 | `AI_NOTATION_ENABLED` | `true` | Specialist notation the layout rules can't read (math, chemistry, medical, engineering) goes to the AI | [more](ai-models.md#specialist-notation) |
 | `AI_NOTATION_MAX` | `100` | Notation blocks per document read by the AI | [more](ai-models.md#specialist-notation) |
@@ -313,7 +314,7 @@ Read by the portal's API and worker (`portal/config.py`): locally from `.env.por
 |---|---|---|---|
 | `PORTAL_ENGINE_URL` | `http://localhost:8000` | The engine's API. Set by the compose file or manifests | [more](configuration.md#scaling-with-the-queue) |
 | `PORTAL_ENGINE_API_KEY` | generated | The key the portal sends the engine as `X-API-Key`: the engine's `SERVICE_API_KEY`. `deploy.sh init` makes it, in both files | [more](secret-rotation.md#the-engines-api-key) |
-| `PORTAL_ENGINE_AI_PROVIDER` | `localai` | The fallback AI provider, for a document sent without an AI level | [more](configuration.md#scaling-with-the-queue) |
+| `PORTAL_ENGINE_AI_PROVIDER` | `localai` | The fallback AI provider for Describe with AI when no model is given. Documents are never sent to it: one without an AI level is made with no AI (#659) | [more](configuration.md#scaling-with-the-queue) |
 | `PORTAL_ENGINE_AI_MODEL` | empty | The fallback AI's model; empty: the provider's default | [more](configuration.md#scaling-with-the-queue) |
 | `PORTAL_ENGINE_MAX_IN_FLIGHT` | `4` | Documents kept at the engine at once, at least. When the engine's running workers have more places (`GET /api/v1/capacity`), the portal uses that number | [more](configuration.md#scaling-with-the-queue) |
 | `PORTAL_ENGINE_IN_FLIGHT_CEILING` | `64` | Never more documents than this at the engine, however many workers answer | [more](configuration.md#scaling-with-the-queue) |

@@ -195,7 +195,8 @@ class PortalSettings(BaseSettings):
     """The key the portal sends the engine as `X-API-Key`: the engine's `SERVICE_API_KEY`. `deploy.sh init` makes
     it, in both files."""
     engine_ai_provider: str = "localai"
-    """The fallback AI provider, for a document sent without an AI level."""
+    """The fallback AI provider for Describe with AI when no model is given. Documents are never sent to it: one
+    without an AI level is made with no AI (#659)."""
     metrics_enabled: bool = True
     """`/metrics` for the deployment's Prometheus (#397)."""
     worker_metrics_port: int = 9464

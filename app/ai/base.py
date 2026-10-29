@@ -107,6 +107,21 @@ _REPEAT = re.compile(r"(.{4,120}?)(?:[\s,;.]*\1){2,}", re.S)
 # What a description is asked to stay under, and where it is cut if it doesn't
 ALT_ASKED, ALT_LIMIT = 250, 400
 ALT_ASKED_LONG, ALT_LIMIT_LONG = 700, 900
+# The tags the AI may propose for an area: those the editor makes from content (NEW_AREA_ROLES)
+AREA_TAG_ROLES = {"P", "H1", "H2", "H3", "H4", "H5", "H6", "Figure", "Formula", "Caption", "Note", "Quote",
+                  "BlockQuote", "Code"}
+
+
+def _thousandths(raw) -> list[float] | None:
+    """A box the model gave in thousandths of the image, as fractions; None for one that isn't a box (a few
+    hundredths wide or tall at least, inside the image once clamped)."""
+    try:
+        x0, y0, x1, y1 = (min(1000.0, max(0.0, float(v))) / 1000 for v in raw)
+    except (TypeError, ValueError):
+        return None
+    if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+        return None
+    return [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)]
 
 
 def collapse_repeats(text: str, limit: int = ALT_LIMIT) -> str:
@@ -358,6 +373,67 @@ class AIProvider(ABC):
         if sorted(order) != list(range(1, len(regions) + 1)):
             raise AIError("reading order is not a permutation of the given ids")
         return [regions[i - 1]["id"] for i in order]
+
+    async def propose_area_tags(self, png: bytes, page: int, items: list[dict], drawings: list[str] | None = None) -> dict:
+        """Tags for the items of content in an area of a page: which items go together as one tag, its type,
+        and alt text for a figure or formula, in reading order. items: {kind, text}, numbered from 1 in the prompt
+        and on the image. drawings: the letters of the drawings found on the page (drawing_blocks), lettered on the
+        image: a figure names the ones it's made of, as their places in the list; without them, or for a figure
+        none fits, it comes with a box as fractions of the image [x0, y0, x1, y1]. Returns {"tags": [{"role",
+        "items" (0-based), "alt", "drawings"?, "box"?}], "decorative": [...]}. What the model leaves out, repeats or
+        names wrongly is dropped, not guessed: the person sees the rest. A whole page's tags are long (about 5,000
+        tokens on an assembly poster), so this answer has its own allowance (AI_AREA_TAGS_MAX_OUTPUT_TOKENS)."""
+        lines = "\n".join(f'- {n}: {it.get("kind") or "content"} "{as_data(it.get("text") or "", 120)}"'
+                           for n, it in enumerate(items, start=1)) or "(none: only pictures)"
+        drawings = drawings or []
+        where = (prompts.AREA_DRAWINGS.format(letters=", ".join(drawings)) if drawings else prompts.AREA_BOX)
+        example = '"drawings": ["A", "C"]' if drawings else '"box": [120, 40, 560, 380]'
+        before = self.max_output_tokens
+        self.max_output_tokens = max(before, get_settings().ai_area_tags_max_output_tokens)
+        try:
+            data = await self.chat_json(prompts.AREA_TAGS.format(page=page + 1, items=lines, data=prompts.DATA,
+                                                                 chars=ALT_ASKED_LONG, where=where, example=example), [png])
+        finally:
+            self.max_output_tokens = before
+        used: set[int] = set()
+        drawn: set[int] = set()
+        place = {name: n for n, name in enumerate(drawings)}
+
+        def take(raw) -> list[int]:
+            out = []
+            for v in raw if isinstance(raw, list) else []:
+                try:
+                    i = int(v) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= i < len(items) and i not in used:
+                    used.add(i)
+                    out.append(i)
+            return out
+
+        def take_drawings(raw) -> list[int]:
+            out = []
+            for v in raw if isinstance(raw, list) else []:
+                n = place.get(str(v).strip().upper())
+                if n is not None and n not in drawn:
+                    drawn.add(n)
+                    out.append(n)
+            return out
+        tags = []
+        for t in data.get("tags") if isinstance(data.get("tags"), list) else []:
+            if not isinstance(t, dict) or str(t.get("type")) not in AREA_TAG_ROLES:
+                continue
+            figure = t["type"] in ("Figure", "Formula")
+            got = take(t.get("items"))
+            parts = take_drawings(t.get("drawings")) if figure else []
+            box = _thousandths(t.get("box")) if figure and not parts else None
+            if got or box or parts:
+                alt = collapse_repeats(str(t.get("alt") or "").strip(), ALT_LIMIT_LONG)
+                tags.append({"role": str(t["type"]), "items": got, "alt": "" if _PLACEHOLDER_ALT.match(alt) else alt,
+                             **({"drawings": parts} if parts else {}), **({"box": box} if box else {})})
+        if not tags:
+            raise AIError("model proposed no tags for the area")
+        return {"tags": tags, "decorative": take(data.get("decorative"))}
 
     # -- verification judges -------------------------------------------------
     async def judge_alt(self, png: bytes, kind: str, alt: str, context: str) -> dict:

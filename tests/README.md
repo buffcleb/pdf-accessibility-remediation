@@ -22,10 +22,14 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 **Engine:**
 
 ```bash
-.venv/bin/python -m pytest -q tests/engine
+.venv/bin/python -m pytest -q -n auto tests/engine
 ```
 
-**Portal:** start a throwaway PostgreSQL first. Each test run empties it.
+`-n auto` (pytest-xdist) runs the tests side by side, one worker per CPU: about a minute instead of four. Leave it
+out to run them in one process, for example to step through one with a debugger.
+
+**Portal:** start a throwaway PostgreSQL first. Each test run empties it. These tests share the one database, so
+they run in one process (no `-n`).
 
 ```bash
 docker run -d --rm --name portal-test-db -e POSTGRES_USER=portal -e POSTGRES_PASSWORD=test -e POSTGRES_DB=portal -p 55432:5432 postgres:16-alpine
@@ -59,11 +63,13 @@ The engine image has everything, so the full suite can run there:
 
 ```bash
 docker compose run --rm -u 0 -v "$PWD:/repo" -w /repo -e PYTHONPATH=/repo worker \
-  sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q tests/engine"
+  sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q -n auto tests/engine"
 ```
 
 ## Layout
 
+- Each suite has a README listing every test file: what it checks, what it needs, the to-dos and PRs it belongs to,
+  and how to run one file or one test: [engine/README.md](engine/README.md), [portal/README.md](portal/README.md).
 - `engine/conftest.py` sets the engine's test environment (job data under `.pytest_data/`, Redis and Celery in
   memory, the mock AI allowed) and builds the sample PDFs (`harness/make_samples.py`) once per run.
 - `portal/conftest.py` sets the portal's test environment (the test database, in-memory storage and mail, test

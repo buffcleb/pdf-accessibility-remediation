@@ -11,11 +11,17 @@ A simple font (Type1 or TrueType) with WinAnsi or MacRoman encoding and no map c
 not every code: the non-breaking space (WinAnsi 0xA0, MacRoman 0xCA) and the soft hyphen are named only in a footnote
 of the standard's encoding table, and PAC reports them as characters it can't map (12 on a datasheet's distributor
 cover page). These fonts get a map of every printable code, from the encoding itself (cp1252, Mac Roman).
+
+A font's own map can be wrong. macOS Quartz writes one for TeX fonts that gives pi as an arrow (U+21E1), the
+multiplication sign as another, the ff ligature as a return symbol, the minus sign and Delta as U+0000 (which fails
+7.21.7). Where the font's /Differences name a glyph and the map says something of another kind (an arrow for a
+letter, a letter for a math sign) or nothing at all, the name is believed instead.
 """
 from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from pathlib import Path
 
 import pikepdf
@@ -50,6 +56,7 @@ _TEX = {
     "slash": "/", "backslash": "\\", "dotlessi": "ı", "dotlessj": "ȷ", "ff": "ﬀ", "fi": "ﬁ", "fl": "ﬂ",
     "ffi": "ﬃ", "ffl": "ﬄ", "visiblespace": "␣", "emptyset": "∅", "prime": "′", "infinity": "∞",
     # More of TeX's symbol fonts (cmsy, msam, msbm, cmex, wasy)
+    "lscript": "ℓ", "Delta": "Δ",  # (the Adobe Glyph List gives Delta as U+2206 INCREMENT, read as "increment")
     "circlecopyrt": "◯", "mapsto": "↦", "square": "□", "squaresolid": "■", "planckover2pi": "ℏ", "planckover2pi1": "ℏ",
     "rightanglenw": "⌜", "rightanglene": "⌝", "rightanglesw": "⌞", "rightanglese": "⌟",
     "archleftdown": "↶", "archrightdown": "↷", "downslope": "⟍", "upslope": "⟋", "varhexagon": "⬡",
@@ -97,8 +104,9 @@ def _builtin_encoding(font: Dictionary) -> dict[int, str]:
     return {int(c): n.decode("latin-1") for c, n in _DUP.findall(clear) if int(c) < 256}
 
 
-def _code_names(font: Dictionary) -> dict[int, str]:
-    names = _builtin_encoding(font)
+def _differences(font: Dictionary) -> dict[int, str]:
+    """Code -> glyph name from the font dictionary's /Encoding /Differences."""
+    names: dict[int, str] = {}
     enc = font.get("/Encoding")
     if isinstance(enc, Dictionary) and isinstance(enc.get("/Differences"), Array):
         code = 0
@@ -109,6 +117,31 @@ def _code_names(font: Dictionary) -> dict[int, str]:
                 names[code] = str(item)[1:]
                 code += 1
     return names
+
+
+def _code_names(font: Dictionary) -> dict[int, str]:
+    return {**_builtin_encoding(font), **_differences(font)}
+
+
+def _kind(ch: str) -> str:
+    """A character's kind, for telling a map's entry from its glyph's name: letter, number, punctuation, space, and
+    each kind of symbol on its own (a math sign is not an arrow)."""
+    cat = unicodedata.category(ch)
+    return cat if cat[0] == "S" else cat[0]
+
+
+def wrong_entry(have: str, named: str) -> bool:
+    """Whether a map's entry for a glyph is wrong, given the text its glyph name stands for: no text at all (U+0000,
+    a byte order mark, control codes), or one character of another kind than the name's. Two spellings of the same
+    thing ("ff" for the ff ligature) and the same kind ("'" for a right quote) are left as the producer wrote them, and
+    so is a format character: a soft hyphen for the hyphen that breaks a word at a line's end is meant."""
+    if not have.strip("\x00\ufeff\ufffe") or all(unicodedata.category(c) == "Cc" for c in have):
+        return True
+    if any(unicodedata.category(c) == "Cf" for c in have):
+        return False
+    if have == named or unicodedata.normalize("NFKC", have) == unicodedata.normalize("NFKC", named):
+        return False
+    return len(have) == 1 and len(named) == 1 and _kind(have) != _kind(named)
 
 
 _HEX = re.compile(r"<([0-9A-Fa-f]+)>")
@@ -275,23 +308,33 @@ def symbol_tounicode(pdf: pikepdf.Pdf, font: Dictionary) -> int:
     changed = sum(1 for (_, a), (_, b) in zip(entries, new) if a != b) + len(entries) - n_own
     if not changed:
         return 0
+    rewrite_map(pdf, font, text, new)
+    return changed
+
+
+def rewrite_map(pdf: pikepdf.Pdf, font: Dictionary, text: str, entries: list[tuple[str, str]]) -> None:
+    """Replace a font's ToUnicode map with `entries` (source code as written in hex, text), keeping the map's own
+    header (its code space) and trailer."""
     head = re.split(r"\d+\s+beginbf(?:char|range)", text, maxsplit=1)[0]
     tail = text[max(text.rfind("endbfchar") + 9, text.rfind("endbfrange") + 10):]
     body = []
-    for i in range(0, len(new), 100):
-        chunk = new[i:i + 100]
+    for i in range(0, len(entries), 100):
+        chunk = entries[i:i + 100]
         body.append(f"{len(chunk)} beginbfchar")
         body += [f"<{src}> <{dst.encode('utf-16-be').hex().upper()}>" for src, dst in chunk]
         body.append("endbfchar")
     font.ToUnicode = pdf.make_stream((head + "\n".join(body) + "\n" + tail).encode("latin-1"))
-    return changed
 
 
 def add_missing_tounicode(src: Path, dst: Path) -> list[str]:
-    """Write dst with ToUnicode maps added where they can be derived, and Symbol and Wingdings characters a map gives
-    as private use code points said as what they are (#605). Returns the fonts fixed."""
+    """Write dst with ToUnicode maps added where they can be derived, Symbol and Wingdings characters a map gives
+    as private use code points said as what they are (#605), and wrong maps of composite fonts corrected
+    (app.tagging.wrong_maps). Returns the fonts fixed."""
+    from app.tagging.wrong_maps import repair_wrong_maps
+
     fixed: list[str] = []
     with pikepdf.open(src) as pdf:
+        fixed += repair_wrong_maps(pdf, src)
         for obj in pdf.objects:
             if not isinstance(obj, Dictionary) or obj.get("/Type") != Name.Font:
                 continue
@@ -314,13 +357,16 @@ def add_missing_tounicode(src: Path, dst: Path) -> list[str]:
             elif isinstance(enc, Name) and enc in _STD_ENC:
                 continue  # standard encodings are already mappable
             names = _code_names(obj)
-            # Keep every existing entry; only fill codes the existing map leaves out.
+            # Fill codes the existing map leaves out; keep its entries, except wrong ones for glyphs /Differences name
             added = {code: u for code, n in names.items() if code not in existing and (u := glyph_to_unicode(n))}
-            if not added:
+            replaced = {code: u for code, n in _differences(obj).items()
+                        if code in existing and (u := glyph_to_unicode(n)) and wrong_entry(existing[code], u)}
+            if not added and not replaced:
                 continue
-            obj.ToUnicode = pdf.make_stream(_cmap({**existing, **added}))
+            obj.ToUnicode = pdf.make_stream(_cmap({**existing, **added, **replaced}))
             fixed.append(f"{str(obj.get('/BaseFont', '/?'))[1:]} (+{len(added)} of {len(names)} glyphs"
-                         + (", existing map kept" if existing else "") + ")")
+                         + (f", {len(replaced)} wrong entries replaced" if replaced else "")
+                         + (", existing map kept" if existing and len(existing) > len(replaced) else "") + ")")
         if fixed:
             pdf.save(dst)
     log.info("added ToUnicode maps to %d font(s)", len(fixed))

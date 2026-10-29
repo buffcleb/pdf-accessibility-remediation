@@ -75,6 +75,10 @@ your administrators; the default is preselected.
   and kind. **Use the same as the others** puts it back.
 - **Set by your group:** if your group uses one AI level for everything, the AI line says so and there's nothing
   to choose.
+- **No AI** (**New 29 October 2026**), if your group offers it: nothing is sent to an AI, and the pages count against
+  the processing service only. Figures are left without alt text: each is listed under **To review** for you to
+  describe in the tag manager, so the document doesn't pass until you do. Use it for documents that mustn't go to an
+  AI. Your group may preselect it, or use it for everything. A document with no AI level is made the same way.
 - **External:** your group may mark options that send documents to an outside provider with **External**. If
   your administrators have turned on a notice for an option, it appears when you pick it, saying where documents
   go.

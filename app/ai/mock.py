@@ -44,6 +44,10 @@ class MockProvider(AIProvider):
             out = {"label": "Mock field label"}
         elif "shows a table" in prompt:
             out = {"header_rows": 1, "header_cols": 0, "spans": [], "summary": "Test data table.", "is_layout_table": False}
+        elif "drew a box round it in a tag editor" in prompt:
+            # Every item one paragraph, in the order given: tests patch this to steer the grouping
+            out = {"tags": [{"type": "P", "items": [int(i)]} for i in re.findall(r"^- (\d+): ", prompt, re.M)],
+                   "decorative": []}
         elif "reading order" in prompt:
             ids = re.findall(r"- id=(\d+)", prompt)
             out = {"order": [int(i) for i in ids]}

@@ -7,7 +7,7 @@ from pikepdf import Array, ContentStreamInstruction, Dictionary, Name, Operator
 from app.tagging.content_marker import mcid_of, write_ops
 from app.tagging.editor._ctx import (
     CONTENT_ROLES, NEW_AREA_ROLES, NOTES, EditError, _absorbed, _ancestors, _clear_parent_tree, _Ctx, _detach,
-    _elem, _give_id, _MARK, _new_sibling, _parent_obj, _reparent_items, _role_of, _same, _subtree, register,
+    _elem, _give_id, _MARK, _new_sibling, _parent_obj, _reparent_items, _role_of, _same, _subtree, register, WAS_MCID,
 )
 from app.tagging.editor.areas import _split_inside
 from app.tagging.role_rules import check_move
@@ -22,16 +22,43 @@ ARTIFACT_KINDS = {"layout": (Name.Layout, None), "header": (Name.Pagination, Nam
                   "footer": (Name.Pagination, Name.Footer), "page_number": (Name.Pagination, Name("/PageNum"))}
 
 
+def _within(ctx: _Ctx, obj: Dictionary, ancestor: Dictionary) -> bool:
+    """Whether `obj` is `ancestor` or under it in the tree as it is now, earlier edits included: the tag map's
+    elements (ctx.elems) keep the tree as it was before any edit, so an earlier move would be missed."""
+    mark = not ancestor.is_indirect  # a direct object is told apart by a mark while it's looked for (_same)
+    if mark:
+        ancestor[_MARK] = True
+    try:
+        for _ in range(512):
+            if not isinstance(obj, Dictionary) or _same(obj, ctx.root):
+                return False
+            if obj is ancestor or _same(obj, ancestor):
+                return True
+            obj = obj.get("/P")
+        return False
+    finally:
+        if mark:
+            del ancestor[_MARK]
+
+
 def _move(ctx: _Ctx, e: Elem, t: Elem, position: str, n: int) -> str:
-    if t.index in {x.index for x in _subtree(ctx, e)}:
+    """Move a tag before or after another, or "in" one: as its last child (into a Sect, say)."""
+    if _within(ctx, t.obj, e.obj):
         raise EditError(f"Edit {n}: an element can't be moved inside itself.")
-    old_parent, new_parent = _parent_obj(ctx, e), _parent_obj(ctx, t)
+    old_parent = _parent_obj(ctx, e)
+    new_parent = t.obj if position == "in" else _parent_obj(ctx, t)
     at_root = lambda p: p is ctx.root or (p.is_indirect and ctx.root.is_indirect and p.objgen == ctx.root.objgen)  # noqa: E731
     v = check_move(e.role, None if at_root(old_parent) else _role_of(ctx, old_parent),
                    None if at_root(new_parent) else _role_of(ctx, new_parent), _same(old_parent, new_parent))
     if not v.ok:
         raise EditError(f"Edit {n}: element {e.index} ({e.role}) can't go there. {v.reason}")
     _detach(ctx, e)
+    if position == "in":
+        kids = _items(t.obj.get("/K"))
+        kids.append(e.obj)
+        t.obj.K = Array(kids)
+        e.obj.P = t.obj
+        return f"element {e.index} ({e.role}) moved into element {t.index} ({t.role})"
     new_parent = _parent_obj(ctx, t)
     if not t.obj.is_indirect:
         t.obj[_MARK] = True
@@ -80,14 +107,17 @@ def _to_artifacts(ctx: _Ctx, member_ids: set[int], kind: str = "layout") -> int:
                     and isinstance(ins.operands[1], Dictionary) and mcid_of(ins.operands[1]) in mcids):
                 typ, sub = ARTIFACT_KINDS[kind]
                 props = Dictionary(Type=typ, **({"Subtype": sub} if sub is not None else {}))
+                props[WAS_MCID] = mcid_of(ins.operands[1])  # until the save: a later edit may tag it again
                 ops[i] = ContentStreamInstruction([Name.Artifact, props], Operator("BDC"))
                 touched = True
                 changed += 1
         if touched:
             write_ops(ctx.pdf, owner, ops)
+            ctx.artifacted[owner_og] = owner
         _clear_parent_tree(ctx, owner, mcids)
     for key in [k for k, users in ctx.checker.index.refs.items() if any(u in member_ids for u in users)]:
         del ctx.checker.index.refs[key]
+        ctx.untagged.add(key)
     return changed
 
 
@@ -215,6 +245,7 @@ def _apply_split(ctx: _Ctx, op: dict, e: Elem, t, n: int) -> str:
     said = (_split_inside(ctx, e, op["at"], op["char"], n) if op.get("char") is not None
             else _split(ctx, e, op["at"], n))
     role = op.get("role")
+    ctx.new_tags = [ctx.made] if ctx.made is not None else []
     if role and ctx.made is not None and role != e.role:  # the new part's own type (#427)
         ctx.made.S = Name("/" + role)
         if role in NOTES:
@@ -229,8 +260,8 @@ def _check_decorative(op: dict, n: int) -> None:
 
 
 def _check_move(op: dict, n: int) -> None:
-    if not isinstance(op.get("target"), int) or op.get("position") not in ("before", "after"):
-        raise EditError(f"Edit {n}: a move needs a target element and before/after.")
+    if not isinstance(op.get("target"), int) or op.get("position") not in ("before", "after", "in"):
+        raise EditError(f"Edit {n}: a move needs a target element and before/after/in.")
     if op["target"] == op["element"]:
         raise EditError(f"Edit {n}: an element can't be moved next to itself.")
 

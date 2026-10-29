@@ -31,7 +31,7 @@ router = APIRouter(tags=["versions"])
 OPS = {"set_role", "set_alt", "set_actual_text", "set_decorative", "set_lang", "set_cell", "move", "merge", "split",
        "assign", "tag_artifacts", "delete", "make_list", "indent", "outdent", "build_list", "take_pieces", "cut_area", "make_toc",
        "set_headers", "link_note", "set_toc_target", "set_field_label", "set_doc_title", "set_doc_lang",
-       "rebuild_table", "build_table"}
+       "rebuild_table", "build_table", "regroup"}
 DOC_OPS = {"set_doc_title", "set_doc_lang"}  # the document's title and language: no element (#363)
 MAX_EDITS = 5000
 MAX_EDITS_BYTES = 8 * 1024 * 1024  # all of one save's or draft's edits together, as JSON
@@ -209,16 +209,29 @@ def version_tagmap(job_id: uuid.UUID, number: int, request: Request, p: Principa
     return Response(data, media_type="application/json")
 
 
+def _names_a_tag(element) -> bool:
+    """A tag by its number in the tag map, or a tag an earlier edit of the save makes ({"made": id, "group": k}, #692)."""
+    return (isinstance(element, int) and not isinstance(element, bool)) or (
+        isinstance(element, dict) and set(element) == {"made", "group"} and isinstance(element["made"], str)
+        and isinstance(element["group"], int) and not isinstance(element["group"], bool))
+
+
+def _refuse_without_ai(job: Job, what: str) -> None:
+    """A document made with No AI, or with no AI level, is never sent to AI afterwards either (#659)."""
+    if job.no_ai or not job.ai_tier:
+        raise ApiError(409, "no_ai_document", f"This document was made without AI, so it isn't {what}.")
+
+
 def _check_edits(edits: list[dict]) -> None:
     """Shape checks; the engine validates each edit against the document itself."""
     total = 0
     for n, op in enumerate(edits, 1):
         if (not isinstance(op, dict) or op.get("op") not in OPS
-                or (op["op"] not in DOC_OPS and not isinstance(op.get("element"), int))):
+                or (op["op"] not in DOC_OPS and not _names_a_tag(op.get("element")))):
             raise ApiError(422, "invalid_edit", f"Edit {n} isn't a valid tag edit.")
         # An area's list of pieces can be long (a whole page); everything else is small
         size = len(json.dumps(op))
-        big = ("assign", "tag_artifacts", "build_list", "take_pieces", "rebuild_table", "build_table")
+        big = ("assign", "tag_artifacts", "build_list", "take_pieces", "rebuild_table", "build_table", "regroup")
         if size > (64000 if op["op"] in big else 8000):
             raise ApiError(422, "invalid_edit", f"Edit {n} is too large.")
         # Together, too: the per-edit caps alone allow hundreds of megabytes a draft, kept in the database
@@ -246,6 +259,8 @@ def create_version(job_id: uuid.UUID, body: VersionCreate, request: Request,
     if base.status != "ready" or base.pdf_file_id is None or base.tagmap_file_id is None:
         raise ApiError(422, "not_editable", "That version isn't ready to edit.")
     _check_edits(body.edits)
+    if body.review != "none":
+        _refuse_without_ai(job, "reviewed by AI")
     if body.review == "full" and not services.full_review_allowed(db, job.ai_tier):
         raise ApiError(422, "full_review_not_allowed", "Reviewing every figure isn't available with this document's AI level.")
     pending = db.scalar(select(func.count()).select_from(DocumentVersion).where(
@@ -316,6 +331,26 @@ def undo_save(job_id: uuid.UUID, number: int, request: Request, p: Principal = D
     return _version_out(db, before, {x.id: x.number for x in vs})
 
 
+@router.delete("/jobs/{job_id}/versions/{number}", status_code=204)
+def discard_failed(job_id: uuid.UUID, number: int, request: Request, p: Principal = Depends(current_principal),
+                   db: Session = Depends(get_db)):
+    """Remove a save that wasn't made ("(not saved)") from the list, with its changes: nothing else changes. Only a
+    failed save's; for the people who can edit the document."""
+    job = _editable_job(db, job_id, p)
+    v = _version(db, job, number)
+    if v.status != "failed":
+        raise ApiError(409, "not_failed", "Only a save that wasn't made can be removed.")
+    get_storage().delete_prefix(version_prefix(job, v.number))
+    for fid in (v.pdf_file_id, v.tagmap_file_id, v.verapdf_file_id):
+        f = db.get(JobFile, fid) if fid else None
+        if f is not None:
+            db.delete(f)
+    audit.record(db, request, "version.discarded", actor=p.user, target_type="job", target_id=job.id,
+                 group_id=job.group_id, details={"version": v.number, "label": v.label, "edits": len(v.edits or [])})
+    db.delete(v)
+    db.commit()
+
+
 def version_prefix(job: Job, number: int) -> str:
     from portal.storage import job_prefix
 
@@ -361,6 +396,26 @@ def _editable_job(db: Session, job_id: uuid.UUID, p: Principal) -> Job:
     if not can_edit(p, job):
         raise ApiError(403, "forbidden", "Only the document's owner or their group admins can edit its tags.")
     return job
+
+
+class FailedEditsOut(BaseModel):
+    based_on: int | None
+    edits: list[dict]
+
+
+@router.get("/jobs/{job_id}/versions/{number}/edits", response_model=FailedEditsOut)
+def failed_edits(job_id: uuid.UUID, number: int, p: Principal = Depends(current_principal),
+                 db: Session = Depends(get_db)):
+    """The changes of a save that failed, and the version they were made on: to put them back as unsaved changes and
+    try again (once what refused them is fixed, or after taking out the one that was). For the people who can edit
+    the document; only a failed save's."""
+    job = _editable_job(db, job_id, p)
+    v = _version(db, job, number)
+    if v.status != "failed" or not v.edits:
+        raise ApiError(409, "not_failed", "Only the changes of a save that failed can be tried again.")
+    base = db.get(DocumentVersion, v.based_on_id) if v.based_on_id else None
+    return FailedEditsOut(based_on=base.number if base is not None and base.superseded_at is None else None,
+                          edits=list(v.edits))
 
 
 @router.get("/jobs/{job_id}/tag-draft", response_model=DraftsOut)
@@ -436,12 +491,12 @@ class DescribeRequest(BaseModel):
 DESCRIBE_PER_HOUR = 120  # per person: enough to describe every part of a long document, not a runaway loop
 
 
-@router.post("/jobs/{job_id}/versions/{number}/describe")
-def describe_area(job_id: uuid.UUID, number: int, body: DescribeRequest, request: Request,
-                  p: Principal = Depends(current_principal), db: Session = Depends(get_db),
-                  limiter: RateLimiter = Depends(get_rate_limiter)):
-    """Alt text for an area of a page, written by the AI at the document's AI level: one AI call, recorded on the
-    document's cost. For people "Describe with AI" is allowed for (the service default, their group or them)."""
+def _ask_ai_about_area(db: Session, request: Request, p: Principal, limiter: RateLimiter, job_id: uuid.UUID,
+                      number: int, page: int, bbox: list[float], ask, action: str, what: str) -> tuple[dict, float]:
+    """One AI call about an area of a version's page, for "Describe with AI" and the AI's tags for an area: who may
+    (as "Describe with AI" is allowed for them), the document's AI level, the hourly limit, and the call's cost on
+    the document and in the log the Describe with AI report reads (#318). ask(engine, filename, file, model) makes
+    the call. Returns the engine's answer and its cost."""
     from portal import ai_describe
     from portal.engine import EngineError, EngineUnavailable, get_engine_client
     from portal.worker import _ai_choice
@@ -453,41 +508,84 @@ def describe_area(job_id: uuid.UUID, number: int, body: DescribeRequest, request
         raise ApiError(403, "ai_describe_off", "Describing with AI isn't turned on for you. A group admin can turn it on.")
     if job.files_deleted_at is not None:
         raise ApiError(410, "files_deleted", "This document's files have been removed.")
-    if body.bbox[2] - body.bbox[0] < 1 or body.bbox[3] - body.bbox[1] < 1:
+    if bbox[2] - bbox[0] < 1 or bbox[3] - bbox[1] < 1:
         raise ApiError(422, "invalid", "Draw an area with some width and height.")
     v = _version(db, job, number)
     if v.status != "ready" or v.pdf_file_id is None:
         raise ApiError(422, "not_ready", "That version isn't ready yet.")
+    _refuse_without_ai(job, "sent to AI")
     ai = _ai_choice(db, job)
     if ai is None:
         raise ApiError(409, "no_ai_level", "This document wasn't processed with an AI level, so there's none to describe with.")
     if not limiter.hit("describe", str(p.user.id), DESCRIBE_PER_HOUR, 3600):
-        raise ApiError(429, "rate_limited", "That's a lot of descriptions in an hour. Try again a little later.")
+        raise ApiError(429, "rate_limited", "That's a lot of AI requests in an hour. Try again a little later.")
     f = db.get(JobFile, v.pdf_file_id)
     import tempfile
     with tempfile.TemporaryFile() as tmp:
         get_storage().get_to_file(f.s3_key, tmp)
         tmp.seek(0)
         try:
-            out = get_engine_client().describe(f.name, tmp, body.page, body.bbox, ai.model, long=body.long)
+            out = ask(get_engine_client(), f.name, tmp, ai.model)
         except EngineUnavailable:
             raise ApiError(503, "ai_unavailable", "The AI couldn't be reached just now. Try again in a minute.")
         except EngineError as e:
-            raise ApiError(422, "describe_failed", f"That area couldn't be described: {e}")
+            raise ApiError(422, "describe_failed", f"The AI couldn't {what} that area: {e}")
     cost = float(out.get("cost_usd") or 0)
     prev = job.cost or {}
     # Each use, for the Describe with AI report (#318): when, by whom, what it cost (the job's cost is super admins')
     log = list(prev.get("describe_log") or [])[-999:]
     log.append({"at": datetime.now(timezone.utc).isoformat(), "user": str(p.user.id), "usd": round(cost, 6),
-                "model": out.get("model"), "page": body.page})
+                "model": out.get("model"), "page": page, **({"for": "tags"} if action == "version.ai_area_tags" else {})})
     job.cost = {**prev, "describe_usd": round(float(prev.get("describe_usd") or 0) + cost, 6),
                 "describe_calls": int(prev.get("describe_calls") or 0) + 1, "describe_log": log}
     # The cost in dollars is super admins' (#314): the job's cost keeps it for them; the audit log, which group admins
     # read, and the answer to anyone else don't carry it
-    audit.record(db, request, "version.ai_described", actor=p.user, target_type="job", target_id=job.id,
-                 group_id=job.group_id, details={"version": v.number, "page": body.page, "model": out.get("model")})
+    audit.record(db, request, action, actor=p.user, target_type="job", target_id=job.id,
+                 group_id=job.group_id, details={"version": v.number, "page": page, "model": out.get("model")})
     db.commit()
+    return out, cost
+
+
+@router.post("/jobs/{job_id}/versions/{number}/describe")
+def describe_area(job_id: uuid.UUID, number: int, body: DescribeRequest, request: Request,
+                  p: Principal = Depends(current_principal), db: Session = Depends(get_db),
+                  limiter: RateLimiter = Depends(get_rate_limiter)):
+    """Alt text for an area of a page, written by the AI at the document's AI level: one AI call, recorded on the
+    document's cost. For people "Describe with AI" is allowed for (the service default, their group or them)."""
+    out, cost = _ask_ai_about_area(
+        db, request, p, limiter, job_id, number, body.page, body.bbox,
+        lambda engine, name, f, model: engine.describe(name, f, body.page, body.bbox, model, long=body.long),
+        "version.ai_described", "describe")
     return {"alt": out.get("alt") or "", "kind": out.get("kind"), "decorative": bool(out.get("decorative")),
+            **({"cost_usd": round(cost, 6)} if p.can(COSTS) else {})}
+
+
+class AreaItem(BaseModel):
+    kind: str = Field("", max_length=20)
+    text: str = Field("", max_length=300)
+    bbox: list[float] = Field(..., min_length=4, max_length=4)
+
+
+class AreaTagsRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    bbox: list[float] = Field(..., min_length=4, max_length=4)  # the area drawn, in the tag map's page units
+    # the area's content, as the tag map has it; none for an area that is only a picture (a poster's artwork)
+    items: list[AreaItem] = Field(default_factory=list, max_length=300)
+
+
+@router.post("/jobs/{job_id}/versions/{number}/area-tags")
+def area_tags(job_id: uuid.UUID, number: int, body: AreaTagsRequest, request: Request,
+              p: Principal = Depends(current_principal), db: Session = Depends(get_db),
+              limiter: RateLimiter = Depends(get_rate_limiter)):
+    """The AI's tags for an area of a page: which of its items of content go together, as what, in reading order
+    ({tags: [{role, items, alt}], decorative}). Nothing changes: the tag manager shows them to be checked before they
+    become edits. One AI call, allowed, limited and costed as "Describe with AI" is."""
+    items = [i.model_dump() for i in body.items]
+    out, cost = _ask_ai_about_area(
+        db, request, p, limiter, job_id, number, body.page, body.bbox,
+        lambda engine, name, f, model: engine.area_tags(name, f, body.page, body.bbox, items, model),
+        "version.ai_area_tags", "suggest tags for")
+    return {"tags": out.get("tags") or [], "decorative": out.get("decorative") or [],
             **({"cost_usd": round(cost, 6)} if p.can(COSTS) else {})}
 
 
@@ -517,6 +615,7 @@ def review_version(job_id: uuid.UUID, number: int, request: Request, body: Revie
         raise ApiError(422, "not_reviewable", "That version isn't ready yet.")
     if v.review_status in ("queued", "running"):
         raise ApiError(409, "review_running", "A review of this version is already running.")
+    _refuse_without_ai(job, "reviewed by AI")
     if full and not services.full_review_allowed(db, job.ai_tier):
         raise ApiError(422, "full_review_not_allowed", "Reviewing every figure isn't available with this document's AI level.")
     queues.forget_removal(db, "reviews", v.id)  # asked for again: a new failure would be listed again

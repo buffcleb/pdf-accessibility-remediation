@@ -64,6 +64,14 @@ class FakeEngine:
             raise self.describe_answer
         return dict(self.describe_answer)
 
+    def area_tags(self, filename, fileobj, page, bbox, items, model):
+        self.area_asked = getattr(self, "area_asked", []) + [(page, list(bbox), items, model, len(fileobj.read()))]
+        answer = getattr(self, "area_answer", {"tags": [{"role": "Figure", "items": [0, 1], "alt": "A chart"}],
+                                               "decorative": [], "model": "commercial", "cost_usd": 0.002})
+        if isinstance(answer, Exception):
+            raise answer
+        return dict(answer)
+
     def ai_models(self):
         return list(self.models)
 
@@ -271,7 +279,7 @@ def test_upload_reserves_and_completion_commits(setup):
     assert "report_json" not in kinds  # the engine's JSON report (with the AI's cost) is super admins' (#314)
     assert next(f for f in job["files"] if f["kind"] == "report_pdf")["label"] == "Report (PDF)"
     # The engine is told how to brand the PDF report (and never given a model name for it)
-    assert s["engine"].brandings[-1]["service_name"] and "ai_label" not in s["engine"].brandings[-1]
+    assert s["engine"].brandings[-1]["service_name"] and s["engine"].brandings[-1]["ai_label"] == "No AI"  # no level (#659)
     # ...and how to run veraPDF: by default its running service, with PDF/UA-2 shown for information
     assert s["engine"].validators[-1] == {"validator": "service", "verapdf_ua2": True}
     me = s["c"]["user"].get(f"{API}/me").json()

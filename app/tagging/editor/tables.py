@@ -9,6 +9,8 @@ from app.tagging.editor._ctx import (
     LIST_ITEM_FROM, NOTES, EditError, _absorbed, _ancestors, _at_root, _Ctx, _detach, _elem, _give_id, _parent_obj,
     _reparent_items, _role_of, _same, register,
 )
+from app.tagging.editor.areas import _split_inside
+from app.tagging.editor.structure import _split
 from app.tagging.role_rules import check_move
 from app.tagging.table_headers import header_links, headers_named, id_of, is_complex, table_attrs
 from app.tagging.tree import is_elem, new_elem, walk
@@ -35,14 +37,13 @@ def _check_table_rows(op: dict, n: int) -> None:
                     or (cell["role"] == "TH" and cell.get("scope", "Column") not in SCOPES)
                     or not whole(cell.get("rows", 1), 1) or not whole(cell.get("cols", 1), 1)
                     or cell.get("rows", 1) > MAX_TABLE_ROWS or cell.get("cols", 1) > MAX_TABLE_COLS
-                    or not isinstance(cell.get(key), list)):
+                    or not isinstance(cell.get(key), list)
+                    or not isinstance(cell.get("text", ""), str) or len(cell.get("text", "")) > 4000):
                 raise EditError(f"Edit {n}: each cell is a header (TH, with a scope) or data cell (TD), with its "
                                 f"spans and what it holds.")
             for ref in cell[key]:
                 if key == "from":
-                    if not whole(ref) or ref in seen:
-                        raise EditError(f"Edit {n}: each old cell can go in one new cell only.")
-                    seen.add(ref)
+                    _check_from(ref, seen, op, n)
                 else:
                     others = op.get("absorb") or []
                     if (not isinstance(ref, dict) or not whole(ref.get("at")) or ("el" in ref and not whole(ref["el"]))
@@ -52,6 +53,27 @@ def _check_table_rows(op: dict, n: int) -> None:
                     if k in seen:
                         raise EditError(f"Edit {n}: each piece can go in one cell only.")
                     seen.add(k)
+    if op["op"] == "rebuild_table":
+        cuts = op.get("cuts") or {}
+        if (not isinstance(cuts, dict) or len(cuts) > 200
+                or not all(str(k).isdigit() and isinstance(v, list) and 1 <= len(v) <= 50
+                           and all(isinstance(x, dict) and whole(x.get("at")) and whole(x.get("char", 0)) for x in v)
+                           for k, v in cuts.items())):
+            raise EditError(f"Edit {n}: a cell's text is cut at places in its pieces of text.")
+        out = op.get("out") or []
+        if not isinstance(out, list) or len(out) > 50:
+            raise EditError(f"Edit {n}: what comes out of the table is a list of paragraphs.")
+        for para in out:
+            if not isinstance(para, dict) or para.get("role", "P") not in ("P", "Caption", "Note") \
+                    or not isinstance(para.get("from"), list) or not para["from"]:
+                raise EditError(f"Edit {n}: each paragraph out of the table names the cells it takes.")
+            for ref in para["from"]:
+                _check_from(ref, seen, op, n)
+        for k, v in cuts.items():  # a cut cell goes in by its parts, every one of them
+            parts = {r[1] for r in seen if isinstance(r, tuple) and r[0] == int(k)}
+            if int(k) in seen or parts != set(range(len(v) + 1)):
+                raise EditError(f"Edit {n}: each part of a cell whose text is cut goes in a cell (or a paragraph) "
+                                "of its own, and every part goes somewhere.")
     caption = op.get("caption")
     if caption is not None and not whole(caption):
         raise EditError(f"Edit {n}: a table's caption is a tag (or none).")
@@ -59,6 +81,20 @@ def _check_table_rows(op: dict, n: int) -> None:
     if not isinstance(absorb, list) or len(absorb) > 500 or op["element"] in absorb or len(set(absorb)) != len(absorb) \
             or not all(whole(a) for a in absorb):
         raise EditError(f"Edit {n}: the other tags to make a table of are a list of tags.")
+
+
+def _check_from(ref, seen: set, op: dict, n: int) -> None:
+    """An old cell a new cell takes: its number, or [its number, a part] when its text is cut (op "cuts")."""
+    whole = lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0  # noqa: E731
+    cut = isinstance(ref, list) and len(ref) == 2 and all(whole(v) for v in ref)
+    if not (whole(ref) or cut):
+        raise EditError(f"Edit {n}: each cell names the old cells it takes.")
+    key = (ref[0], ref[1]) if cut else ref
+    if cut and str(ref[0]) not in (op.get("cuts") or {}):
+        raise EditError(f"Edit {n}: a part of a cell is named only when its text is cut.")
+    if key in seen:
+        raise EditError(f"Edit {n}: each old cell can go in one new cell only.")
+    seen.add(key)
 
 
 def _set_cell(ctx: _Ctx, e: Elem, role: str, scope: str | None) -> str:
@@ -357,8 +393,34 @@ def _rebuild_table(ctx: _Ctx, e: Elem, op: dict, t: dict, n: int) -> str:
     if e.role != "Table" or not e.obj.is_indirect:
         raise EditError(f"Edit {n}: element {e.index} is a {e.role}, not a table.")
     table = e.obj
+    # A cell whose words belong in several cells is cut first, from its last cut back (each cut leaves it shorter):
+    # its parts are new cells right after it, named by part number
+    parts: dict[int, list[Elem]] = {}
+    for idx, cell in t["cuts"].items():
+        if cell.role not in ("TH", "TD") or _table_of(ctx, cell.obj) is None or not _same(_table_of(ctx, cell.obj), table):
+            raise EditError(f"Edit {n}: a cell cut isn't one of this table's cells. Reload and try again.")
+        made = []
+        for cut in sorted(op["cuts"][str(idx)], key=lambda c: (c["at"], c.get("char", 0)), reverse=True):
+            if cut.get("char"):
+                _split_inside(ctx, cell, cut["at"], cut["char"], n)
+            else:
+                _split(ctx, cell, cut["at"], n)
+            made.append(Elem(index=len(ctx.elems), obj=ctx.made, role=cell.role, raw_role=cell.raw_role, page=cell.page,
+                             parent=cell.parent))
+            ctx.elems.append(made[-1])
+        parts[idx] = [cell] + made[::-1]
+
+    def resolve(x):
+        if isinstance(x, tuple):
+            got = parts.get(x[0].index, [])
+            if x[1] >= len(got):
+                raise EditError(f"Edit {n}: a cell's text was cut into fewer parts than the table names.")
+            return got[x[1]]
+        return x
+    t = {**t, "cells": [[[resolve(x) for x in cell] for cell in row] for row in t["cells"]],
+         "out": [[resolve(x) for x in para] for para in t["out"]]}
     own = {c.objgen for c in _cells_of(ctx, table)}
-    listed = [x for row in t["cells"] for cell in row for x in cell]
+    listed = [x for row in t["cells"] for cell in row for x in cell] + [x for para in t["out"] for x in para]
     if any(x.obj.objgen not in own for x in listed if x.obj.is_indirect) or any(not x.obj.is_indirect for x in listed):
         raise EditError(f"Edit {n}: a cell named isn't one of this table's cells. Reload and try again.")
     missing = own - {x.obj.objgen for x in listed}
@@ -386,6 +448,11 @@ def _rebuild_table(ctx: _Ctx, e: Elem, op: dict, t: dict, n: int) -> str:
                 base = _new_elem(ctx, spec["role"], tr, table)
             base.S = Name("/" + spec["role"])
             base.P = tr
+            if "text" in spec:  # what it's read as, set in the table editor (empty: its drawn text)
+                if spec["text"].strip():
+                    base.ActualText = String(spec["text"].strip())
+                elif "/ActualText" in base:
+                    del base["/ActualText"]
             _cell_attrs(base, spec["role"], spec.get("scope"), spec.get("rows", 1), spec.get("cols", 1))
             kids.append(base)
             objs.append(base)
@@ -396,11 +463,38 @@ def _rebuild_table(ctx: _Ctx, e: Elem, op: dict, t: dict, n: int) -> str:
         if a is not None and "/Headers" in a:
             del a["/Headers"]
     linked = _link_headers(ctx, slots, objs, f"t{e.index}")
+    old_caption = next((k for k in _items(table.get("/K")) if is_elem(k) and _role_of(ctx, k) == "Caption"), None)
     caption = _table_caption(ctx, e, op, t.get("caption"), n)
     table.K = Array(([caption] if caption is not None else []) + trs)
+    # Cells that aren't the table's (a paragraph set beside it, read as a column): one paragraph each, after it
+    outside = []
+    for spec, cells in zip(op.get("out") or [], t["out"]):
+        parent = _parent_obj(ctx, e)
+        para = _new_elem(ctx, spec.get("role", "P"), parent, table)
+        content = []
+        for o in cells:
+            content += _reparent_items(ctx, o, _items(o.obj.get("/K")), para)
+            o.obj.K = Array([])
+        para.K = Array(content)
+        outside.append(para)
+    if outside:
+        parent = _parent_obj(ctx, e)
+        siblings = _items(parent.get("/K"))
+        pos = next((i for i, k in enumerate(siblings) if _same(k, table)), len(siblings) - 1)
+        parent.K = Array(siblings[:pos + 1] + outside + siblings[pos + 1:])
+    # The tags as the table now has them, in the order the tag manager shows them (refs.py): an old caption put back
+    # as a paragraph, the table, its caption, each row and its cells, then the paragraphs taken out after it
+    ctx.new_tags = ([old_caption] if old_caption is not None and op.get("caption", 0) is None else []) + [table] + (
+        [caption] if caption is not None else [])
+    cells = iter(objs)
+    for tr, row in zip(trs, op["rows"]):
+        ctx.new_tags += [tr] + [next(cells) for _ in row]
+    ctx.new_tags += outside
     width = 1 + max(s.col + s.col_span - 1 for s in slots)
     return (f"element {e.index} (Table): {len(trs)} row(s) by {width} column(s)"
             + (f", {merged} cell(s) merged into others" if merged else "")
+            + (f", {sum(len(v) - 1 for v in parts.values())} cut(s) in cells' text" if parts else "")
+            + (f", {len(outside)} paragraph(s) taken out after it" if outside else "")
             + (f"; {linked} cell(s) name their headers" if linked else ""))
 
 
@@ -459,8 +553,10 @@ def _build_table(ctx: _Ctx, e: Elem, others: list[Elem], op: dict, n: int) -> st
     slots = _layout(op["rows"], n)
     table = _new_elem(ctx, "Table", parent, e.obj)
     trs, objs = [], []
+    ctx.new_tags = [table]  # the table, then each row and its cells (refs.py)
     for row in op["rows"]:
         tr = _new_elem(ctx, "TR", table, e.obj)
+        ctx.new_tags.append(tr)
         kids = []
         for spec in row:
             cell = _new_elem(ctx, spec["role"], tr, e.obj)
@@ -475,6 +571,7 @@ def _build_table(ctx: _Ctx, e: Elem, others: list[Elem], op: dict, n: int) -> st
             _cell_attrs(cell, spec["role"], spec.get("scope"), spec.get("rows", 1), spec.get("cols", 1))
             kids.append(cell)
             objs.append(cell)
+            ctx.new_tags.append(cell)
         tr.K = Array(kids)
         trs.append(tr)
     table.K = Array(trs)
@@ -515,8 +612,12 @@ def _check_note(op: dict, n: int) -> None:
 
 
 def _table_targets(ctx: _Ctx, op: dict, n: int) -> dict:
-    """rebuild_table: the old cells each new cell takes, and the caption chosen."""
-    return {"cells": [[[_elem(ctx, i, None, n) for i in cell["from"]] for cell in row] for row in op["rows"]],
+    """rebuild_table: the old cells each new cell takes (a cut cell's part as (cell, part)), the cells cut, the
+    paragraphs taken out, and the caption chosen."""
+    ref = lambda r: (_elem(ctx, r[0], None, n), r[1]) if isinstance(r, list) else _elem(ctx, r, None, n)  # noqa: E731
+    return {"cells": [[[ref(i) for i in cell["from"]] for cell in row] for row in op["rows"]],
+            "cuts": {int(k): _elem(ctx, int(k), None, n) for k in (op.get("cuts") or {})},
+            "out": [[ref(i) for i in para["from"]] for para in op.get("out") or []],
             "caption": _elem(ctx, op["caption"], None, n) if op.get("caption") is not None else None}
 
 

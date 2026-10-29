@@ -146,6 +146,8 @@ export type UploadOptions = {
   pdfua_choices?: PdfUa[];
   /** The one preselected. */
   pdfua_default?: PdfUa;
+  /** No AI (#659): "off", "on" (offered beside the AI levels) or "default" (offered and preselected). */
+  no_ai?: "off" | "on" | "default";
 };
 
 /** The PDF/UA part a document is run for (#445): PDF/UA-1, PDF/UA-2 (the file as PDF 2.0), or both (two files). */
@@ -253,8 +255,13 @@ export type Group = {
   require_approval: boolean;
   /** "choose": people pick the AI level and kind; "fixed": the group's level and kind are always used. */
   ai_mode: "choose" | "fixed";
+  /** "fixed": the level ("none": No AI, #659). */
   ai_level: string | null;
   ai_kind: string | null;
+  /** No AI for its people (#659): "off", "on" or "default" (preselected). */
+  no_ai?: "off" | "on" | "default";
+  /** Super admins offer No AI, so the group's setting takes effect. */
+  no_ai_offered?: boolean;
   /** Mark the upload options that send documents to an outside provider. */
   show_external: boolean;
   /** Its people may make API tokens for scripts (#518) */
@@ -473,6 +480,8 @@ export type RuntimeSettings = {
   api_tokens_enabled: boolean;
   /** PDF/UA-2 for PDF 1.x documents is offered to groups (#445). */
   pdfua2_enabled: boolean;
+  /** No AI as a choice for remediation (#659): offered here first, then by each group. */
+  no_ai_enabled?: boolean;
   api_token_days: number;
   api_token_max_days: number;
   api_tokens_per_person: number;
@@ -862,6 +871,8 @@ export type TagElement = {
   say?: string; // the tag's own text in full, when it differs from text (which is cut short, and includes child tags)
   order: number | null;
   parts?: TagPart[];
+  made?: boolean; // a tag unsaved changes make, numbered after the saved ones until it's saved (viewer/made.ts, #692)
+  of?: number; // a table being rebuilt: the table it is in the file, which the table editor edits again
 };
 
 /** One item of a tag's content, in order: a piece of content, a child tag, or a link. */
@@ -923,6 +934,9 @@ export type DocVersion = {
 
 export type Versions = { can_edit: boolean; versions: DocVersion[] };
 
+/** Where a moved tag goes: before or after the target, or "in" it, as its last child (into a section, say). */
+export type MovePosition = "before" | "after" | "in";
+
 export type TagEdit =
   | { op: "set_role"; element: number; expect_role: string; role: string }
   // reading: which of a formula's two readings a person chose (#403); recorded in the engine's report
@@ -931,13 +945,13 @@ export type TagEdit =
   | { op: "set_decorative"; element: number; expect_role: string; as?: "layout" | "header" | "footer" | "page_number" }
   | { op: "set_lang"; element: number; expect_role: string; lang: string }
   | { op: "set_cell"; element: number; expect_role: string; role: "TH" | "TD"; scope?: string }
-  | { op: "move"; element: number; expect_role: string; target: number; expect_target_role: string; position: "before" | "after" }
+  | { op: "move"; element: number; expect_role: string; target: number; expect_target_role: string; position: MovePosition }
   | { op: "merge"; element: number; expect_role: string; absorb: number[] }
   // role: the new part's own type (#427)
-  | { op: "split"; element: number; expect_role: string; at: number; char?: number; role?: string }
+  | { op: "split"; element: number; expect_role: string; at: number; char?: number; role?: string; id?: string }
   | { op: "delete"; element: number; expect_role: string; children: "lift" | "delete" }
   | { op: "assign"; element: number; expect_role: string; pieces: { page: number; mcid: number }[] }
-  | { op: "tag_artifacts"; element: number; expect_role: string; position: "before" | "after"; page: number; sections: number[]; role: string; alt?: string }
+  | { op: "tag_artifacts"; element: number; expect_role: string; position: "before" | "after"; page: number; sections: number[]; role: string; alt?: string; id?: string }
   | { op: "make_list"; element: number; expect_role: string; absorb: number[] }
   | { op: "indent"; element: number; expect_role: string }
   | { op: "outdent"; element: number; expect_role: string }
@@ -951,15 +965,32 @@ export type TagEdit =
   | { op: "set_doc_title"; title: string }
   | { op: "set_doc_lang"; lang: string }
   | { op: "build_list"; element: number; expect_role: string; absorb?: number[]; rows: ListRow[] }
-  | { op: "take_pieces"; element: number; expect_role: string; pieces: { page: number; mcid: number }[]; role: string; alt?: string }
-  | { op: "cut_area"; element: number; expect_role: string; page: number; bbox: [number, number, number, number]; role: string; alt?: string }
+  | { op: "take_pieces"; element: number; expect_role: string; pieces: { page: number; mcid: number }[]; role: string; alt?: string; id?: string }
+  | { op: "cut_area"; element: number; expect_role: string; page: number; bbox: [number, number, number, number]; role: string; alt?: string; id?: string }
   // The table editor (#370): a table as it should be, or text tags made a table
-  | { op: "rebuild_table"; element: number; expect_role: string; rows: TableCellSpec[][]; caption?: number | null }
-  | { op: "build_table"; element: number; expect_role: string; absorb?: number[]; rows: BuildCellSpec[][] };
+  // cuts: an old cell's text cut at places in its pieces of text, its parts then named [cell, part]; out: cells that
+  // come out of the table as paragraphs after it (a paragraph set beside it, read as a column)
+  | { op: "rebuild_table"; element: number; expect_role: string; rows: TableCellSpec[][]; caption?: number | null;
+      cuts?: Record<string, TableCut[]>; out?: { role: "P"; from: CellRef[] }[] }
+  | { op: "build_table"; element: number; expect_role: string; absorb?: number[]; rows: BuildCellSpec[][] }
+  // An area's content in new tags, as the AI suggested and a person checked: pieces of tagged content (MCIDs on the
+  // page) and untagged sections (the tag map's numbers). They go where the first piece's tag was, else by the anchor
+  | { op: "regroup"; element: number; expect_role: string; position: "before" | "after" | "in"; page: number; groups: AreaGroup[]; id?: string };
+
+/** One new tag of an area's regrouping. */
+export type AreaGroup = { role: string; pieces?: number[]; sections?: number[]; box?: [number, number, number, number]; alt?: string };
+
+/** The AI's tags for an area: items are indices into the items it was sent, in reading order. */
+export type AreaTags = { tags: { role: string; items: number[]; alt: string; box?: [number, number, number, number] }[]; decorative: number[] };
 
 /** A cell of the table editor's grid, as the engine takes it: header or data, its spans, and the old cells whose
  * content it takes (a table being edited) or the pieces of text it holds (text tags being made a table). */
-export type TableCellSpec = { from: number[]; role: "TH" | "TD"; scope?: "Row" | "Column" | "Both"; rows?: number; cols?: number };
+// text: what the cell is read as (its ActualText), set in the table editor; "" goes back to its drawn text
+export type TableCellSpec = { from: CellRef[]; role: "TH" | "TD"; scope?: "Row" | "Column" | "Both"; rows?: number; cols?: number; text?: string };
+/** An old cell a new one takes: the cell, or [cell, part] when its text is cut. */
+export type CellRef = number | [number, number];
+/** A place a cell's text is cut: before /K item `at`, or inside it before character `char`. */
+export type TableCut = { at: number; char?: number };
 export type BuildCellSpec = { parts: { el?: number; at: number }[]; role: "TH" | "TD"; scope?: "Row" | "Column" | "Both"; rows?: number; cols?: number };
 
 /** One row of a list being built from a tag's content: where it starts (item `at` of tag `el`, the edit's own tag

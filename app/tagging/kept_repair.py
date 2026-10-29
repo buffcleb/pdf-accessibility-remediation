@@ -202,6 +202,10 @@ def repair_kept(pdf: pikepdf.Pdf, src: Path, analysis: DocumentAnalysis, existin
                     continue
                 kinds = sm.existing_kinds.get(mcid, set())
                 drawing_only = bool(kinds) and kinds <= {"path", "shading"}
+                if kinds == {"text"} and mcid not in sm.existing_ink:
+                    # Only spaces (Word's blank lines, as in #490): never a paragraph of its own
+                    decorative_orphans.add((sm.owner.objgen, mcid))
+                    continue
                 # Lines and shapes alone are placed as drawings are: in the figure they lie in, else
                 # decoration (a slide's tab shapes, a button's border)
                 key, _ = resolvers[page_no]("path" if drawing_only else "form", bbox, 0)

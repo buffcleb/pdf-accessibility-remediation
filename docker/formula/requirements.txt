@@ -1,12 +1,14 @@
 # The formula reading service (#403): RapidLaTeXOCR (Apache-2.0), pix2tex's model (MIT) as ONNX, so no PyTorch.
 # Every package pinned: resolved with `uv pip compile --exclude-newer <date two weeks back>` from
-# rapid-latex-ocr==0.0.9, requests and redis, so each release is at least two weeks old.
+# rapid-latex-ocr==0.0.9, requests and redis, so each release is at least two weeks old. Except, by choice on
+# 2026-10-29 for their CRITICAL fixes (#504): certifi 2026.10.19 (released 2026-10-20), filelock 4.2.1 and pillow 13.0.0
+# (2026-10-16).
 anyio==4.15.1
-certifi==2026.7.22
+certifi==2026.10.19
 chardet==7.6.0
 charset-normalizer==3.5.2
 click==8.5.0
-filelock==4.0.10
+filelock==4.2.1
 flatbuffers==25.12.19
 fsspec==2026.9.0
 h11==0.16.0
@@ -19,7 +21,7 @@ numpy==1.26.4
 onnxruntime==1.30.0
 opencv-python==4.11.0.86
 packaging==26.3
-pillow==12.3.0
+pillow==13.0.0
 protobuf==7.36.2
 pyyaml==6.0.3
 rapid-latex-ocr==0.0.9

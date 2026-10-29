@@ -32,6 +32,8 @@ _GENERIC_ALT = {"image", "picture", "photo", "graphic", "figure", "img", "logo",
 _GENERIC_LINK = re.compile(r"^\s*(click here|here|link|read more|more|this link|learn more|go)\s*\.?\s*$", re.I)
 _NUM_LABEL = re.compile(r"^\s*\(?(\d{1,3})[.)]")
 _PER_ISSUE_CAP = 25
+# Each is a figure for a person to describe (#659: every figure of a document made without AI), so each keeps its row
+_UNCAPPED = {"figure has no alt text"}
 
 
 def _patch_pdfplumber_marked_content() -> None:
@@ -80,14 +82,44 @@ _ALT_LONG = 300
 _ALT_LONG_DRAWING = 1000  # above what a labeled figure's description is cut at (ALT_LIMIT_LONG, app/ai/base.py)
 
 
-def _gap(prev: dict, c: dict) -> bool:
+_NEAR = 4  # glyph pairs each side looked at for how close a line's letters sit
+
+
+def _gap(prev: dict, c: dict, near=None) -> bool:
     """Whether a space stands between two glyphs drawn one after the other: the second starts a new line (back to the
     left and lower down; a raised or lowered script carries on to the right), or a gap on the line is a word space drawn
-    by moving the pen rather than with a space character."""
+    by moving the pen rather than with a space character: over a quarter of an em, or over 0.18 em where the letters
+    around it sit much closer (near(): the narrowest of their gaps). TeX's justified lines set word spaces down to
+    about 0.23 em with letters touching (a problem set read "Atrainisinitially"); a heading set with wide letter
+    spacing has every gap that wide, and reads as words, not letters. A line that writes its word spaces as
+    characters (an OCR layer, whose glyph widths aren't the picture's) has no narrow word space to find."""
     size = max(prev.get("size") or 0.0, c.get("size") or 0.0, 1.0)
     if c["x0"] < prev["x0"] and abs(c["top"] - prev["top"]) > 0.5 * size:
         return not prev["text"].rstrip().endswith("-")  # a word broken at the line's end stays one word
-    return c["x0"] - prev["x1"] > 0.25 * size
+    gap = c["x0"] - prev["x1"]
+    if gap > 0.25 * size:
+        return True
+    return gap > 0.18 * size and near is not None and gap > 3 * near() + 0.05 * size
+
+
+def _near_gaps(chars: list, i: int, before: list[float] | None) -> float:
+    """The narrowest gap between neighbouring glyphs on the line around chars[i]: `before` (the line's last few gaps
+    up to it) and the next few after it. Infinite where the line writes space characters (before is None, or one
+    follows)."""
+    if before is None:
+        return float("inf")
+    gaps = list(before)
+    prev = chars[i]
+    for c in chars[i + 1:]:
+        if len(gaps) >= len(before) + _NEAR:
+            break
+        if not c["text"].strip():
+            return float("inf")
+        if abs(c["top"] - prev["top"]) > 0.5 * max(c.get("size") or 0.0, 1.0) or c["x0"] < prev["x0"]:
+            break
+        gaps.append(c["x0"] - prev["x1"])
+        prev = c
+    return max(0.0, min(gaps)) if gaps else float("inf")
 
 
 def glyph_text(chars: list, limit: int | None = None) -> tuple[str, list[int]]:
@@ -99,13 +131,22 @@ def glyph_text(chars: list, limit: int | None = None) -> tuple[str, list[int]]:
     out: list[str] = []
     starts: list[int] = []
     last_space, prev = True, None
-    for c in chars:
+    recent: list[float] | None = []  # the line's last few gaps between glyphs (None: it writes spaces as characters)
+    for i, c in enumerate(chars):
         if limit is not None and len(out) > limit:
             return "".join(out)[:limit], starts
         t = c["text"]
-        if prev is not None and not last_space and t.strip() and _gap(prev, c):
-            out.append(" ")
-            last_space = True
+        if prev is not None and t.strip():
+            same_line = abs(c["top"] - prev["top"]) <= 0.5 * max(c.get("size") or 0.0, 1.0) and c["x0"] >= prev["x0"]
+            if not last_space and _gap(prev, c, lambda: _near_gaps(chars, i, recent)):
+                out.append(" ")
+                last_space = True
+            if not same_line:
+                recent = []
+            elif recent is not None:
+                recent = (recent + [c["x0"] - prev["x1"]])[-_NEAR:]
+        elif prev is not None and recent is not None and t and not t.strip():
+            recent = None
         starts.append(len(out))
         for ch in t:
             if ch.isspace():
@@ -349,17 +390,15 @@ def _collect_page(i: int, page, fpage: fitz.Page, pkpage, by_page_mcid: dict) ->
             out.artifact = Content()
         return out.artifact
 
-    rot = fpage.rotation_matrix if fpage.rotation else None
     vis = fpage.rect
     out.page_size = (vis.width, vis.height)
     top0 = float(page.bbox[1])
     x00 = float(page.bbox[0])
 
     def vbox(o):
-        r = fitz.Rect(o["x0"] - x00, o["top"] - top0, o["x1"] - x00, o["bottom"] - top0)
-        if rot is not None:
-            r = r * rot
-        return (r.x0, r.y0, r.x1, r.y1)
+        # pdfplumber gives a rotated page's positions in visual space already (since 0.11): turning them again put a
+        # /Rotate 90 page's boxes half a turn off
+        return (o["x0"] - x00, o["top"] - top0, o["x1"] - x00, o["bottom"] - top0)
 
     forms_cache: dict = {}
 
@@ -406,7 +445,7 @@ def _collect_page(i: int, page, fpage: fitz.Page, pkpage, by_page_mcid: dict) ->
         clips = {}
     counts = Counter(im.get("mcid") for im in page.images)
     seen: Counter = Counter()
-    to_page = fpage.transformation_matrix * (rot if rot is not None else fitz.Identity)
+    to_page = fpage.transformation_matrix * fpage.rotation_matrix
     for im in page.images:
         b = vbox(im)
         mcid = im.get("mcid")
@@ -604,7 +643,8 @@ class SemanticChecker:
                 pw, ph = page.rect.width, page.rect.height
                 worst = 0.0
                 for info in page.get_image_info():
-                    x0, y0, x1, y1 = info["bbox"]
+                    # Placed in unrotated page space, and the page's size is its visual one
+                    x0, y0, x1, y1 = fitz.Rect(info["bbox"]) * page.rotation_matrix
                     area = (x1 - x0) * (y1 - y0)
                     if area < 0.25 * pw * ph:
                         continue  # small pictures bleeding off the edge are a design choice
@@ -698,7 +738,13 @@ class SemanticChecker:
                 self.add("suggest", "figure contains only text", e, text=c.text[:80],
                          action="tag as text (P/Formula) so it can be read and reflowed", confidence=0.4)
             if not alt:
-                continue  # missing alt is a PDF/UA failure reported by veraPDF
+                # A PDF/UA failure veraPDF reports too, but listed here for a person to describe: a document made
+                # without AI (#659), or one whose AI calls failed, has every figure left like this
+                if e.role == "Figure" and (c.images or c.graphics or c.chars):
+                    self.add("high", "figure has no alt text", e,
+                             action="describe it with Edit tag in the tag manager, or mark it decorative if it only "
+                                    "decorates; until then a screen reader says nothing for it", confidence=1.0)
+                continue
             low = alt.lower().strip(" .")
             if _FILENAME.search(alt) or low in _GENERIC_ALT:
                 self.add("review", "alt text is a file name or generic word", e, detail=f'alt: "{alt[:80]}"',
@@ -760,8 +806,11 @@ class SemanticChecker:
                     self.add("review", "large image marked as decorative (hidden from screen readers)",
                              page=page + 1, detail=f"{area / page_area:.0%} of the page", boxes=area_boxes([b]),
                              action="confirm it is decorative, or tag it as a Figure with alt text", confidence=0.6)
+            # The margins are a tenth of the page, and at least an inch: a landscape page is short, and its running
+            # header, as far down as a portrait page's, was taken for body text (#665)
+            margin = max(0.1 * h, 72.0)
             body = [ch for ch in c.chars if ch["text"].strip()
-                    and h * 0.1 < (ch["vbox"][1] + ch["vbox"][3]) / 2 < h * 0.9]
+                    and margin < (ch["vbox"][1] + ch["vbox"][3]) / 2 < h - margin]
             if len(body) > 40:
                 sample = glyph_text(body[:80])[0]
                 self.add("high", "text in the body of the page is marked as an artifact", page=page + 1,
@@ -939,6 +988,9 @@ class SemanticChecker:
             by_issue[f.issue].append(f)
         out = []
         for issue, fs in by_issue.items():
+            if issue in _UNCAPPED:
+                out += fs
+                continue
             out += fs[:_PER_ISSUE_CAP]
             if len(fs) > _PER_ISSUE_CAP:
                 out.append(Finding(layer="semantic", severity=fs[0].severity,

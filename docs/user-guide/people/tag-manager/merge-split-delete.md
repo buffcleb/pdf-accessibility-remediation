@@ -42,9 +42,17 @@ the tag.](../../../images/tag-manager/delete.png)
   when the tag above can hold text (a span inside a paragraph); otherwise it's no longer read, and the window shows
   which text.
 - **Delete it and everything in it:** the tags inside go too, and all of its content becomes an artifact, which
-  screen readers skip. The window shows the text that will stop being read.
+  screen readers skip. The window shows the text that will stop being read. Before you save, that content can be
+  tagged again from an [area](areas.md#tagged-content): moved into another tag, or made a new one. (**New 29 October
+  2026**)
 - Links and form fields have to stay tagged. Deleting a tag with everything in it keeps the links and fields inside
   it: each moves up into the tag's place, with its own text. A tag that is itself a link or a field can't be deleted,
   nor can the document's top tag.
+
+To delete several tags at once, select them (Ctrl-click or Cmd-click, or Shift-click for a run of them), right-click
+one, and choose **Remove or delete these N tags…**. One choice covers all of them. If none of them holds other tags,
+there's nothing to choose and they're deleted. A tag inside another one you're deleting with everything in it goes
+with it. A tag that can't be removed the way you chose is named, with the reason, and left as it is; the rest are
+removed. (**New 28 October 2026**)
 
 Like every change, nothing happens to the file until you save, and it can be undone under **Unsaved changes**.

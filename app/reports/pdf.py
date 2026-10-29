@@ -151,6 +151,12 @@ def build_html(meta: dict, result: dict, branding: dict | None = None) -> str:
             s.append("<p>Two files were returned: the <strong>remediated PDF</strong>, which passes where possible but looks "
                      "slightly different" + (f" on page{'s' if len(dp) > 1 else ''} {_and(dp)}" if dp else "")
                      + ", and a <strong>visually exact PDF</strong>, which looks identical to the original.</p>")
+        if metrics.get("ai_provider") == "none":  # #659: No AI
+            missing = after.get("figures_missing_alt")
+            s.append("<p>Made <strong>without AI</strong>"
+                     + (f": {missing:,} figure{'s have' if missing != 1 else ' has'} no alt text, each listed under "
+                        "<em>For review</em> for a person to describe." if isinstance(missing, int) and missing
+                        else ".") + "</p>")
     tv = (reports.get("tag_verification") or {})
     primary = tv.get("primary") or tv.get("original") or next((v for v in tv.values() if v), None) or {}
     findings = primary.get("findings") or []

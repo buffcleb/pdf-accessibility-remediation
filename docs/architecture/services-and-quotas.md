@@ -19,6 +19,20 @@ wait in the queue rather than fail), and confirm-before-send. It can show a **no
 documents go. Unmetered services count use but never limit it. An AI level also decides what a **Check only** run
 costs: free, counted against the level, or made without AI.
 
+**No AI** (**New 29 October 2026**, #659) isn't a service: it's the AI level key `none` (`portal/no_ai.py`), taken at
+upload (`ai_tier`, `per_file`), on API tokens and as a group's fixed level (`ai_mode` `fixed`, `ai_level` `none`). It's
+offered top down: the `no_ai_enabled` setting (super admins), then `groups.no_ai` (`off`, `on`, or `default`:
+preselected ahead of the group's default level; migration 0054, inherited with the other AI settings). A local-only
+group can use it whatever its levels are. `_plan` in `portal/routers/jobs.py` gives such a document no tier and
+`jobs.no_ai`; its pages are charged on the processing service only. A document with no tier for any reason (No AI, no
+level, no default, Adobe without AI alt text, a check whose level is set to make checks without AI) goes to the engine
+with `ai_provider` `none` and `verify_ai`, `ocr_ai` and `notation_ai` off (`portal/engine.py`): never to the
+engine's fallback (`PORTAL_ENGINE_AI_PROVIDER`). The engine lists each figure left without alt text as a `high`
+finding ("figure has no alt text", `app/verification/semantic.py`), every one with its own row rather than folded
+into "and N more like this" past 25, and both reports say the document was made
+without AI. Afterwards the tag manager's AI (Describe and Suggest tags with AI, a save's AI review, a later review)
+is refused for it with `no_ai_document` (`portal/routers/versions.py`).
+
 A group's admins (or the super admins, if it has none) are emailed once when its pool runs low, below a share of
 its size or a number of pages (Settings); topping it up re-arms the alert (`portal/pool_alerts.py`, #358).
 

@@ -3,7 +3,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TagElement, TagMap } from "../src/api";
-import { contentMoves, newTags, splitKeeps, splitKeptText } from "../src/viewer/areaPreview";
+import { contentMoves, splitKeeps, splitKeptText } from "../src/viewer/areaPreview";
+import { expand } from "../src/viewer/made";
 
 type Spec = Partial<TagElement> & { i: number; role: string; parent: number | null };
 function doc(specs: Spec[], more: Partial<TagMap> = {}): TagMap {
@@ -12,6 +13,13 @@ function doc(specs: Spec[], more: Partial<TagMap> = {}): TagMap {
   } as TagElement));
   return { schema: 1, pages: [{ w: 600, h: 800 }, { w: 600, h: 800 }], elements, ...more };
 }
+
+/** The tags the edits make, as the tag manager shows them (made.ts): numbered after the saved ones. */
+function newTags(map: TagMap, ops: Parameters<typeof expand>[1]): TagElement[] {
+  const v = expand(map, ops);
+  return v.made.map((m) => v.map.elements[m.i]);
+}
+const kidsOf = (map: TagMap, ops: Parameters<typeof expand>[1], i: number) => expand(map, ops).map.elements[i].kids;
 
 // A heading, a paragraph of two pieces, a figure of one piece (and a drawing outside the page's stream), and two
 // untagged sections at the foot of page 1
@@ -38,22 +46,29 @@ const MAP = doc([
   ],
 });
 
-test("an area of untagged content becomes a new tag, shown where it will be read", () => {
-  const [t] = newTags(MAP, [{ op: "tag_artifacts", element: 3, expect_role: "Figure", position: "after", page: 1,
-    sections: [4, 5], role: "P" }]);
-  assert.deepEqual(t, { anchor: 3, position: "after", role: "P", alt: "", text: "Source: survey of 2026",
-    boxes: [{ page: 1, bbox: [50, 700, 550, 725] }], op: 0 });
-  const [fig] = newTags(MAP, [{ op: "tag_artifacts", element: 1, expect_role: "H1", position: "before", page: 1,
-    sections: [4], role: "Figure", alt: "Logo" }]);
-  assert.equal(fig.position, "before");
-  assert.equal(fig.alt, "Logo");
+test("an area of untagged content becomes a new tag, placed where it will be read", () => {
+  const ops = [{ op: "tag_artifacts" as const, element: 3, expect_role: "Figure", position: "after" as const, page: 1,
+    sections: [5, 4], role: "P" }];
+  const [t] = newTags(MAP, ops);
+  assert.deepEqual([t.i, t.parent, t.role, t.text, t.boxes, t.made], [4, 0, "P", "Source: survey of 2026",
+    [{ page: 1, bbox: [50, 700, 550, 725] }], true]);
+  assert.deepEqual(kidsOf(MAP, ops, 0), [1, 2, 3, 4]);
+  // Its content in the order the page draws it, so it can be split like any tag
+  assert.deepEqual(t.parts?.map((p) => [p.k, p.text]), [[0, "Source: survey"], [1, "of 2026"]]);
+  const before = [{ op: "tag_artifacts" as const, element: 1, expect_role: "H1", position: "before" as const, page: 1,
+    sections: [4], role: "Figure", alt: "Logo" }];
+  assert.equal(newTags(MAP, before)[0].alt, "Logo");
+  assert.deepEqual(kidsOf(MAP, before, 0), [4, 1, 2, 3]);
+  assert.equal(MAP.elements.length, 4, "the saved tag map isn't changed");
 });
 
 test("a split makes a tag of the same type from the cut on; the tag keeps what's before it", () => {
   const ops = [{ op: "split" as const, element: 2, expect_role: "P", at: 1 }];
   const [t] = newTags(MAP, ops);
-  assert.deepEqual(t, { anchor: 2, position: "after", role: "P", alt: "", text: "Second line.",
-    boxes: [{ page: 1, bbox: [50, 135, 480, 160] }], op: 0 });
+  assert.deepEqual([t.role, t.text, t.boxes, t.parts?.map((p) => p.k)], ["P", "Second line.",
+    [{ page: 1, bbox: [50, 135, 480, 160] }], [0]]);
+  assert.deepEqual(kidsOf(MAP, ops, 0), [1, 2, 4, 3]);
+  assert.deepEqual(expand(MAP, ops).map.elements[2].parts?.map((p) => p.k), [0]); // the tag keeps the rest
   // The new part's own type, chosen before saving (#427)
   assert.equal(newTags(MAP, [{ ...ops[0], role: "H2" }])[0].role, "H2");
   assert.deepEqual(splitKeeps(MAP, ops).get(2), [{ page: 1, bbox: [50, 100, 500, 125] }]);
@@ -95,4 +110,24 @@ test("a tag with content the pieces don't cover keeps its boxes; pieces it alrea
   assert.deepEqual(moved.added.get(2), [{ page: 1, bbox: [50, 200, 400, 300] }]);
   const none = contentMoves(MAP, [{ op: "assign", element: 2, expect_role: "P", pieces: [{ page: 1, mcid: 1 }] }]);
   assert.equal(none.boxes.size + none.added.size + none.emptied.size, 0);
+});
+
+test("an area's new tags from the AI are each a new tag, and the content they take leaves its tags", () => {
+  const ops = [{ op: "regroup" as const, element: 1, expect_role: "H1", position: "after" as const, page: 1, groups: [
+    { role: "H2", pieces: [1, 2] },
+    { role: "Figure", pieces: [3], box: [40, 190, 420, 420] as [number, number, number, number], alt: "A chart" },
+    { role: "P", sections: [4] }] }];
+  const made = newTags(MAP, ops);
+  assert.deepEqual(made.map((t) => [t.i, t.role, t.text ?? "", t.alt ?? ""]), [
+    [4, "H2", "First line. Second line.", ""], [5, "Figure", "", "A chart"], [6, "P", "Source: survey", ""]]);
+  assert.deepEqual(made[1].boxes, [{ page: 1, bbox: [40, 190, 420, 420] }]); // the part of the picture, with its drawing
+  // Where the engine puts them: before the tag that held the first of their pieces (the paragraph), in order
+  assert.deepEqual(kidsOf(MAP, ops, 0), [1, 4, 5, 6, 2, 3]);
+  // The paragraph gives up both its pieces: it's left with nothing, so it's not drawn
+  const moves = contentMoves(MAP, ops);
+  assert.ok(moves.emptied.has(2) && !moves.added.size);
+  // "in": the document's top tag, when every tag near the area was deleted: at its end
+  const into = [{ ...ops[0], element: 0, position: "in" as const, groups: [{ role: "P", sections: [4] }] }];
+  assert.deepEqual(kidsOf(MAP, into, 0), [1, 2, 3, 4]);
+  assert.equal(newTags(MAP, into)[0].parent, 0);
 });

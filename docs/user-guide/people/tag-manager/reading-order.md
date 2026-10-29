@@ -24,8 +24,15 @@ review list names these pages ("right-to-left reading order") so you can check t
 ## Moving tags
 
 In the **tag tree** (of a version you can edit), drag a tag to another place, or move it with **Alt+↑** and
-**Alt+↓**. To put it inside a section, drop it next to one of that section's tags. **Reading order** in the tag menu
-also reads a tag earlier or later on its page.
+**Alt+↓**. **Reading order** in the tag menu also reads a tag earlier or later on its page.
+
+To put a tag **inside** another, a section say, drop it on the middle of that tag's row (the row is outlined), or
+press **Alt+→** to move it into the tag just before it, at its end. **Alt+←** takes it out of the tag it's in, to
+just after that tag (also **Move out of its …** under the tag menu's **Reading order**). (**New 28 October 2026**)
+
+The tag menu's **Move into** lists every tag on the page that can hold the one you chose: a section, a list item's
+body, a table cell, a figure, and so on, including an empty one. Choose one and the tag goes in at its end. Tags it
+can't go into aren't listed (a paragraph inside a heading, say). (**Updated 28 October 2026**)
 
 - The **Reading order** list works the same way (drag, or **Alt+↑** and **Alt+↓**, with the same rules), and it's
   the same change everywhere: the tree, the list and the numbers on the page all follow at once.

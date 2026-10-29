@@ -3,13 +3,12 @@ import { Link } from "react-router-dom";
 import type { DocVersion, Finding, TagEdit } from "../api";
 import { checkLink } from "../checks";
 import { errorMessage, fmtNum } from "../components/ui";
-import { absorbedBy, deletedTags, overrides, pageOrder, type Area } from "./draft";
+import { absorbedBy, deletedTags, overrides, pageOrder, type Area, type AreaBoxes } from "./draft";
 import { chooseAt, tagsAt, type LastHit } from "./hit";
 import { holes, subtree } from "./isolate";
-import { builtPreview, type Box } from "./outline";
-import { tablePreview, tableReplaced } from "./tablegrid";
-import { splitPreview } from "./figure";
-import { contentMoves, newTags, splitKeeps } from "./areaPreview";
+import { type Box } from "./outline";
+import { contentMoves, splitKeeps } from "./areaPreview";
+import { expand } from "./made";
 import { loadVersion, watchVersion, type LoadState, type PaneData } from "./pdf";
 import { LoadProgress } from "../components/LoadProgress";
 import { LARGE_NOTE, drawingPage, isLarge, pageLoading } from "../components/loadWords";
@@ -32,6 +31,7 @@ type Props = {
   onNumber: (n: number) => void;
   mode: OverlayMode;
   zoom: number; // 1 = fit the pane's width
+  cards?: boolean; // a tag's card shows on hover and focus (off: only the outline)
   selected: number | null;
   onSelect: (i: number | null) => void;
   onPage?: (page: number) => void;  // a click on a page: the editing panel shows that page
@@ -47,6 +47,7 @@ type Props = {
   onlyPage?: number | null; // one-page view: show just this page (1-based)
   areaMode?: boolean;
   area?: Area | null;
+  areaBoxes?: AreaBoxes | null; // the AI's figures for the area, drawn on their page
   onArea?: (page: number, bbox: [number, number, number, number]) => void;
   picked?: number[];
   onPick?: (i: number) => void;
@@ -56,8 +57,6 @@ type Props = {
   spot?: Spot | null; // a review item's area, highlighted on its page (#426)
   onSpot?: (f: Finding) => void;
   onSpotClose?: () => void;
-  pendingSel?: number | null; // a tag pending edits make, chosen (#427): the place of the edit making it
-  onPendingSelect?: (op: number) => void;
 };
 
 export const TREE = "tree";
@@ -96,11 +95,16 @@ export function versionStatus(v: DocVersion): string {
   return s.compliant ? "passes" : `${fmtNum(s.failed_checks)} failed checks`;
 }
 
-export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, selected, onSelect, onPage, ops, scrollRef, onScroll, onLayout, onData, highlight = null, onTree, treeDisabled,
-  areaMode = false, area = null, onArea, onlyPage = null, tools, picked, onPick, onMenu, onPageMenu, isolated = null,
-  spot = null, onSpot, onSpotClose, pendingSel = null, onPendingSelect }: Props) {
+export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, cards = true, selected, onSelect, onPage, ops: given, scrollRef, onScroll, onLayout, onData, highlight = null, onTree, treeDisabled,
+  areaMode = false, area = null, areaBoxes = null, onArea, onlyPage = null, tools, picked, onPick, onMenu, onPageMenu, isolated = null,
+  spot = null, onSpot, onSpotClose }: Props) {
   const version = versions.find((v) => v.number === number);
-  const [data, setData] = useState<PaneData | null>(null);
+  const [loaded, setData] = useState<PaneData | null>(null);
+  // The right-hand version with the unsaved changes: the tags they make drawn as tags (made.ts, #692), every tag the
+  // changes name a number of that map
+  const draft = useMemo(() => (loaded && side === "right" ? expand(loaded.tagmap, given) : null), [loaded, side, given]);
+  const data = useMemo(() => (loaded && draft ? { ...loaded, tagmap: draft.map } : loaded), [loaded, draft]);
+  const ops = draft?.ops ?? given;
   const [error, setError] = useState<unknown>(null);
   const [width, setWidth] = useState(600);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -188,48 +192,11 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
       pages.forEach((_, p) => pageOrder(data.tagmap, p + 1, side === "right" ? ops : []).forEach((e, n) => orderNo.set(e.i, n + 1)));
     }
     const deleted = side === "right" ? deletedTags(data.tagmap, ops) : new Set<number>();
-    // A list being built from a paragraph is drawn as it will be saved: the heading, each list and each item, in
-    // place of the paragraph (and of the tags it takes in)
-    const building = side === "right" ? ops.filter((o): o is Extract<TagEdit, { op: "build_list" | "build_table" | "rebuild_table" }> =>
-      o.op === "build_list" || o.op === "build_table" || o.op === "rebuild_table") : [];
-    // ...and a table made or edited (#370), in place of the tags it replaces
-    const builtFrom = new Set(building.flatMap((o) => [o.element, ...(o.op === "build_list" ? o.absorb ?? [] : tableReplaced(data.tagmap, o))]));
-    for (const op of building) {
-      const el = data.tagmap.elements[op.element];
-      if (!el || (mode === "off" && el.i !== selected)) continue;
-      for (const row of op.op === "build_list" ? builtPreview(data.tagmap, op) : tablePreview(data.tagmap, op)) {
-        // A list's (or table's, or row's) outline is set a little outside what it holds, or it would lie on their
-        // edges and not be seen
-        const pad = row.role === "Table" ? 4 : row.role === "TR" ? 2 : row.role !== "L" ? 0 : row.depth === 0 ? 4 : 2;
-        for (const b of row.boxes) {
-          const [x0, y0, x1, y1] = b.bbox;
-          out[b.page - 1]?.items.push({ el, bbox: [x0 - pad, y0 - pad, x1 + pad, y1 + pad], role: row.role, findings: [], text: row.text, pending: true });
-        }
-      }
-    }
-    // A figure being split: each part it will make, as it will be once saved
-    if (side === "right") {
-      for (const [from, parts] of splitPreview(data.tagmap, ops)) {
-        const el = data.tagmap.elements[from];
-        if (!el || (mode === "off" && el.i !== selected)) continue;
-        for (const part of parts) {
-          for (const b of part.boxes) out[b.page - 1]?.items.push({ el, bbox: b.bbox, role: part.role, findings: [], text: part.alt, pending: true });
-        }
-      }
-    }
     // Tags pending edits make (an area of untagged content, a split) and content they move between tags (#427):
     // drawn at once, whatever is being shown, as they will be once saved
     const moves = side === "right" ? contentMoves(data.tagmap, ops) : null;
     const keeps = side === "right" ? splitKeeps(data.tagmap, ops) : new Map<number, Box[]>();
     if (side === "right") {
-      for (const t of newTags(data.tagmap, ops)) {
-        const el = data.tagmap.elements[t.anchor];
-        if (!el) continue;
-        for (const b of t.boxes) {
-          out[b.page - 1]?.items.push({ el, bbox: b.bbox, role: t.role, findings: [], text: t.alt || t.text,
-            pending: true, made: t.op, madeSelected: t.op === pendingSel });
-        }
-      }
       for (const [i, boxes] of moves!.added) {
         const el = data.tagmap.elements[i];
         if (!el) continue;
@@ -240,22 +207,24 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
       }
     }
     for (const raw of data.tagmap.elements) {
-      if (deleted.has(raw.i) || builtFrom.has(raw.i) || moves?.emptied.has(raw.i)) continue;
+      if (deleted.has(raw.i) || moves?.emptied.has(raw.i)) continue;
       // A tag merged into another by a pending edit is drawn as part of the tag that absorbs it
       const el = merged.has(raw.i) ? data.tagmap.elements[merged.get(raw.i)!] : raw;
       const fs = byEl.get(el.i) ?? [];
-      const show = el.i === selected || !!picked?.includes(el.i) || el.i === highlight || (mode === "flagged" && fs.length > 0) || ((mode === "all" || mode === "order") && raw.own);
+      // A tag the changes make is drawn whatever is being shown, as it will be once saved
+      const show = el.i === selected || !!picked?.includes(el.i) || el.i === highlight || (mode === "flagged" && fs.length > 0) || ((mode === "all" || mode === "order") && raw.own) || !!raw.made;
       if (!show) continue;
       const o = over.get(el.i) ?? {};
       for (const b of moves?.boxes.get(raw.i) ?? keeps.get(raw.i) ?? raw.boxes) {
         out[b.page - 1]?.items.push({
           el, bbox: b.bbox, role: o.role ?? el.role, findings: fs, decorative: o.decorative, alt: o.alt, lang: o.lang,
           orderNo: mode === "order" && raw === el ? orderNo.get(el.i) : undefined, highlighted: el.i === highlight,
+          ...(raw.made ? { pending: true, text: o.alt ?? el.alt ?? el.text } : {}),
         });
       }
     }
     return out;
-  }, [data, pages, findings, mode, selected, picked, highlight, over, merged, ops, side, pendingSel]);
+  }, [data, pages, findings, mode, selected, picked, highlight, over, merged, ops, side]);
 
   const picker = (
     <div className="pv-head">
@@ -302,13 +271,13 @@ export function Pane({ side, jobId, versions, number, onNumber, mode, zoom, sele
           <div className={`pv-pages${zoom > 1 ? " zoomed" : ""}`} aria-busy={drawing || undefined}>
             {pages.map((p, i) => shownPage !== null && i !== shownPage - 1 ? null : (
               <PageView key={i} pdf={data.pdf} index={i} size={p} scale={scale} items={perPage[i]?.items ?? []}
-                pageFindings={perPage[i]?.notes ?? []} showLabels={mode === "all"} selected={selected}
+                pageFindings={perPage[i]?.notes ?? []} showLabels={mode === "all"} cards={cards} selected={selected}
                 onSelect={(el) => onSelect(el === selected ? null : el)} onPage={onPage} hitAt={hitAt}
                 areaMode={areaMode} area={area?.page === i + 1 ? area.bbox : null} onArea={onArea}
+                boxes={areaBoxes?.page === i + 1 ? areaBoxes.boxes : undefined}
                 picked={picked} onPick={onPick} onMenu={onMenu} onPageMenu={onPageMenu}
                 veil={inside && data ? holes(data.tagmap, inside, i + 1) : null} onDrawn={markDrawn}
-                spot={spot?.page === i + 1 ? spot : null} onSpot={onSpot} onSpotClose={onSpotClose}
-                onPendingSelect={onPendingSelect} />
+                spot={spot?.page === i + 1 ? spot : null} onSpot={onSpot} onSpotClose={onSpotClose} />
             ))}
           </div>
           </>

@@ -8,6 +8,10 @@ Select a tag on the right-hand page, or in the tag tree, then change it in one o
   the Menu key) on a tag, or use **Actions** at the top of the page.
 - **Edit tag…** in the menu opens the tag in a window: what it says, its findings, and its type, alt text,
   read-aloud text and language. On a version you can't edit, it's **Tag details…** and shows the same, read-only.
+  To see the page under it, drag the window by its title, or use **Move to the side** (press it again for the
+  other side, then the middle). While it's open, the tag's details card doesn't cover the page. (**New 26 October
+  2026**) Each of the tag's findings has its status from **Needs review**, to sign it off once it's fixed; it's
+  the same status in both places. (**New 26 October 2026**)
 - **The editing panel** beside the pages holds the same tools. It's hidden at first, to give the pages its width:
   **Panel** at the top shows it again, and it stays as you leave it.
 

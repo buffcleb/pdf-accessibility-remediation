@@ -11,7 +11,7 @@ from app.pipeline.models import DocumentAnalysis
 from app.pipeline.structure.artifacts import (mark_drawn_lines, mark_heading_icons, mark_repeated_images,
                                               mark_running_artifacts, mark_text_badges)
 from app.pipeline.structure.formulas import assign_formulas
-from app.pipeline.structure.headings import assign_headings
+from app.pipeline.structure.headings import assign_headings, join_chapter_numbers, join_divider_pages
 from app.pipeline.structure.lists_captions import assign_lists_and_captions, attach_list_continuations, caption_pairs
 from app.pipeline.markers import footnote_words
 from app.pipeline.structure.notes import mark_endnotes, mark_footnotes, mark_table_notes
@@ -26,8 +26,12 @@ PASSES: list[tuple[Callable[[DocumentAnalysis], None], tuple[str, ...]]] = [
     (mark_drawn_lines, ()),
     (mark_running_artifacts, ()),
     (mark_repeated_images, ()),
+    (join_chapter_numbers, ()),
+    # A section's title page is read without its running header and page number
+    (join_divider_pages, ("mark_running_artifacts",)),
     # A row of dashes with a dot isn't a heading (#438); nor is a page number or a running header (skipped as Artifact)
-    (assign_headings, ("mark_drawn_lines", "mark_running_artifacts")),
+    # A chapter's number joins its title first: the number is what ranks the chapters alike
+    (assign_headings, ("mark_drawn_lines", "mark_running_artifacts", "join_chapter_numbers", "join_divider_pages")),
     (mark_heading_icons, ("assign_headings",)),  # an icon beside a heading: it reads H* roles
     (mark_text_badges, ()),
     # Only P is made a list item or a caption: a heading candidate with a bullet label was decided by assign_headings

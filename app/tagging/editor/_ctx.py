@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pikepdf
@@ -28,6 +28,7 @@ NOTES = {"Note", "FENote"}
 NEW_AREA_ROLES = {"H1", "H2", "H3", "H4", "H5", "H6", "P", "Caption", "BlockQuote", "Note", "Code", "Quote",
                   "Figure", "Formula"}
 MAX_TEXT = 4000
+WAS_MCID = Name("/RemediationWasMCID")
 _MARK = Name("/RemediationEditMark")
 
 
@@ -46,6 +47,19 @@ class _Ctx:
     tagged_sections: dict | None = None
     ids_changed: bool = False  # an element ID was given or taken away: the IDTree is rebuilt before saving
     made: Dictionary | None = None  # the tag the last split made
+    # Content earlier edits made artifacts (a tag deleted with what's in it), as (page objgen, mcid); its artifact
+    # sections say which MCID they were (WAS_MCID) until the save, so a later edit can tag them again
+    untagged: set = field(default_factory=set)
+    artifacted: dict = field(default_factory=dict)  # the streams those sections are in, by objgen
+    # How many of a piece of text's glyphs are still its own after cuts earlier in this save, by (page objgen, mcid):
+    # a piece cut twice (a table cell's words into three cells) is cut from its end, each cut leaving it shorter
+    cut_glyphs: dict = field(default_factory=dict)
+    # Tags a save makes and its later edits name (refs.py, #692): the tags each named edit made, by its id; the tags
+    # named by number, by that number; and where each object is in the tag index, kept until the index changes
+    new_tags: list = field(default_factory=list)  # the tags the edit running makes, in order
+    named: dict = field(default_factory=dict)
+    pinned: dict = field(default_factory=dict)
+    where: tuple | None = None
 
 
 @dataclass(frozen=True)

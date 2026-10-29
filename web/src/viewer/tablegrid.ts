@@ -3,8 +3,9 @@
 // column's content joins its neighbour (above, or to the left; below or to the right for the first), so nothing on
 // the page goes untagged. The grid is turned into one edit for the engine: rebuild_table for a table, build_table
 // for text tags made into one.
-import type { TagEdit, TagElement, TagMap } from "../api";
+import type { CellRef, TableCut, TagEdit, TagElement, TagMap } from "../api";
 import { unite, type BuiltRow } from "./outline";
+import { splitPieces } from "./pieces";
 
 /** A piece of a text tag that a cell can hold: /K item `at` of tag `el`. */
 export type PieceRef = { el: number; at: number };
@@ -15,12 +16,16 @@ export type GridCell = {
   rows: number; cols: number;
   role: "TH" | "TD";
   scope?: "Row" | "Column" | "Both";
-  from: number[];        // the old cells it takes the content of (a table being edited)
+  from: CellRef[];       // the old cells it takes the content of (a table being edited): a cut cell by its parts
   pieces: PieceRef[];    // or the pieces of text it holds (text tags being made a table)
   text: string;          // what it says, for the grid
+  say?: string;          // what it's read as, set here (its ActualText; "" for its drawn text); unset: unchanged
 };
 
-export type Grid = { cells: GridCell[]; height: number; width: number; caption?: number | null; next: number };
+/** cuts: old cells whose words go in several cells, where their text is cut; out: cells taken out of the table, as
+ * paragraphs after it. */
+export type Grid = { cells: GridCell[]; height: number; width: number; caption?: number | null; next: number;
+  cuts?: Record<number, TableCut[]>; out?: { from: CellRef[]; text: string }[] };
 
 const SCOPES = new Set(["Row", "Column", "Both"]);
 
@@ -62,7 +67,7 @@ export function fromTable(map: TagMap, table: number): Grid {
       const [rs, cs] = e.span ?? [1, 1];
       for (let i = 0; i < rs; i++) for (let j = 0; j < cs; j++) taken.add(`${r + i},${c + j}`);
       cells.push({ key: key++, r, c, rows: rs, cols: cs, role: e.role, scope: e.role === "TH" ? (SCOPES.has(e.scope ?? "") ? e.scope as GridCell["scope"] : "Column") : undefined,
-        from: [e.i], pieces: [], text: e.text ?? "" });
+        from: [e.i], pieces: [], text: e.text ?? "", ...(e.actual_text ? { say: e.actual_text } : {}) });
       c += cs;
     }
   });
@@ -74,8 +79,10 @@ export function fromTable(map: TagMap, table: number): Grid {
 
 /** The grid a pending rebuild_table describes, so the editor reopens where it was left. */
 export function fromOp(map: TagMap, op: Extract<TagEdit, { op: "rebuild_table" }>): Grid {
-  const text = (ids: number[]) => ids.map((i) => map.elements[i]?.text ?? "").filter(Boolean).join(" ");
-  const g: Grid = { cells: [], height: op.rows.length, width: 0, caption: op.caption === undefined ? fromTable(map, op.element).caption : op.caption, next: 0 };
+  const cuts = Object.fromEntries(Object.entries(op.cuts ?? {}).map(([k, v]) => [Number(k), v]));
+  const text = (ids: CellRef[]) => refsText(map, cuts, ids);
+  const g: Grid = { cells: [], height: op.rows.length, width: 0, caption: op.caption === undefined ? fromTable(map, op.element).caption : op.caption, next: 0,
+    cuts, out: (op.out ?? []).map((p) => ({ from: p.from, text: text(p.from) })) };
   const taken = new Set<string>();
   op.rows.forEach((row, r) => {
     let c = 0;
@@ -84,7 +91,7 @@ export function fromOp(map: TagMap, op: Extract<TagEdit, { op: "rebuild_table" }
       const rs = s.rows ?? 1, cs = s.cols ?? 1;
       for (let i = 0; i < rs; i++) for (let j = 0; j < cs; j++) taken.add(`${r + i},${c + j}`);
       g.cells.push({ key: g.next++, r, c, rows: rs, cols: cs, role: s.role, scope: s.role === "TH" ? s.scope ?? "Column" : undefined,
-        from: [...s.from], pieces: [], text: text(s.from) });
+        from: [...s.from], pieces: [], text: text(s.from), ...(s.text !== undefined ? { say: s.text } : {}) });
       g.width = Math.max(g.width, c + cs);
       c += cs;
     }
@@ -160,8 +167,18 @@ function cellAt(g: Grid, r: number, c: number): GridCell | undefined {
 
 function joined(into: GridCell, other: GridCell, before = false): GridCell {
   const [a, b] = before ? [other, into] : [into, other];  // what comes first in reading order
-  return { ...into, from: [...a.from, ...b.from], pieces: [...a.pieces, ...b.pieces],
+  // What it was set to be read as was for one of them: the joined cell is read as its drawn text until set again
+  const { say: _old, ...rest } = into;
+  return { ...rest, from: [...a.from, ...b.from], pieces: [...a.pieces, ...b.pieces],
     text: [a.text, b.text].filter(Boolean).join(" ") };
+}
+
+/** What the cell is read as: set here, or its drawn text. */
+export const cellSays = (x: GridCell) => (x.say?.trim() ? x.say.trim() : x.text);
+
+/** The cell set to be read as `say` ("" for its drawn text). */
+export function setSay(g: Grid, key: number, say: string): Grid {
+  return { ...g, cells: g.cells.map((x) => (x.key === key ? { ...x, say } : x)) };
 }
 
 /** The cell to its right (or below) joins it, when it's as tall (or as wide) and lines up. */
@@ -312,6 +329,82 @@ export function problems(g: Grid): string | null {
   return null;
 }
 
+/** A cell's words, for cutting its text into cells: each word with where a cut before it goes (none for the first),
+ * as the engine cuts (before /K item `at`, or before character `char` inside it). Only a cell that is one old
+ * cell, not yet cut, with its own pieces of text. */
+export function cellWords(map: TagMap, x: GridCell): { text: string; cut: TableCut | null }[] {
+  if (x.from.length !== 1 || typeof x.from[0] !== "number") return [];
+  const e = map.elements[x.from[0]];
+  if (!e) return [];
+  const out: { text: string; cut: TableCut | null }[] = [];
+  for (const p of splitPieces(e)) {
+    let at = 0;
+    for (const w of p.text.split(" ")) {
+      if (w) out.push({ text: w, cut: out.length === 0 ? null : at === 0 ? { at: p.k } : { at: p.k, char: at } });
+      at += w.length + 1;
+    }
+  }
+  return out;
+}
+
+/** The text of each part of an old cell cut at `cuts`. */
+export function partTexts(map: TagMap, cell: number, cuts: TableCut[]): string[] {
+  const e = map.elements[cell];
+  if (!e) return [];
+  const parts: string[][] = [[]];
+  const at = (c: TableCut) => `${c.at}:${c.char ?? 0}`;
+  const where = new Set(cuts.map(at));
+  for (const p of splitPieces(e)) {
+    let pos = 0;
+    for (const w of p.text.split(" ")) {
+      if (w && (where.has(`${p.k}:${pos}`) || (pos === 0 && where.has(`${p.k}:0`))) && parts[parts.length - 1].length) parts.push([]);
+      if (w) parts[parts.length - 1].push(w);
+      pos += w.length + 1;
+    }
+  }
+  return parts.map((ws) => ws.join(" "));
+}
+
+function refsText(map: TagMap, cuts: Record<number, TableCut[]>, refs: CellRef[]): string {
+  return refs.map((r) => (typeof r === "number" ? map.elements[r]?.text ?? "" : partTexts(map, r[0], cuts[r[0]] ?? [])[r[1]] ?? ""))
+    .filter(Boolean).join(" ");
+}
+
+/** A cell's words go in several cells: cut before the words at `starts` (indices into cellWords), the first part
+ * stays, each next part goes in the next cell to its right: an empty one takes it, one with content gets it before
+ * its own, and a column is added where the row runs out. */
+export function cutCell(map: TagMap, g: Grid, key: number, starts: number[]): Grid {
+  const x = g.cells.find((y) => y.key === key);
+  const words = x ? cellWords(map, x) : [];
+  const at = [...new Set(starts)].filter((i) => i > 0 && i < words.length).sort((a, b) => a - b);
+  if (!x || !at.length) return g;
+  const cell = x.from[0] as number;
+  const cuts = at.map((i) => words[i].cut!);
+  const texts = partTexts(map, cell, cuts);
+  let out: Grid = { ...g, cuts: { ...(g.cuts ?? {}), [cell]: cuts } };
+  out = { ...out, cells: out.cells.map((y) => (y.key === key ? { ...y, from: [[cell, 0]], text: texts[0], say: undefined } : y)) };
+  for (let i = 1; i < texts.length; i++) {
+    const c = x.c + x.cols - 1 + i;
+    if (c >= out.width) out = addColumn(out, out.width - 1);
+    const t = cellAt(out, x.r, c)!;
+    const part: CellRef = [cell, i];
+    out = { ...out, cells: out.cells.map((y) => (y.key === t.key
+      ? { ...y, from: [part, ...y.from], text: [texts[i], y.text].filter(Boolean).join(" ") } : y)) };
+  }
+  return out;
+}
+
+/** Column `c` comes out of the table as one paragraph after it (a paragraph set beside the table, its lines read as
+ * a column's cells), read top to bottom. A cell spanning it gets narrower and keeps its content. */
+export function takeOutColumn(g: Grid, c: number): Grid {
+  if (g.width < 2) return g;
+  const gone = sorted(g.cells.filter((x) => x.c === c && x.cols === 1));
+  const cells = g.cells.filter((x) => !(x.c === c && x.cols === 1))
+    .map((x) => (x.c > c ? { ...x, c: x.c - 1 } : x.c <= c && x.c + x.cols - 1 >= c ? { ...x, cols: x.cols - 1 } : x));
+  const para = { from: gone.flatMap((x) => x.from), text: gone.map((x) => x.text).filter(Boolean).join(" ") };
+  return { ...g, cells: sorted(cells), width: g.width - 1, out: [...(g.out ?? []), para] };
+}
+
 function rowsOf<T>(g: Grid, f: (x: GridCell) => T): T[][] {
   const out: T[][] = Array.from({ length: g.height }, () => []);
   for (const x of sorted(g.cells)) out[x.r].push(f(x));
@@ -320,15 +413,19 @@ function rowsOf<T>(g: Grid, f: (x: GridCell) => T): T[][] {
 
 function shape(x: GridCell) {
   return { role: x.role, ...(x.role === "TH" ? { scope: x.scope ?? "Column" } : {}),
-    ...(x.rows > 1 ? { rows: x.rows } : {}), ...(x.cols > 1 ? { cols: x.cols } : {}) };
+    ...(x.rows > 1 ? { rows: x.rows } : {}), ...(x.cols > 1 ? { cols: x.cols } : {}),
+    ...(x.say !== undefined ? { text: x.say.trim() } : {}) };
 }
 
 /** The edit that makes a table what the grid shows. */
 export function rebuildEdit(map: TagMap, table: number, g: Grid): Extract<TagEdit, { op: "rebuild_table" }> {
   const original = fromTable(map, table).caption ?? null;
+  const cuts = Object.entries(g.cuts ?? {}).filter(([, v]) => v.length);
   return { op: "rebuild_table", element: table, expect_role: map.elements[table].role,
     rows: rowsOf(g, (x) => ({ from: x.from, ...shape(x) })),
-    ...((g.caption ?? null) !== original ? { caption: g.caption ?? null } : {}) };
+    ...((g.caption ?? null) !== original ? { caption: g.caption ?? null } : {}),
+    ...(cuts.length ? { cuts: Object.fromEntries(cuts) } : {}),
+    ...(g.out?.length ? { out: g.out.map((p) => ({ role: "P" as const, from: p.from })) } : {}) };
 }
 
 /** The edit that makes text tags the table the grid shows. */
@@ -363,9 +460,10 @@ export function tablePreview(map: TagMap, op: Extract<TagEdit, { op: "build_tabl
       }));
     }
   } else {
+    const cuts = Object.fromEntries(Object.entries(op.cuts ?? {}).map(([k, v]) => [Number(k), v]));
+    const cellOfRef = (r: CellRef) => els[typeof r === "number" ? r : r[0]];
     for (const row of op.rows) {
-      rows.push(row.map((c) => cellOf(c, c.from.map((i) => els[i]?.text ?? "").filter(Boolean).join(" "),
-        c.from.flatMap((i) => ownBoxes(els[i])))));
+      rows.push(row.map((c) => cellOf(c, c.text?.trim() || refsText(map, cuts, c.from), c.from.flatMap((r) => ownBoxes(cellOfRef(r))))));
     }
   }
   const out: BuiltRow[] = [];
@@ -382,6 +480,13 @@ export function tablePreview(map: TagMap, op: Extract<TagEdit, { op: "build_tabl
   for (const row of rows) {
     out.push({ role: "TR", depth: 1, text: "", boxes: unite(row.flatMap((c) => c.boxes)) });
     out.push(...row);
+  }
+  if (op.op === "rebuild_table") {  // paragraphs taken out of the table, after it
+    const cuts = Object.fromEntries(Object.entries(op.cuts ?? {}).map(([k, v]) => [Number(k), v]));
+    for (const p of op.out ?? []) {
+      out.push({ role: "P", depth: 0, text: refsText(map, cuts, p.from),
+        boxes: unite(p.from.flatMap((r) => ownBoxes(els[typeof r === "number" ? r : r[0]]))) });
+    }
   }
   return out;
 }

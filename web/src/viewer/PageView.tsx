@@ -18,8 +18,6 @@ export type OverlayItem = {
   highlighted?: boolean;
   text?: string;     // its own words, when they aren't the tag's (a row of a list built from it)
   pending?: boolean; // part of an unsaved change: drawn as it will be once saved
-  made?: number; // a tag a pending edit makes (#427): the place of that edit, which stands for it until it's saved
-  madeSelected?: boolean;
 };
 
 const SEV_RANK: Record<string, number> = { high: 0, review: 1, suggest: 2 };
@@ -38,11 +36,13 @@ type Props = {
   items: OverlayItem[];
   pageFindings: Finding[]; // findings on this page that aren't tied to a drawn element
   showLabels: boolean;
+  cards?: boolean; // a tag's card shows on hover and focus; off, the person turned them off for now
   selected: number | null;
   onSelect: (i: number) => void;
   onPage?: (page: number) => void;
   areaMode?: boolean; // dragging on the page draws an area instead of selecting tags
   area?: [number, number, number, number] | null; // the chosen area on this page, in page units
+  boxes?: { bbox: [number, number, number, number]; label: string }[]; // the AI's figures for the area, numbered
   onArea?: (page: number, bbox: [number, number, number, number]) => void;
   picked?: number[]; // other tags selected along with `selected`
   onPick?: (i: number) => void; // Ctrl or Cmd with a click: add the tag to the selection, or take it out
@@ -57,13 +57,12 @@ type Props = {
   onSpot?: (f: Finding) => void; // one of the page's own items chosen in its list
   onSpotClose?: () => void;
   onDrawn?: () => void; // the page has been drawn (or couldn't be): the pane stops showing its progress (#424)
-  onPendingSelect?: (op: number) => void; // a tag pending edits make, chosen (#427)
 };
 
 /** One page: the rendered canvas (only while near the viewport) with tag boxes drawn over it. */
-export const PageView = memo(function PageView({ pdf, index, size, scale, items, pageFindings, showLabels, selected, onSelect, onPage,
-  areaMode = false, area = null, onArea, picked, onPick, onMenu, onPageMenu, hitAt, veil = null,
-  onDrawn, spot = null, onSpot, onSpotClose, onPendingSelect }: Props) {
+export const PageView = memo(function PageView({ pdf, index, size, scale, items, pageFindings, showLabels, cards = true, selected, onSelect, onPage,
+  areaMode = false, area = null, boxes = [], onArea, picked, onPick, onMenu, onPageMenu, hitAt, veil = null,
+  onDrawn, spot = null, onSpot, onSpotClose }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   // A pointer event's place on this page, in page units
   const at = (e: { clientX: number; clientY: number }) => {
@@ -116,10 +115,11 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
     };
   }, [near, pdf, index, w]);
 
+  // A tag hovered in the tree is only outlined here: its card would cover the page being looked at beside the tree
   const shown = items.find((it) => it.el.i === hover) ?? (popHidden ? undefined
-    : items.find((it) => it.highlighted && hover === null) ?? items.find((it) => it.el.i === selected && hover === null));
+    : items.find((it) => it.el.i === selected && hover === null));
   const popId = useId();
-  const card = shown && !areaMode ? shown : undefined;
+  const card = shown && !areaMode && cards ? shown : undefined;
   return (
     <div className="pv-page" ref={wrapRef} style={{ width: w, height: h }} data-page={index + 1}
       onMouseLeave={() => setHover(null)}
@@ -148,7 +148,7 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
         return (
           <Fragment key={`${it.el.i}-${it.role}-${x0}-${y0}`}>
           <button type="button"
-            className={`pv-box ${roleClass(it.role)}${it.pending ? " pending" : ""}${sev ? ` sev-${sev}` : ""}${(it.made === undefined ? selected === it.el.i || picked?.includes(it.el.i) : it.madeSelected) ? " selected" : ""}${it.decorative ? " decorative" : ""}${it.highlighted ? " hl" : ""}`}
+            className={`pv-box ${roleClass(it.role)}${it.pending ? " pending" : ""}${sev ? ` sev-${sev}` : ""}${selected === it.el.i || picked?.includes(it.el.i) ? " selected" : ""}${it.decorative ? " decorative" : ""}${it.highlighted ? " hl" : ""}`}
             style={{ left: x0 * scale, top: y0 * scale, width: Math.max(4, (x1 - x0) * scale), height: Math.max(4, (y1 - y0) * scale) }}
             tabIndex={sev || selected === it.el.i ? 0 : -1}
             aria-label={label} aria-describedby={it === card ? popId : undefined}
@@ -157,9 +157,9 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
             // Tabbing on into the card (when it scrolls) keeps it open
             onBlur={(e) => { if (!(e.relatedTarget as Element | null)?.closest?.(".pv-pop")) setHover(null); }}
             onClick={(e) => {
-              if (it.made !== undefined && onPendingSelect) { onPendingSelect(it.made); return; } // not saved yet
               const p = at(e);
-              const i = (p && hitAt?.(index + 1, p.x, p.y)) ?? it.el.i;
+              // A tag the changes make is chosen by its own outline: the tag it came from can lie under it, line for line
+              const i = it.el.made ? it.el.i : (p && hitAt?.(index + 1, p.x, p.y)) ?? it.el.i;
               if ((e.ctrlKey || e.metaKey) && onPick) onPick(i);
               else onSelect(i);
             }}
@@ -167,7 +167,8 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
               if (!onMenu) return;
               e.preventDefault();
               const p = at(e);
-              onMenu((p && hitAt?.(index + 1, p.x, p.y, true)) ?? it.el.i, e.clientX, e.clientY, p ? { page: index + 1, ...p } : null);
+              onMenu(it.el.made ? it.el.i : (p && hitAt?.(index + 1, p.x, p.y, true)) ?? it.el.i, e.clientX, e.clientY,
+                p ? { page: index + 1, ...p } : null);
             }}
             onKeyDown={(e) => {
               if (!onMenu || !(e.key === "ContextMenu" || (e.shiftKey && e.key === "F10"))) return;
@@ -195,6 +196,10 @@ export const PageView = memo(function PageView({ pdf, index, size, scale, items,
         </svg>
       )}
       {spot && onSpotClose && <SpotLayer spot={spot} index={index} scale={scale} w={w} h={h} onClose={onSpotClose} />}
+      {boxes.map((b, k) => (
+        <div key={k} className="pv-area pv-area-figure" aria-hidden="true" style={{ left: b.bbox[0] * scale, top: b.bbox[1] * scale,
+          width: (b.bbox[2] - b.bbox[0]) * scale, height: (b.bbox[3] - b.bbox[1]) * scale }}><span>{b.label}</span></div>
+      ))}
       {area && <div className="pv-area" aria-hidden="true" style={{ left: area[0] * scale, top: area[1] * scale,
         width: (area[2] - area[0]) * scale, height: (area[3] - area[1]) * scale }} />}
       {areaMode && onArea && <AreaDraw scale={scale} size={size} onArea={(b) => onArea(index + 1, b)} />}

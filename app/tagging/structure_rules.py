@@ -82,6 +82,28 @@ def _user_bbox(m: tuple, box) -> list[float]:
     return [round(min(xs), 2), round(min(ys), 2), round(max(xs), 2), round(max(ys), 2)]
 
 
+def bboxes_from_tagmap(pdf: pikepdf.Pdf, tagmap: dict, matrices: list) -> int:
+    """Figures and formulas on one page with no /BBox get theirs from where the tag map puts them: for a file the tag
+    editor changed, which makes tags (a figure out of an area, a part of a picture, a type changed to Figure) without
+    knowing where content is drawn. tagmap: build_tagmap's, of this file; matrices: each page's user-to-visual
+    matrix. The tag map's elements are the tree's walk, in order; a tree that doesn't match it is left alone."""
+    from app.tagging.tree import walk
+    root = pdf.Root.get("/StructTreeRoot")
+    els = tagmap.get("elements") or []
+    tree = walk(root) if isinstance(root, Dictionary) else []
+    if len(tree) != len(els):
+        return 0
+    given = 0
+    for e, el in zip(tree, els):
+        boxes = el.get("boxes") or []
+        if el.get("role") in ("Figure", "Formula") and len(boxes) == 1 and not _has(e, "/BBox"):
+            pi = boxes[0]["page"] - 1
+            if 0 <= pi < len(matrices):
+                _layout(e).BBox = Array(_user_bbox(matrices[pi], boxes[0]["bbox"]))
+                given += 1
+    return given
+
+
 def apply(pdf: pikepdf.Pdf, boxes: dict | None = None, matrices: list | None = None) -> dict:
     """The rules above, over the whole tree. boxes: objgen -> (page index, box in visual space) for figures and
     formulas whose place is known; matrices: each page's user-to-visual matrix. Returns what was done, by kind."""

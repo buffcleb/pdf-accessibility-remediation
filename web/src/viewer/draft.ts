@@ -31,6 +31,7 @@ function key(op: TagEdit): string | null {
     case "build_list":
     case "take_pieces":
     case "cut_area":
+    case "regroup":
       return null;
     case "make_toc":
       return `toc:${op.element}`;
@@ -173,7 +174,7 @@ export function describe(op: TagEdit, map: TagMap): string {
       return op.lang ? `${what} language → ${op.lang}${page}` : `Language removed from ${what}${page}`;
     case "move": {
       const t = map.elements[op.target];
-      return `Moved ${what} ${op.position} ${t ? t.role : "element"}${t?.text ? ` “${t.text.slice(0, 30)}…”` : ""}${page}`;
+      return `Moved ${what} ${op.position === "in" ? "into" : op.position} ${t ? t.role : "element"}${t?.text ? ` “${t.text.slice(0, 30)}…”` : ""}${page}`;
     }
     case "merge":
       return `Merged ${op.absorb.length} tag${op.absorb.length > 1 ? "s" : ""} into ${what}${page}`;
@@ -222,6 +223,10 @@ export function describe(op: TagEdit, map: TagMap): string {
     case "set_headers": {
       const names = op.headers.map((h) => `“${(map.elements[h]?.text ?? `element ${h}`).slice(0, 20)}”`).join(", ");
       return op.headers.length ? `${what} read with ${names}${page}` : `Headers removed from ${what}${page}`;
+    }
+    case "regroup": {
+      const roles = op.groups.map((g) => ROLE_NAMES[g.role] ?? g.role);
+      return `${op.groups.length} new tag${op.groups.length === 1 ? "" : "s"} for an area of page ${op.page}: ${roles.slice(0, 4).join(", ")}${roles.length > 4 ? ", …" : ""}`;
     }
     case "tag_artifacts":
       return `New ${op.role} from ${op.sections.length} untagged item${op.sections.length > 1 ? "s" : ""} on page ${op.page}, ${op.position} ${what}`;
@@ -312,12 +317,19 @@ export function draftTree(map: TagMap, ops: TagEdit[]): { kids: Map<number, numb
     }
     if (op.op !== "move") continue;
     const from = parent.get(op.element);
-    const to = parent.get(op.target);
+    // "in": the target's last child (into a Sect, say)
+    const to = op.position === "in" ? op.target : parent.get(op.target);
     if (from === undefined || to === undefined) continue;
     const take = (p: number | null) => p === null ? roots : kids.get(p)!;
     const src = take(from);
     const at0 = src.indexOf(op.element);
     if (at0 >= 0) src.splice(at0, 1);
+    if (op.position === "in") {
+      if (!kids.has(op.target)) kids.set(op.target, []);
+      kids.get(op.target)!.push(op.element);
+      parent.set(op.element, op.target);
+      continue;
+    }
     const dst = take(to);
     const at = dst.indexOf(op.target);
     if (at < 0) continue;
@@ -330,6 +342,9 @@ export function draftTree(map: TagMap, ops: TagEdit[]): { kids: Map<number, numb
 
 export type Area = { page: number; bbox: [number, number, number, number] };
 
+/** The figures the AI suggests for an area (parts of a picture), numbered as in its list, to draw on the page. */
+export type AreaBoxes = { page: number; boxes: { bbox: [number, number, number, number]; label: string }[] };
+
 /** Content and artifacts already used by pending area edits (so they aren't offered twice). */
 export function pendingArea(ops: TagEdit[]): { pieces: Map<string, number>; sections: Set<string> } {
   const pieces = new Map<string, number>();
@@ -338,6 +353,12 @@ export function pendingArea(ops: TagEdit[]): { pieces: Map<string, number>; sect
     if (op.op === "assign") for (const p of op.pieces) pieces.set(`${p.page}:${p.mcid}`, op.element);
     if (op.op === "take_pieces") for (const p of op.pieces) pieces.set(`${p.page}:${p.mcid}`, -1); // into a tag not made yet
     if (op.op === "tag_artifacts") for (const s of op.sections) sections.add(`${op.page}:${s}`);
+    if (op.op === "regroup") {
+      for (const g of op.groups) {
+        for (const m of g.pieces ?? []) pieces.set(`${op.page}:${m}`, -1); // into a tag not made yet
+        for (const s of g.sections ?? []) sections.add(`${op.page}:${s}`);
+      }
+    }
   }
   return { pieces, sections };
 }
@@ -362,6 +383,8 @@ export function editMarks(map: TagMap, ops: TagEdit[]): Map<number, string[]> {
     if (!l.includes(what)) l.push(what);
     out.set(i, l);
   };
+  // The tags the changes make (made.ts): numbered after the saved ones, at the end
+  for (let i = map.elements.length - 1; i >= 0 && map.elements[i].made; i--) add(i, "new tag");
   const owner = new Map((map.pieces ?? []).map((p) => [`${p.page}:${p.mcid}`, p.el]));
   let levels: ListPlan | null = null;
   for (const op of ops) {
@@ -382,6 +405,7 @@ export function editMarks(map: TagMap, ops: TagEdit[]): Map<number, string[]> {
         }
         break;
       case "tag_artifacts": add(op.element, `new ${op.role} ${op.position} it`); break;
+      case "regroup": add(op.element, "area given new tags"); break;
       case "build_list": add(op.element, "list built"); break;
       case "take_pieces": case "cut_area": add(op.element, `split: new ${ROLE_NAMES[op.role] ?? op.role}`); break;
       case "make_list": for (const i of [op.element, ...op.absorb]) add(i, map.elements[i]?.role === "L" ? "joined a list" : "list item"); break;

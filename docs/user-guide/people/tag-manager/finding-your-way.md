@@ -49,7 +49,10 @@ or link), and its page. The same pane can show **Reading order** instead of the 
   with the name a screen reader announces ("field: Enter account number").
 - **Hover over or focus a tag** for its details, including what a screen reader will read. The details show
   everything in full (alt text, read-aloud text, a paragraph's words), above the tag or below it, always inside the
-  pane; a long one scrolls, and Tab from the tag goes into it. Clicking blank page hides the details.
+  pane; a long one scrolls, and Tab from the tag goes into it. Clicking blank page hides the details. When the
+  details get in the way of your work, untick **Tag cards** (beside the zoom, above the right-hand page): they stay
+  off for the rest of your session in that browser tab, until you tick it again. The tag's menu (right-click) and
+  the panel still have them. (**New 28 October 2026**)
 - **Long text in the tag tree** is cut short on its row, with the whole of it in the row's tooltip (and read in full
   by a screen reader). **Read all**, beside the cut-off words, selects the tag and opens its details.
 - **Clicking a tag on the page** selects the innermost tag under the pointer, even inside an outlined list or
@@ -66,6 +69,9 @@ or link), and its page. The same pane can show **Reading order** instead of the 
 - the area the item is about is outlined (solid and dashed) and the rest of the page is dimmed; an item about the
   whole page (reading order, right-to-left text) outlines the page;
 - a label names the item. Its **×**, or Escape, closes the highlight.
+- the label has the item's status, the same one as on **Needs review**, so you can sign it off where you fixed it:
+  **Not looked at**, **Checked**, **Fixed** or **Not an issue**, with an optional note. People who can't edit the
+  document see the status, not the choice. (**New 26 October 2026**)
 
 Items that no tag holds (text hidden as an artifact, a decorative image, faint text, an AI reading) are shown this way
 too. On a page with such items, **N page-level notes**, in the page's top-left corner, lists them; choosing one highlights it in

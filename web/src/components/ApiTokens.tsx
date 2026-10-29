@@ -1,6 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { del, get, post, type ServiceChoice } from "../api";
+import { del, get, post, type ServiceChoice, type UploadOptions } from "../api";
 import { DialogButton } from "./AdminDialog";
+import { withNoAi } from "./noAi";
 import { ErrorNotice, Loading, fmtDate, useLoad } from "./ui";
 import { useUnsavedChanges } from "./unsaved";
 
@@ -93,7 +94,9 @@ export function ApiTokens({ wrap }: { wrap: (children: ReactNode) => ReactNode }
 function NewToken({ tokens, onDone, onClose }: { tokens: Tokens; onDone: () => void; onClose: () => void }) {
   const choices = useLoad(() => get<ServiceChoice[]>("/services"), []);
   const processing = (choices.data ?? []).filter((c) => c.kind === "processing");
-  const levels = (choices.data ?? []).filter((c) => c.kind === "ai_tier");
+  const options = useLoad(() => get<UploadOptions>("/upload-options"), []);
+  // The AI levels, and No AI where the group offers it (#659)
+  const levels = withNoAi((choices.data ?? []).filter((c) => c.kind === "ai_tier"), options.data?.no_ai);
   const [name, setName] = useState("");
   const [service, setService] = useState("");
   const [level, setLevel] = useState("");

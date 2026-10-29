@@ -58,6 +58,20 @@ def test_the_report_reads_as_a_report():
     assert '<th scope="row">' in h and "<caption>" in h
 
 
+def test_a_document_made_without_ai_says_so():
+    """#659: No AI: the summary says so, and how many figures are left for a person to describe."""
+    assert "without AI" not in build_html(META, RESULT, BRAND)
+    after = {**RESULT["reports"]["comparison"]["after"], "figures_missing_alt": 3}
+    result = {**RESULT, "metrics": {**RESULT["metrics"], "ai_provider": "none"},
+              "reports": {**RESULT["reports"], "comparison": {**RESULT["reports"]["comparison"], "after": after}}}
+    h = build_html(META, result, {**BRAND, "ai_label": "No AI"})
+    assert "Made <strong>without AI</strong>: 3 figures have no alt text" in h and "No AI" in h
+    from app.reports.markdown import render_job_markdown
+    assert "made without AI" in render_job_markdown("j", {**META, "ai_provider": "none"}, "completed", result)
+    md = render_job_markdown("j", {**META, "ai_provider": "gateway", "ai_model": "m"}, "completed", RESULT)
+    assert "without AI" not in md and "gateway" in md
+
+
 def test_an_audit_has_no_after():
     result = {**RESULT, "files": {}, "reports": {**RESULT["reports"], "comparison": {
         "before": RESULT["reports"]["comparison"]["before"]}}}

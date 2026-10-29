@@ -8,8 +8,10 @@ import threading
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import pymupdf as fitz
 
+from app.pipeline.lists import roman_value
 from app.pipeline.markers import BULLET_ONLY, BULLET_START, FOOTNOTE_MARK, LABEL_RUN
 from app.pipeline.symbol_chars import unicode_for
 from app.pipeline import plots, schemes
@@ -93,7 +95,7 @@ _CHARGE = re.compile(r"^(\d?)([+\-−–⊕⊖])$")
 class _Run:
     """One character with its position, as typeset. Math producers emit glyphs out of order and may
     draw a decimal point into a gap left in a run ("3 46" + "."), so order comes from position."""
-    __slots__ = ("x0", "y0", "x1", "y1", "ox", "text", "size", "bold", "base", "script", "color", "seq")
+    __slots__ = ("x0", "y0", "x1", "y1", "ox", "text", "size", "bold", "base", "script", "color", "seq", "ocr")
 
     def __init__(self, span: dict, char: dict, seq: int):
         self.x0, self.y0, self.x1, self.y1 = _rect(char["bbox"])
@@ -106,6 +108,7 @@ class _Run:
         self.script: str | None = None  # "sup" / "sub" when attached to a line as a script
         self.color = int(span.get("color", 0))
         self.seq = seq  # extraction (content stream) order
+        self.ocr = False  # from the engine's OCR layer: written a line at a time, at a size that fits the line's box
 
 
 class _VLine:
@@ -155,14 +158,19 @@ def _visual_lines(runs: list[_Run]) -> list[_VLine]:
             near = ln.x0 - 0.6 * ln.size <= r.x0 <= ln.x1 + 1.5 * ln.size
             offset = r.base - ln.base
             shifted = offset >= 0.1 * ln.size or offset <= -0.15 * ln.size
-            if r.size <= 0.85 * ln.size and near and shifted and -0.75 * ln.size <= offset <= 0.5 * ln.size:
+            # An OCR layer's smaller text is a smaller line (a form's label), never a script: OCR writes no scripts
+            if (not r.ocr and r.size <= 0.85 * ln.size and near and shifted
+                    and -0.75 * ln.size <= offset <= 0.5 * ln.size):
                 if host is None or abs(offset) < abs(r.base - host.base):
                     host = ln
         if host is not None:
             r.script = "sup" if r.base < host.base else "sub"
             host.add(r)
             continue
-        same = [ln for ln in lines if abs(r.base - ln.base) <= 0.3 * max(ln.size, r.size)]
+        # An OCR line's baseline is worked out from its box, so lines of different print on one row come out
+        # nearly level (a form's number in small print, its title across the page): much smaller, it's its own
+        same = [ln for ln in lines if abs(r.base - ln.base) <= 0.3 * max(ln.size, r.size)
+                and not (r.ocr and r.size < 0.7 * ln.size)]
         if same:
             min(same, key=lambda ln: abs(r.base - ln.base)).add(r)
             continue
@@ -188,6 +196,9 @@ def _join_shifted(lines: list[_VLine]) -> list[_VLine]:
     right where it ends, joins it as its scripts. Lines of text are always a whole line apart."""
     out: list[_VLine] = []
     for ln in sorted(lines, key=lambda ln: (ln.x0, -len(ln.runs))):
+        if all(r.ocr for r in ln.runs):  # an OCR layer's line is a whole line, never moved off another
+            out.append(ln)
+            continue
         host = None
         for h in out:
             # The same size: a text rise moves text without scaling it. (A footnote mark a point smaller, raised
@@ -395,6 +406,43 @@ def _join(runs: list[_Run], spoken: bool) -> str:
     return " ".join(_word_text(w, spoken) for w in _words(runs))
 
 
+def _apart_from_typed(runs: list[_Run]) -> list[list[_Run]]:
+    """A line of a scanned form split where it passes between the form's print (the OCR layer) and a value typed
+    onto it: the label and the value are each a block of their own, and each reads as drawn (the value is drawn
+    before the OCR layer, so one tag holding both would show the value first)."""
+    out: list[list[_Run]] = []
+    kind = None
+    for r in runs:
+        if r.text.strip() and r.ocr != kind:
+            kind = r.ocr
+            out.append([])
+        if not out:
+            out.append([])
+        out[-1].append(r)
+    return [part for part in out if any(r.text.strip() for r in part)]
+
+
+def _label_kind(word: list[_Run]) -> str:
+    """A list label's kind: a number, or a letter or roman numeral."""
+    return "number" if any(r.text.isdigit() for r in word) else "letter"
+
+
+_PART_LABEL = re.compile(r"^\s*\(([b-z])\)")
+
+
+def _wraps_into_part(group: list[list[_Run]], text: str) -> bool:
+    """A part's label at the start of a line, where the block so far has the part before it in its running text
+    ("... (a) the sum of ...; (b) the product" then "(c) the product 5.6 × π") and the line above runs on to the
+    block's right edge: the text wraps there, it doesn't start a list item. (Parts set one under another end short.)"""
+    m = _PART_LABEL.match(text)
+    if not m:
+        return False
+    right = max(r.x1 for line in group for r in line)
+    size = max(_style(group[-1])[0], 1.0)
+    above = " ".join(_join(line, spoken=False) for line in group)
+    return max(r.x1 for r in group[-1]) >= right - 2 * size and above.find(f"({chr(ord(m.group(1)) - 1)})") > 0
+
+
 def _split_inline_items(line: _VLine) -> list[list[_Run]]:
     """'(a) 346 000 000   (b) 2710   (c) 0.000543' on one line is three list items, not one."""
     words = _words(line.runs)
@@ -409,6 +457,8 @@ def _split_inline_items(line: _VLine) -> list[list[_Run]]:
         w = words[k]
         if any(r.script for r in w) or not LABEL_RUN.match("".join(r.text for r in w)):
             continue
+        if k == 1 and _label_kind(words[0]) != _label_kind(w):
+            continue  # "7.   (a) Can an object ...": a problem's number and its first part, one item
         if w[0].x0 - words[k - 1][-1].x1 >= 0.9 * size:  # well beyond a word space (about 0.25 em)
             cuts.append(w[0].x0)
     if not cuts:
@@ -416,6 +466,24 @@ def _split_inline_items(line: _VLine) -> list[list[_Run]]:
     bounds = [float("-inf"), *cuts, float("inf")]
     pieces = [[r for r in line.runs if lo <= r.x0 < hi] for lo, hi in zip(bounds, bounds[1:])]
     return [pc for pc in pieces if any(r.text.strip() for r in pc)]
+
+
+_CHAPTER_NO = re.compile(r"^(?:\d{1,2}|[IVX]{1,5})$")
+
+
+def _apart_from_chapter_number(runs: list[_Run]) -> list[list[_Run]]:
+    """A chapter's number set huge beside its title's last line ("made in a small batch vessel at room heat   4", the 4 in
+    80 points): a piece of its own, as it is when it stands on a line apart, and not a word of the title (#665)."""
+    words = _words(runs)
+    if len(words) < 2:
+        return [runs]
+    for word in (words[-1], words[0]):
+        text = "".join(r.text for r in word).strip()
+        rest = [r.size for w in words if w is not word for r in w if r.text.strip()]
+        if rest and _CHAPTER_NO.match(text) and min(r.size for r in word) >= 2.5 * max(rest):
+            inside = set(map(id, word))
+            return [[r for r in runs if id(r) not in inside], word]
+    return [runs]
 
 
 def _style(runs: list[_Run]) -> tuple[float, bool]:
@@ -434,7 +502,7 @@ def _style(runs: list[_Run]) -> tuple[float, bool]:
 
 
 def _visible_backgrounds(page: fitz.Page) -> list[fitz.Rect]:
-    """Areas where light text can still be seen: anything filled with a color, and images."""
+    """Areas where light text can still be seen: anything filled with a color, and images (in visual page space)."""
     rects = []
     for d in page.get_drawings():
         fill = d.get("fill")
@@ -442,7 +510,7 @@ def _visible_backgrounds(page: fitz.Page) -> list[fitz.Rect]:
             rects.append(fitz.Rect(d["rect"]))
     for info in page.get_image_info():
         rects.append(fitz.Rect(info["bbox"]))
-    return rects
+    return [r * page.rotation_matrix for r in rects] if page.rotation else rects
 
 
 # --------------------------------------------------------------------------- two-level math
@@ -461,6 +529,7 @@ class _Frac:
         self.bold = False
         self.color = 0
         self.script = None
+        self.ocr = False
         self.seq = min(r.seq for r in parts)
         nt, dt = _stacked_text(num, False), _stacked_text(den, False)
         ns, ds = _stacked_text(num, True), _stacked_text(den, True)
@@ -485,20 +554,22 @@ def _stacked_text(runs: list, spoken: bool) -> str:
 
 
 def _fraction_bars(page: fitz.Page) -> list[tuple[float, float, float]]:
-    """Short horizontal rules that could be fraction bars: (x0, x1, y). A rule that is part of a box or a grid (a
-    table cell's border: another rule carries on from its end, or an upright one meets it) is not one."""
+    """Short horizontal rules that could be fraction bars: (x0, x1, y), in visual page space. A rule that is part of a
+    box or a grid (a table cell's border: another rule carries on from its end, or an upright one meets it) is not
+    one."""
     bars, across, upright = [], [], []
     limit = 0.6 * page.rect.width
+    rot = page.rotation_matrix if page.rotation else fitz.Identity
     for d in page.get_drawings():
         for it in d.get("items") or []:
             if it[0] == "l":
-                p1, p2 = it[1], it[2]
+                p1, p2 = it[1] * rot, it[2] * rot
                 if abs(p1.y - p2.y) <= 0.3 and abs(p2.x - p1.x) >= 2.5:
                     across.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
                 elif abs(p1.x - p2.x) <= 0.3 and abs(p2.y - p1.y) >= 2.5:
                     upright.append(((p1.x + p2.x) / 2, min(p1.y, p2.y), max(p1.y, p2.y)))
             elif it[0] == "re":
-                r = fitz.Rect(it[1])
+                r = fitz.Rect(it[1]) * rot
                 if r.height <= 1.5 and r.width >= 2.5 and d.get("fill") is not None:
                     across.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
                 elif r.width <= 1.5 and r.height >= 2.5 and d.get("fill") is not None:
@@ -636,18 +707,33 @@ def _find_fraction(bar, pool: list):
     num_base = sorted(r.base for r in num)[len(num) // 2]
     den_base = sorted(r.base for r in den)[len(den) // 2]
 
+    def runs_on(r) -> bool:
+        # A piece of a line of text that carries on well past the bar: the paragraph above or below the fraction (or
+        # the page's footer under it), set a little smaller, not a script of its numerator or denominator ("e in gram"
+        # of "solute in grams" read into W over M.W)
+        return any(o is not r and o.text.strip() and abs(o.base - r.base) <= 0.3 * r.size
+                   and (o.x1 < bx0 - size or o.x0 > bx1 + size) for o in pool)
+
     def belongs(r, base: float, lo: float, hi: float) -> bool:
         cy = (r.y0 + r.y1) / 2
         if not lo <= cy <= hi:
             return False
         # a smaller script beside the part, or more of the part's own line over the bar
-        return r.size < 0.9 * size or (abs(r.base - base) <= 0.3 * size and bx0 - 0.5 <= (r.x0 + r.x1) / 2 <= bx1 + 0.5)
+        return (r.size < 0.9 * size and not runs_on(r)) or (
+            abs(r.base - base) <= 0.3 * size and bx0 - 0.5 <= (r.x0 + r.x1) / 2 <= bx1 + 0.5)
 
     num += [r for r in near if belongs(r, num_base, top, by - 0.01)]
     den += [r for r in near if r not in num and belongs(r, den_base, by + 0.01, bottom)]
     host = [r for r in pool if r.text.strip() and r not in num and r not in den and r.y0 < by < r.y1
             and (0 <= bx0 - r.x1 <= 1.5 * size or 0 <= r.x0 - bx1 <= 1.5 * size)]
     return num, den, host
+
+
+_RADICALS = frozenset("√∛∜")
+
+
+# An ion's charge written alone: "2-", "3+", "2–"
+_ION_CHARGE = re.compile(r"\s*\d\s*[+\-\u2013\u2212]\s*")
 
 
 def _merge_units(page: fitz.Page, units: list[tuple[list, list]]) -> list[tuple[list, list]]:
@@ -676,10 +762,12 @@ def _merge_units(page: fitz.Page, units: list[tuple[list, list]]) -> list[tuple[
             (pool if r.text.strip() else spaces).append(r)
 
     # Interleaved lines: a run of one block on another block's line, inside or touching it
-    lines = []
+    lines, charges = [], []
     for ui, (runs, _) in enumerate(units):
         for ln in _visual_lines([r for r in runs if r.text.strip()]) if runs else []:
             lines.append((ui, ln.base, ln.size, ln.x0, ln.x1))
+            if _ION_CHARGE.fullmatch("".join(r.text for r in ln.runs)):
+                charges.append(lines[-1])
     lines.sort(key=lambda t: t[1])
     for a in range(len(lines)):
         ua, base_a, size_a, x0a, x1a = lines[a]
@@ -690,6 +778,31 @@ def _merge_units(page: fitz.Page, units: list[tuple[list, list]]) -> list[tuple[
                 break
             if ua != ub and x0b <= x1a + 0.5 * size_a and x0a <= x1b + 0.5 * size_b:
                 union(ua, ub)
+            elif ua != ub:
+                # A tall radical sign set as a block of its own parts the line: the sign in the gap, reaching above
+                # and below the line, joins all three ("T = 2π" √ "ℓ/g for the time"). Only a radical: a tall
+                # integral or sum in a displayed equation stands between pieces that are lines of their own
+                (lu, lb, lx1), (ru, rx0) = ((ua, base_a, x1a), (ub, x0b)) if x0b > x1a else ((ub, base_b, x1b), (ua, x0a))
+                for r in pool:
+                    if (r.text in _RADICALS and owner[id(r)] not in (lu, ru) and lx1 - 1 <= r.x0 and r.x1 <= rx0 + 1 and r.x1 - r.x0 < 3 * size_a
+                            and r.y1 - r.y0 >= 2.5 * size_a and r.y0 < lb - 0.7 * size_a and r.y1 > lb + 0.5 * size_a
+                            and sum(1 for o in units[owner[id(r)]][0] if o.text.strip()) == 1):
+                        union(lu, owner[id(r)])
+                        union(lu, ru)
+                        # Read in the line, not as a line of its own (its origin is at its top) nor as text of
+                        # another size
+                        r.base, r.size = lb, size_a
+                        break
+
+    # An ion's charge in smaller print, a line of its own that the producer started a block with ("Pb(OH)4" | "2- +
+    # ClO- -> ..."): it fills the gap the test above measures, its baseline raised too far to count, but it touches the
+    # end of a line in larger print, inside that line's height. Read apart, one equation was three paragraphs. Only a
+    # charge: a root's index or a power in TeX math is placed by the fraction and radical rules
+    for us, base_s, size_s, x0s, x1s in charges:
+        for ul, base_l, size_l, x0l, x1l in lines:
+            if (us != ul and size_s <= 0.8 * size_l and -0.75 * size_l <= base_s - base_l <= 0.4 * size_l
+                    and x0s <= x1l + 0.5 * size_s and x0l <= x1s + 0.5 * size_s):
+                union(us, ul)
 
     # Fractions, innermost (narrowest) first so a fraction inside another becomes part of it
     consumed: set[int] = set()
@@ -737,12 +850,121 @@ def _drop_overprint(runs: list) -> list:
     return out
 
 
-def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
+def _text_to_visual(data: dict, rot: fitz.Matrix) -> None:
+    """PyMuPDF's text of a rotated page, its boxes, pen positions and writing directions turned into visual page space.
+    Text that reads across the screen is written up or down the unrotated page (a landscape page, a screenshot turned
+    to fit): judged unturned, each of its lines stood apart, never joined into paragraphs or read by baseline."""
+    turn = fitz.Matrix(rot.a, rot.b, rot.c, rot.d, 0, 0)
+    for blk in data["blocks"]:
+        if blk.get("type") != 0:
+            continue
+        blk["bbox"] = tuple(fitz.Rect(blk["bbox"]) * rot)
+        for line in blk["lines"]:
+            line["bbox"] = tuple(fitz.Rect(line["bbox"]) * rot)
+            if "dir" in line:
+                line["dir"] = tuple(fitz.Point(line["dir"]) * turn)
+            for span in line["spans"]:
+                span["bbox"] = tuple(fitz.Rect(span["bbox"]) * rot)
+                if "origin" in span:
+                    span["origin"] = tuple(fitz.Point(span["origin"]) * rot)
+                for ch in span.get("chars", []):
+                    ch["bbox"] = tuple(fitz.Rect(ch["bbox"]) * rot)
+                    ch["origin"] = tuple(fitz.Point(ch["origin"]) * rot)
+
+
+# A contents page's own title, and what an entry ends with: its page number, in figures or roman numerals
+_CONTENTS_TITLE = re.compile(r"^\s*(?:table\s+of\s+)?contents\s*$|^\s*list\s+of\s+(?:figures|tables|illustrations)\s*$",
+                             re.I)
+_PAGE_REF = re.compile(r"(?:^|\s)(\d{1,4}|[ivxlc]{1,7}|[IVXLC]{1,7})\s*$")
+# What starts an entry of its own: a section's number, or the word that labels a chapter or part
+_ENTRY_START = re.compile(r"^\s*(?:\d{1,3}(?:\.\d{1,3})*\.?\s"
+                          r"|(?:Chapter|CHAPTER|Part|PART|Appendix|APPENDIX|Section|SECTION)\s+\w+)")
+
+
+def _page_ref(ws: list) -> int | None:
+    """The page number a contents line ends with, set apart from its words (after a tab or dot leaders, at least two
+    spaces' width), or None. A word that happens to be made of i, v, x, l and c ("civil") is a numeral only when it
+    reads as one."""
+    if len(ws) < 2:
+        return None
+    last, before = ws[-1], ws[-2]
+    t = last[4].strip()
+    value = int(t) if t.isdigit() and len(t) <= 4 else roman_value(t)
+    if value is None:
+        return None
+    apart = last[0] - before[2] >= 2 * max(2.0, 0.25 * (last[3] - last[1])) or before[4].rstrip().endswith("..")
+    return value if apart else None
+
+
+def _contents_page(page: fitz.Page) -> bool:
+    """Whether a page is (part of) a table of contents: it says so ("Table of Contents", "List of Figures"), or most of
+    its lines are entries, words ending in a page number at one right edge and mostly led by a section's number (the
+    contents' later pages, which have no title). Read as ordinary text its entries were joined into paragraphs of
+    several entries each, and its chapter entries were taken for headings (#665)."""
+    # Lines by height, not by the producer's lines: an entry's page number is often set apart after a tab
+    rows: list[list] = []
+    for w in sorted(page.get_text("words"), key=lambda w: ((w[1] + w[3]) / 2, w[0])):
+        if rows and abs((w[1] + w[3]) / 2 - (rows[-1][0][1] + rows[-1][0][3]) / 2) <= 3:
+            rows[-1].append(w)
+        else:
+            rows.append([w])
+    texts = [(" ".join(w[4] for w in ws), ws) for ws in (sorted(r, key=lambda w: w[0]) for r in rows)]
+    worded = [(t, ws) for t, ws in texts if sum(ch.isalpha() for ch in t) >= 3]
+    numbered = [(t, ws, ref) for t, ws in worded if (ref := _page_ref(ws)) is not None]
+    # Its title at the top, over entries (a slide deck's "Table of Contents" link on every slide is no contents)
+    if len(numbered) >= 3 and any(_CONTENTS_TITLE.match(t) and ws[0][3] < page.rect.height / 3 for t, ws in texts):
+        return True
+    if len(worded) < 8 or len(numbered) < 0.6 * len(worded):
+        return False
+    rights = Counter(round(ws[-1][2]) for _, ws, _ in numbered)
+    edge, _ = rights.most_common(1)[0]
+    at_edge = sum(1 for _, ws, _ in numbered if abs(ws[-1][2] - edge) <= 3)
+    led = sum(1 for t, _, _ in numbered if _ENTRY_START.match(t))
+    # The page numbers go up the page down (or stay: two sections on one page)
+    refs = [ref for _, _, ref in numbered]
+    rising = sum(1 for a, b in zip(refs, refs[1:]) if b >= a)
+    return (at_edge >= 0.6 * len(numbered) and led >= 0.3 * len(numbered)
+            and rising >= 0.9 * (len(refs) - 1))
+
+
+def _contents_entries(blocks: list[TextBlock]) -> list[TextBlock]:
+    """A contents page's lines (one block each) as its entries: a line ending in a page number closes an entry, a
+    line led by a section's number starts one, and a line that does neither is the entry above it wrapped. Entries
+    are TOCI; the page's title, in larger print, and its running header and page number stay as they are."""
+    sizes = sorted(b.font_size for b in blocks if _PAGE_REF.search(b.text))
+    size = sizes[len(sizes) // 2] if sizes else 0.0
+    out: list[TextBlock] = []
+    entry: TextBlock | None = None
+    closed = True
+    for b in blocks:
+        worded = sum(ch.isalpha() for ch in b.text) >= 3
+        if not size or not worded or b.font_size > 1.15 * size or _CONTENTS_TITLE.match(b.text):
+            out.append(b)
+            entry = None
+            continue
+        ends = bool(_PAGE_REF.search(b.text))
+        starts = bool(_ENTRY_START.match(b.text))
+        if entry is not None and not starts and (not closed or not ends):
+            append_block(entry, b)
+            closed = closed or ends
+            continue
+        b.role = "TOCI"
+        out.append(b)
+        entry, closed = b, ends
+    return out
+
+
+def _extract_blocks(page: fitz.Page, page_no: int, ocr: bool = False) -> list[TextBlock]:
     """Text blocks built from visual lines (runs sorted by position, scripts attached to their line),
     split wherever font size / weight changes between lines (separates headings), at every list bullet
     and between list items sharing a line, then re-joined into paragraphs where a producer emitted one
-    block per line. Text that can't be seen (white on a blank page) becomes an artifact."""
+    block per line. Text that can't be seen (white on a blank page) becomes an artifact.
+
+    ocr: the page has the engine's OCR layer, whose invisible text has no scripts (see _visual_lines). Invisible
+    text elsewhere (a flattened page's, glyph by glyph at the original sizes) may have."""
     data = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP)
+    if page.rotation:
+        _text_to_visual(data, page.rotation_matrix)
     backgrounds = None
     blocks: list[TextBlock] = []
     invisible: list[BBox] = []
@@ -760,9 +982,18 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
             line_runs: list[_Run] = []
             for span in line["spans"]:
                 key = float("-inf")
+                prev: _Run | None = None
                 for ch in span.get("chars", []):
                     seq += 1
                     r = _Run(span, ch, seq)
+                    if (prev is not None and r.text != ch["c"] and r.x1 - r.x0 < 0.05 * r.size
+                            and abs(r.x0 - prev.x1) < 0.5 and abs(r.base - prev.base) < 0.5):
+                        # One glyph the font's map gives as two: the letter typed, then the symbol it stands for in
+                        # Word ("à" then U+F0E0, a Wingdings arrow), at no width. The symbol, in the letter's place
+                        prev.text = r.text
+                        continue
+                    prev = r
+                    r.ocr = ocr and span.get("alpha", 255) == 0  # (render mode 3 is reported as alpha 0)
                     # Within a span keep the producer's order (ligature halves can report odd positions);
                     # other spans' glyphs still slot in between by position.
                     key = r.ox = max(r.ox, key)
@@ -794,6 +1025,7 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
                     continue
             visible.append(r)
         units.append((visible, rotated))
+    contents = _contents_page(page)
     # Producers split one visual line (or a fraction and the line it sits in) across blocks: join them,
     # and read each fraction as a unit.
     for runs, rotated in _merge_units(page, units):
@@ -801,7 +1033,9 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
         pieces: list[list[_Run]] = []
         if any(r.text.strip() for r in runs):
             for vl in _visual_lines(runs):
-                pieces += _split_inline_items(vl)
+                for item in _split_inline_items(vl):
+                    for part in _apart_from_chapter_number(item):
+                        pieces += _apart_from_typed(part) if ocr else [part]
         pieces += [ln for ln in rotated if any(r.text.strip() for r in ln)]
         if not pieces:
             continue
@@ -812,7 +1046,7 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
                 if len(groups[-1]) == 1 and BULLET_ONLY.match(first):
                     groups[-1].append(piece)  # bullet glyph on its own line: text follows
                     continue
-                rule = _starts_new_block(groups[-1], piece, page.rect.width)
+                rule = "contents line" if contents else _starts_new_block(groups[-1], piece, page.rect.width)
                 if rule is None:
                     groups[-1].append(piece)
                     continue
@@ -843,14 +1077,16 @@ def _extract_blocks(page: fitz.Page, page_no: int) -> list[TextBlock]:
                     # Spoken form when it differs from the text, or the visual order when the typeset order is scrambled
                     actual_text=spoken if (spoken != text or reorder) else None,
                     has_scripts=has_scripts,
+                    fraction=any(isinstance(r, _Frac) for r in flat),
                     baseline=first[len(first) // 2],
                     marks=marks,
                     mark_after=mark_after,
                     mark_boxes=mark_boxes,
                     lead_mark=lead,
+                    typed_on_scan=ocr and any(r.text.strip() and not r.ocr for r in flat),
                 )
             )
-    blocks = _merge_paragraph_lines(_attach_bullets(blocks))
+    blocks = _contents_entries(blocks) if contents else _merge_paragraph_lines(_attach_bullets(blocks))
     for box in invisible:
         blocks.append(TextBlock(id="", page=page_no, bbox=box, text="", font_size=0.0, role="Artifact",
                                 artifact_type="Layout"))
@@ -885,7 +1121,8 @@ def _starts_new_block(group: list[list[_Run]], piece: list[_Run], page_width: fl
     size, bold = _style(piece)
     psize, pbold = _style(group[-1])
     rules = (
-        ("list marker", lambda: BULLET_START.match(text) or BULLET_ONLY.match(text)),
+        ("list marker", lambda: (BULLET_START.match(text) and not _wraps_into_part(group, text))
+         or BULLET_ONLY.match(text)),
         # Notes set one after another: a line that starts with its own raised number ("³Da dun") under a note that
         # did too is the next note (#598)
         ("next note", lambda: _leads_with_mark(piece) and _leads_with_mark(group[0])),
@@ -904,10 +1141,28 @@ def _continues_paragraph(prev: TextBlock, b: TextBlock) -> bool:
     size = max(prev.font_size, b.font_size, 1.0)
     gap = b.bbox[1] - prev.bbox[3]
     same_style = prev.bold == b.bold and abs(prev.font_size - b.font_size) <= max(_STYLE_SIZE_TOL, 0.12 * size)
-    aligned = abs(b.bbox[0] - prev.bbox[0]) <= 6
+    aligned = abs(b.bbox[0] - prev.bbox[0]) <= 6 or _indented_on(prev, b, size)
     return (same_style and aligned and _LINE_GAP[0] * size <= gap <= _LINE_GAP[1] * size
             and not BULLET_START.match(b.text) and not BULLET_ONLY.match(b.text)
             and not (b.lead_mark and prev.lead_mark))  # two notes, each starting with its raised number
+
+
+_ENDS_SENTENCE = (".", ":", "?", "!", ";")
+
+
+def _indented_on(prev: TextBlock, b: TextBlock, size: float) -> bool:
+    """Whether b goes on with prev's paragraph though its left edge is elsewhere: prev is one line that runs on to
+    where the paragraph's lines end, and b is the rest, set further in (a caption's or a heading's hanging indent,
+    "Figure 1.1 Reaction energy profile for an" over "uncatalysed reaction", the lower case saying it goes on) or
+    further out (a paragraph's first line indented, the sentence running on). Read apart, a caption's first line
+    was the caption and the rest a paragraph, and a heading's last words a heading of their own (#665)."""
+    one_line = prev.bbox[3] - prev.bbox[1] <= 1.6 * size
+    runs_on = prev.bbox[2] >= b.bbox[2] - 1.5 * size and not prev.text.rstrip().endswith(_ENDS_SENTENCE)
+    dx = b.bbox[0] - prev.bbox[0]
+    if not (one_line and runs_on) or abs(dx) > max(4 * size, 0.2 * (prev.bbox[2] - prev.bbox[0])):
+        return False
+    first = b.text.lstrip()[:1]
+    return dx < 0 or first.islower() or prev.text.rstrip().endswith(("-", "‐", "–"))
 
 
 def _merge_paragraph_lines(blocks: list[TextBlock]) -> list[TextBlock]:
@@ -969,7 +1224,185 @@ def _extract_tables(page: fitz.Page, page_no: int) -> list[TableRegion]:
         for cell in region.cells:
             cell.is_header = cell.row < region.header_rows
         tables.append(region)
+    tables += _ruled_tables(page, page_no, len(found.tables), [t.bbox for t in tables])
     return tables
+
+
+# A table's caption, which sits between two tables and not inside one
+_CAPTION_START = re.compile(r"^\s*(?:table|figure|fig\.|scheme|chart)\s+[A-Z]?\d", re.I)
+
+
+def _rule_levels(page: fitz.Page) -> list[tuple[float, float, float, list[float]]]:
+    """The horizontal rules drawn across the page, by height: each a row of segments drawn edge to edge (Word draws
+    a cell's border for each cell, so a rule is broken where its columns meet): (height, left, right, the breaks)."""
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001 - odd drawings: no ruled table is found, as before
+        return []
+    found: list[tuple[float, float, float]] = []
+    for d in drawings:
+        colour = d.get("fill") if d.get("type") == "f" else d.get("color")
+        if colour is not None and min(colour) > 0.9:
+            continue  # a white line is no rule
+        for it in d.get("items") or []:
+            if it[0] == "re" and it[1].height <= 2 and it[1].width >= 5:
+                found.append(((it[1].y0 + it[1].y1) / 2, it[1].x0, it[1].x1))
+            elif it[0] == "l" and abs(it[1].y - it[2].y) < 1 and abs(it[1].x - it[2].x) >= 5:
+                found.append((it[1].y, min(it[1].x, it[2].x), max(it[1].x, it[2].x)))
+    levels: list[tuple[float, list[tuple[float, float]]]] = []
+    for y, x0, x1 in sorted(found):
+        if levels and y - levels[-1][0] <= 1.5:
+            levels[-1][1].append((x0, x1))
+        else:
+            levels.append((y, [(x0, x1)]))
+    out = []
+    for y, segs in levels:
+        segs.sort()
+        joined: list[list[float]] = []
+        for x0, x1 in segs:
+            if joined and x0 - joined[-1][1] <= 2.5:
+                joined[-1][1] = max(joined[-1][1], x1)
+                if x0 > joined[-1][2][-1] + 2:  # where one cell's border ends and the next one's starts
+                    joined[-1][2].append(x0)
+            elif not joined or x1 > joined[-1][1]:
+                joined.append([x0, x1, [x0]])
+        # One unbroken rule per height: two side by side are two things (a form's lines to write on)
+        if len(joined) == 1 and joined[0][1] - joined[0][0] >= 60:
+            x0, x1, starts = joined[0]
+            out.append((y, x0, x1, starts[1:]))
+    return out
+
+
+def _ruled_tables(page: fitz.Page, page_no: int, start: int, avoid: list[BBox]) -> list[TableRegion]:
+    """Tables drawn with horizontal rules only: one over the header, one under it and one under the last row, with
+    no lines between the columns ("three-line" tables, as Word's and the journals' styles draw them). The finder
+    needs lines on every side and finds none of them, and their header row read as a run of headings (#665).
+
+    The rules must be stacked one under another, the same width, with nothing but the table between them: a caption
+    or a line of prose between two rules ends a table. The columns are where the rules break (Word draws each cell's
+    border), else the gaps the words leave."""
+    levels = _rule_levels(page)
+    if len(levels) < 3:
+        return []
+    words = [w for w in page.get_text("words") if w[4].strip()]
+    lines: dict[tuple, list] = {}
+    for w in words:
+        lines.setdefault((w[5], w[6]), []).append(w)
+
+    def between(y0: float, y1: float, x0: float, x1: float) -> list[list]:
+        return [ws for ws in lines.values() if y0 < (ws[0][1] + ws[0][3]) / 2 < y1
+                and x0 - 2 <= min(w[0] for w in ws) and max(w[2] for w in ws) <= x1 + 2]
+
+    def breaks_table(band: list[list], x0: float, x1: float, edges: list[float]) -> bool:
+        for ws in band:
+            text = " ".join(w[4] for w in ws)
+            crosses = sum(1 for e in edges if min(w[0] for w in ws) < e - 2 and max(w[2] for w in ws) > e + 2)
+            if _CAPTION_START.match(text) or (len(ws) >= 8 and crosses and max(w[2] for w in ws) - min(w[0] for w in ws)
+                                              >= 0.6 * (x1 - x0)):
+                return True
+        return False
+
+    stacks: list[list] = []
+    for y, left, right, breaks in levels:
+        span = (left, right)
+        last = stacks[-1][-1] if stacks else None
+        if (last is not None and abs(last[1][0] - span[0]) <= 3 and abs(last[1][1] - span[1]) <= 3
+                and bool(last[2]) == bool(breaks)  # a table's rules are all broken by its columns, or none are
+                and not breaks_table(between(last[0], y, *span), *span, stacks[-1][0][2] or breaks)):
+            stacks[-1].append((y, span, breaks))
+        else:
+            stacks.append([(y, span, breaks)])
+    tables: list[TableRegion] = []
+    for stack in stacks:
+        if len(stack) < 3:
+            continue
+        top, x0, x1, bottom = stack[0][0], stack[0][1][0], stack[0][1][1], stack[-1][0]
+        bbox = (x0, top, x1, bottom)
+        if any(bbox_intersection(bbox, a) > 0.2 * (bbox_area(bbox) or 1.0) for a in avoid):
+            continue
+        region = _ruled_table(f"p{page_no}t{start + len(tables)}", page_no, bbox, [y for y, _, _ in stack],
+                              stack[0][2], between(top, bottom, x0, x1))
+        if region is not None:
+            tables.append(region)
+    return tables
+
+
+def _ruled_table(tid: str, page_no: int, bbox: BBox, rules: list[float], breaks: list[float],
+                 lines: list[list]) -> TableRegion | None:
+    """One ruled table's grid: the rows between the first two rules are its header, one row; below them each line
+    of text is a row, unless it only goes on with the cells above it (a cell's text wrapped onto a second line)."""
+    x0, _, x1, _ = bbox
+    edges = [x0] + breaks + [x1]
+    if len(edges) == 2:
+        # No breaks in the rules: the columns are the gaps that run down the whole table between the words
+        covered = sorted((w[0], w[2]) for ws in lines for w in ws)
+        gaps, reach = [], x0
+        for a, b in covered:
+            if a - reach >= 8:
+                gaps.append((reach + a) / 2)
+            reach = max(reach, b)
+        edges = [x0] + gaps + [x1]
+    n_cols = len(edges) - 1
+    if n_cols < 2:
+        return None
+
+    def column(w) -> int:
+        cx = (w[0] + w[2]) / 2
+        return next((i for i in range(n_cols) if cx < edges[i + 1]), n_cols - 1)
+
+    rows: list[dict[int, list]] = []
+    row_bands: list[int] = []
+    rows_y: list[float] = []
+    for ws in sorted(lines, key=lambda ws: ((ws[0][1] + ws[0][3]) / 2, ws[0][0])):
+        cy = (ws[0][1] + ws[0][3]) / 2
+        band = next(i for i in range(len(rules) - 1) if cy < rules[i + 1])
+        cells: dict[int, list] = {}
+        for w in ws:
+            cells.setdefault(column(w), []).append(w)
+        same_line = rows and row_bands[-1] == band and abs(rows_y[-1] - cy) < 3
+        wrapped = (rows and row_bands[-1] == band
+                   and (band == 0 or (0 not in cells and 0 in rows[-1] and len(cells) <= max(1, n_cols // 2))))
+        if same_line or wrapped:
+            for c, cw in cells.items():
+                rows[-1].setdefault(c, []).extend(cw)
+            rows_y[-1] = cy
+            continue
+        rows.append(cells)
+        row_bands.append(band)
+        rows_y.append(cy)
+    if len(rows) < 2 or row_bands[0] != 0 or len(rows[0]) < 2:
+        return None
+    # A header says what its columns hold, in words ("1 2 3 4 5 6" over the same is a diagram's labels)
+    if not any(sum(ch.isalpha() for w in ws for ch in w[4]) >= 3 for ws in rows[0].values()):
+        return None
+    # Many rules with one line between each two: a column of worked fractions (a calculation set out with its
+    # bars), not a table's rows, which a three-line table holds several of between two rules
+    if len(rules) >= 5 and len(set(row_bands)) == len(rows):
+        return None
+    # Each cell is its column's width and its row's height, the rows meeting halfway between their words, so every
+    # piece of text in the table falls in a cell
+    tops = [min(w[1] for ws in row.values() for w in ws) for row in rows]
+    bottoms = [max(w[3] for ws in row.values() for w in ws) for row in rows]
+    cuts = [rules[0]] + [(bottoms[r] + tops[r + 1]) / 2 for r in range(len(rows) - 1)] + [rules[-1]]
+    cells_out: list[TableCell] = []
+    for r, row in enumerate(rows):
+        for c in range(n_cols):
+            ws = sorted(row.get(c, []), key=lambda w: (round((w[1] + w[3]) / 2), w[0]))
+            cells_out.append(TableCell(row=r, col=c, bbox=(edges[c], cuts[r], edges[c + 1], cuts[r + 1]),
+                                       text=_clean(" ".join(w[4] for w in ws)), is_header=r == 0))
+    region = TableRegion(id=tid, page=page_no, bbox=bbox, n_rows=len(rows), n_cols=n_cols, cells=cells_out,
+                         header_rows=1, irregular=any(not c.text for c in cells_out if c.row == 0))
+    region.header_evidence = True  # a rule under it sets the header row apart
+    return region
+
+
+def covers_page(bbox, width: float, height: float) -> bool:
+    """Whether an image is a scanned page's picture of the page: what's visible of it covers most of the page. A scan
+    can sit inside margins, be drawn in several layers, or be larger than the page and cut off at its edge (a web
+    page "printed" to PDF), so its own width and height don't say."""
+    w = min(bbox[2], width) - max(bbox[0], 0.0)
+    h = min(bbox[3], height) - max(bbox[1], 0.0)
+    return w > 0 and h > 0 and w * h >= 0.6 * width * height
 
 
 def _looks_scanned(doc, img) -> bool:
@@ -1243,8 +1676,231 @@ def _extract_vector_figures(page: fitz.Page, page_no: int, start: int, tables: l
         word_text = sum(bbox_intersection(bbox, w) for w in words)
         if word_text > 0.12 * area or (block_text > 0.25 * area and word_text > 0.03 * area):
             continue
+        # Nothing but rules, with words among them: a table's borders (Word draws them as hairline filled boxes), its
+        # text too sparse for the test above (an answer key, choices beside a picture), not a drawing
+        inside = [r for r in all_drawings if r.intersects(fitz.Rect(bbox))]
+        if word_text > 0 and inside and all(min(r.width, r.height) <= 1.5 for r in inside):
+            continue
         out.append(ImageRegion(id=f"p{page_no}i{start + len(out)}", page=page_no, bbox=bbox, xref=0, kind="vector"))
     return out
+
+
+_LABEL_PAD = 16.0  # points: how far outside a drawing its labels sit (an axis's name, its values)
+
+
+def _axis_label(b: TextBlock, body: float) -> bool:
+    """A graph's label: a name or a value (plots._is_label), or a row of values ("t (s) 2 4 6 8 10 12 14 16"). Never
+    a list item, a sentence or an equation ending one, a heading (bold or larger than the page's text) or an artifact."""
+    words = b.text.split()
+    if (not words or b.role != "P" or b.bold or b.font_size > 1.15 * body or BULLET_START.match(b.text)
+            or b.text.rstrip()[-1] in ".:;"):
+        return False
+    return plots._is_label(b) or (len(words) <= 12 and all(len(w) <= 4 for w in words))
+
+
+def _page_body_size(pa: PageAnalysis) -> float:
+    """The size most of the page's paragraph text is set in (by characters), or 0."""
+    sizes = sorted(b.font_size for b in pa.blocks for _ in range(min(len(b.text), 400)) if b.role == "P" and b.font_size)
+    return sizes[len(sizes) // 2] if sizes else 0.0
+
+
+def _take_in_labels(pa: PageAnalysis, v: ImageRegion) -> None:
+    """The labels just outside a drawn graph (its axes' names and values) are part of it, read through its alt text,
+    not as paragraphs beside it: the figure's box grows to take them in."""
+    body = _page_body_size(pa)
+    for _ in range(3):
+        grown = (v.bbox[0] - _LABEL_PAD, v.bbox[1] - _LABEL_PAD, v.bbox[2] + _LABEL_PAD, v.bbox[3] + _LABEL_PAD)
+        near = [b for b in pa.blocks if _axis_label(b, body)
+                and 0.08 * pa.height < b.bbox[1] and b.bbox[3] < 0.92 * pa.height  # (not a running header or footer)
+                and bbox_intersection(b.bbox, grown) >= 0.5 * (bbox_area(b.bbox) or 1.0)]
+        if not near:
+            return
+        v.bbox = bbox_union([v.bbox] + [b.bbox for b in near])
+        pa.blocks = [b for b in pa.blocks if b not in near]
+
+
+def _labels_on_pictures(pa: PageAnalysis, pictures: list[ImageRegion] | None = None, joined: bool = False) -> None:
+    """Short labels set as text on top of a picture (a diagram's "voltmeter", "wire", "salt bridge"; a row of marks set
+    in type) are part of it, read through its alt text, as a drawn chart's are: read as paragraphs after it they said
+    nothing. Only a picture smaller than a third of the page, with two or more labels and nothing else on it: a
+    page-sized background, a banner with its title, or text read off a scan by OCR stays text.
+
+    joined: pictures made of pieces drawn over one another (a graph placed in strips), which one label is enough for,
+    and a label set sideways in larger print too (an axis's name, never a title): left out, it stood between the graph
+    and its caption."""
+    body = _page_body_size(pa)
+    least = 1 if joined else 2
+    for img in pa.images if pictures is None else pictures:
+        if img.kind != "image" or img.decorative or bbox_area(img.bbox) > pa.width * pa.height / 3:
+            continue
+        on = [b for b in pa.blocks if b.role != "Artifact"
+              and bbox_intersection(b.bbox, img.bbox) >= 0.9 * (bbox_area(b.bbox) or 1.0)]
+        if len(on) < least or any(sum(1 for w in b.text.split() if any(c.isalnum() for c in w)) > 6
+                                  or BULLET_START.match(b.text) or b.ocr_conf is not None or b.typed_on_scan
+                                  or (body and b.font_size > 1.15 * body and not (joined and _sideways(b)))
+                                  for b in on):
+            continue
+        on.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
+        img.labels = " ".join(b.actual_text or b.text for b in on)
+        pa.blocks = [b for b in pa.blocks if b not in on]
+
+
+def _sideways(b: TextBlock) -> bool:
+    """A label set on its side: a few characters in a box much taller than wide."""
+    w, h = b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]
+    return len(b.text.strip()) <= 12 and h > 2 * w
+
+
+def line_shaped(bbox: BBox) -> bool:
+    """A picture shaped like a line or a word of print: a few lines tall at most, and wider than it is tall."""
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    return 0 < h <= 40 and w >= 2.5 * h
+
+
+def _join_stacked_pictures(pa: PageAnalysis) -> None:
+    """Pictures drawn on top of one another are one picture: a logo built of layers (its ring, its emblem, the ribbon
+    under it), a word placed on a diagram as a picture of its own, two photos of one apparatus overlapping. Each was a
+    Figure, so the logo was described six times over. They become one figure holding them all, when either covers
+    half of the smaller; so do the pictures inside a chart drawn with lines (its curve placed as a picture between
+    drawn axes). A page-sized picture is the page's background, not part of what's drawn on it."""
+    pics = [i for i in pa.images if i.xref and i.kind == "image" and not i.decorative
+            and not covers_page(i.bbox, pa.width, pa.height)]
+    group = list(range(len(pics)))
+
+    def root(n: int) -> int:
+        while group[n] != n:
+            group[n] = group[group[n]]
+            n = group[n]
+        return n
+
+    for a in range(len(pics)):
+        for b in range(a + 1, len(pics)):
+            small = min(bbox_area(pics[a].bbox), bbox_area(pics[b].bbox)) or 1.0
+            if bbox_intersection(pics[a].bbox, pics[b].bbox) >= 0.5 * small:
+                group[root(b)] = root(a)
+    members: dict[int, list[ImageRegion]] = {}
+    for n, img in enumerate(pics):
+        members.setdefault(root(n), []).append(img)
+    gone: list[ImageRegion] = []
+    made: list[ImageRegion] = []
+    for pieces in members.values():
+        if len(pieces) < 2:
+            continue
+        gone += pieces
+        labels = " ".join(p.labels for p in pieces if p.labels)
+        made.append(ImageRegion(id=f"p{pa.number}j{len(made)}", page=pa.number, bbox=bbox_union([p.bbox for p in pieces]),
+                                xref=0, holds_pieces=True, labels=labels or None, drawing="layers"))
+    pa.images = [i for i in pa.images if not any(i is g for g in gone)] + made
+    # Their labels, but not a badge's number (a circle and its shadow): the number says what the badge means
+    _labels_on_pictures(pa, [m for m in made if max(m.bbox[2] - m.bbox[0], m.bbox[3] - m.bbox[1]) > 0.12 * pa.width],
+                        joined=True)
+    # A picture inside one of these, or inside a chart drawn with lines, is a piece of it too (a strip of a graph
+    # placed between two others it doesn't overlap; a smaller group of layers in a diagram's box), largest first
+    holders = [v for v in pa.images if (v in made or (v.kind == "vector" and not v.holds_pieces)) and not v.decorative]
+    for v in sorted(holders, key=lambda v: -bbox_area(v.bbox)):
+        if not any(v is i for i in pa.images):
+            continue  # (taken into a larger one)
+        # (slivers and specks too, as a graph drawn dot by dot takes them: left on their own they stood between the
+        # figure and its caption)
+        inside = [i for i in pa.images if i.kind == "image" and i is not v
+                  and bbox_intersection(i.bbox, v.bbox) >= 0.8 * (bbox_area(i.bbox) or 1.0)]
+        if v in made or any(not i.decorative for i in inside):
+            v.holds_pieces = True
+            v.labels = " ".join(x for x in [v.labels] + [i.labels for i in inside] if x) or None
+            pa.images = [i for i in pa.images if not any(i is g for g in inside)]
+
+
+def _text_as_pictures(page: fitz.Page, pa: PageAnalysis) -> bool:
+    """A page with no text whose print was placed as pictures, a line or a word each (an online converter's cover
+    page): not a scan, but only OCR can read it. Two or more line-shaped pictures say so; a photo or a drawing alone
+    doesn't. Upright pages only (its pictures and the OCR lines are compared where they lie)."""
+    if page.rotation or page.get_text("text").strip():
+        return False
+    return sum(1 for i in pa.images if i.xref and not i.decorative and line_shaped(i.bbox)) >= 2
+
+
+def _background_picture(page: fitz.Page, pa: PageAnalysis) -> None:
+    """A picture covering the page with the page's text printed on it (a certificate's border, a letterhead) is the
+    page's background: an artifact. As a Figure it came first on the page, described as whatever stood out in it.
+    Only when it is blank where the page's print is: a scanned score with its title typed on it is the page's content."""
+    text = [b for b in pa.blocks if b.role != "Artifact" and b.text.strip()]
+    if len(text) < 3:
+        return
+    for img in pa.images:
+        if not img.xref or img.decorative or not covers_page(img.bbox, pa.width, pa.height):
+            continue
+        on = sum(1 for b in text if bbox_intersection(b.bbox, img.bbox) >= 0.9 * (bbox_area(b.bbox) or 1.0))
+        if on >= 0.8 * len(text) and _blank_inside(page, pa, img):
+            img.decorative = True
+            img.alt = None
+
+
+def _blank_inside(page: fitz.Page, pa: PageAnalysis, img: ImageRegion) -> bool:
+    """Whether a page-sized picture holds next to no ink away from its edges (a border, a tint), the page's text and
+    the other pictures on it left out."""
+    x0, y0, x1, y1 = img.bbox
+    dx, dy = 0.12 * (x1 - x0), 0.12 * (y1 - y0)
+    inner = fitz.Rect(x0 + dx, y0 + dy, x1 - dx, y1 - dy) & page.rect
+    if inner.is_empty or page.rotation:
+        return False
+    pix = page.get_pixmap(dpi=24, clip=inner, colorspace=fitz.csGRAY, alpha=False, annots=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width].copy()
+    scale = pix.width / inner.width
+    for box in [b.bbox for b in pa.blocks] + [i.bbox for i in pa.images if i is not img]:
+        c0, r0 = int((box[0] - inner.x0) * scale) - 1, int((box[1] - inner.y0) * scale) - 1
+        c1, r1 = int((box[2] - inner.x0) * scale) + 2, int((box[3] - inner.y0) * scale) + 2
+        arr[max(r0, 0):max(r1, 0), max(c0, 0):max(c1, 0)] = 255
+    paper = float(np.median(arr))
+    return float((arr < paper - 40).mean()) < 0.02
+
+
+# A displayed equation's number at the right of its line: "Equation 1.1", "Eq. 3", "(2.4)"
+_EQUATION_LABEL = re.compile(r"^\s*(?:\(?\s*(?:equation|eqn?\.?)\s*\d+(?:[.\-]\d+)*[a-z]?\s*\)?"
+                             r"|\(\d+(?:\.\d+)*[a-z]?\))\s*$", re.I)
+
+
+def _equation_lines(pa: PageAnalysis) -> None:
+    """A displayed equation set as pieces on one line, numbered at the right ("Equation 1.1"): a fraction's top and
+    bottom, an exponent and a few symbols as text, and the parts the producer drew as small pictures. Read one by one
+    they say nothing (one became a heading for its size, each picture got its own description), so the line's pieces
+    become one Formula picture holding them, read as a whole; the number stays a paragraph beside it (#665)."""
+    for label in [b for b in pa.blocks if _EQUATION_LABEL.match(b.text)]:
+        lx0, ly0, _, ly1 = label.bbox
+        band = (ly0, ly1)
+        taken_blocks: list[TextBlock] = []
+        taken_images: list[ImageRegion] = []
+        for _ in range(4):  # a fraction's top and bottom reach above and below the number's line
+            grew = False
+            for b in pa.blocks:
+                if b is label or b in taken_blocks or b.role == "Artifact" or b.bbox[2] > lx0 + 1:
+                    continue
+                if b.bbox[1] < band[1] and b.bbox[3] > band[0]:
+                    taken_blocks.append(b)
+                    grew = True
+            for img in pa.images:
+                if img in taken_images or img.decorative or img.bbox[2] > lx0 + 1:
+                    continue
+                if img.bbox[1] < band[1] and img.bbox[3] > band[0]:
+                    taken_images.append(img)
+                    grew = True
+            pieces = [b.bbox for b in taken_blocks] + [i.bbox for i in taken_images]
+            if pieces:
+                band = (min(band[0], min(p[1] for p in pieces)), max(band[1], max(p[3] for p in pieces)))
+            if not grew:
+                break
+        # Only pieces: a sentence on the line (prose wrapping beside a number in brackets) is not an equation
+        if (len(taken_blocks) + len(taken_images) < 2 or not taken_images
+                or any(len(b.text.split()) > 6 or b.text.rstrip().endswith((".", ":")) for b in taken_blocks)
+                or band[1] - band[0] > 6 * max(label.font_size, 6.0)
+                or any(i.holds_pieces or i.kind == "music" for i in taken_images)):
+            continue
+        box = bbox_union([b.bbox for b in taken_blocks] + [i.bbox for i in taken_images])
+        taken_images.sort(key=lambda i: i.bbox[0])
+        holder = ImageRegion(id=taken_images[0].id, page=pa.number, bbox=box, xref=0, kind="formula",
+                             holds_pieces=True, drawing="equation",
+                             labels=" ".join(b.text for b in sorted(taken_blocks, key=lambda b: b.bbox[0])) or None)
+        pa.images = [i for i in pa.images if i not in taken_images] + [holder]
+        pa.blocks = [b for b in pa.blocks if b not in taken_blocks]
 
 
 # --------------------------------------------------------------------------- fonts
@@ -1266,9 +1922,8 @@ def _font_issues(doc: fitz.Document, page: fitz.Page, page_no: int) -> list[dict
 
 # --------------------------------------------------------------------------- driver
 def _to_visual(pa: PageAnalysis, rot: fitz.Matrix) -> None:
+    """Images and tables into visual page space (text blocks are built in it: _text_to_visual)."""
     v = lambda b: _rect(fitz.Rect(b) * rot)  # noqa: E731
-    for b in pa.blocks:
-        b.bbox = v(b.bbox)
     for i in pa.images:
         i.bbox = v(i.bbox)
     for t in pa.tables:
@@ -1291,12 +1946,12 @@ def _cell_at(table: TableRegion, b: TextBlock) -> TableCell | None:
 _PAGE_LOCK = threading.Lock()
 
 
-def analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[dict]]:
+def analyze_page(doc: fitz.Document, page_no: int, ocr: bool = False) -> tuple[PageAnalysis, list[dict]]:
     with _PAGE_LOCK:
-        return _analyze_page(doc, page_no)
+        return _analyze_page(doc, page_no, ocr)
 
 
-def _analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[dict]]:
+def _analyze_page(doc: fitz.Document, page_no: int, ocr: bool = False) -> tuple[PageAnalysis, list[dict]]:
     page = doc[page_no]
     # Everything is analyzed in *visual* page space (what a reader sees, after /Rotate), so layout
     # heuristics like "top of page" and "left column" hold for rotated pages too. PyMuPDF extracts
@@ -1311,7 +1966,7 @@ def _analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[
         pdf_to_page=(m.a, m.b, m.c, m.d, m.e, m.f),
     )
 
-    pa.blocks = _extract_blocks(page, page_no)
+    pa.blocks = _extract_blocks(page, page_no, ocr)
     pa.tables = _extract_tables(page, page_no)
     pa.images = _extract_images(page, page_no)
     if page.rotation:
@@ -1336,6 +1991,16 @@ def _analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[
                                      avoid=[t.bbox for t in pa.tables])
         if drawn:
             schemes.add_to_page(pa, drawn, words)
+    # (before the pictures are joined: a line's picture inside a drawn table's grid is taken into it)
+    pa.text_pictures = _text_as_pictures(page, pa)
+    # (after the schemes, which find their own labels)
+    for v in vectors:
+        if v in pa.images:
+            _take_in_labels(pa, v)
+    _labels_on_pictures(pa)
+    _equation_lines(pa)
+    # (after a displayed equation's line takes its pictures: one of its pieces drawn over another is part of it)
+    _join_stacked_pictures(pa)
 
     # Text belonging to a table is tagged through the table cells, not as paragraphs. The cells keep the
     # spoken form of any math the blocks inside them read (fractions, exponents).
@@ -1362,32 +2027,42 @@ def _analyze_page(doc: fitz.Document, page_no: int) -> tuple[PageAnalysis, list[
     page_area = pa.width * pa.height
     big = [i for i in pa.images if bbox_area(i.bbox) > 0.8 * page_area]
     # A scan, or a scan with a few values typed onto it (a filled-in form): the typed text is real, but the printed
-    # form is only in the picture and needs reading
-    pa.is_scanned = bool(big) and (not page.get_text("text").strip()
-                                   or (any(_looks_scanned(doc, i) for i in big) and _sparse_text(page)))
+    # form is only in the picture and needs reading. A page with no text at all is read when a picture covers most of
+    # it, inside margins too: a screenshot of a web page placed on a page fills 78% of it
+    if page.get_text("text").strip():
+        pa.is_scanned = bool(big) and any(_looks_scanned(doc, i) for i in big) and _sparse_text(page)
+        if not pa.is_scanned:
+            _background_picture(page, pa)
+    else:
+        # (a picture: drawings found above, made of lines and curves, are no scan). A page whose lines of print are
+        # pictures of their own is read too
+        pa.is_scanned = pa.text_pictures or any(i.xref and covers_page(i.bbox, pa.width, pa.height) for i in pa.images)
 
     issues = _font_issues(doc, page, page_no)
     pa.font_issues = sorted({p for i in issues for p in i["problems"]})
     return pa, issues
 
 
-def analyze_pages(path: Path | str, numbers: list[int]) -> dict[int, tuple[PageAnalysis, list[dict]]]:
+def analyze_pages(path: Path | str, numbers: list[int], ocr_pages: frozenset = frozenset()
+                  ) -> dict[int, tuple[PageAnalysis, list[dict]]]:
     """The pages numbered, each analyzed as analyze_document does (one page_pool worker's share, #124)."""
     with fitz.open(path) as doc:
-        return {n: analyze_page(doc, n) for n in numbers}
+        return {n: analyze_page(doc, n, n in ocr_pages) for n in numbers}
 
 
-def analyze_document(path: Path | str) -> DocumentAnalysis:
+def analyze_document(path: Path | str, ocr_pages=()) -> DocumentAnalysis:
+    """ocr_pages: the pages given the engine's OCR layer."""
     from app.pipeline import page_pool
 
     doc = fitz.open(path)
     try:
         pages, font_issues = [], []
         workers = page_pool.workers_for(doc.page_count)
-        done = page_pool.run("app.pipeline.analyzer:analyze_pages", path, doc.page_count, workers) \
-            if workers > 1 else None
+        ocr_pages = frozenset(ocr_pages)
+        done = page_pool.run("app.pipeline.analyzer:analyze_pages", path, doc.page_count, workers,
+                             arg=ocr_pages or None) if workers > 1 else None
         for n in range(doc.page_count):
-            pa, issues = done[n] if done is not None else analyze_page(doc, n)
+            pa, issues = done[n] if done is not None else analyze_page(doc, n, n in ocr_pages)
             pages.append(pa)
             font_issues.extend(issues)
 

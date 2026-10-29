@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from portal import api_tokens, approval, audit, services, settings_store
+from portal import api_tokens, approval, audit, no_ai, services, settings_store
 from portal.db import get_db
 from portal.deps import Principal, current_principal, group_for_admin
 from portal.errors import ApiError, not_found
@@ -77,7 +77,9 @@ def token_out(db: Session, t: ApiToken, with_owner: bool = False) -> TokenOut:
     level = services.get_service(db, t.ai_tier) if t.ai_tier else None
     proc = services.get_service(db, t.processing)
     parts = [proc.label if proc else t.processing]
-    if t.ai_tier:
+    if t.ai_tier == no_ai.NO_AI:
+        parts.append(no_ai.LABEL)
+    elif t.ai_tier:
         parts.append(level.label if level else t.ai_tier)
         parts.append("Let AI decide" if t.ai_kind == services.AUTO else services.kind_label(db, t.ai_tier, t.ai_kind))
     state = "revoked" if t.revoked_at else "expired" if t.expires_at <= _now() else "active"
@@ -135,7 +137,9 @@ def make_token(body: TokenCreate, request: Request, p: Principal = Depends(curre
     secret, prefix, digest = api_tokens.new_secret()
     token = ApiToken(user_id=p.user.id, group_id=p.user.group_id, name=body.name.strip(), prefix=prefix,
                      token_hash=digest, can_submit=True, can_status=body.can_status or body.download is not None,
-                     download=body.download, download_kinds=kinds, processing=body.processing, ai_tier=plan.tier,
+                     download=body.download, download_kinds=kinds, processing=body.processing,
+                     # No AI asked for is kept as such, not as "the group's default" (#659)
+                     ai_tier=no_ai.NO_AI if body.ai_tier == no_ai.NO_AI else plan.tier,
                      ai_kind=services.AUTO if plan.auto else plan.kind, auto_confirm=body.auto_confirm,
                      expires_at=_now() + timedelta(days=days))
     db.add(token)

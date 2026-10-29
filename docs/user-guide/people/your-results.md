@@ -66,6 +66,10 @@ Short notes, one line each, for anything worth knowing, with **Why?** for the de
 picked by *Let AI decide*, or that an outside service was used. **New 24 October 2026:** **PDF 2.0** when you
 chose PDF/UA-2 (the file was converted to PDF 2.0) or Both (whether the PDF/UA-2 copy passes its check).
 
+**New 29 October 2026:** a document made with **No AI** says so beside its level, and under the result: how many
+figures have no alt text, each listed under **To review** for you to describe in the tag manager. The report says so
+too.
+
 ### Three tiles
 
 **Fixed** (accessibility checks), **To review** (items for a person) and **Still failing** (rules). Each opens its
@@ -186,7 +190,8 @@ proposed rewrite.
 **Not an issue**, with an optional note. The list says how many are signed off, and **Still to check** shows only the
 rest. The document's owner and their group admins set statuses; everyone who can open the document sees them. A
 status stays with its item in later versions, as long as the item is the same (the same problem, on the same page,
-about the same tag and text). **Download as CSV** gives the list with each item's status, note, who set it and when,
+about the same tag and text). The same status can be set in the tag manager, on the item's highlight and beside
+the item in **Edit tag** (**added 26 October 2026**). **Download as CSV** gives the list with each item's status, note, who set it and when,
 for a record of the review.
 
 **Typical items:** alt text that may be inaccurate (charts, diagrams), a heading that looks like body text, a

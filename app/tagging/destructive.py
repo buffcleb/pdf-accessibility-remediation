@@ -50,10 +50,11 @@ def _unseen(span: dict, look: fitz.Pixmap, page: fitz.Page) -> bool:
     return True
 
 
-def _text_spans(page: fitz.Page, font: fitz.Font) -> list[tuple]:
+def _text_spans(page: fitz.Page, font: fitz.Font, unreadable: frozenset[str] = frozenset()) -> list[tuple]:
     """Text to redraw invisibly. Characters the text-layer font cannot draw are dropped (they would
     become .notdef glyphs, PDF/UA 7.21.8). If most of the page's text has no usable Unicode (fonts
-    without ToUnicode), OCR the page instead when Tesseract is available."""
+    without ToUnicode, or fonts in `unreadable`, whose Unicode veraPDF found wrong), OCR the page instead
+    when Tesseract is available: a wrong map's text reads as letters, but not as the page's words."""
     spans, total, bad = [], 0, 0
     look = page.get_pixmap(dpi=capped_dpi(page, 36), alpha=False, annots=False)
     for block in page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]:
@@ -63,7 +64,7 @@ def _text_spans(page: fitz.Page, font: fitz.Font) -> list[tuple]:
                     continue
                 raw = "".join(c["c"] for c in span["chars"])
                 total += len(raw.strip())
-                text = "".join(ch for ch in raw if _usable(ch, font))
+                text = "" if span["font"].split("+", 1)[-1] in unreadable else "".join(ch for ch in raw if _usable(ch, font))
                 bad += len(raw.strip()) - len(text.strip())
                 if text.strip():
                     # Horizontal text is placed glyph by glyph at the original pen positions: the text-layer
@@ -132,9 +133,11 @@ def _write_glyphs(page: fitz.Page, font: fitz.Font, glyphs: list, size: float, c
 
 
 def flatten_pages(src: str, dst: str, pages: list[int],
-                  vector_figures: dict[int, list[tuple[float, float, float, float]]] | None = None
+                  vector_figures: dict[int, list[tuple[float, float, float, float]]] | None = None,
+                  unreadable: frozenset[str] = frozenset()
                   ) -> dict[int, list[tuple[float, float, float, float]]]:
     """Flatten pages in place. Vector figures are re-drawn as their own image so they keep a Figure tag.
+    `unreadable`: fonts (names without the subset tag) whose text isn't to be trusted for the text layer.
     Returns, per page, the bbox of the background raster (to mark as Artifact)."""
     vector_figures = vector_figures or {}
     settings = get_settings()
@@ -148,7 +151,7 @@ def flatten_pages(src: str, dst: str, pages: list[int],
             derot = page.derotation_matrix  # analysis bboxes are in visual space; flattening works unrotated
             # Text (and OCR, which must see the page upright) is collected before un-rotating;
             # its coordinates are unrotated either way.
-            spans = _text_spans(page, font)
+            spans = _text_spans(page, font, unreadable)
             if rotation:
                 page.set_rotation(0)
             rules = _rules(page)

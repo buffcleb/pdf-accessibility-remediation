@@ -12,7 +12,9 @@ import pymupdf as fitz
 from app.ai.base import AIError, AIProvider
 from app.config import get_settings
 from app.pipeline.analyzer import render_png
-from app.pipeline.models import DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, point_distance
+from app.pipeline.lists import label_kind
+from app.pipeline.models import (DocumentAnalysis, ImageRegion, PageAnalysis, TableRegion, TextBlock,
+                                    point_distance)
 from app.pipeline.structure import caption_pairs, needs_ai_reading_order
 
 log = logging.getLogger(__name__)
@@ -87,6 +89,9 @@ def _context(page: PageAnalysis, img: ImageRegion) -> str:
         text = ("[The picture is a chemical structure or a reaction scheme drawn with lines. Say what it shows: each "
                 "compound by name if it is named, else by its main features, and for a reaction what reacts, what is "
                 "written on each arrow, and what forms, in the order the arrows give. Name only what is drawn.] " + text)
+    elif img.drawing == "equation":
+        text = ("[The picture is one displayed equation, set partly as text and partly as small pictures. Read it out "
+                "whole, as it would be spoken, and give it as a formula.] " + text)
     return text[:1500]
 
 
@@ -432,9 +437,10 @@ async def _images(ai, doc, analysis, stats, dpi) -> None:
             stats.images_decorative += 1
             continue
         img.alt = res["alt"]
-        # Found by its staves, or by its bonds: that stands, whatever the description calls it (a drawn
-        # structure is a picture of a molecule, not a formula to be read out symbol by symbol)
-        if img.kind != "music" and img.drawing != "scheme":
+        # Found by its staves, or by its bonds, or by the number beside its line (an equation): that stands, whatever
+        # the description calls it (a drawn structure is a picture of a molecule, not a formula to be read out
+        # symbol by symbol)
+        if img.kind != "music" and img.drawing not in ("scheme", "equation"):
             img.kind = "formula" if res["kind"] == "formula" else res["kind"]
         img.latex = res.get("latex")
         stats.images_described += 1
@@ -543,6 +549,34 @@ def headings_first(page: PageAnalysis, order: list[str]) -> tuple[list[str], int
     return order, moved
 
 
+def items_before_choices(page: PageAnalysis, order: list[str]) -> tuple[list[str], int]:
+    """A numbered item comes before the lettered items under it ("17." before its "a.", "b."): where the AI's order
+    reads one of them first (a small model once put a question's first choice ahead of the question, which became a
+    list of one choice before it), the item moves to just before the first of them. Its own items are the ones drawn
+    below it in its column, of another kind of label, before the next item of its own kind. Returns the order and how
+    many items moved."""
+    order = list(order)
+    items = [e for e in order if isinstance(el := page.element(e), TextBlock) and el.role == "LI" and el.list_label]
+    kinds = {e: label_kind(page.element(e).list_label)[0] for e in items}
+    moved = 0
+    for xid in items:
+        x = page.element(xid)
+
+        def column(b) -> bool:
+            overlap = min(x.bbox[2], b.bbox[2]) - max(x.bbox[0], b.bbox[0])
+            return overlap >= 0.5 * min(x.bbox[2] - x.bbox[0], b.bbox[2] - b.bbox[0]) > 0
+
+        below = [e for e in items if e != xid and page.element(e).bbox[1] >= x.bbox[3] - 2 and column(page.element(e))]
+        nxt = min((page.element(e).bbox[1] for e in below if kinds[e] == kinds[xid]), default=float("inf"))
+        own = {e for e in below if kinds[e] != kinds[xid] and page.element(e).bbox[1] < nxt}
+        at = order.index(xid)
+        first = next((i for i, eid in enumerate(order[:at]) if eid in own), None)
+        if first is not None:
+            order.insert(first, order.pop(at))
+            moved += 1
+    return order, moved
+
+
 async def _reading_order(ai, doc, analysis, stats) -> None:
     pages = [p for p in analysis.pages if needs_ai_reading_order(p) and len(p.reading_order) > 1]
     limit = get_settings().ai_order_pages_max
@@ -575,6 +609,10 @@ async def _reading_order(ai, doc, analysis, stats) -> None:
         if moved:
             stats.findings.append(f"page {p.number + 1}: the AI read {moved} heading(s) after text drawn below them in "
                                   "their column; each now comes first")
+        order, moved = items_before_choices(p, order)
+        if moved:
+            stats.findings.append(f"page {p.number + 1}: the AI read {moved} list item(s) after the items under them; "
+                                  "each now comes first")
         if order != p.reading_order:
             stats.findings.append(f"page {p.number + 1}: reading order adjusted by AI")
         p.reading_order = order

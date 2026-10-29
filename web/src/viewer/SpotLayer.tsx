@@ -1,7 +1,8 @@
 // The area a review item is about, highlighted on its page (#426), and the page's own list of items no tag holds
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Finding } from "../api";
 import type { Spot } from "./spot";
+import { ItemStatus } from "../components/reviewMarks";
 
 const LABEL_W = 300;
 
@@ -20,9 +21,14 @@ export function SpotLayer({ spot, index, scale, w, h, onClose }: {
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
   }, [onClose]);
+  // The label's height, so it sits clear of the area: taller with the item's status (#663), and once signed off
+  const [tall, setTall] = useState(32);
+  useLayoutEffect(() => { setTall(labelRef.current?.offsetHeight ?? 32); });
   const first = spot.boxes[0];
-  // Above the area when there's room, below it otherwise; inside the page across
-  const top = !first ? 8 : first[1] * scale - 40 >= 0 ? first[1] * scale - 40 : Math.min(h - 36, first[3] * scale + 8);
+  // Above the area when there's room, below it otherwise; inside the page across. A whole-page item's label goes
+  // below the page's notes button
+  const top = !first ? 32 : first[1] * scale - tall - 8 >= 0 ? first[1] * scale - tall - 8
+    : Math.min(h - tall - 4, first[3] * scale + 8);
   const left = Math.min(Math.max(4, (first?.[0] ?? 0) * scale), Math.max(4, w - LABEL_W - 4));
   return (
     <>
@@ -43,11 +49,12 @@ export function SpotLayer({ spot, index, scale, w, h, onClose }: {
           style={b ? { left: b[0] * scale - 4, top: b[1] * scale - 4, width: (b[2] - b[0]) * scale + 8,
             height: (b[3] - b[1]) * scale + 8 } : undefined} />
       ))}
-      <div className="pv-spot-label" ref={labelRef} tabIndex={-1} role="note" style={{ top, left, maxWidth: LABEL_W }}
+      <div className="pv-spot-label" ref={labelRef} tabIndex={-1} role="note" onClick={(e) => e.stopPropagation()} style={{ top, left, maxWidth: LABEL_W }}
         aria-label={`${spot.issue}, page ${spot.page}${spot.boxes.length ? "" : ", the whole page"}`}>
         <span>{spot.issue}{spot.boxes.length ? "" : " (the whole page)"}</span>
         <button type="button" className="pv-spot-close" onClick={onClose} aria-label="Close the highlight"
           title="Close the highlight (Esc)">×</button>
+        <ItemStatus f={spot} />
       </div>
     </>
   );

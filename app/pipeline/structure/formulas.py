@@ -21,8 +21,9 @@ def assign_formulas(doc: DocumentAnalysis) -> None:
 
 
 def mostly_math(b: TextBlock) -> bool:
-    """Math operators with numbers (or scripts), and few words: a formula, not prose with a little math in it."""
+    """Math operators with numbers (or scripts, or a stacked fraction: "M = n over V"), and few words: a formula, not
+    prose with a little math in it."""
     t = b.text
     dense = len(re.sub(r"\s", "", t)) or 1
     words = sum(len(w) for w in _WORD.findall(t))
-    return any(c in _MATH_CHARS for c in t) and (b.has_scripts or any(c.isdigit() for c in t)) and words <= 0.25 * dense
+    return any(c in _MATH_CHARS for c in t) and (b.has_scripts or b.fraction or any(c.isdigit() for c in t)) and words <= 0.25 * dense

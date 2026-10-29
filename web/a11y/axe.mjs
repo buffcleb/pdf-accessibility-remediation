@@ -34,11 +34,31 @@ const PAGES = [
   // Show on a review item no tag holds (#426): its area outlined, the rest of the page dimmed, a label with focus
   { name: "tags: tag manager, an item shown", as: PERSON, path: `/jobs/${SEED.done}/tags?v=1&page=1`,
     wait: ".pv-spot-label" },
+  // The item's status set where it's shown (#663): signed off on the label, its note box then shown too
+  { name: "tags: tag manager, an item signed off", as: PERSON, path: `/jobs/${SEED.done}/tags?v=1&page=1`,
+    wait: ".pv-spot-label select",
+    act: async (page) => {
+      await page.locator(".pv-spot-label select").selectOption("checked");
+      await page.locator(".pv-spot-label input").waitFor();
+    } },
   // One page at a time: the page turning laid out like a PDF viewer's (^ | v, the page number box, "of N")
   { name: "tags: tag manager, one page", as: PERSON, path: `/jobs/${SEED.done}/tags`, wait: ".pv-top",
     act: async (page) => {
       await page.locator("#pv-view").selectOption("one");
       await page.locator("#pv-page").waitFor();
+    } },
+  // The Areas window over the page, moved to the side to show the page under it, as Edit tag can be
+  { name: "tags: tag manager, areas moved aside", as: PERSON, path: `/jobs/${SEED.done}/tags`, wait: ".pv-top",
+    act: async (page) => {
+      // A right-click on the page where there is no tag: its menu has the area tools, and the area opens in a window
+      const right = page.locator(".pv-page[data-page='1']").last();
+      const box = await right.boundingBox();
+      await page.mouse.click(box.x + box.width * 0.9, box.y + 400, { button: "right" });  // blank, below the text
+      await page.getByRole("menuitem", { name: /^Use all of page 1/ }).click();
+      const dlg = page.locator("dialog.pv-areadlg");
+      await dlg.getByRole("button", { name: "Move to the side" }).click();
+      await dlg.getByRole("button", { name: "Move to the left" }).waitFor();
+      if (process.env.A11Y_SHOT) await page.screenshot({ path: process.env.A11Y_SHOT });
     } },
   // While it loads (#424): the PDF's download is held back, so the pane shows its progress
   { name: "tags: tag manager, loading", as: PERSON, path: `/jobs/${SEED.done}/tags`, wait: ".pv-loading",

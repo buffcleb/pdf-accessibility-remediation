@@ -331,10 +331,11 @@ GUARDS = {
         POST /jobs/{job_id}/keep  GET /jobs/{job_id}/files/{file_id}  GET /jobs/{job_id}/report
         POST /documents/export/plan  POST /documents/export  GET /jobs/{job_id}/files.zip
         GET /jobs/{job_id}/versions  GET /jobs/{job_id}/versions/{number}/pdf
-        GET /jobs/{job_id}/versions/{number}/tagmap  POST /jobs/{job_id}/versions
-        POST /jobs/{job_id}/versions/{number}/undo-save  GET /jobs/{job_id}/tag-draft  PUT /jobs/{job_id}/tag-draft
+        GET /jobs/{job_id}/versions/{number}/tagmap  GET /jobs/{job_id}/versions/{number}/edits  POST /jobs/{job_id}/versions
+        POST /jobs/{job_id}/versions/{number}/undo-save  DELETE /jobs/{job_id}/versions/{number}  GET /jobs/{job_id}/tag-draft  PUT /jobs/{job_id}/tag-draft
         DELETE /jobs/{job_id}/tag-draft  GET /jobs/{job_id}/tag-draft/{user_id}
-        POST /jobs/{job_id}/versions/{number}/describe  POST /jobs/{job_id}/versions/{number}/review
+        POST /jobs/{job_id}/versions/{number}/describe  POST /jobs/{job_id}/versions/{number}/area-tags
+        POST /jobs/{job_id}/versions/{number}/review
         GET /jobs/{job_id}/finding-marks  PUT /jobs/{job_id}/finding-marks/{key}  GET /jobs/{job_id}/findings.csv
         GET /groups  GET /groups/browse  GET /groups/{group_id}  GET /groups/{group_id}/users
         GET /groups/{group_id}/people  PATCH /groups/{group_id}/users/{user_id}  PATCH /groups/{group_id}

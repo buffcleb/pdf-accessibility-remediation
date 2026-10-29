@@ -354,6 +354,15 @@ function LimitsAi() {
   return (
     <LimitTab label="AI">
       {(s, set) => <>
+          <Section title="No AI" intro={"For documents that mustn't go to any AI. Offered here, each group's " +
+            "admins can offer No AI beside their AI levels, preselect it, or make it the only choice. Nothing is sent to an AI; " +
+            "the pages count against the processing service only, and figures are left without alt text, each listed for a " +
+            "person to describe. A document with no AI level is always made this way."}>
+            <label className="check">
+              <input type="checkbox" checked={!!s.no_ai_enabled} onChange={(e) => set({ no_ai_enabled: e.target.checked })} />
+              <span>Let groups offer No AI</span>
+            </label>
+          </Section>
           <Section title="AI in the tag manager" intro="Each use is one AI call at the document's AI level, recorded on its cost.">
             <label className="check">
               <input type="checkbox" checked={s.ai_describe_default} onChange={(e) => set({ ai_describe_default: e.target.checked })} />

@@ -118,6 +118,15 @@ class IntegrityChecker:
         self._check_parent_tree(root)
         return self.findings, self.index
 
+    def rewalk(self) -> None:
+        """The tree's index built again from the tree as it is now, after run(): the tag editor's, once its edits
+        have changed the tree (#692). The content streams aren't scanned again, and nothing is checked."""
+        root = self.pdf.Root.get("/StructTreeRoot")
+        self.index = TagIndex(page_of_owner=self.index.page_of_owner,
+                              page_objgens=[p.objgen for p in self.pdf.pages])
+        if isinstance(root, Dictionary):
+            self._walk_tree(root)
+
     # ------------------------------------------------------------------ content streams
     @staticmethod
     def _resources(node):

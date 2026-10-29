@@ -4,8 +4,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TagElement, TagMap } from "../src/api";
 import {
-  addColumn, addRow, buildEdit, canMerge, fromLayout, fromOp, fromTable, headerCols, headerRows, merge, problems,
-  rebuildEdit, removeColumn, removeRow, setHeaders, split, tablePreview, tableReplaced, toggleHeader, type Grid,
+  addColumn, addRow, buildEdit, canMerge, cellWords, cutCell, fromLayout, fromOp, fromTable, headerCols, headerRows,
+  merge, partTexts, problems, rebuildEdit, removeColumn, removeRow, setHeaders, setSay, split, tablePreview,
+  tableReplaced, takeOutColumn, toggleHeader, type Grid,
 } from "../src/viewer/tablegrid";
 
 type Spec = Partial<TagElement> & { i: number; role: string; parent: number | null };
@@ -75,7 +76,7 @@ test("a removed row joins the row above (the first, the row below); a removed co
   g = removeColumn(fromTable(TABLE, 2), 2);
   assert.deepEqual(texts(g)[1], ["Q1", "120 64%"]);
   // Every old cell is still somewhere: nothing on the page goes untagged
-  const all = rebuildEdit(TABLE, 2, g).rows.flat().flatMap((c) => c.from).sort((a, b) => a - b);
+  const all = rebuildEdit(TABLE, 2, g).rows.flat().flatMap((c) => c.from as number[]).sort((a, b) => a - b);
   assert.deepEqual(all, [4, 5, 6, 8, 9, 10, 12, 13, 14]);
 });
 
@@ -173,4 +174,66 @@ test("a pending table edit is previewed as it will be saved: rows, cells, their 
   const preview = tablePreview(TABLE, rebuilt);
   assert.deepEqual(preview.slice(0, 2).map((r) => [r.role, r.text]), [["Table", ""], ["Caption", "Results by quarter"]]);
   assert.deepEqual(new Set(tableReplaced(TABLE, rebuilt)), new Set([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1]));
+});
+
+// A switch table read off a picture (production: the Assembly Poster): a row's words all in its first cell, the cells
+// beside it empty, and a paragraph set beside the table read as its last column
+const SWITCHES = doc([
+  { i: 0, role: "Document", parent: null },
+  { i: 1, role: "Table", parent: 0 },
+  { i: 2, role: "TR", parent: 1 },
+  { i: 3, role: "TH", parent: 2, own: true, text: "MS1 MS2 Resolution", scope: "Column" },
+  { i: 4, role: "TD", parent: 2 },
+  { i: 5, role: "TD", parent: 2 },
+  { i: 6, role: "TH", parent: 2, own: true, text: "These switches", scope: "Column" },
+  { i: 7, role: "TR", parent: 1 },
+  { i: 8, role: "TD", parent: 7, own: true, text: "OFF ON 1/2 Step" },
+  { i: 9, role: "TD", parent: 7 },
+  { i: 10, role: "TD", parent: 7 },
+  { i: 11, role: "TD", parent: 7, own: true, text: "are optional." },
+]);
+
+test("a cell's words are cut into the cells beside it, and a column comes out as a paragraph", () => {
+  let g = fromTable(SWITCHES, 1);
+  const head = at(g, 0, 0);
+  assert.deepEqual(cellWords(SWITCHES, head).map((w) => [w.text, w.cut]),
+    [["MS1", null], ["MS2", { at: 0, char: 4 }], ["Resolution", { at: 0, char: 8 }]]);
+  g = cutCell(SWITCHES, g, head.key, [1, 2]);
+  g = cutCell(SWITCHES, g, at(g, 1, 0).key, [1, 2]);
+  assert.deepEqual(texts(g), [["MS1", "MS2", "Resolution", "These switches"], ["OFF", "ON", "1/2 Step", "are optional."]]);
+  assert.deepEqual(partTexts(SWITCHES, 8, [{ at: 0, char: 4 }, { at: 0, char: 7 }]), ["OFF", "ON", "1/2 Step"]);
+  g = takeOutColumn(g, 3);
+  assert.deepEqual(texts(g), [["MS1", "MS2", "Resolution"], ["OFF", "ON", "1/2 Step"]]);
+  assert.equal(problems(g), null);
+  const op = rebuildEdit(SWITCHES, 1, g);
+  assert.deepEqual(op.rows[0].map((c) => c.from), [[[3, 0]], [[3, 1], 4], [[3, 2], 5]]);
+  assert.deepEqual(op.cuts, { 3: [{ at: 0, char: 4 }, { at: 0, char: 8 }], 8: [{ at: 0, char: 4 }, { at: 0, char: 7 }] });
+  assert.deepEqual(op.out, [{ role: "P", from: [6, 11] }]);
+  // Reopened from the pending edit, and previewed with the paragraph after the table
+  assert.deepEqual(texts(fromOp(SWITCHES, op)), texts(g));
+  const preview = tablePreview(SWITCHES, op);
+  assert.deepEqual(preview.at(-1), { role: "P", depth: 0, text: "These switches are optional.", boxes: [] });
+  // A row running out of cells gets a column; a cut cell can't be cut again
+  const narrow = takeOutColumn(fromTable(SWITCHES, 1), 3);
+  const wider = cutCell(SWITCHES, narrow, at(narrow, 1, 0).key, [1, 2, 3]);
+  assert.equal(wider.width, 4);
+  assert.deepEqual(texts(wider)[1], ["OFF", "ON", "1/2", "Step"]);
+  assert.deepEqual(cellWords(SWITCHES, at(g, 0, 0)), []);
+});
+
+test("a cell is set to be read as other words, in the table editor, and back to its drawn text", () => {
+  let g = fromTable(SWITCHES, 1);
+  g = cutCell(SWITCHES, g, at(g, 1, 0).key, [1, 2]);
+  g = setSay(g, at(g, 1, 2).key, "1/2 step");  // a part of a cut cell too: it's read as this once saved
+  const op = rebuildEdit(SWITCHES, 1, g);
+  assert.equal(op.rows[1][2].text, "1/2 step");
+  assert.equal("text" in op.rows[1][0], false);  // cells not set here are left as they are
+  assert.equal(tablePreview(SWITCHES, op).find((r) => r.text === "1/2 step")?.role, "TD");
+  assert.equal(fromOp(SWITCHES, op).cells.find((x) => x.r === 1 && x.c === 2)?.say, "1/2 step");
+  // A cell already read as other words shows them; emptied, it goes back to its drawn text; merged, it's unset
+  const said = doc(SWITCHES.elements.map((e) => (e.i === 11 ? { ...e, parent: e.parent, actual_text: "are optional" } : { ...e, parent: e.parent })));
+  const h = fromTable(said, 1);
+  assert.equal(at(h, 1, 3).say, "are optional");
+  assert.equal(rebuildEdit(said, 1, setSay(h, at(h, 1, 3).key, "")).rows[1][3].text, "");
+  assert.equal(merge(h, at(h, 1, 2).key, "right").cells.find((x) => x.r === 1 && x.c === 2)?.say, undefined);
 });

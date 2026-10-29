@@ -119,7 +119,7 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```
 
 ```bash
-.venv/bin/python -m pytest -q tests/engine
+.venv/bin/python -m pytest -q -n auto tests/engine
 ```
 
 The portal's tests need a throwaway PostgreSQL; see [tests/README.md](tests/README.md). GitHub Actions runs both

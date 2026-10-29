@@ -17,6 +17,15 @@ a grid. Choose a cell, then:
 - **Remove row** or **Remove column**: its content joins the row above (the column to its left; for the first row or
   column, the one after it), so nothing on the page is left untagged.
 - **Make it a header** or **Make it a data cell**.
+- **Split its words into cells…**: for a cell holding words that belong in several cells (a row read off a
+  picture, its words all in the first cell). Choose the words that start a new cell; the first part stays, and each
+  next part goes in the next cell to its right (an empty one takes it), with a column added if the row runs out. The
+  page doesn't change. (**New 28 October 2026**)
+- **Take the column out as a paragraph**: for a paragraph set beside a table and read as one of its columns. The
+  column's text, top to bottom, becomes one paragraph right after the table. (**New 28 October 2026**)
+- **Read aloud as**: what the chosen cell is read as, when its drawn text reads wrongly (a value misread off a
+  picture, a stray mark). Leave it empty to read the drawn text. It works for a cell you've just split too, before
+  saving. (**New 28 October 2026**)
 
 Above the grid, **Header rows** and **Header columns** make the first rows and columns headers at once (the corner,
 where they meet, heads both ways), and **Caption** makes the paragraph just before or after the table its caption

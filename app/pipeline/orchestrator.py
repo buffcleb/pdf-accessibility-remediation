@@ -30,9 +30,9 @@ import pymupdf as fitz
 from app.ai.base import AIError
 from app.ai.registry import get_provider
 from app.config import get_settings
-from app.pipeline.analyzer import analyze_document
+from app.pipeline.analyzer import analyze_document, covers_page, line_shaped
 from app.pipeline.enrichment import EnrichmentStats, enrich, render_slots
-from app.pipeline.models import DocumentAnalysis
+from app.pipeline.models import DocumentAnalysis, bbox_area, bbox_intersection
 from app.pipeline.outputs import (Progress, StageClock, add_bookmarks, current_clock, delta, move_xml, snapshot, tagmap_file,
                                   validate, verdict_line, visual_fidelity, write_json_report, xml_name)
 from app.pipeline.run_result import RunResult, ai_usage, timed
@@ -111,17 +111,12 @@ class JobOptions:
 
 
 # --------------------------------------------------------------------------- helpers
-def _covers_page(bbox, width: float, height: float) -> bool:
-    """Whether an image is a scanned page's picture of the page: what's visible of it covers most of the page. A scan
-    can sit inside margins, be drawn in several layers, or be larger than the page and cut off at its edge (a web
-    page "printed" to PDF), so its own width and height don't say."""
-    w = min(bbox[2], width) - max(bbox[0], 0.0)
-    h = min(bbox[3], height) - max(bbox[1], 0.0)
-    return w > 0 and h > 0 and w * h >= 0.6 * width * height
-
-
-def prepare_analysis(path: Path) -> DocumentAnalysis:
-    analysis = analyze_document(path)
+def prepare_analysis(path: Path, ocr_pages=(), ocr_records=()) -> DocumentAnalysis:
+    """ocr_pages: the pages given the engine's OCR layer; ocr_records: its lines, when known, for how sure the OCR
+    was of each block's words (a scanned formula reads with low confidence, as does a line it mostly failed on)."""
+    analysis = analyze_document(path, ocr_pages)
+    if ocr_records:
+        block_confidence([p for p in analysis.pages if p.number in ocr_pages], ocr_records)
     assign_roles(analysis)
     for p in analysis.pages:
         p.columns = detect_columns(p)
@@ -142,6 +137,9 @@ _APP_PREFIX = re.compile(r"^microsoft\s+(?:office\s+)?(?:word|powerpoint|excel|p
                          re.I | re.S)
 _FILE_NAME = re.compile(r"^[^\n]{0,250}\.(?:docx?|docm|dotx?|pptx?|ppsx?|xlsx?|xlsm|rtf|odt|odp|ods|pages|key|"
                         r"numbers|pdf|txt|html?|tex|indd|pub|vsdx?|ps|eps|qxp)$", re.I)
+# A source file's name with no extension, as TeX front ends write it ("ps1", "hw_03", "lec-7b"): one short token with
+# a digit, underscore or hyphen in it
+_STEM = re.compile(r"^(?=[^\s]*[\d_-])[^\s]{1,16}$")
 _NO_TITLE = {"untitled", "untitled document", "document", "no title", "title", "powerpoint presentation"}
 
 
@@ -152,10 +150,20 @@ def usable_title(title: str | None) -> bool:
     return bool(t) and t.lower() not in _NO_TITLE and not _APP_PREFIX.match(t) and not _FILE_NAME.match(t)
 
 
+def _stem_title(title: str, analysis: DocumentAnalysis) -> bool:
+    """Whether a title is the name of the file it was made from ("ps1" for a problem set): a short token like a
+    file's name that the first page doesn't print. One it prints ("W-9", "1040") is the document's name."""
+    t = title.strip()
+    if not _STEM.match(t):
+        return False
+    first = " ".join(b.text for b in analysis.pages[0].blocks).lower() if analysis.pages else ""
+    return t.lower() not in first
+
+
 def _pick_title(opts: JobOptions, analysis: DocumentAnalysis) -> str:
     if opts.title:
         return opts.title
-    if usable_title(analysis.title):
+    if usable_title(analysis.title) and not _stem_title(analysis.title, analysis):
         return analysis.title.strip()[:TITLE_MAX]
     for p in analysis.pages:
         for b in p.blocks:
@@ -266,6 +274,11 @@ async def _ocr(base: Path, analysis: DocumentAnalysis, scanned: list[int], ai, o
     with fitz.open(base) as before_ocr:
         typed_on = {pno for pno in scanned if before_ocr[pno].get_text("text").strip()}
     ocr_records = await asyncio.to_thread(ocr_lines, str(base), scanned, True, pictures)
+    # Pages whose print was placed as pictures of their lines (not a scan): what OCR reads inside a photo or a logo
+    # is part of that picture, described with it, not a line of the page
+    pictured = {p.number: p for p in analysis.pages if p.number in scanned and p.text_pictures}
+    if pictured:
+        ocr_records = [rec for rec in ocr_records if rec.page not in pictured or not _in_picture(pictured[rec.page], rec.bbox)]
     if ocr_ai:
         progress("ai_ocr", 22)
         async with ai:
@@ -286,27 +299,48 @@ async def _ocr(base: Path, analysis: DocumentAnalysis, scanned: list[int], ai, o
         # Not on a page with typed text: a figure is drawn again on top of the page, which would cover the typed
         # values with the paper of the scan (and a filled-in form's rules aren't a figure)
         scan_regions = await asyncio.to_thread(scan_figures.separate, str(base), str(figures_path),
-                                               [p for p in scanned if p not in typed_on], text_boxes, pictures)
+                                               [p for p in scanned if p not in typed_on and p not in pictured],
+                                               text_boxes, pictures)
     except Exception as exc:  # noqa: BLE001 - a problem here only means the figures stay untagged
         log.warning("figures on scanned pages not separated: %s", exc)
         scan_regions = {}
     if scan_regions:
         base = figures_path
-    analysis = await asyncio.to_thread(prepare_analysis, base)
-    # How sure the OCR was of each block's words: a scanned formula reads with low confidence (notation)
-    block_confidence([p for p in analysis.pages if p.number in scanned], ocr_records)
-    # The OCR text now carries the content; the page scan itself becomes a background artifact.
+    analysis = await asyncio.to_thread(prepare_analysis, base, {rec.page for rec in ocr_records}, ocr_records)
+    # The OCR text now carries the content; the page scan itself becomes a background artifact (a picture: a large
+    # drawing, a table's grid, is no scan)
     for p in analysis.pages:
         if p.number in scanned:
             for img in p.images:
-                if _covers_page(img.bbox, p.width, p.height):
+                if img.xref and covers_page(img.bbox, p.width, p.height):
                     img.decorative = True
+            if p.number in pictured:
+                _read_pictures_to_background(p, text_boxes.get(p.number, []))
             if scan_regions.get(p.number):
                 scan_figure_count += scan_figures.add_to_page(p, scan_regions[p.number])
                 p.reading_order = heuristic_reading_order(p)
             p.reading_order = [e for e in p.reading_order if not (
                 (el := p.element(e)) is not None and getattr(el, "decorative", False))]
     return base, analysis, ocr_count, scan_figure_count
+
+def _in_picture(page, bbox) -> bool:
+    """Whether an OCR line lies in one of a page's pictures that isn't a line of print (a photo, a logo)."""
+    area = bbox_area(bbox) or 1.0
+    return any(img.kind == "image" and not img.decorative and not line_shaped(img.bbox)
+               and bbox_intersection(bbox, img.bbox) >= 0.5 * area for img in page.images)
+
+
+def _read_pictures_to_background(page, lines: list) -> None:
+    """A picture of a line of print that OCR read is that text's background now: an artifact, as a scan is. One it
+    didn't read (white letters on a dark band) stays a Figure, described."""
+    for img in page.images:
+        if img.kind != "image" or img.decorative or not line_shaped(img.bbox):
+            continue
+        read = sum(bbox_intersection(img.bbox, b) for b in lines)
+        if read >= 0.3 * (bbox_area(img.bbox) or 1.0):  # (the picture has a margin round its letters)
+            img.decorative = True
+            img.alt = None
+
 
 async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress = lambda s, p: None) -> dict:
     settings = get_settings()
@@ -412,7 +446,8 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
             warnings.append(f"{ai.failures} of {ai.calls + ai.failures} AI calls failed; see ai_findings")
     else:
         if any(not i.decorative for p in analysis.pages for i in p.images):
-            warnings.append("ai_provider 'none': figures are tagged without alt text")
+            warnings.append("made without AI: figures are tagged without alt text, each listed for a person to "
+                            "describe")
     # Formulas as MathML, and read by rule (MathCAT) to check the AI's reading of them (#403): before the tags are
     # checked, so a formula whose two readings disagree is flagged there
     await _read_formulas(enrichment, [i for p in analysis.pages for i in p.images], base)
@@ -580,18 +615,23 @@ async def run_remediation(store: JobStore, opts: JobOptions, progress: Progress 
         if widths_subpixel is not None and not fonts_embedded:
             stage_src = base  # flattening re-tags from the untagged base; widths are re-fixed afterwards
         pm = _primary(vera_modified) if vera_modified else pv
+        unreadable: frozenset[str] = frozenset()
         if not (pm and pm.compliant):
-            destructive_pages = await asyncio.to_thread(_destructive_candidates,
-                                                        _rules(vera_modified) if vera_modified else rv, analysis,
-                                                        stage_src)
+            rules_now = _rules(vera_modified) if vera_modified else rv
+            destructive_pages = await asyncio.to_thread(_destructive_candidates, rules_now, analysis, stage_src)
+            # Fonts whose map gives glyphs U+0000 (7.21.7, test 2): their text is OCR'd for the text layer, not copied.
+            # A font with no map at all (test 1) is still read through its encoding, as before
+            unreadable = frozenset(n for f in (rules_now.failures if rules_now else []) if f.clause == "7.21.7"
+                                   and f.test == "2" for n in f.fonts)
         if destructive_pages:
             progress("flattening", 84)
             flat = work / "flattened.pdf"
             candidate = work / "modified.pdf"
             vectors = {p.number: [i.bbox for i in p.images if i.kind == "vector" or (i.xref == 0 and not i.decorative)]
                        for p in analysis.pages if p.number in destructive_pages}
-            await asyncio.to_thread(flatten_pages, str(stage_src), str(flat), destructive_pages, vectors)
-            analysis_mod = await asyncio.to_thread(prepare_analysis, flat)
+            await asyncio.to_thread(flatten_pages, str(stage_src), str(flat), destructive_pages, vectors,
+                                    unreadable)
+            analysis_mod = await asyncio.to_thread(prepare_analysis, flat, scanned if ocr_count else ())
             music.carry_over(analysis, analysis_mod)
             layout_mod = transfer_enrichment(analysis, analysis_mod, set(destructive_pages), enrichment.layout_tables,
                                              notation=enrichment.notation)
@@ -1138,7 +1178,8 @@ def _summary(analysis, tv: TagResult, tm: TagResult | None, enr: EnrichmentStats
                      "shapes (they used ZapfDingbats, a font that isn't embedded); the pages look the same.")
     if comparison.get("unicode_maps_added"):
         lines.append(f"Unicode maps completed for {len(comparison['unicode_maps_added'])} font(s) "
-                     f"({'; '.join(comparison['unicode_maps_added'][:4])}) so symbols can be read aloud; rendering unchanged.")
+                     f"({'; '.join(comparison['unicode_maps_added'][:4])}) so their text can be read aloud; rendering "
+                     "unchanged.")
     if comparison.get("glyph_widths_modified_only"):
         lines.append(f"Font metrics: {comparison['glyph_widths_modified_only']} glyph width(s) corrected in the "
                      "modified file only (the shifts are a fraction of a point, invisible but not pixel-identical).")

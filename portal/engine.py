@@ -40,6 +40,8 @@ class Engine(Protocol):
                  pages: int = 3) -> dict: ...
     def describe(self, filename: str, fileobj: BinaryIO, page: int, bbox: list[float], model: str | None,
                  long: bool = False) -> dict: ...
+    def area_tags(self, filename: str, fileobj: BinaryIO, page: int, bbox: list[float], items: list[dict],
+                  model: str | None) -> dict: ...
     def fetch(self, path: str, out: BinaryIO) -> int: ...
     def capacity(self) -> int | None: ...
     def stop(self, engine_job_id: str) -> None: ...
@@ -58,14 +60,16 @@ class HttpEngine:
                full_review: bool = False, route: str = "standard", branding: dict | None = None,
                no_ai: bool = False, validator: dict | None = None, ignore_existing: bool = False,
                pdfua: str = "1") -> str:
-        """ai: the job's AI tier (a gateway model); without one, the configured default provider is used.
+        """ai: the job's AI tier (a gateway model); without one, no AI at all (#659: never the fallback provider).
         full_review: the AI review checks every figure instead of the flagged ones plus a sample.
         route: the engine route of the job's processing service (standard | adobe).
         branding: for the PDF report (service and organization name, accent color, the AI level by name).
-        no_ai: no AI at all, for an audit whose AI level is set to make audits without it.
+        no_ai: made without AI, whatever ai says.
         validator: how veraPDF runs ({"validator": "service" | "command_line", "verapdf_ua2": bool}).
         pdfua: the PDF/UA part delivered, "1", "2" or "both" (#445)."""
-        provider, model = (("gateway", ai.model) if ai else ("none", None) if no_ai else (self.provider, self.model))
+        ai = None if no_ai else ai
+        no_ai = ai is None
+        provider, model = ("gateway", ai.model) if ai else ("none", None)
         data = {"ai_provider": provider,
                 "flags": json.dumps({"report_only": report_only, **({"full_review": True} if full_review else {}),
                                      **({"ignore_existing": True} if ignore_existing else {}),
@@ -151,6 +155,24 @@ class HttpEngine:
             data["ai_model"] = model or self.model
         try:
             r = self.client.post("/api/v1/describe", data=data, files={"file": (filename, fileobj, "application/pdf")})
+        except httpx.HTTPError as e:
+            raise EngineUnavailable(str(e)) from e
+        if r.status_code >= 500 or r.status_code == 429:
+            raise EngineUnavailable(_detail(r))
+        if r.status_code >= 400:
+            raise EngineError(_detail(r))
+        return r.json()
+
+    def area_tags(self, filename: str, fileobj: BinaryIO, page: int, bbox: list[float], items: list[dict],
+                  model: str | None) -> dict:
+        """The AI's tags for an area of a page (items: its content, {kind, text, bbox}): {tags, decorative, model,
+        cost_usd, ...}. Answers at once; errors as for describe."""
+        data = {"page": str(page), "bbox": json.dumps(bbox), "items": json.dumps(items),
+                "ai_provider": "gateway" if model else self.provider}
+        if model or self.model:
+            data["ai_model"] = model or self.model
+        try:
+            r = self.client.post("/api/v1/area-tags", data=data, files={"file": (filename, fileobj, "application/pdf")})
         except httpx.HTTPError as e:
             raise EngineUnavailable(str(e)) from e
         if r.status_code >= 500 or r.status_code == 429:

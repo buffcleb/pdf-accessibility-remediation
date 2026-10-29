@@ -61,7 +61,9 @@ async def test_autotag_round_trip_cleans_up(tmp_path, samples):
         assert not check_integrity(pdf)[0]
     assert res.report is not None and res.report.read_bytes()[:2] == b"PK"
     st = app.state.fake
-    assert st.calls["token"] == 1 and st.calls["status"] == 3
+    # Two "in progress" answers, then done; one more when the fake's tagging thread is still busy (a loaded machine:
+    # the suite runs on parallel workers)
+    assert st.calls["token"] == 1 and st.calls["status"] >= 3
     assert len(st.deleted) == 3  # the upload, the tagged PDF and the report
 
 

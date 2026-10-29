@@ -49,3 +49,21 @@ def test_the_analyzer_reads_a_symbol_fonts_private_use_characters_as_unicode():
     char = {"c": "", "bbox": (0, 0, 5, 10), "origin": (0, 9)}
     assert _Run(span, char, 0).text == "β"
     assert _Run({**span, "font": "Arial"}, char, 0).text == ""
+
+
+def test_one_glyph_word_maps_as_a_letter_and_a_symbol_is_read_as_the_symbol(tmp_path):
+    """Word's map for a Wingdings arrow gives the letter typed and the symbol ("à" then U+F0E0): the text extractor
+    reads two characters for one glyph, the second at no width. The engine's text has the arrow alone."""
+    from app.pipeline.orchestrator import prepare_analysis
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    cmap = CMAP.format(body="3 beginbfchar\n<41> <0041>\n<42> <0042>\n<E0> <00E0F0E0>\nendbfchar\n")
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name("/Wingdings-Regular"),
+                                        FirstChar=32, LastChar=255, Widths=[600] * 224,
+                                        ToUnicode=pdf.make_stream(cmap.encode("latin-1"))))
+    page.Resources = Dictionary(Font=Dictionary(F1=font))
+    page.Contents = pdf.make_stream(b"BT /F1 12 Tf 72 700 Td (A B \xe0 A) Tj ET")
+    src = tmp_path / "arrow.pdf"
+    pdf.save(src)
+    (block,) = prepare_analysis(src).pages[0].blocks
+    assert block.text == "A B → A"

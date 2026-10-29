@@ -289,15 +289,31 @@ test("the menu's top level is short: kinds of change open submenus, one-choice k
   const { menu } = menuAndTypes(tagMenu(sample(), [], [6], { page: 1, x: 10, y: 615 }));
   const sections = menuEntries(menu);
   const top = sections.map((s) => s.map((e) => (e.kind === "item" ? e.item.id : `${e.label} >`)));
-  assert.deepEqual(top[0], ["types", "Merge and split >", "Lists and tables >", "Reading order >", "Mark as artifact >"]);
+  assert.deepEqual(top[0], ["types", "Merge and split >", "Lists and tables >", "Reading order >", "Move into >", "Mark as artifact >"]);
   assert.deepEqual(top[top.length - 1], ["edit", "delete", "read", "report"]);         // More: on the top level
   const order = sections[0].find((e) => e.kind === "group" && e.group === "order");
-  assert.ok(order && order.kind === "group" && order.items.length === 2);
+  assert.ok(order && order.kind === "group" && order.items.length === 3);  // earlier, later, out
   // a kind where nothing can be chosen now still opens, dimmed, to say why
   const locked = menuEntries(menuAndTypes(tagMenu(sample(), [], [6], { page: 1, x: 10, y: 615 }, false)).menu)[0];
   assert.ok(locked.some((e) => e.kind === "group" && e.none));
   // the page menu's area tools are a plain list
   assert.deepEqual(menuEntries(pageMenu(2, false, false)).map((s) => s.map((e) => e.kind)), [["item", "item"]]);
+});
+
+test("a tag moves into any tag on its page that can hold it, or out of its own, with the unsaved moves taken into account", () => {
+  const into = (ops: TagEdit[], i: number) => tagMenu(sample(), ops, [i]).filter((x) => x.group === "nest" && x.ops).map((x) => x.id);
+  // A paragraph: into the section or the figure, not into another paragraph or the heading, nor its own parent
+  assert.deepEqual(into([], 2), ["into:4", "into:5"]);
+  assert.deepEqual(item(tagMenu(sample(), [], [2]), "into:5")!.ops, [{ op: "move", element: 2, expect_role: "P", target: 5, expect_target_role: "Sect", position: "in" }]);
+  // The paragraph in the section: out of it, it goes just after the section
+  const out = item(tagMenu(sample(), [], [6]), "out")!;
+  assert.deepEqual(out.ops, [{ op: "move", element: 6, expect_role: "P", target: 5, expect_target_role: "Sect", position: "after" }]);
+  assert.ok(!into([], 6).includes("into:5"));                         // already in it
+  // Once moved out, the section is offered again, and noted as the tag just before it
+  assert.ok(into(out.ops!, 6).includes("into:5"));
+  assert.ok(/just before/.test(item(tagMenu(sample(), out.ops!, [6]), "into:5")!.note!));
+  // A top-level tag can't come out of the document
+  assert.equal(item(tagMenu(sample(), [], [2]), "out")!.disabled, "It's already at the top level.");
 });
 
 test("one tag can be opened in the edit dialog; a version that can't be edited still shows its details", () => {

@@ -11,9 +11,9 @@ from app.tagging.content_marker import apply as apply_matrix
 from app.tagging.content_marker import mat_mul, mcid_of
 from app.tagging.editor._ctx import (
     CONTENT_ROLES, MAX_TEXT, NEW_AREA_ROLES, EditError, _Ctx, _detach, _insert_after, _MARK, _new_sibling, _page_obj,
-    _parent_obj, _reparent_items, _role_of, _same, register,
+    _parent_obj, _reparent_items, _role_of, _same, register, WAS_MCID,
 )
-from app.tagging.role_rules import check_move
+from app.tagging.role_rules import GROUPING, check_move
 from app.tagging.tree import is_elem, new_mcr, number_tree_get
 from app.tagging.tree import items as _items
 from app.verification.integrity import Elem
@@ -55,8 +55,9 @@ def _split_inside(ctx: _Ctx, e: Elem, k: int, char: int, n: int) -> str:
     new_mcid = max(used | {mcid}) + 1
     fonts = page.resources.get("/Font")
     out, counted = _split_stream(instrs, mcid, g, new_mcid, fonts if isinstance(fonts, Dictionary) else Dictionary())
-    if out is None or counted != len(glyphs):
+    if out is None or counted != ctx.cut_glyphs.get((pg.objgen, mcid), len(glyphs)):
         raise EditError(cant)
+    ctx.cut_glyphs[(pg.objgen, mcid)] = g  # what's left of it: the glyphs before the cut
     pg.Contents = ctx.pdf.make_stream(pikepdf.unparse_content_stream(out))
 
     pt = ctx.root.get("/ParentTree")
@@ -256,16 +257,21 @@ def _set_parent(arr, mcid: int, elem) -> None:
 
 
 def _assign(ctx: _Ctx, e: Elem, pieces: list[dict], n: int) -> str:
-    """Change the area a tag covers: pieces of tagged content move from their tags into this one."""
+    """Change the area a tag covers: pieces of tagged content move from their tags into this one. Content a tag
+    deleted earlier in this save held (an artifact until the save) is marked content again, in this tag (#692)."""
     if e.role not in CONTENT_ROLES:
         raise EditError(f"Edit {n}: a {e.role} holds other tags, not content of its own. Select a paragraph, heading, "
                         "figure, cell or list item body to give it this content.")
     moved, emptied = 0, []
+    back: dict = {}  # untagged content to mark again, by page
     for piece in pieces:
         if piece["page"] > len(ctx.pdf.pages):
             raise EditError(f"Edit {n}: page {piece['page']} doesn't exist.")
         page = ctx.pdf.pages[piece["page"] - 1].obj
         users = ctx.checker.index.refs.get((page.objgen, piece["mcid"]))
+        if not users and (page.objgen, piece["mcid"]) in ctx.untagged:
+            back.setdefault(page.objgen, (page, set()))[1].add(piece["mcid"])
+            continue
         if not users:
             raise EditError(f"Edit {n}: that piece of content on page {piece['page']} isn't tagged (an artifact can "
                             "be tagged with \"Tag as\" instead).")
@@ -301,6 +307,17 @@ def _assign(ctx: _Ctx, e: Elem, pieces: list[dict], n: int) -> str:
         moved += 1
         if not kept and owner not in emptied:
             emptied.append(owner)
+    for page, mcids in back.values():
+        _retag(ctx, page, mcids, e.role, n)
+        arr = _page_array(ctx, page, create=True)
+        for m in sorted(mcids):
+            e.obj.K = Array(_items(e.obj.get("/K")) + [m if _same_page(e.obj, page) else new_mcr(page, m)])
+            if "/Pg" not in e.obj:
+                e.obj.Pg = page
+            _set_parent(arr, m, e.obj)
+            ctx.checker.index.refs[(page.objgen, m)] = [e.index]
+            ctx.untagged.discard((page.objgen, m))
+            moved += 1
     # Content in the order it's drawn, when the tag holds only content
     items = _items(e.obj.get("/K"))
     if items and not any(is_elem(it) for it in items):
@@ -326,6 +343,10 @@ def _take_pieces(ctx: _Ctx, e: Elem, op: dict, n: int) -> str:
     for piece in pieces:
         page = ctx.pdf.pages[piece["page"] - 1].obj if piece["page"] <= len(ctx.pdf.pages) else None
         users = ctx.checker.index.refs.get((page.objgen, piece["mcid"])) if page is not None else None
+        if page is not None and (page.objgen, piece["mcid"]) in ctx.untagged:
+            raise EditError(f"Edit {n}: a piece of content on page {piece['page']} isn't in this {e.role} any more: an "
+                            "earlier change in this save deleted the tag with its content. Save first, then tag the "
+                            "content from what's untagged.")
         if not users or users[0] != e.index:
             raise EditError(f"Edit {n}: a piece of content on page {piece['page']} isn't part of this {e.role}.")
     mine = {(p, m) for (p, m), users in ctx.checker.index.refs.items() if users and users[0] == e.index}
@@ -343,6 +364,7 @@ def _take_pieces(ctx: _Ctx, e: Elem, op: dict, n: int) -> str:
     # A record for the new tag, so later edits in this save find the pieces' new owner
     made = Elem(index=len(ctx.elems), obj=new, role=op["role"], raw_role=op["role"], page=e.page, parent=e.parent)
     ctx.elems.append(made)
+    ctx.new_tags = [new]
     _assign(ctx, made, pieces, n)
     return f"element {e.index} ({e.role}): {len(pieces)} piece(s) of content made into a new {op['role']} after it"
 
@@ -564,6 +586,7 @@ def _cut_area(ctx: _Ctx, e: Elem, op: dict, n: int) -> str:
     _insert_after(ctx, e, [new], n)
     made = Elem(index=len(ctx.elems), obj=new, role=op["role"], raw_role=op["role"], page=op["page"] - 1, parent=e.parent)
     ctx.elems.append(made)
+    ctx.new_tags = [new]
     arr = _page_array(ctx, pg, create=True)
     ref = lambda m, owner: m if _same_page(owner, pg) else new_mcr(pg, m)  # noqa: E731
     kept: list = []
@@ -597,27 +620,30 @@ def _same_page(obj, page) -> bool:
     return pg is not None and pg.is_indirect and page.is_indirect and pg.objgen == page.objgen
 
 
-def _tag_artifacts(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
-    """Tag a new area: artifact sections of a page's stream become one new tag, next to the anchor tag."""
-    from app.tagging.content_marker import existing_mcids
-
-    role, wanted = op["role"], set(op["sections"])
-    if op["page"] > len(ctx.pdf.pages):
-        raise EditError(f"Edit {n}: page {op['page']} doesn't exist.")
-    # Sections are numbered as in the tag map; ones tagged by earlier edits are no longer artifacts
-    if ctx.tagged_sections is None:
-        ctx.tagged_sections = {}
-    done = ctx.tagged_sections.setdefault(op["page"], set())
-    if wanted & done:
-        raise EditError(f"Edit {n}: artifact section {min(wanted & done)} on page {op['page']} is already tagged by an "
-                        "earlier change.")
-    sections = {s - sum(1 for d in done if d < s) for s in wanted}
-    page = ctx.pdf.pages[op["page"] - 1]
-    parent = _parent_obj(ctx, anchor)
+def _check_place(ctx: _Ctx, role: str, parent, n: int) -> None:
+    """A new tag of this role may go under parent."""
     at_root = parent is ctx.root or (parent.is_indirect and ctx.root.is_indirect and parent.objgen == ctx.root.objgen)
     v = check_move(role, "Document", None if at_root else _role_of(ctx, parent), False)
     if not v.ok:
         raise EditError(f"Edit {n}: a new {role} can't go there. {v.reason}")
+
+
+def _mark_sections(ctx: _Ctx, page_no: int, wanted: set[int], role: str, n: int):
+    """Artifact sections of a page's stream (numbered as in the tag map) become marked content of this role, each
+    with a new MCID. Returns the page and the MCIDs, for the tag that is to hold them."""
+    from app.tagging.content_marker import existing_mcids
+
+    if page_no > len(ctx.pdf.pages):
+        raise EditError(f"Edit {n}: page {page_no} doesn't exist.")
+    # Sections are numbered as in the tag map; ones tagged by earlier edits are no longer artifacts
+    if ctx.tagged_sections is None:
+        ctx.tagged_sections = {}
+    done = ctx.tagged_sections.setdefault(page_no, set())
+    if wanted & done:
+        raise EditError(f"Edit {n}: artifact section {min(wanted & done)} on page {page_no} is already tagged by an "
+                        "earlier change.")
+    sections = {s - sum(1 for d in done if d < s) for s in wanted}
+    page = ctx.pdf.pages[page_no - 1]
     ops = list(pikepdf.parse_content_stream(page.obj))
     next_mcid = max(existing_mcids(ops) or {-1}) + 1
     new_mcids, seq, stack, found = [], 0, [], set()
@@ -633,7 +659,7 @@ def _tag_artifacts(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
             if is_art:
                 if seq in sections:
                     if any(tag for tag, _ in stack):
-                        raise EditError(f"Edit {n}: artifact section {seq} on page {op['page']} is inside another "
+                        raise EditError(f"Edit {n}: artifact section {seq} on page {page_no} is inside another "
                                         "marked section; select the section around it instead.")
                     ops[i] = ContentStreamInstruction([Name("/" + role), Dictionary(MCID=next_mcid)], Operator("BDC"))
                     new_mcids.append(next_mcid)
@@ -642,17 +668,26 @@ def _tag_artifacts(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
                     chosen = True
                 seq += 1
             elif has_mcid and any(c for _, c in stack):
-                raise EditError(f"Edit {n}: an artifact section you chose on page {op['page']} has tagged content "
+                raise EditError(f"Edit {n}: an artifact section you chose on page {page_no} has tagged content "
                                 "inside it, so it can't become a tag of its own.")
             stack.append((has_mcid or is_art, chosen))
         elif name == "EMC" and stack:
             stack.pop()
     missing = sections - found
     if missing:
-        raise EditError(f"Edit {n}: page {op['page']} has no artifact section {min(missing)} (the document may have "
+        raise EditError(f"Edit {n}: page {page_no} has no artifact section {min(missing)} (the document may have "
                         "changed; reload and try again).")
     done |= wanted
     page.obj.Contents = ctx.pdf.make_stream(pikepdf.unparse_content_stream(ops))
+    return page, new_mcids
+
+
+def _tag_artifacts(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
+    """Tag a new area: artifact sections of a page's stream become one new tag, next to the anchor tag."""
+    role = op["role"]
+    parent = _parent_obj(ctx, anchor)
+    _check_place(ctx, role, parent, n)
+    page, new_mcids = _mark_sections(ctx, op["page"], set(op["sections"]), role, n)
     elem = ctx.pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name("/" + role), P=parent, Pg=page.obj,
                                             K=Array(new_mcids)))
     alt = str(op.get("alt") or "").strip()
@@ -671,8 +706,171 @@ def _tag_artifacts(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
         raise EditError(f"Edit {n}: the tag to place it next to wasn't found under its parent.")
     kids.insert(at if op["position"] == "before" else at + 1, elem)
     parent.K = Array(kids)
+    ctx.new_tags = [elem]
     return (f"page {op['page']}: {len(new_mcids)} artifact section(s) tagged as a new {role}, "
             f"{op['position']} element {anchor.index} ({anchor.role})")
+
+
+def _regroup(ctx: _Ctx, anchor: Elem, op: dict, n: int) -> str:
+    """An area's content regrouped into new tags, in order (the AI's proposal for an area, checked by a person): each
+    group's pieces of tagged content move from their tags into it, a tag left with nothing being removed, and its
+    untagged sections are tagged into it. A figure's box is a part of a picture the page draws (a poster's artwork):
+    that part is drawn again as the figure's own content (picture_parts). The new tags go before the tag, at block
+    level, that held the first of the pieces; with no pieces, next to the anchor as tag_artifacts places a new tag,
+    or at the end of it ("in": the document's top tag, when every tag near the area has been deleted)."""
+    page_no, groups = op["page"], op["groups"]
+    if page_no > len(ctx.pdf.pages):
+        raise EditError(f"Edit {n}: page {page_no} doesn't exist.")
+    page = ctx.pdf.pages[page_no - 1].obj
+    tagged = lambda m: bool(ctx.checker.index.refs.get((page.objgen, m)))  # noqa: E731
+    for g in groups:
+        for m in g.get("pieces") or []:
+            # Content of a tag deleted earlier in this save is tagged again from its artifact section
+            if not tagged(m) and (page.objgen, m) not in ctx.untagged:
+                raise EditError(f"Edit {n}: a piece of content on page {page_no} isn't tagged any more: an earlier "
+                                "change in this save took it out. Ask for new tags after saving.")
+    at, position = anchor, op["position"]
+    first = next((ctx.elems[ctx.checker.index.refs[(page.objgen, m)][0]] for g in groups for m in g.get("pieces") or []
+                  if tagged(m)), None)
+    if first is not None:
+        # The tag holding the first piece, or the tag around it that sits straight in a grouping tag (a Link or Span
+        # in a paragraph: the paragraph), so a new paragraph doesn't go inside a paragraph
+        e = first
+        while e.parent is not None and ctx.elems[e.parent].role not in GROUPING:
+            e = ctx.elems[e.parent]
+        if e.parent is not None:
+            at, position = e, "before"
+    parent = at.obj if position == "in" else _parent_obj(ctx, at)
+    # Still in the tree: each tag up from it is among its parent's kids (a deleted tag keeps its /P)
+    obj, attached = at.obj, not at.obj.is_indirect  # a direct one can't be told apart this way: trusted
+    for _ in range(0 if attached else 10000):
+        up = obj.get("/P") if isinstance(obj, Dictionary) else None
+        if not isinstance(up, Dictionary) or not any(_same(k, obj) for k in _items(up.get("/K"))):
+            break
+        if up.get("/Type") == Name.StructTreeRoot:
+            attached = True
+            break
+        obj = up
+    if not attached:
+        raise EditError(f"Edit {n}: the tag to place the new tags next to was removed by an earlier change in this "
+                        "save; choose the area again.")
+    for g in groups:
+        _check_place(ctx, g["role"], parent, n)
+    # The tags around each piece now, to remove those the move leaves with nothing in them (a list whose items all
+    # went, a section of only a figure that went)
+    around = []
+    for g in groups:
+        for m in [m for m in g.get("pieces") or [] if tagged(m)]:
+            e = ctx.elems[ctx.checker.index.refs[(page.objgen, m)][0]]
+            chain = []
+            while e.parent is not None:
+                e = ctx.elems[e.parent]
+                chain.append(e.obj)
+            around.append(chain)
+    made = []
+    for g in groups:
+        new = ctx.pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name("/" + g["role"]), P=parent, Pg=page,
+                                               K=Array([])))
+        if str(g.get("alt") or "").strip():
+            new.Alt = String(g["alt"].strip())
+        if "/Lang" in at.obj:
+            new.Lang = at.obj.Lang
+        made.append(new)
+    # Placed first, all together: moving the pieces can empty (and so remove) the tag they were placed by
+    if not at.obj.is_indirect:
+        at.obj[_MARK] = True
+    kids = _items(parent.get("/K"))
+    pos = len(kids) if position == "in" else next((k for k, it in enumerate(kids) if _same(it, at.obj)), None)
+    if _MARK in at.obj:
+        del at.obj[_MARK]
+    if pos is None:
+        raise EditError(f"Edit {n}: the tag to place them next to wasn't found under its parent.")
+    pos = pos if position in ("before", "in") else pos + 1
+    parent.K = Array(kids[:pos] + made + kids[pos:])
+    ctx.new_tags = list(made)
+    for g, new in zip(groups, made):
+        elem = Elem(index=len(ctx.elems), obj=new, role=g["role"], raw_role=g["role"], page=page_no - 1,
+                    parent=at.parent)
+        ctx.elems.append(elem)
+        if g.get("box"):
+            from app.tagging.editor.picture_parts import redraw_part
+            m = redraw_part(ctx, page_no, g["box"], g["role"], n)
+            new.K = Array(_items(new.get("/K")) + [m])
+            _set_parent(_page_array(ctx, page, create=True), m, new)
+            ctx.checker.index.refs[(page.objgen, m)] = [elem.index]
+        if g.get("sections"):
+            _, mcids = _mark_sections(ctx, page_no, set(g["sections"]), g["role"], n)
+            new.K = Array(_items(new.get("/K")) + mcids)
+            arr = _page_array(ctx, page, create=True)
+            for m in mcids:
+                _set_parent(arr, m, new)
+                ctx.checker.index.refs[(page.objgen, m)] = [elem.index]
+        back = [m for m in g.get("pieces") or [] if not tagged(m)]
+        if back:
+            _retag(ctx, page, set(back), g["role"], n)
+            new.K = Array(_items(new.get("/K")) + back)
+            arr = _page_array(ctx, page, create=True)
+            for m in back:
+                _set_parent(arr, m, new)
+                ctx.checker.index.refs[(page.objgen, m)] = [elem.index]
+                ctx.untagged.discard((page.objgen, m))
+        if [m for m in g.get("pieces") or [] if m not in back]:
+            _assign(ctx, elem, [{"page": page_no, "mcid": m} for m in g["pieces"] if m not in back], n)
+    removed = 0
+    for chain in around:
+        for obj in chain:
+            up = obj.get("/P")
+            if _items(obj.get("/K")) or not isinstance(up, Dictionary) or obj.get("/S") is None:
+                break
+            up.K = Array([k for k in _items(up.get("/K")) if not _same(k, obj)])
+            removed += 1
+    names = ", ".join(g["role"] for g in groups)
+    return f"page {page_no}: the area's content regrouped into {len(groups)} new tag(s) ({names})" + (
+        f"; {removed} tag(s) left empty were removed" if removed else "")
+
+
+def _retag(ctx: _Ctx, page, mcids: set[int], role: str, n: int) -> None:
+    """Content an earlier edit in this save made artifacts (its tag deleted) is marked content again, with its MCID."""
+    ops = list(pikepdf.parse_content_stream(page))
+    found = set()
+    for i, ins in enumerate(ops):
+        if (isinstance(ins, ContentStreamInstruction) and str(ins.operator) == "BDC" and len(ins.operands) == 2
+                and isinstance(ins.operands[1], Dictionary) and ins.operands[1].get(WAS_MCID) is not None
+                and int(ins.operands[1][WAS_MCID]) in mcids):
+            m = int(ins.operands[1][WAS_MCID])
+            ops[i] = ContentStreamInstruction([Name("/" + role), Dictionary(MCID=m)], Operator("BDC"))
+            found.add(m)
+    if mcids - found:
+        raise EditError(f"Edit {n}: a piece of content a deleted tag held wasn't found on its page; save first, then "
+                        "tag it from what's untagged.")
+    page.Contents = ctx.pdf.make_stream(pikepdf.unparse_content_stream(ops))
+
+
+def _check_regroup(op: dict, n: int) -> None:
+    groups = op.get("groups")
+    if (not isinstance(op.get("page"), int) or op["page"] < 1 or op.get("position") not in ("before", "after", "in")
+            or not isinstance(groups, list) or not 1 <= len(groups) <= 300):
+        raise EditError(f"Edit {n}: new tags for an area need the page, the tags and where they go.")
+    pieces, sections = set(), set()
+    for g in groups:
+        if not isinstance(g, dict):
+            raise EditError(f"Edit {n}: each new tag needs the content it holds.")
+        ps, ss, box = g.get("pieces") or [], g.get("sections") or [], g.get("box")
+        if box is not None and (g.get("role") not in ("Figure", "Formula") or not isinstance(box, list) or len(box) != 4
+                                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in box)
+                                or box[2] - box[0] < 1 or box[3] - box[1] < 1):
+            raise EditError(f"Edit {n}: a part of a picture is made a figure or formula, from a box (left, top, right, "
+                            "bottom).")
+        if (not isinstance(ps, list) or not isinstance(ss, list) or not (ps or ss or box)
+                or not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in ps + ss)):
+            raise EditError(f"Edit {n}: each new tag needs the content it holds.")
+        if pieces & set(ps) or sections & set(ss) or len(set(ps)) < len(ps) or len(set(ss)) < len(ss):
+            raise EditError(f"Edit {n}: a piece of content can go in only one new tag.")
+        pieces |= set(ps)
+        sections |= set(ss)
+        _check_new_tag(g, n)
+    if len(pieces) > 2000 or len(sections) > 500:
+        raise EditError(f"Edit {n}: that's too much content for one area; draw a smaller one.")
 
 
 def _check_pieces(op: dict, n: int) -> None:
@@ -727,3 +925,4 @@ register("assign", lambda ctx, op, e, t, n: _assign(ctx, e, op["pieces"], n), _c
 register("take_pieces", lambda ctx, op, e, t, n: _take_pieces(ctx, e, op, n), _check_take_pieces)
 register("cut_area", lambda ctx, op, e, t, n: _cut_area(ctx, e, op, n), _check_cut_area)
 register("tag_artifacts", lambda ctx, op, e, t, n: _tag_artifacts(ctx, e, op, n), _check_tag_artifacts)
+register("regroup", lambda ctx, op, e, t, n: _regroup(ctx, e, op, n), _check_regroup)

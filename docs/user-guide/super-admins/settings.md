@@ -42,7 +42,7 @@ One sub-tab per topic, each with its own **Save**; moving to another with unsave
 |---|---|
 | **Uploads and queues** | Each upload, each person's queue, large documents |
 | **Downloads and scripts** | Downloading as a zip, API tokens for scripts |
-| **AI** | AI in the tag manager, Let AI decide the kind of document |
+| **AI** | No AI, AI in the tag manager, Let AI decide the kind of document |
 | **Checks** | PDF/UA-2, PDF/UA validation (veraPDF) |
 | **Help** | Help requests |
 | **Alerts** | Alerts, security alerts |
@@ -64,8 +64,15 @@ One sub-tab per topic, each with its own **Save**; moving to another with unsave
   "The document couldn't be processed", with what the person was told, the error's name, and the engine's
   recorded detail as an internal note. Close the ones that are known limitations with a note. Documents
   someone stopped don't get one. With it off, people can still ask for help with a failed document.
+- **No AI** (**New 29 October 2026**, #659): **Let groups offer No AI** (off by default). On, each group's admins can
+  offer No AI beside their AI levels, preselect it, or make it their only choice, for documents that mustn't go to any
+  AI. Such a document is charged on its processing service only, and its figures are left without alt text, each
+  listed for a person to describe. Off, No AI can't be picked, and a group set to use it for everything has its uploads
+  refused until its admins choose a level. Whatever this says, a document with no AI level is made without AI: it never
+  goes to the engine's fallback AI.
 - **AI in the tag manager: Describe with AI** (off by default) is the service default for the tag manager's AI alt
-  text for a part of a figure: one AI call at the document's AI level each time, recorded on the document's cost
+  text for a part of a figure or a drawn area, and for **Suggest tags with AI** in Areas (**New 27 October 2026**):
+  one AI call at the document's AI level each time, recorded on the document's cost
   (`describe_usd`, `describe_calls`). Each group, and each person in a group, can be set otherwise by their group
   admins or a super admin (Groups → the group's settings, and its People).
 - **Kind of document: Let AI decide** offers *Let AI decide* among an AI level's kinds:

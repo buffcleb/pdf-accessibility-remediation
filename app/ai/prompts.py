@@ -71,7 +71,9 @@ Words in [[double brackets]] are ones the OCR engine was unsure of.
 
 Correct only the bracketed words, by reading them in the image. Keep every other word exactly as given,
 keep the same number of words, and keep the same order. Don't fix spelling or grammar that is printed that
-way, don't translate, and don't add anything that isn't printed. Remove the brackets.
+way, don't translate, and don't add anything that isn't printed. Remove the brackets. If a bracketed word is
+not text at all but a picture the OCR engine read as letters (rating stars, a check box, an icon or a logo),
+write [picture] in its place; don't just leave it out.
 
 JSON schema: {{"text": str, "confidence": float}}"""
 
@@ -109,6 +111,35 @@ layout before moving to the next; sidebars and captions next to the content they
 Include every id exactly once.
 
 JSON schema: {{"order": [1, 3, 2, ...]}} (the numeric ids, each exactly once)"""
+
+AREA_TAGS = """This image is part of page {page} of a document. A person drew a box round it in a tag editor because
+the tags that tell a screen reader what this part of the page is were wrong. Each numbered red box in the image is
+one item of content; here they are with the text in each (empty for a picture or a drawing):
+{items}
+{data}
+
+Give the tags a screen reader should read for this part of the page, in the order a sighted reader would read
+them. Each tag has a type:
+- "P": a paragraph or other run of text; "H1" to "H6": a heading, H1 the most important;
+- "Figure": a picture, chart, diagram or photo read as one thing; give "alt", what it shows, in at most {chars}
+  characters. Several things drawn in one picture (each board, part or device of an assembly diagram) are each a
+  figure of its own. {where}
+- "Formula": mathematics, with "alt", how it is said;
+- "Caption": the caption of a figure or table, right after it; "Note": a footnote; "Quote", "BlockQuote", "Code".
+Each tag lists the numbered items it holds in "items". The words of a figure's labels go in the figure, not in
+tags of their own. An item that is only decoration (a rule, a border, a background) goes in "decorative". Use
+each item at most once.
+
+JSON schema: {{"tags": [{{"type": "P", "items": [1, 2], "alt": ""}}, {{"type": "Figure", "items": [3],
+"alt": "...", {example}}}, ...], "decorative": [5]}}"""
+
+# Where a figure is, in AREA_TAGS: by the lettered drawings found on the page, or (with none found) by a box
+AREA_DRAWINGS = """The lettered blue boxes ({letters}) are the drawings and pictures here, found by where the ink is. A figure
+  lists the letters of the boxes it's made of in "drawings" (a drawing can be several boxes; a box goes in one
+  figure at most). Only for a figure no lettered box fits, give its "box" instead, as [left, top, right, bottom]
+  in thousandths of the image's width and height (0 to 1000);"""
+AREA_BOX = """Give its "box", round all of it, as [left, top, right, bottom] in thousandths of the image's width and
+  height (0 to 1000);"""
 
 ALT_JUDGE = """You are reviewing alt text written for an image in a PDF, for people using screen readers.
 Image type (from an earlier pass, may be wrong): {kind}

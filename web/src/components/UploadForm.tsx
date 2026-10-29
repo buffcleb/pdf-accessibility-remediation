@@ -5,6 +5,7 @@ import {
 } from "../api";
 import { ErrorNotice, LiveRegion, Notice, fmtBytes, fmtNum, useLoad } from "./ui";
 import { checkNotOffered, checkNotOfferedLine } from "./checkOffer";
+import { NO_AI_LABEL, withNoAi } from "./noAi";
 import { SLOW_UPLOAD_SECONDS, uploadWait } from "./uploadWait";
 
 type Picked = { file: File; choice: FileChoice | null; open: boolean };
@@ -61,7 +62,8 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
   const partChoices = opts?.pdfua_choices ?? ["1"];
   const pdfuaOffered = partChoices.length > 1 && chosen?.engine_route === "standard";
   const partChosen: PdfUa = pdfua ?? opts?.pdfua_default ?? "1";
-  const levels = choices.filter((c) => c.kind === "ai_tier");
+  // The group's AI levels, and No AI where the group offers it (#659)
+  const levels = withNoAi(choices.filter((c) => c.kind === "ai_tier"), opts?.no_ai);
   const defaultLevel = levels.find((c) => c.is_default) ?? null;
   const fixedChoice: FileChoice | null = fixed ? { ai_tier: opts!.ai_level, ai_kind: opts!.ai_kind } : null;
   const base = fixedChoice ?? batch ?? { ai_tier: defaultLevel?.key ?? null, ai_kind: null };
@@ -73,7 +75,7 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
 
   function label(c: FileChoice) {
     const l = levels.find((x) => x.key === c.ai_tier);
-    if (!l) return "The service's own AI";
+    if (!l) return NO_AI_LABEL;  // no level: made without AI (#659)
     const k = l.kinds.find((x) => x.key === (c.ai_kind ?? "general"));
     return k && k.key !== "general" ? `${l.label} · ${k.label}` : l.label;
   }
@@ -212,7 +214,7 @@ export function UploadForm({ choices, onChanged }: { choices: ServiceChoice[]; o
             </dd>
           </div>
         )}
-        {usesAi && (levels.length > 0 || fixed) && (
+        {usesAi && (
           <div className="upload-row">
             <dt>AI</dt>
             <dd>

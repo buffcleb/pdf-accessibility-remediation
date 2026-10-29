@@ -14,6 +14,7 @@ import { LedgerTable } from "../../components/tables";
 import { ErrorNotice, Loading, Meter, Notice, fmtDate, fmtNum, useLoad, useTitle } from "../../components/ui";
 import { AdminDialog, DialogButton } from "../../components/AdminDialog";
 import { GroupApiTokens } from "../../components/ApiTokens";
+import { NO_AI, NO_AI_LABEL, type NoAiSetting } from "../../components/noAi";
 import { SAVED, useUnsavedChanges } from "../../components/unsaved";
 import { acrossGroups, can, roleLabel } from "../../permissions";
 import { GroupHelp } from "./Help";
@@ -1045,25 +1046,34 @@ function FromParent({ group, onChange }: { group: Group; onChange: (g: Group) =>
   );
 }
 
-/** Whether people pick the AI level and kind of document when they upload, or the group sets one for everything. */
+/** Whether people pick the AI level and kind of document when they upload, or the group sets one for everything; and
+ * whether No AI is among the choices (#659). */
 function AiChoice({ group, onChange }: { group: Group; onChange: (g: Group) => void }) {
   const levels = group.services.filter((x) => x.kind === "ai_tier" && x.available);
+  const offered = !!group.no_ai_offered;
+  // No AI as a level here once super admins offer it, or while the group already uses it for everything
+  const choices = [...levels.map((x) => ({ key: x.key, label: x.label })),
+    ...(offered || group.ai_level === NO_AI ? [{ key: NO_AI, label: NO_AI_LABEL }] : [])];
   const [mode, setMode] = useState(group.ai_mode);
-  const [level, setLevel] = useState(group.ai_level ?? levels.find((x) => x.is_default)?.key ?? levels[0]?.key ?? "");
+  const [level, setLevel] = useState(group.ai_level ?? levels.find((x) => x.is_default)?.key ?? choices[0]?.key ?? "");
   const [kind, setKind] = useState(group.ai_kind ?? "general");
+  const [noAi, setNoAi] = useState<NoAiSetting>(group.no_ai ?? "off");
   const [error, setError] = useState<unknown>(null);
   const [msg, setMsg] = useState("");
   const kinds = levels.find((x) => x.key === level)?.kinds ?? [];
-  const dirty = mode !== group.ai_mode || (mode === "fixed"
+  const fixedNoAi = mode === "fixed" && level === NO_AI;
+  const dirty = mode !== group.ai_mode || noAi !== (group.no_ai ?? "off") || (mode === "fixed"
     && (level !== (group.ai_level ?? "") || kind !== (group.ai_kind ?? "general")));
 
   async function save(e: FormEvent) {
     e.preventDefault();
     setError(null);
     try {
-      const body = mode === "fixed" ? { ai_mode: mode, ai_level: level, ai_kind: kind } : { ai_mode: mode };
-      onChange(await patch<Group>(`/groups/${group.id}`, body));
-      setMsg(mode === "fixed" ? "Everyone's documents now use the group's AI level." : "People now choose the AI level.");
+      const body = mode === "fixed" ? { ai_mode: mode, ai_level: level, ai_kind: fixedNoAi ? "general" : kind }
+        : { ai_mode: mode };
+      onChange(await patch<Group>(`/groups/${group.id}`, { ...body, ...(fixedNoAi ? {} : { no_ai: noAi }) }));
+      setMsg(fixedNoAi ? "Everyone's documents are now made with No AI."
+        : mode === "fixed" ? "Everyone's documents now use the group's AI level." : "People now choose the AI level.");
     } catch (err) {
       setError(err);
     }
@@ -1073,15 +1083,22 @@ function AiChoice({ group, onChange }: { group: Group; onChange: (g: Group) => v
     <section className="panel" aria-labelledby="ai-choice-h">
       <h2 id="ai-choice-h">AI for uploads</h2>
       <Follows group={group} setting="ai" />
-      {group.ai_mode === "fixed" && group.ai_level && !levels.some((x) => x.key === group.ai_level) && (
+      {group.ai_mode === "fixed" && group.ai_level && group.ai_level !== NO_AI && !levels.some((x) => x.key === group.ai_level) && (
         <Notice kind="warn" title="The group's AI level isn't on here">
           <p>Everyone's documents use {group.services.find((x) => x.key === group.ai_level)?.label ?? group.ai_level}, which isn't
             switched on for {group.name}{group.parent ? ` (or ${group.parent.name})` : ""}, so uploads that need it are refused.
             Switch it on in <Link to={`/admin/groups/${group.id}/services`}>Services and pages</Link>, or choose another level here.</p>
         </Notice>
       )}
-      {levels.length === 0 ? (
-        <p className="muted">The group has no AI levels switched on, so there's nothing to choose.</p>
+      {group.ai_mode === "fixed" && group.ai_level === NO_AI && !offered && (
+        <Notice kind="warn" title="No AI isn't offered now">
+          <p>Everyone's documents are made with No AI, but super admins have stopped offering it, so uploads are refused.
+            Choose an AI level here, or ask a super admin.</p>
+        </Notice>
+      )}
+      {choices.length === 0 ? (
+        <p className="muted">The group has no AI levels switched on, so there's nothing to choose. Its documents are made
+          without AI.</p>
       ) : (
         <form onSubmit={(e) => void save(e)} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <fieldset className="choices">
@@ -1101,13 +1118,28 @@ function AiChoice({ group, onChange }: { group: Group; onChange: (g: Group) => v
             <div className="form-row">
               <div className="field"><label htmlFor="ai-fixed-level">AI level</label>
                 <select id="ai-fixed-level" value={level} onChange={(e) => { setLevel(e.target.value); setKind("general"); }}>
-                  {levels.map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}
+                  {choices.map((x) => <option key={x.key} value={x.key}>{x.label}</option>)}
                 </select></div>
-              <div className="field"><label htmlFor="ai-fixed-kind">Kind of document</label>
-                <select id="ai-fixed-kind" value={kind} onChange={(e) => setKind(e.target.value)}>
-                  <option value="general">General</option>
-                  {kinds.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}
-                </select></div>
+              {!fixedNoAi && (
+                <div className="field"><label htmlFor="ai-fixed-kind">Kind of document</label>
+                  <select id="ai-fixed-kind" value={kind} onChange={(e) => setKind(e.target.value)}>
+                    <option value="general">General</option>
+                    {kinds.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}
+                  </select></div>
+              )}
+            </div>
+          )}
+          {!fixedNoAi && (
+            <div className="field">
+              <label htmlFor="ai-no-ai"><strong>No AI</strong> as a choice</label>
+              <select id="ai-no-ai" value={noAi} onChange={(e) => setNoAi(e.target.value as NoAiSetting)}>
+                <option value="off">Not offered</option>
+                <option value="on">Offered beside the AI levels</option>
+                <option value="default">Offered and picked to start with</option>
+              </select>
+              <span className="hint">For documents that mustn't go to any AI: nothing is sent to one, the pages count against
+                the processing service only, and figures are left without alt text for a person to describe.
+                {!offered && " Super admins don't offer No AI at the moment, so this takes effect once they do."}</span>
             </div>
           )}
           <div className="actions">

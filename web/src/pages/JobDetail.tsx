@@ -1,9 +1,9 @@
 import DOMPurify from "dompurify";
 import { marked } from "marked";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useSeen } from "../components/seen";
-import { MARK_LABELS, download, get, getText, heldFor, post, put, type DocVersion, type Finding, type FindingMark, type FindingMarks, type Job, type JobFile, type MarkStatus, type PdfUa, type RemovalResult, type Versions } from "../api";
+import { del, download, get, getText, heldFor, post, type DocVersion, type Finding, type Job, type JobFile, type PdfUa, type RemovalResult, type Versions } from "../api";
 import { parseVeraPdf, VeraPdfView, type VeraReport } from "../components/verapdf";
 import { RunDetails, RunSoFar } from "../components/RunDetails";
 import { RerunDialog } from "../components/RerunDialog";
@@ -13,10 +13,13 @@ import { HelpPanel } from "../components/help";
 import { LoadProgress } from "../components/LoadProgress";
 import { downloading, fraction, type Received } from "../components/loadWords";
 import { ErrorNotice, Loading, Notice, fmtBytes, fmtDate, fmtNum, isActive, useLoad, useTitle } from "../components/ui";
+import { noAiLine } from "../components/noAi";
 import { showUrl } from "../viewer/spot";
+import { MarkControl, useFindingMarks } from "../components/reviewMarks";
 import { DocumentNav } from "../components/neighbours";
 import { listSource, safeFrom } from "../components/listQuery";
 import { ListPager } from "../components/lists";
+import { TabList } from "../components/TabList";
 import { can } from "../permissions";
 
 const SEVERITY: Record<string, [string, string]> = {
@@ -335,6 +338,7 @@ function Status({ job: j, stage }: { job: Job; stage: string }) {
           ? <span className="doc-badge good"><Check /> Passes PDF/UA-{r.pdfua_part ?? 1}</span>
           : <span className="doc-badge warn"><span aria-hidden="true">▲</span> Doesn't fully pass yet</span>}
         <span>Failed checks: <strong>{fmtNum(r.failed_checks_before)}</strong> → <strong>{fmtNum(r.failed_checks_after)}</strong></span>
+        {j.no_ai && <span>{noAiLine(Number(r.before_after?.figures_missing_alt?.[1]) || 0)}</span>}
       </div>
     );
   }
@@ -497,34 +501,6 @@ function Tile({ label, value, unit, on, onClick, tone }: {
       <span className="doc-tile-value">{value}</span>
       <span className="doc-tile-unit">{unit}</span>
     </button>
-  );
-}
-
-/** Accessible tabs: arrow keys, Home and End move between them; only the selected one is in the Tab order. */
-function TabList({ label, items, active, onPick, idPrefix, small = false }: {
-  label: string; items: { key: string; label: string; count?: number | null }[]; active: string;
-  onPick: (key: string) => void; idPrefix: string; small?: boolean;
-}) {
-  const refs = useRef<Record<string, HTMLButtonElement | null>>({});
-  function onKey(e: KeyboardEvent<HTMLButtonElement>, i: number) {
-    const next = e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : e.key === "Home" ? 0
-      : e.key === "End" ? items.length - 1 : null;
-    if (next === null) return;
-    e.preventDefault();
-    const t = items[(next + items.length) % items.length];
-    onPick(t.key);
-    refs.current[t.key]?.focus();
-  }
-  return (
-    <div role="tablist" aria-label={label} className={small ? "doc-subtabs" : "doc-tablist"}>
-      {items.map((t, i) => (
-        <button key={t.key} ref={(el) => { refs.current[t.key] = el; }} role="tab" id={`${idPrefix}-tab-${t.key}`}
-          aria-selected={t.key === active} aria-controls={`${idPrefix}-panel-${t.key}`} tabIndex={t.key === active ? 0 : -1}
-          className="doc-tab" onClick={() => onPick(t.key)} onKeyDown={(e) => onKey(e, i)}>
-          {t.label}{t.count != null && <span className="doc-count">{fmtNum(t.count)}</span>}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -761,25 +737,7 @@ function Review({ jobId, findings, total, version = 1 }: { jobId: string; findin
   const left = params.get("rs") === "left";  // only what hasn't been signed off
   const q = params.get("rq") ?? "";
   // Each item's status (#366): checked, fixed or not an issue, by the item's key
-  const [marks, setMarks] = useState<Map<string, FindingMark>>(new Map());
-  const [canMark, setCanMark] = useState(false);
-  const [markError, setMarkError] = useState<unknown>(null);
-  const [said, setSaid] = useState("");
-  useEffect(() => {
-    get<FindingMarks>(`/jobs/${jobId}/finding-marks`)
-      .then((m) => { setMarks(new Map(m.marks.map((x) => [x.key, x]))); setCanMark(m.can_mark); })
-      .catch(setMarkError);
-  }, [jobId]);
-  async function mark(f: Finding, status: MarkStatus | null, note?: string | null) {
-    if (!f.key) return;
-    try {
-      const m = await put<FindingMark | null>(`/jobs/${jobId}/finding-marks/${f.key}`,
-        { status, note: note === undefined ? marks.get(f.key)?.note ?? null : note });
-      setMarks((cur) => { const next = new Map(cur); if (m) next.set(f.key!, m); else next.delete(f.key!); return next; });
-      setSaid(status ? `${f.issue}: ${MARK_LABELS[status]}.` : `${f.issue}: not looked at.`);
-      setMarkError(null);
-    } catch (e) { setMarkError(e); }
-  }
+  const { marks, canMark, mark, error: markError, setError: setMarkError, said } = useFindingMarks(jobId);
   const signedOff = findings.filter((f) => f.key && marks.has(f.key)).length;
   const [search, setSearch] = useState(q);
   const page = Number(params.get("rp")) || 1;
@@ -893,7 +851,7 @@ function Review({ jobId, findings, total, version = 1 }: { jobId: string; findin
                         Show<span className="visually-hidden"> {f.issue}{f.page != null ? ` on page ${f.page}` : ""}</span>
                       </button>
                     )}
-                    {f.key && <MarkControl f={f} mark={marks.get(f.key)} canMark={canMark} onMark={mark} />}
+                    {f.key && <MarkControl f={f} mark={marks.get(f.key)} canMark={canMark} onMark={(...a) => void mark(...a)} />}
                   </div>
                 </li>
               );
@@ -905,35 +863,6 @@ function Review({ jobId, findings, total, version = 1 }: { jobId: string; findin
           topId="review-top" onPage={(p) => update({ rp: p > 1 ? String(p) : null })} />
         {total > findings.length && <p className="muted small">Showing {fmtNum(findings.length)} of {fmtNum(total)}. The full list is in the report.</p>}
       </>}
-    </div>
-  );
-}
-
-/** One review item's status: a choice for people who can edit the document, and a note once it's signed off. */
-function MarkControl({ f, mark, canMark, onMark }: { f: Finding; mark?: FindingMark; canMark: boolean;
-  onMark: (f: Finding, status: MarkStatus | null, note?: string | null) => void }) {
-  const [note, setNote] = useState(mark?.note ?? "");
-  useEffect(() => setNote(mark?.note ?? ""), [mark?.note]);
-  const who = mark ? `${MARK_LABELS[mark.status]} by ${mark.set_by_email}, ${fmtDate(mark.set_at)}${mark.note ? `: ${mark.note}` : ""}` : "";
-  if (!canMark) return mark ? <span className="pill good review-mark" title={who}>{MARK_LABELS[mark.status]}</span> : null;
-  return (
-    <div className="review-mark">
-      <label>
-        <span className="visually-hidden">Status of {f.issue}{f.page != null ? ` on page ${f.page}` : ""}</span>
-        <select value={mark?.status ?? ""} title={who || undefined}
-          onChange={(e) => onMark(f, (e.target.value || null) as MarkStatus | null)}>
-          <option value="">Not looked at</option>
-          {(Object.keys(MARK_LABELS) as MarkStatus[]).map((s) => <option key={s} value={s}>{MARK_LABELS[s]}</option>)}
-        </select>
-      </label>
-      {mark && (
-        <label>
-          <span className="visually-hidden">Note on {f.issue}</span>
-          <input type="text" value={note} maxLength={1000} placeholder="Note (optional)"
-            onChange={(e) => setNote(e.target.value)}
-            onBlur={() => { if (note.trim() !== (mark.note ?? "")) onMark(f, mark.status, note.trim() || null); }} />
-        </label>
-      )}
     </div>
   );
 }
@@ -1158,6 +1087,18 @@ function VersionsPanel({ jobId, own, versions, onError, canEdit, onChanged }: {
       setBusy(null);
     }
   }
+  async function discard(v: DocVersion) {
+    if (!window.confirm(`Discard ${v.label}? It leaves the list with its ${v.edits_count} change${v.edits_count === 1 ? "" : "s"}; the document and its other versions don't change.`)) return;
+    setBusy(v.number);
+    try {
+      await del(`/jobs/${jobId}/versions/${v.number}`);
+      onChanged();
+    } catch (e) {
+      onError(e);
+    } finally {
+      setBusy(null);
+    }
+  }
   return (
     <ol className="versions-list">
       {versions.map((v) => (
@@ -1174,7 +1115,9 @@ function VersionsPanel({ jobId, own, versions, onError, canEdit, onChanged }: {
               ? <>{v.summary?.compliant ? `passes PDF/UA-${v.summary.pdfua_part ?? 1}` : checkLink(jobId, v)
                 ? <Link to={checkLink(jobId, v)!}>{fmtNum(v.summary?.failed_checks)} failed checks</Link>
                 : `${fmtNum(v.summary?.failed_checks)} failed checks`} · {v.edits_count} edit(s) by {v.created_by_email ?? "–"}, {fmtDate(v.finished_at)}</>
-              : v.status === "failed" ? `not saved: ${v.error_message ?? ""}`
+              : v.status === "failed" ? <>not saved: {v.error_message ?? ""}{canEdit && <>{" "}
+                <button className="linkbtn" disabled={busy === v.number} aria-label={`Discard ${v.label}`}
+                  onClick={() => void discard(v)}>{busy === v.number ? "Discarding…" : "Discard"}</button></>}</>
               : v.replacing != null ? "being checked; it replaces the one above when it passes…" : "being checked…"}
           </span>
           {v.note && <span className="muted small">“{v.note}”</span>}

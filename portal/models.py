@@ -47,6 +47,9 @@ class Group(Base):
     ai_mode: Mapped[str] = mapped_column(String(8), nullable=False, default="choose", server_default="choose")
     ai_level: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ai_kind: Mapped[str | None] = mapped_column(String(40), nullable=True)  # None: General
+    # No AI as a choice for its documents (#659), once super admins offer it: "off", "on" (offered beside the AI
+    # levels) or "default" (offered and preselected). ai_level "none" with ai_mode "fixed" makes it the only choice
+    no_ai: Mapped[str] = mapped_column(String(8), nullable=False, default="off", server_default="off")
     # Show people which options send documents to an external provider (off: the badge is hidden)
     show_external: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
     # "Describe with AI" for the group's people: True/False, or None to follow the service default
@@ -76,6 +79,7 @@ class Group(Base):
     __table_args__ = (
         CheckConstraint("status in ('active','disabled')", name="group_status"),
         CheckConstraint("pdfua_default in ('1','2','both')", name="group_pdfua_default"),
+        CheckConstraint("no_ai in ('off','on','default')", name="group_no_ai"),
         CheckConstraint("parent_id is null or parent_id <> id", name="group_not_own_parent"),
     )
 

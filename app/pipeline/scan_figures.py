@@ -29,11 +29,18 @@ MIN_AREA = 4000.0     # square points: about 1.2 by 0.8 inches
 MAX_PAGE_SHARE = 0.85  # bigger than this is the page's own background, not a picture
 MAX_TEXT_SHARE = 0.35  # more of a region covered by OCR text than this: a text panel or shaded table, not a picture
 TEXT_PAD = 1.5
+# A region over this share of the page is several drawings joined by thin lines (an assembly poster's dashed
+# wiring): split into its solid drawings (lines up to THIN points wide taken out) and its line drawings (what's
+# left of its ink, joined across REST_JOIN points, at least REST_INK of each cluster's box ink)
+SPLIT_SHARE = 0.4
+THIN = 5
+REST_JOIN = 18
+REST_INK = 0.04
 
 
 def _ink_mask(page: fitz.Page) -> np.ndarray:
     """True where the scan is darker than its paper (one pixel per point)."""
-    pix = page.get_pixmap(dpi=72, colorspace=fitz.csGRAY, alpha=False)
+    pix = page.get_pixmap(dpi=72, colorspace=fitz.csGRAY, alpha=False, annots=False)  # the scan, not markup on it
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
     paper = float(np.median(arr))
     return arr < max(0.0, paper - 28.0)
@@ -78,10 +85,53 @@ def _grow(grid: np.ndarray, axis: int, by: int = 2) -> np.ndarray:
 
 def find_regions(page: fitz.Page, text_boxes: list, hints: list | None = None) -> list[BBox]:
     """Picture regions on a scanned page: ink outside the OCR text (text_boxes), joined across small gaps, plus the
-    boxes OCR read as letters but that look like pictures (hints)."""
+    boxes OCR read as letters but that look like pictures (hints). A region over SPLIT_SHARE of the page is split
+    into the drawings it joins (_split)."""
     if page.rotation:
         return []
     ink = _ink_mask(page)
+    found = _regions(ink, text_boxes, hints)
+    page_area = float(ink.shape[0] * ink.shape[1])
+    out: list[BBox] = []
+    for r in found:
+        out += _split(ink, text_boxes, r) if bbox_area(r) > SPLIT_SHARE * page_area else [r]
+    return sorted(out, key=lambda b: (b[1], b[0]))
+
+
+def _split(ink: np.ndarray, text_boxes: list, region: BBox) -> list[BBox]:
+    """A region over most of the page, as the drawings in it: the solid ones (thin lines taken out, so a dashed wire
+    from a motor to a board doesn't join them), then what's left of its ink outside them and the text, in clusters
+    (a schematic drawn in thin lines). Kept whole when it doesn't come apart."""
+    from app.pipeline.drawing_blocks import _dilate, _erode
+    h, w = ink.shape
+    page_area = float(w * h)
+    x0, y0, x1, y1 = (int(v) for v in region)
+    inside = np.zeros_like(ink)
+    inside[y0:y1 + 1, x0:x1 + 1] = ink[y0:y1 + 1, x0:x1 + 1]
+    cores = [c for c in _regions(_dilate(_erode(inside, THIN), THIN), text_boxes, None) if bbox_area(c) <= SPLIT_SHARE * page_area]
+    rest = inside.copy()
+    for b in cores + [tuple(t) for t in text_boxes]:
+        rest[max(0, int(b[1]) - 2):int(b[3]) + 3, max(0, int(b[0]) - 2):int(b[2]) + 3] = False
+    c = 3
+    rows, cols = h // c, w // c
+    grid = _dilate(rest[:rows * c, :cols * c].reshape(rows, c, cols, c).any(axis=(1, 3)), (REST_JOIN // c) * 2 + 1)
+    lines: list[BBox] = []
+    for comp in _components(grid):
+        rs = [r for r, _ in comp]
+        cs = [q for _, q in comp]
+        b = (float(min(cs) * c), float(min(rs) * c), float((max(cs) + 1) * c), float((max(rs) + 1) * c))
+        bw, bh = b[2] - b[0], b[3] - b[1]
+        if (bw < MIN_W or bh < MIN_H or bw * bh < MIN_AREA or bw * bh > SPLIT_SHARE * page_area
+                or rest[int(b[1]):int(b[3]), int(b[0]):int(b[2])].mean() < REST_INK
+                or any(bbox_intersection(b, k) > 0.5 * bw * bh for k in cores)):
+            continue
+        lines.append(b)
+    parts = cores + lines
+    return parts if len(parts) > 1 else [region]
+
+
+def _regions(ink: np.ndarray, text_boxes: list, hints: list | None) -> list[BBox]:
+    """Regions of ink outside the text: see find_regions."""
     h, w = ink.shape
     text = np.zeros_like(ink)
     for b in text_boxes:

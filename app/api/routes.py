@@ -537,6 +537,127 @@ async def describe_area(file: UploadFile = File(...), page: int = Form(..., ge=1
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+AREA_ITEMS_MAX = 300  # items of content in one area: a page of a busy poster, not a whole document
+
+
+@router.post("/area-tags", dependencies=[Depends(require_api_key)])
+async def area_tags(file: UploadFile = File(...), page: int = Form(..., ge=1), bbox: str = Form(..., max_length=200),
+                    items: str = Form(..., max_length=200_000), ai_provider: str = Form("gateway", max_length=40),
+                    ai_model: str | None = Form(None, max_length=200)):
+    """Tags for an area of a page, proposed by the AI: the area (bbox, as for /describe) is drawn with a numbered box
+    round each item of content in it (items: JSON [{kind, text, bbox}], from the tag map: pieces of tagged content
+    and untagged sections; none when the area is only a picture), and the AI groups them into tags in reading order.
+    A figure can be a part of a picture, with its box on the page ("box", the tag map's units): the pictures and
+    drawings in it join it. Answers at once with {tags: [{role, items (indices into items), alt, box?}],
+    decorative: [indices], model, cost_usd, prompt_tokens, completion_tokens}; nothing is kept and the file isn't
+    changed: the tag manager turns the answer into edits a person checks."""
+    import io
+
+    import pymupdf as fitz
+    from PIL import Image, ImageDraw
+
+    from app.ai.base import AIError
+    from app.ai.registry import available_providers, get_provider
+    from app.pipeline import drawing_blocks
+    from app.pipeline.analyzer import render_png
+    try:
+        box = [float(v) for v in json.loads(bbox)]
+        if len(box) != 4 or box[2] - box[0] < 1 or box[3] - box[1] < 1:
+            raise ValueError
+    except (json.JSONDecodeError, ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="bbox must be a JSON list [x0, y0, x1, y1] with some width and height")
+    try:
+        got = json.loads(items)
+        if not isinstance(got, list) or len(got) > AREA_ITEMS_MAX:
+            raise ValueError
+        clean = []
+        for it in got:
+            b = [float(v) for v in it["bbox"]]
+            if len(b) != 4:
+                raise ValueError
+            clean.append({"kind": str(it.get("kind") or "")[:20], "text": str(it.get("text") or "")[:300], "bbox": b})
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=422, detail=f"items must be a JSON list of at most {AREA_ITEMS_MAX} "
+                                                    "{kind, text, bbox}")
+    if ai_provider not in available_providers() or ai_provider == "none":
+        raise HTTPException(status_code=422, detail=f"unknown AI provider: {ai_provider}")
+    tmp = Path(tempfile.mkdtemp(prefix="area-tags-"))
+    try:
+        path = tmp / "in.pdf"
+        size, limit = 0, get_settings().max_upload_mb * 1024 * 1024
+        with path.open("wb") as out:
+            while chunk := await file.read(_CHUNK):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(status_code=413, detail=f"file exceeds {get_settings().max_upload_mb} MB")
+                out.write(chunk)
+        await run_in_threadpool(_check_pdf, path)
+
+        shown = fitz.Rect(box)  # what of the area the picture shows: the area, on the page
+        blocks: list = []  # the drawings found in it, lettered on the picture for the AI to name
+
+        def draw() -> bytes:
+            nonlocal shown, blocks
+            with fitz.open(path) as doc:
+                if page > doc.page_count:
+                    raise HTTPException(status_code=422, detail=f"page {page} doesn't exist")
+                area = shown = fitz.Rect(box) & doc[page - 1].rect
+                png = render_png(doc, page - 1, clip=tuple(box), max_px=1600)
+                blocks = drawing_blocks.find(doc[page - 1], tuple(area),
+                                             [it["bbox"] for it in clean if it["text"].strip()])
+            # Each item's numbered box, so the model can tell which item is which
+            img = Image.open(io.BytesIO(png)).convert("RGB")
+            sx, sy = img.width / max(area.width, 1), img.height / max(area.height, 1)
+            pen = ImageDraw.Draw(img)
+            for n, it in enumerate(clean, start=1):
+                x0, y0, x1, y1 = it["bbox"]
+                r = [(x0 - area.x0) * sx, (y0 - area.y0) * sy, (x1 - area.x0) * sx, (y1 - area.y0) * sy]
+                pen.rectangle([r[0] - 1, r[1] - 1, r[2] + 1, r[3] + 1], outline=(220, 0, 0), width=1)
+                pen.text((r[0], max(0, r[1] - 11)), str(n), fill=(220, 0, 0))
+            for name, (x0, y0, x1, y1) in zip(drawing_blocks.letters(len(blocks)), blocks):
+                r = [(x0 - area.x0) * sx, (y0 - area.y0) * sy, (x1 - area.x0) * sx, (y1 - area.y0) * sy]
+                pen.rectangle(r, outline=(0, 70, 220), width=2)
+                pen.text((r[0] + 3, r[1] + 2), name, fill=(0, 70, 220))
+            out = io.BytesIO()
+            img.save(out, "PNG")
+            return out.getvalue()
+        try:
+            png = await run_in_threadpool(draw)
+        except ValueError as exc:  # the box is off the page
+            raise HTTPException(status_code=422, detail=str(exc))
+        ai = get_provider(ai_provider, ai_model)
+        try:
+            out = await ai.propose_area_tags(png, page - 1, clean, drawing_blocks.letters(len(blocks)))
+        except AIError as exc:
+            raise HTTPException(status_code=502, detail=f"ai_unavailable: {exc}")
+        # A figure's box from fractions of the picture to the page; the pictures and drawings inside it are its own
+        used = {i for t in out["tags"] for i in t["items"]} | set(out["decorative"])
+        for t in out["tags"]:
+            if t.get("drawings"):  # the drawings it's made of, and the labels it holds: its box on the page
+                # (not a picture under most of the area, a poster's artwork, which would make it the whole area)
+                big = 0.5 * shown.width * shown.height
+                parts = [blocks[n] for n in t.pop("drawings")] + [
+                    clean[i]["bbox"] for i in t["items"]
+                    if clean[i]["text"].strip() or (clean[i]["bbox"][2] - clean[i]["bbox"][0]) * (clean[i]["bbox"][3] - clean[i]["bbox"][1]) < big]
+                t["box"] = [round(min(p[0] for p in parts), 2), round(min(p[1] for p in parts), 2),
+                            round(max(p[2] for p in parts), 2), round(max(p[3] for p in parts), 2)]
+                continue
+            if "box" not in t:
+                continue
+            x0, y0, x1, y1 = t["box"]
+            t["box"] = [round(shown.x0 + x0 * shown.width, 2), round(shown.y0 + y0 * shown.height, 2),
+                        round(shown.x0 + x1 * shown.width, 2), round(shown.y0 + y1 * shown.height, 2)]
+            for i, it in enumerate(clean):
+                cx, cy = (it["bbox"][0] + it["bbox"][2]) / 2, (it["bbox"][1] + it["bbox"][3]) / 2
+                if i not in used and not it["text"].strip() and t["box"][0] <= cx <= t["box"][2] and t["box"][1] <= cy <= t["box"][3]:
+                    t["items"].append(i)
+                    used.add(i)
+        return {**out, "model": getattr(ai, "model", ai_model), "cost_usd": round(ai.usage.cost_usd, 6),
+                "prompt_tokens": ai.usage.prompt_tokens, "completion_tokens": ai.usage.completion_tokens}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @router.get("/metrics", include_in_schema=False)
 async def prometheus_metrics():
     """For the deployment's Prometheus (#397): what's waiting in Redis. Only the portal and Prometheus may reach the

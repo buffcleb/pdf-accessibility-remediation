@@ -42,7 +42,9 @@ of their own…**).
 
 If **Describe with AI** is on for you (your group admins decide), it sits under the alt text box when splitting a
 figure: it shows the AI the part you picked or boxed and fills in its description, for you to check and correct.
-Each use is one AI call at your document's AI level.
+Each use is one AI call at your document's AI level. It's also under the alt text box in [Areas](areas.md), when
+untagged items are tagged as a figure or formula: there it shows the AI the area you drew. (**New 27 October
+2026**)
 
 ## A drawing that isn't tagged as a figure
 

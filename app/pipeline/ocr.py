@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -94,7 +95,8 @@ def _tesseract_tsv(page: fitz.Page, language: str, dpi: int = 300) -> list[dict]
     if exe is None:
         return []
     dpi = capped_dpi(page, dpi)  # a page of absurd size is read at a lower resolution, not at gigabytes
-    pix = page.get_pixmap(dpi=dpi, alpha=False)
+    # Without annotations: a box drawn round a line of the scan (markup) hid that line from Tesseract
+    pix = page.get_pixmap(dpi=dpi, alpha=False, annots=False)
     scale = 72.0 / dpi
     back = ~page.rotation_matrix  # rendered (rotated) space -> unrotated page space
     with tempfile.TemporaryDirectory() as tmp:
@@ -151,6 +153,58 @@ def _drop_graphics(rows: list[dict], dropped: list | None = None) -> list[dict]:
     return kept
 
 
+# Tesseract reads a dotted or dashed leader ("Name ........ Date", the line a form's value is written on) as a long
+# "word" of a few letters over and over ("aeeseseee..."), with next to no confidence, and the leader's first dots
+# as a letter or two; and a blank to fill in as underscores
+LEADER_CONFIDENCE = 30.0
+_BLANK = re.compile(r"^(_+|[_.\-…·]{2,})$")  # (a lone dot or dash may be the text's own)
+# A blank read on the end of a word's letters ("Name__a"), the rest a speck or two
+_BLANK_END = re.compile(r"[_.…·]{2,}[^_.…·]{0,2}$")
+
+
+def _leader(row: dict) -> bool:
+    return _letter_leader(row) or row["conf"] < LEADER_CONFIDENCE and bool(_BLANK.match(row["text"]))
+
+
+def _letter_leader(row: dict) -> bool:
+    """A long run of letters only (no digits or signs: math reads with low confidence too) and few kinds of them."""
+    text = row["text"]
+    kinds = {c.casefold() for c in text}
+    return row["conf"] < LEADER_CONFIDENCE and len(text) >= 10 and text.isalpha() and len(kinds) <= len(text) // 4
+
+
+def _short_of(row: dict, text_boxes: list, rotated: bool) -> dict:
+    """A word whose end runs under text the page already has (a form's label, its blank read into it, and the value
+    typed on the blank) ends where that text starts, without the blank: otherwise label and value overlap, and are
+    read letter by letter in turn."""
+    x0, y0, x1, y1 = row["bbox"]
+    starts = [t[0] for t in text_boxes if x0 < t[0] < x1 and min(y1, t[3]) - max(y0, t[1]) >= 0.5 * (y1 - y0)]
+    text = _BLANK_END.sub("", row["text"])
+    if rotated or not starts or not text or text == row["text"]:
+        return row  # nothing typed on it, or the word isn't a blank's start: it stays as read
+    end = min(starts)
+    return {**row, "text": text, "bbox": (x0, y0, end, y1), "visual": (x0, y0, end, y1)}
+
+
+def _drop_leaders(rows: list[dict]) -> int:
+    """Marks the leaders in one line's words (sorted along it) to be left out, with an uncertain letter or two
+    beside one (its first dots); returns how many."""
+    height = max(r["line"][3] for r in rows) - min(r["line"][1] for r in rows)
+    marked = {i for i, r in enumerate(rows) if _leader(r)}
+    for i in [i for i in marked if _letter_leader(rows[i])]:
+        v = rows[i]["line"]
+        for j in (i - 1, i + 1):
+            if not 0 <= j < len(rows):
+                continue
+            w = rows[j]["line"]
+            gap = max(w[0] - v[2], v[0] - w[2])
+            if len(rows[j]["text"]) <= 2 and rows[j]["conf"] < LEADER_CONFIDENCE and gap <= 2 * height:
+                marked.add(j)
+    for i in marked:
+        rows[i]["skip"] = True
+    return len(marked)
+
+
 def _covered(box, text_boxes: list) -> bool:
     """Whether half or more of a word's box lies on text the page already has."""
     area = max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
@@ -162,56 +216,117 @@ def _covered(box, text_boxes: list) -> bool:
     return False
 
 
+# A turned line is read with confidence: the boxes of a music score's notes and of noise read as letters are often
+# taller than wide too
+TURNED_CONFIDENCE = 70.0
+
+
+def _way(rows: list[dict]) -> int:
+    """Which way a line of words runs on the upright page: 0 across, -1 up (text turned a quarter left, as in a
+    form's margin), 1 down. Tesseract reads turned text too and gives its words in reading order, but as boxes
+    taller than wide, stacked in one column. Only a line of real words read with confidence counts."""
+    long = [r for r in rows if len(r["text"]) >= 3]
+    upright = [r for r in long if r["visual"][3] - r["visual"][1] > 1.5 * (r["visual"][2] - r["visual"][0])]
+    if len(upright) < 2 or 3 * len(upright) < 2 * len(long):
+        return 0
+    if sum(r["conf"] for r in rows) / len(rows) < TURNED_CONFIDENCE:
+        return 0
+    if max(r["visual"][0] for r in rows) >= min(r["visual"][2] for r in rows):
+        return 0  # not one column
+    first, last = rows[0]["visual"], rows[-1]["visual"]
+    return 1 if first[1] + first[3] < last[1] + last[3] else -1
+
+
+def _along(box: tuple, way: int) -> tuple:
+    """A box in the line's own space: along the line, then across it from the tops of the letters to their foot."""
+    x0, y0, x1, y1 = box
+    return {0: (x0, y0, x1, y1), -1: (-y1, x0, -y0, x1), 1: (y0, -x1, y1, -x0)}[way]
+
+
+def _upright(u: float, v: float, way: int) -> fitz.Point:
+    """A point of the line's own space back on the upright page."""
+    return fitz.Point({0: (u, v), -1: (v, -u), 1: (-v, u)}[way])
+
+
 def _tsv_lines(page: fitz.Page, language: str, dropped: list | None = None, existing: list | None = None) -> list[OcrLine]:
     """OCR lines straight from Tesseract's own words, so text and confidence come from one reading.
-    Lines run left to right on the upright page; their geometry is mapped back to unrotated space.
+    Lines run left to right on the upright page, or up or down it where the text is turned (see _way); their
+    geometry is mapped back to unrotated space.
 
     existing: boxes of text the page already has (values typed onto a scanned form). OCR words on them are dropped,
-    so that text isn't read twice, and a line is split where they were, so each part keeps its own place."""
+    so that text isn't read twice, and a line is split where they were, so each part keeps its own place. Dotted
+    leaders read as letters are dropped the same way."""
     groups: dict[tuple, list[dict]] = {}
     for r in _drop_graphics(_tesseract_tsv(page, language), dropped):
         if existing and _covered(r["bbox"], existing):
             r = {**r, "skip": True}
+        elif existing:
+            r = _short_of(r, existing, page.rotation != 0)
         groups.setdefault(r["key"], []).append(r)
     back = ~page.rotation_matrix
-    d = fitz.Point(1, 0) * back - fitz.Point(0, 0) * back  # the upright reading direction, unrotated
-    direction = (round(d.x), round(d.y))
     segments = []
+    leaders = 0
     for rows in groups.values():
-        rows.sort(key=lambda r: r["visual"][0])
+        way = _way(rows)
+        for r in rows:
+            r["line"] = _along(r["visual"], way)
+        rows.sort(key=lambda r: r["line"][0])
+        leaders += _drop_leaders(rows)
         # Table rows come back as one line across the columns: split at wide gaps, so each cell's text sits
         # over its own cell
-        height = max(r["visual"][3] for r in rows) - min(r["visual"][1] for r in rows)
+        height = max(r["line"][3] for r in rows) - min(r["line"][1] for r in rows)
         seg: list[dict] = []
         for r in rows:
-            if r.get("skip"):  # the page's own text: the line breaks here
+            if r.get("skip"):  # the page's own text, or a leader: the line breaks here
                 if seg:
-                    segments.append(seg)
+                    segments.append((seg, way))
                 seg = []
                 continue
-            if seg and r["visual"][0] - seg[-1]["visual"][2] > 1.5 * max(height, 1.0):
-                segments.append(seg)
+            if seg and r["line"][0] - seg[-1]["line"][2] > 1.5 * max(height, 1.0):
+                segments.append((seg, way))
                 seg = []
             seg.append(r)
         if seg:
-            segments.append(seg)
+            segments.append((seg, way))
+    if leaders:
+        log.info("OCR: left out %d word(s) that look like dotted leaders read as letters", leaders)
     out = []
-    for rows in segments:
-        vx0 = min(r["visual"][0] for r in rows)
-        vy0 = min(r["visual"][1] for r in rows)
-        vx1 = max(r["visual"][2] for r in rows)
-        vy1 = max(r["visual"][3] for r in rows)
-        height = vy1 - vy0
-        size = max(4.0, height / 1.15)
-        origin = fitz.Point(vx0, vy1 - 0.2 * height) * back  # baseline, a little above the bottom of descenders
-        box = fitz.Rect(vx0, vy0, vx1, vy1) * back
+    for rows, way in segments:
+        u0 = min(r["line"][0] for r in rows)
+        v0 = min(r["line"][1] for r in rows)
+        u1 = max(r["line"][2] for r in rows)
+        v1 = max(r["line"][3] for r in rows)
+        height = v1 - v0
+        size = _line_size(rows)
+        # baseline, a little above the bottom of descenders
+        origin = _upright(u0, v1 - 0.2 * height, way) * back
+        d = (_upright(1, 0, way) - _upright(0, 0, way)) * back - fitz.Point(0, 0) * back  # the reading direction
+        box = fitz.Rect(min(r["visual"][0] for r in rows), min(r["visual"][1] for r in rows),
+                        max(r["visual"][2] for r in rows), max(r["visual"][3] for r in rows)) * back
         text = " ".join(r["text"] for r in rows)
-        line = OcrLine(page.number, text, (box.x0, box.y0, box.x1, box.y1), (origin.x, origin.y), size, direction,
-                       vx1 - vx0, words=[OcrWord(r["text"], r["conf"], r["bbox"]) for r in rows])
+        line = OcrLine(page.number, text, (box.x0, box.y0, box.x1, box.y1), (origin.x, origin.y), size,
+                       (round(d.x), round(d.y)), u1 - u0, words=[OcrWord(r["text"], r["conf"], r["bbox"]) for r in rows])
         if text in _BULLET_MISREADS and line.extent <= height:
             line.text, line.words = "\u2022", [OcrWord("\u2022", 100.0, line.words[0].bbox)]
         out.append(line)
     return out
+
+
+DESCENDERS = frozenset("gjpqy,;()[]{}|@$")  # what reaches below the baseline
+DESCENT = 1.22  # a line's height with descenders over its height without (ascenders or capitals to the baseline)
+SIZE_CONFIDENCE = 50.0
+
+
+def _line_size(rows: list[dict]) -> float:
+    """The font size of an OCR line, from the height of its words' boxes as if it reached below the baseline: a line
+    with no descenders ("Certified Database") is shorter than one with ("Hyper-V") at the same size, and the lines of
+    one heading came apart as two sizes. Words read with little confidence don't count where others are sure (the
+    stars of a rating read as letters, taller than the text, made a heading of their line)."""
+    sure = [r for r in rows if r["conf"] >= SIZE_CONFIDENCE] or rows
+    height = max(r["line"][3] for r in sure) - min(r["line"][1] for r in sure)
+    if not any(DESCENDERS.intersection(r["text"]) for r in sure):
+        height *= DESCENT
+    return max(4.0, height / 1.15)
 
 
 def _attach_words(line: OcrLine, words: list[OcrWord]) -> None:
@@ -294,6 +409,8 @@ def write_ocr_layer(src: str, dst: str, lines: list[OcrLine]) -> int:
     try:
         wrapped: set[int] = set()
         for ln in lines:
+            if not ln.text.strip():
+                continue  # every word on it was a picture read as letters
             page = doc[ln.page]
             if ln.page not in wrapped:
                 # Scanner output often leaves a bare `cm` in the content stream; isolate it so it

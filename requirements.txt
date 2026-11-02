@@ -1,9 +1,9 @@
 # API / queue
-fastapi==0.143.2
+fastapi==0.162.0
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32
-pydantic==2.14.1
-pydantic-settings==2.16.0
+pydantic==2.14.2
+pydantic-settings==2.16.2
 celery==5.6.3
 redis==8.1.0
 prometheus-client==0.26.0  # metrics for the deployment's Prometheus (#397)
@@ -16,7 +16,7 @@ lxml==6.1.3
 pdfplumber==0.11.10  # independent reader for tag verification
 py3langid==0.4.0
 latex2mathml==3.81.1  # formulas as MathML, from the AI's LaTeX (#403)
-fonttools==4.67.0  # Adobe Glyph List (glyph name -> Unicode)
+fonttools==4.68.0  # Adobe Glyph List (glyph name -> Unicode)
 weasyprint==70.0  # the PDF report (PDF/UA-1); needs Pango from the OS
 # brotli comes through fonttools[woff] (weasyprint). 1.2.0 has GHSA-9v8h-qqgm-4m35 (CRITICAL), which held every engine
 # image at build.sh's scan; 1.2.1 (2026-10-22) is under the two-week rule, an exception agreed on 2026-10-24
